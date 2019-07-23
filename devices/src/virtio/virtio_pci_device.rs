@@ -340,13 +340,14 @@ impl PciDevice for VirtioPciDevice {
         let mut ranges = Vec::new();
         let settings_config_addr = resources
             .mmio_allocator()
-            .allocate(
+            .allocate_with_align(
                 CAPABILITY_BAR_SIZE,
                 Alloc::PciBar { bus, dev, bar: 0 },
                 format!(
                     "virtio-{}-cap_bar",
                     type_to_str(self.device.device_type()).unwrap_or("?")
                 ),
+                CAPABILITY_BAR_SIZE,
             )
             .map_err(|e| PciDeviceError::IoAllocationFailed(CAPABILITY_BAR_SIZE, e))?;
         let config = PciBarConfiguration::default()
@@ -377,7 +378,7 @@ impl PciDevice for VirtioPciDevice {
         for config in self.device.get_device_bars() {
             let device_addr = resources
                 .device_allocator()
-                .allocate(
+                .allocate_with_align(
                     config.get_size(),
                     Alloc::PciBar {
                         bus,
@@ -388,6 +389,7 @@ impl PciDevice for VirtioPciDevice {
                         "virtio-{}-custom_bar",
                         type_to_str(self.device.device_type()).unwrap_or("?")
                     ),
+                    config.get_size(),
                 )
                 .map_err(|e| PciDeviceError::IoAllocationFailed(config.get_size(), e))?;
             let config = config.set_address(device_addr);
@@ -426,12 +428,12 @@ impl PciDevice for VirtioPciDevice {
             .collect()
     }
 
-    fn config_registers(&self) -> &PciConfiguration {
-        &self.config_regs
+    fn read_config_register(&self, reg_idx: usize) -> u32 {
+        self.config_regs.read_reg(reg_idx)
     }
 
-    fn config_registers_mut(&mut self) -> &mut PciConfiguration {
-        &mut self.config_regs
+    fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+        (&mut self.config_regs).write_reg(reg_idx, offset, data)
     }
 
     // Clippy: the value of COMMON_CONFIG_BAR_OFFSET happens to be zero so the

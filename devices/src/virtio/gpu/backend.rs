@@ -21,6 +21,7 @@ use gpu_display::*;
 use gpu_renderer::{
     format_fourcc as renderer_fourcc, Box3, Context as RendererContext, Image as RendererImage,
     Renderer, Resource as GpuRendererResource, ResourceCreateArgs, VIRGL_RES_BIND_SCANOUT,
+    VIRGL_RES_BIND_SHARED,
 };
 
 use super::protocol::{
@@ -114,21 +115,7 @@ impl VirglResource for GpuRendererResource {
         src_offset: u64,
         _mem: &GuestMemory,
     ) {
-        let res = self.transfer_write(
-            None,
-            0,
-            0,
-            0,
-            Box3 {
-                x,
-                y,
-                z: 0,
-                w: width,
-                h: height,
-                d: 0,
-            },
-            src_offset,
-        );
+        let res = self.transfer_write(None, 0, 0, 0, Box3::new_2d(x, y, width, height), src_offset);
         if let Err(e) = res {
             error!(
                 "failed to write to resource (x={} y={} w={} h={}, src_offset={}): {}",
@@ -143,16 +130,9 @@ impl VirglResource for GpuRendererResource {
             None,
             0,
             0,
-            0,
-            Box3 {
-                x,
-                y,
-                z: 0,
-                w: width,
-                h: height,
-                d: 0,
-            },
-            0,
+            0, /* layer_stride */
+            Box3::new_2d(x, y, width, height),
+            0, /* offset */
             dst,
         );
         if let Err(e) = res {
@@ -725,7 +705,7 @@ impl Backend {
     }
 
     pub fn allocate_using_minigbm(args: ResourceCreateArgs) -> bool {
-        args.bind & VIRGL_RES_BIND_SCANOUT != 0
+        args.bind & (VIRGL_RES_BIND_SCANOUT | VIRGL_RES_BIND_SHARED) != 0
             && args.depth == 1
             && args.array_size == 1
             && args.last_level == 0

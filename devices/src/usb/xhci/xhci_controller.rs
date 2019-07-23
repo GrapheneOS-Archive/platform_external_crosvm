@@ -216,10 +216,11 @@ impl PciDevice for XhciController {
         // xHCI spec 5.2.1.
         let bar0_addr = resources
             .mmio_allocator()
-            .allocate(
+            .allocate_with_align(
                 XHCI_BAR0_SIZE,
                 Alloc::PciBar { bus, dev, bar: 0 },
                 "xhci_bar0".to_string(),
+                XHCI_BAR0_SIZE,
             )
             .map_err(|e| PciDeviceError::IoAllocationFailed(XHCI_BAR0_SIZE, e))?;
         let bar0_config = PciBarConfiguration::default()
@@ -233,12 +234,12 @@ impl PciDevice for XhciController {
         Ok(vec![(bar0_addr, XHCI_BAR0_SIZE)])
     }
 
-    fn config_registers(&self) -> &PciConfiguration {
-        &self.config_regs
+    fn read_config_register(&self, reg_idx: usize) -> u32 {
+        self.config_regs.read_reg(reg_idx)
     }
 
-    fn config_registers_mut(&mut self) -> &mut PciConfiguration {
-        &mut self.config_regs
+    fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+        (&mut self.config_regs).write_reg(reg_idx, offset, data)
     }
 
     fn read_bar(&mut self, addr: u64, data: &mut [u8]) {

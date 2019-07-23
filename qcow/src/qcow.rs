@@ -38,6 +38,7 @@ pub enum Error {
     InvalidClusterSize,
     InvalidIndex,
     InvalidL1TableOffset,
+    InvalidL1TableSize(u32),
     InvalidMagic,
     InvalidOffset(u64),
     InvalidRefcountTableOffset,
@@ -76,13 +77,18 @@ impl Display for Error {
             BackingFilesNotSupported => write!(f, "backing files not supported"),
             CompressedBlocksNotSupported => write!(f, "compressed blocks not supported"),
             EvictingCache(e) => write!(f, "failed to evict cache: {}", e),
-            FileTooBig(size) => write!(f, "file larger than max of 1TB: {}", size),
+            FileTooBig(size) => write!(
+                f,
+                "file larger than max of {}: {}",
+                MAX_QCOW_FILE_SIZE, size
+            ),
             GettingFileSize(e) => write!(f, "failed to get file size: {}", e),
             GettingRefcount(e) => write!(f, "failed to get refcount: {}", e),
             InvalidClusterIndex => write!(f, "invalid cluster index"),
             InvalidClusterSize => write!(f, "invalid cluster size"),
             InvalidIndex => write!(f, "invalid index"),
             InvalidL1TableOffset => write!(f, "invalid L1 table offset"),
+            InvalidL1TableSize(size) => write!(f, "invalid L1 table size {}", size),
             InvalidMagic => write!(f, "invalid magic"),
             InvalidOffset(_) => write!(f, "invalid offset"),
             InvalidRefcountTableOffset => write!(f, "invalid refcount table offset"),
@@ -115,6 +121,9 @@ pub enum ImageType {
     Raw,
     Qcow2,
 }
+
+// Maximum data size supported.
+const MAX_QCOW_FILE_SIZE: u64 = 0x01 << 44; // 16 TB.
 
 // QCOW magic constant that starts the header.
 const QCOW_MAGIC: u32 = 0x5146_49fb;
@@ -357,11 +366,21 @@ impl QcowFile {
             return Err(Error::UnsupportedVersion(header.version));
         }
 
+        // Make sure that the L1 table fits in RAM.
+        if u64::from(header.l1_size) > MAX_RAM_POINTER_TABLE_SIZE {
+            return Err(Error::InvalidL1TableSize(header.l1_size));
+        }
+
         let cluster_bits: u32 = header.cluster_bits;
         if cluster_bits < MIN_CLUSTER_BITS || cluster_bits > MAX_CLUSTER_BITS {
             return Err(Error::InvalidClusterSize);
         }
         let cluster_size = 0x01u64 << cluster_bits;
+
+        // Limit the total size of the disk.
+        if header.size > MAX_QCOW_FILE_SIZE {
+            return Err(Error::FileTooBig(header.size));
+        }
 
         // No current support for backing files.
         if header.backing_file_offset != 0 {
@@ -1547,12 +1566,12 @@ fn offset_is_cluster_boundary(offset: u64, cluster_bits: u32) -> Result<()> {
 
 // Ceiling of the division of `dividend`/`divisor`.
 fn div_round_up_u64(dividend: u64, divisor: u64) -> u64 {
-    (dividend + divisor - 1) / divisor
+    dividend / divisor + if dividend % divisor != 0 { 1 } else { 0 }
 }
 
 // Ceiling of the division of `dividend`/`divisor`.
 fn div_round_up_u32(dividend: u32, divisor: u32) -> u32 {
-    (dividend + divisor - 1) / divisor
+    dividend / divisor + if dividend % divisor != 0 { 1 } else { 0 }
 }
 
 fn convert_copy<R, W>(reader: &mut R, writer: &mut W, offset: u64, size: u64) -> Result<()>
@@ -1793,9 +1812,9 @@ mod tests {
 
     #[test]
     fn invalid_cluster_bits() {
-        let mut header = test_huge_header();
+        let mut header = valid_header();
         header[23] = 3;
-        with_basic_file(&test_huge_header(), |disk_file: File| {
+        with_basic_file(&header, |disk_file: File| {
             QcowFile::from(disk_file).expect_err("Failed to create file.");
         });
     }
@@ -1803,6 +1822,24 @@ mod tests {
     #[test]
     fn test_header_huge_file() {
         let header = test_huge_header();
+        with_basic_file(&header, |disk_file: File| {
+            QcowFile::from(disk_file).expect_err("Failed to create file.");
+        });
+    }
+
+    #[test]
+    fn test_header_crazy_file_size_rejected() {
+        let mut header = valid_header();
+        &mut header[24..32].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x1e]);
+        with_basic_file(&header, |disk_file: File| {
+            QcowFile::from(disk_file).expect_err("Failed to create file.");
+        });
+    }
+
+    #[test]
+    fn test_huge_l1_table() {
+        let mut header = valid_header();
+        header[36] = 0x12;
         with_basic_file(&header, |disk_file: File| {
             QcowFile::from(disk_file).expect_err("Failed to create file.");
         });

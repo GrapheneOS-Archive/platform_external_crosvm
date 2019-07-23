@@ -270,7 +270,11 @@ impl AsRawFd for TaggedControlSocket {
     }
 }
 
-fn create_base_minijail(root: &Path, seccomp_policy: &Path) -> Result<Minijail> {
+fn create_base_minijail(
+    root: &Path,
+    log_failures: bool,
+    seccomp_policy: &Path,
+) -> Result<Minijail> {
     // All child jails run in a new user namespace without any users mapped,
     // they run as nobody unless otherwise configured.
     let mut j = Minijail::new().map_err(Error::DeviceJail)?;
@@ -289,8 +293,9 @@ fn create_base_minijail(root: &Path, seccomp_policy: &Path) -> Result<Minijail> 
     // Use TSYNC only for the side effect of it using SECCOMP_RET_TRAP, which will correctly kill
     // the entire device process if a worker thread commits a seccomp violation.
     j.set_seccomp_filter_tsync();
-    #[cfg(debug_assertions)]
-    j.log_seccomp_filter_failures();
+    if log_failures {
+        j.log_seccomp_filter_failures();
+    }
     j.parse_seccomp_filters(seccomp_policy)
         .map_err(Error::DeviceJail)?;
     j.use_seccomp_filter();
@@ -308,7 +313,11 @@ fn simple_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
             return Err(Error::PivotRootDoesntExist(pivot_root));
         }
         let policy_path: PathBuf = cfg.seccomp_policy_dir.join(policy);
-        Ok(Some(create_base_minijail(root_path, &policy_path)?))
+        Ok(Some(create_base_minijail(
+            root_path,
+            cfg.seccomp_log_failures,
+            &policy_path,
+        )?))
     } else {
         Ok(None)
     }
@@ -552,7 +561,7 @@ fn create_gpu_device(
     cfg: &Config,
     exit_evt: &EventFd,
     gpu_device_socket: VmMemoryControlRequestSocket,
-    gpu_socket: virtio::resource_bridge::ResourceResponseSocket,
+    gpu_sockets: Vec<virtio::resource_bridge::ResourceResponseSocket>,
     wayland_socket_path: &Path,
 ) -> DeviceResult {
     let jailed_wayland_path = Path::new("/wayland-0");
@@ -560,7 +569,7 @@ fn create_gpu_device(
     let dev = virtio::Gpu::new(
         exit_evt.try_clone().map_err(Error::CloneEventFd)?,
         Some(gpu_device_socket),
-        Some(gpu_socket),
+        gpu_sockets,
         if cfg.sandbox {
             &jailed_wayland_path
         } else {
@@ -764,8 +773,7 @@ fn create_pmem_device(
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev) as Box<dyn VirtioDevice>,
-        /// TODO(jstaron) Create separate device policy for pmem_device.
-        jail: simple_jail(&cfg, "block_device.policy")?,
+        jail: simple_jail(&cfg, "pmem_device.policy")?,
     })
 }
 
@@ -836,34 +844,43 @@ fn create_virtio_devices(
     }
 
     #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
-    let mut resource_bridge_wl_socket = None::<virtio::resource_bridge::ResourceRequestSocket>;
+    let mut resource_bridges = Vec::<virtio::resource_bridge::ResourceResponseSocket>::new();
+
+    if let Some(wayland_socket_path) = cfg.wayland_socket_path.as_ref() {
+        #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+        let mut wl_resource_bridge = None::<virtio::resource_bridge::ResourceRequestSocket>;
+
+        #[cfg(feature = "gpu")]
+        {
+            if cfg.gpu {
+                let (wl_socket, gpu_socket) =
+                    virtio::resource_bridge::pair().map_err(Error::CreateSocket)?;
+                resource_bridges.push(gpu_socket);
+                wl_resource_bridge = Some(wl_socket);
+            }
+        }
+
+        devs.push(create_wayland_device(
+            cfg,
+            wayland_socket_path,
+            wayland_device_socket,
+            wl_resource_bridge,
+        )?);
+    }
 
     #[cfg(feature = "gpu")]
     {
         if cfg.gpu {
             if let Some(wayland_socket_path) = &cfg.wayland_socket_path {
-                let (wl_socket, gpu_socket) =
-                    virtio::resource_bridge::pair().map_err(Error::CreateSocket)?;
-                resource_bridge_wl_socket = Some(wl_socket);
-
                 devs.push(create_gpu_device(
                     cfg,
                     _exit_evt,
                     gpu_device_socket,
-                    gpu_socket,
+                    resource_bridges,
                     wayland_socket_path,
                 )?);
             }
         }
-    }
-
-    if let Some(wayland_socket_path) = cfg.wayland_socket_path.as_ref() {
-        devs.push(create_wayland_device(
-            cfg,
-            wayland_socket_path,
-            wayland_device_socket,
-            resource_bridge_wl_socket,
-        )?);
     }
 
     if let Some(cid) = cfg.cid {

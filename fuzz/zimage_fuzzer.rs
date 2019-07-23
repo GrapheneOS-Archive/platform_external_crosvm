@@ -12,6 +12,8 @@ use std::panic;
 use std::process;
 use std::slice;
 
+const MEM_SIZE: u64 = 256 * 1024 * 1024;
+
 fn make_elf_bin(elf_bytes: &[u8]) -> File {
     let mut shm = SharedMemory::new(None).expect("failed to create shared memory");
     shm.set_size(elf_bytes.len() as u64)
@@ -30,7 +32,7 @@ pub fn test_one_input(data: *const u8, size: usize) -> i32 {
         // function.
         let bytes = unsafe { slice::from_raw_parts(data, size) };
         let mut kimage = make_elf_bin(bytes);
-        let mem = GuestMemory::new(&[(GuestAddress(0), bytes.len() as u64 + 0x1000)]).unwrap();
+        let mem = GuestMemory::new(&[(GuestAddress(0), MEM_SIZE)]).unwrap();
         let _ = kernel_loader::load_kernel(&mem, GuestAddress(0), &mut kimage);
     })
     .err()
