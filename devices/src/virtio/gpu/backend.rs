@@ -75,15 +75,7 @@ trait VirglResource {
     );
 
     /// Reads from the given rectangle of pixels in the resource to the `dst` slice of memory.
-    fn read_to_volatile(
-        &mut self,
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-        dst: VolatileSlice,
-        dst_stride: u32,
-    );
+    fn read_to_volatile(&mut self, x: u32, y: u32, width: u32, height: u32, dst: VolatileSlice);
 }
 
 impl VirglResource for GpuRendererResource {
@@ -132,20 +124,12 @@ impl VirglResource for GpuRendererResource {
         }
     }
 
-    fn read_to_volatile(
-        &mut self,
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-        dst: VolatileSlice,
-        dst_stride: u32,
-    ) {
+    fn read_to_volatile(&mut self, x: u32, y: u32, width: u32, height: u32, dst: VolatileSlice) {
         let res = GpuRendererResource::read_to_volatile(
             self,
             None,
             0,
-            dst_stride,
+            0,
             0, /* layer_stride */
             Box3::new_2d(x, y, width, height),
             0, /* offset */
@@ -293,19 +277,8 @@ impl VirglResource for BackedBuffer {
         }
     }
 
-    fn read_to_volatile(
-        &mut self,
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-        dst: VolatileSlice,
-        dst_stride: u32,
-    ) {
-        if let Err(e) = self
-            .buffer
-            .read_to_volatile(x, y, width, height, 0, dst, dst_stride)
-        {
+    fn read_to_volatile(&mut self, x: u32, y: u32, width: u32, height: u32, dst: VolatileSlice) {
+        if let Err(e) = self.buffer.read_to_volatile(x, y, width, height, 0, dst) {
             error!("failed to copy resource: {}", e);
         }
     }
@@ -318,7 +291,7 @@ impl VirglResource for BackedBuffer {
 /// failure, or requested data for the given command.
 pub struct Backend {
     display: Rc<RefCell<GpuDisplay>>,
-    device: Option<Device>,
+    device: Device,
     renderer: Renderer,
     resources: Map<u32, Box<dyn VirglResource>>,
     contexts: Map<u32, RendererContext>,
@@ -334,11 +307,8 @@ impl Backend {
     /// Creates a new backend for virtio-gpu that realizes all commands using the given `device` for
     /// allocating buffers, `display` for showing the results, and `renderer` for submitting
     /// rendering commands.
-    ///
-    /// If the `device` is None, all buffer allocations will be done internally by the renderer or
-    /// the display and buffer data is copied as needed.
     pub fn new(
-        device: Option<Device>,
+        device: Device,
         display: GpuDisplay,
         renderer: Renderer,
         gpu_device_socket: VmMemoryControlRequestSocket,
@@ -406,54 +376,30 @@ impl Backend {
         id: u32,
         width: u32,
         height: u32,
-        format: u32,
+        fourcc: u32,
     ) -> GpuResponse {
         if id == 0 {
             return GpuResponse::ErrInvalidResourceId;
         }
         match self.resources.entry(id) {
-            Entry::Vacant(slot) => match self.device.as_ref() {
-                Some(device) => match renderer_fourcc(format) {
-                    Some(fourcc) => {
-                        let res = device.create_buffer(
-                            width,
-                            height,
-                            Format::from(fourcc),
-                            Flags::empty().use_scanout(true).use_linear(true),
-                        );
-                        match res {
-                            Ok(res) => {
-                                slot.insert(Box::from(BackedBuffer::from(res)));
-                                GpuResponse::OkNoData
-                            }
-                            Err(_) => {
-                                error!("failed to create renderer resource {}", fourcc);
-                                GpuResponse::ErrUnspec
-                            }
-                        }
+            Entry::Vacant(slot) => {
+                let res = self.device.create_buffer(
+                    width,
+                    height,
+                    Format::from(fourcc),
+                    Flags::empty().use_scanout(true).use_linear(true),
+                );
+                match res {
+                    Ok(res) => {
+                        slot.insert(Box::from(BackedBuffer::from(res)));
+                        GpuResponse::OkNoData
                     }
-                    None => {
-                        error!(
-                            "unrecognized format can not be converted to fourcc {}",
-                            format
-                        );
-                        GpuResponse::ErrInvalidParameter
-                    }
-                },
-                None => {
-                    let res = self.renderer.create_resource_2d(id, width, height, format);
-                    match res {
-                        Ok(res) => {
-                            slot.insert(Box::new(res));
-                            GpuResponse::OkNoData
-                        }
-                        Err(e) => {
-                            error!("failed to create renderer resource: {}", e);
-                            GpuResponse::ErrUnspec
-                        }
+                    Err(_) => {
+                        error!("failed to create renderer resource {}", fourcc);
+                        GpuResponse::ErrUnspec
                     }
                 }
-            },
+            }
             Entry::Occupied(_) => GpuResponse::ErrInvalidResourceId,
         }
     }
@@ -498,10 +444,10 @@ impl Backend {
         &mut self,
         resource_id: u32,
         surface_id: u32,
-        _x: u32,
-        _y: u32,
-        _width: u32,
-        _height: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
     ) -> GpuResponse {
         let resource = match self.resources.get_mut(&resource_id) {
             Some(r) => r,
@@ -514,13 +460,12 @@ impl Backend {
         }
 
         // Import failed, fall back to a copy.
-        let mut display = self.display.borrow_mut();
+        let display = self.display.borrow_mut();
         // Prevent overwriting a buffer that is currently being used by the compositor.
         if display.next_buffer_in_use(surface_id) {
             return GpuResponse::OkNoData;
         }
-
-        let fb = match display.framebuffer_region(surface_id, 0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT) {
+        let fb = match display.framebuffer_memory(surface_id) {
             Some(fb) => fb,
             None => {
                 error!("failed to access framebuffer for surface {}", surface_id);
@@ -528,14 +473,7 @@ impl Backend {
             }
         };
 
-        resource.read_to_volatile(
-            0,
-            0,
-            DEFAULT_WIDTH,
-            DEFAULT_HEIGHT,
-            fb.as_volatile_slice(),
-            fb.stride(),
-        );
+        resource.read_to_volatile(x, y, width, height, fb);
         display.flip(surface_id);
 
         GpuResponse::OkNoData
@@ -660,16 +598,10 @@ impl Backend {
             // Importing failed, so try copying the pixels into the surface's slower shared memory
             // framebuffer.
             if let Some(buffer) = resource.buffer() {
-                if let Some(fb) = self.display.borrow_mut().framebuffer(cursor_surface) {
-                    if let Err(e) = buffer.read_to_volatile(
-                        0,
-                        0,
-                        buffer.width(),
-                        buffer.height(),
-                        0,
-                        fb.as_volatile_slice(),
-                        fb.stride(),
-                    ) {
+                if let Some(fb) = self.display.borrow_mut().framebuffer_memory(cursor_surface) {
+                    if let Err(e) =
+                        buffer.read_to_volatile(0, 0, buffer.width(), buffer.height(), 0, fb)
+                    {
                         error!("failed to copy resource to cursor: {}", e);
                         return GpuResponse::ErrInvalidParameter;
                     }
@@ -686,7 +618,7 @@ impl Backend {
     pub fn move_cursor(&mut self, x: u32, y: u32) -> GpuResponse {
         if let Some(cursor_surface) = self.cursor_surface {
             if let Some(scanout_surface) = self.scanout_surface {
-                let mut display = self.display.borrow_mut();
+                let display = self.display.borrow_mut();
                 display.set_position(cursor_surface, x, y);
                 display.commit(scanout_surface);
             }
@@ -816,11 +748,10 @@ impl Backend {
         match self.resources.entry(id) {
             Entry::Occupied(_) => GpuResponse::ErrInvalidResourceId,
             Entry::Vacant(slot) => {
-                if self.device.is_some() && Backend::allocate_using_minigbm(create_args) {
-                    let device = self.device.as_ref().unwrap();
+                if Backend::allocate_using_minigbm(create_args) {
                     match renderer_fourcc(create_args.format) {
                         Some(fourcc) => {
-                            let buffer = match device.create_buffer(
+                            let buffer = match self.device.create_buffer(
                                 width,
                                 height,
                                 Format::from(fourcc),
@@ -829,7 +760,7 @@ impl Backend {
                                 Ok(buffer) => buffer,
                                 Err(_) => {
                                     // Attempt to allocate the buffer without scanout flag.
-                                    match device.create_buffer(
+                                    match self.device.create_buffer(
                                         width,
                                         height,
                                         Format::from(fourcc),
