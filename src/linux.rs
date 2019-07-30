@@ -11,7 +11,6 @@ use std::fmt::{self, Display};
 use std::fs::{File, OpenOptions};
 use std::io::{self, stdin, Read};
 use std::net::Ipv4Addr;
-use std::num::NonZeroU8;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -563,33 +562,19 @@ fn create_gpu_device(
     exit_evt: &EventFd,
     gpu_device_socket: VmMemoryControlRequestSocket,
     gpu_sockets: Vec<virtio::resource_bridge::ResourceResponseSocket>,
-    wayland_socket_path: Option<PathBuf>,
-    x_display: Option<String>,
+    wayland_socket_path: &Path,
 ) -> DeviceResult {
     let jailed_wayland_path = Path::new("/wayland-0");
-
-    let mut display_backends = vec![
-        virtio::DisplayBackend::X(x_display),
-        virtio::DisplayBackend::Null,
-    ];
-
-    if let Some(socket_path) = wayland_socket_path.as_ref() {
-        display_backends.insert(
-            0,
-            virtio::DisplayBackend::Wayland(if cfg.sandbox {
-                Some(jailed_wayland_path.to_owned())
-            } else {
-                Some(socket_path.to_owned())
-            }),
-        );
-    }
 
     let dev = virtio::Gpu::new(
         exit_evt.try_clone().map_err(Error::CloneEventFd)?,
         Some(gpu_device_socket),
-        NonZeroU8::new(1).unwrap(), // number of scanouts
         gpu_sockets,
-        display_backends,
+        if cfg.sandbox {
+            &jailed_wayland_path
+        } else {
+            wayland_socket_path
+        },
     );
 
     let jail = match simple_jail(&cfg, "gpu_device.policy")? {
@@ -620,9 +605,7 @@ fn create_gpu_device(
 
             // Bind mount the wayland socket into jail's root. This is necessary since each
             // new wayland context must open() the socket.
-            if let Some(path) = wayland_socket_path {
-                jail.mount_bind(path.as_ref(), jailed_wayland_path, true)?;
-            }
+            jail.mount_bind(wayland_socket_path, jailed_wayland_path, true)?;
 
             add_crosvm_user_to_jail(&mut jail, "gpu")?;
 
@@ -888,14 +871,15 @@ fn create_virtio_devices(
     #[cfg(feature = "gpu")]
     {
         if cfg.gpu {
-            devs.push(create_gpu_device(
-                cfg,
-                _exit_evt,
-                gpu_device_socket,
-                resource_bridges,
-                cfg.wayland_socket_path.clone(),
-                cfg.x_display.clone(),
-            )?);
+            if let Some(wayland_socket_path) = &cfg.wayland_socket_path {
+                devs.push(create_gpu_device(
+                    cfg,
+                    _exit_evt,
+                    gpu_device_socket,
+                    resource_bridges,
+                    wayland_socket_path,
+                )?);
+            }
         }
     }
 

@@ -11,7 +11,7 @@ use std::i64;
 use std::mem::{self, size_of};
 use std::num::NonZeroU8;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -717,20 +717,22 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub fn new(
+    pub fn new<P: AsRef<Path>>(
         exit_evt: EventFd,
         gpu_device_socket: Option<VmMemoryControlRequestSocket>,
-        num_scanouts: NonZeroU8,
         resource_bridges: Vec<ResourceResponseSocket>,
-        display_backends: Vec<DisplayBackend>,
+        wayland_socket_path: P,
     ) -> Gpu {
+        let display_backends = vec![DisplayBackend::Wayland(Some(
+            wayland_socket_path.as_ref().to_owned(),
+        ))];
         Gpu {
             config_event: false,
             exit_evt,
             gpu_device_socket,
             resource_bridges,
             kill_evt: None,
-            num_scanouts,
+            num_scanouts: NonZeroU8::new(1).unwrap(),
             display_backends,
         }
     }
