@@ -1,0 +1,583 @@
+rust_binary_host {
+    name: "crosvm.experimental",
+    crate_name: "crosvm",
+    edition: "2018",
+    enabled: false,
+    relative_install_path: "x86_64-linux-gnu",
+    srcs: ["src/main.rs"],
+
+    target: {
+        linux_glibc_x86_64: {
+            rlibs: ["libx86_64_rust"],
+            enabled: true,
+        },
+    },
+
+    // Install the crosvm prebuilts as requirements until we're building these as well.
+    required: [
+        "x86_64_linux_gnu_libepoxy.so.0_for_crosvm",
+        "x86_64_linux_gnu_libgbm.so.1_for_crosvm",
+        "x86_64_linux_gnu_libvirglrenderer.so.0_for_crosvm",
+    ],
+
+    features: [
+        "default-no-sandbox",
+        "gpu",
+    ],
+    flags: [
+        "-C overflow-checks=y",
+        "-C panic=abort",
+        "-L device/google/cuttlefish_vmm/x86_64-linux-gnu/bin/",
+    ],
+    ld_flags: [
+        "-Wl,--rpath,\\$$ORIGIN",
+        "-Wl,--rpath,\\$$ORIGIN/../../lib64",
+    ],
+
+    rlibs: [
+        "libassertions",
+        "libarch",
+        "libaudio_streams",
+        "libbit_field",
+        "libbyteorder",
+        "libdata_model",
+        "libdevices",
+        "libgpu_buffer",
+        "libio_jail",
+        "libkernel_cmdline",
+        "libkernel_loader",
+        "libkvm",
+        "libkvm_sys",
+        "libc_rust",
+        "liblibcras",
+        "libmsg_socket",
+        "libnet_util",
+        "libp9",
+        "libqcow",
+        "librand_ish",
+        "libresources",
+        "libsync_rust",
+        "libsys_util",
+        "libvhost",
+        "libvm_control",
+    ],
+    proc_macros: [
+        "libremain",
+        "libenumn",
+    ],
+    shared_libs: [
+        "libminijail",
+        "libcap",
+    ],
+    static_libs: [
+        "libusb",
+        "libdisplay_wl",
+        "libwayland_client",
+        "libffi",
+        "libfdt",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libvm_control",
+    crate_name: "vm_control",
+    edition: "2018",
+    srcs: ["vm_control/src/lib.rs"],
+
+    features: ["sandboxed-libusb"],
+
+    rlibs: [
+        "libbyteorder",
+        "libdata_model",
+        "libkvm",
+        "libc_rust",
+        "libmsg_socket",
+        "libresources",
+        "libsys_util",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libnet_sys",
+    crate_name: "net_sys",
+    edition: "2018",
+    srcs: ["net_sys/src/lib.rs"],
+
+    rlibs: ["libsys_util"],
+}
+
+rust_library_host_rlib {
+    name: "libio_jail",
+    crate_name: "io_jail",
+    edition: "2018",
+    srcs: ["io_jail/src/lib.rs"],
+
+    rlibs: ["libc_rust"],
+}
+
+rust_library_host_rlib {
+    name: "libdevices",
+    crate_name: "devices",
+    edition: "2018",
+    srcs: ["devices/src/lib.rs"],
+
+    features: [
+        "gpu",
+        "wl-dmabuf",
+    ],
+
+    rlibs: [
+        "libaudio_streams",
+        "libbit_field",
+        "libbyteorder",
+        "libdata_model",
+        "libgpu_buffer",
+        "libgpu_display",
+        "libgpu_renderer",
+        "libio_jail",
+        "libkvm",
+        "libc_rust",
+        "libmsg_socket",
+        "libnet_sys",
+        "libnet_util",
+        "libp9",
+        "libresources",
+        "libsync_rust",
+        "libsys_util",
+        "libusb_util",
+        "libvhost",
+        "libvirtio_sys",
+        "libvm_control",
+    ],
+    proc_macros: [
+        "libmsg_on_socket_derive",
+        "libenumn",
+        "libremain",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libnet_util",
+    crate_name: "net_util",
+    edition: "2018",
+    srcs: ["net_util/src/lib.rs"],
+
+    rlibs: [
+        "libc_rust",
+        "libnet_sys",
+        "libsys_util",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libkvm_sys",
+    crate_name: "kvm_sys",
+    edition: "2018",
+    srcs: ["kvm_sys/src/lib.rs"],
+
+    rlibs: [
+        "libc_rust",
+        "libsys_util",
+    ],
+}
+
+rust_proc_macro {
+    name: "libpoll_token_derive",
+    crate_name: "poll_token_derive",
+    edition: "2018",
+    srcs: ["sys_util/poll_token_derive/poll_token_derive.rs"],
+    host_supported: true,
+
+    rlibs: [
+        "libsyn",
+        "libquote",
+        "libproc_macro2",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libvhost",
+    crate_name: "vhost",
+    edition: "2018",
+    srcs: ["vhost/src/lib.rs"],
+
+    rlibs: [
+        "libassertions",
+        "libc_rust",
+        "libnet_util",
+        "libsys_util",
+        "libvirtio_sys",
+    ],
+}
+
+rust_library_rlib {
+    name: "libsys_util",
+    edition: "2018",
+    crate_name: "sys_util",
+    srcs: ["sys_util/src/lib.rs"],
+    host_supported: true,
+
+    rlibs: [
+        "libdata_model",
+        "libc_rust",
+        "libsync_rust",
+        "libsyscall_defines",
+    ],
+    proc_macros: ["libpoll_token_derive"],
+}
+
+rust_library_rlib {
+    name: "libsyscall_defines",
+    crate_name: "syscall_defines",
+    edition: "2018",
+    host_supported: true,
+    srcs: ["syscall_defines/src/lib.rs"],
+}
+
+rust_library_host_rlib {
+    name: "libusb_util",
+    crate_name: "usb_util",
+    edition: "2018",
+    srcs: ["usb_util/src/lib.rs"],
+
+    rlibs: [
+        "libassertions",
+        "libdata_model",
+        "libsync_rust",
+    ],
+}
+
+rust_proc_macro {
+    name: "libbit_field_derive",
+    crate_name: "bit_field_derive",
+    edition: "2018",
+    srcs: ["bit_field/bit_field_derive/bit_field_derive.rs"],
+    host_supported: true,
+
+    rlibs: [
+        "libproc_macro2",
+        "libquote",
+        "libsyn",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libbit_field",
+    crate_name: "bit_field",
+    edition: "2018",
+    srcs: ["bit_field/src/lib.rs"],
+
+    proc_macros: ["libbit_field_derive"],
+}
+
+rust_library_rlib {
+    name: "libdata_model",
+    crate_name: "data_model",
+    srcs: ["data_model/src/lib.rs"],
+    host_supported: true,
+
+    rlibs: ["libassertions"],
+}
+
+rust_library_host_rlib {
+    name: "libtempfile",
+    crate_name: "tempfile",
+    edition: "2018",
+    srcs: ["tempfile/src/lib.rs"],
+
+    rlibs: ["librand_ish"],
+}
+
+rust_library_rlib {
+    name: "libassertions",
+    crate_name: "assertions",
+    srcs: ["assertions/src/lib.rs"],
+    host_supported: true,
+}
+
+rust_library_host_rlib {
+    name: "libarch",
+    crate_name: "arch",
+    edition: "2018",
+    srcs: ["arch/src/lib.rs"],
+
+    rlibs: [
+        "libbyteorder",
+        "libdevices",
+        "libio_jail",
+        "libkernel_cmdline",
+        "libkvm",
+        "libc_rust",
+        "libresources",
+        "libsync_rust",
+        "libsys_util",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libresources",
+    crate_name: "resources",
+    edition: "2018",
+    srcs: ["resources/src/lib.rs"],
+
+    features: ["wl-dmabuf"],
+
+    rlibs: [
+        "libgpu_buffer",
+        "libc_rust",
+        "libmsg_socket",
+        "libsys_util",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libvirtio_sys",
+    crate_name: "virtio_sys",
+    edition: "2018",
+    srcs: ["virtio_sys/src/lib.rs"],
+
+    rlibs: ["libsys_util"],
+}
+
+rust_library_host_rlib {
+    name: "libkvm",
+    crate_name: "kvm",
+    edition: "2018",
+    srcs: ["kvm/src/lib.rs"],
+
+    rlibs: [
+        "libkvm_sys",
+        "libmsg_socket",
+        "libc_rust",
+        "libsys_util",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libgpu_renderer",
+    crate_name: "gpu_renderer",
+    edition: "2018",
+    srcs: ["gpu_renderer/src/lib.rs"],
+
+    rlibs: [
+        "libdata_model",
+        "libc_rust",
+        "libsys_util",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libmsg_socket",
+    crate_name: "msg_socket",
+    edition: "2018",
+    srcs: ["msg_socket/src/lib.rs"],
+
+    rlibs: [
+        "libdata_model",
+        "libsys_util",
+    ],
+    proc_macros: ["libmsg_on_socket_derive"],
+}
+
+rust_proc_macro {
+    name: "libmsg_on_socket_derive",
+    crate_name: "msg_on_socket_derive",
+    edition: "2018",
+    srcs: ["msg_socket/msg_on_socket_derive/msg_on_socket_derive.rs"],
+    host_supported: true,
+
+    rlibs: [
+        "libproc_macro2",
+        "libquote",
+        "libsyn",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libqcow",
+    crate_name: "qcow",
+    edition: "2018",
+    srcs: ["qcow/src/qcow.rs"],
+
+    rlibs: [
+        "libbyteorder",
+        "libc_rust",
+        "libsys_util",
+        "libdata_model",
+    ],
+    proc_macros: ["libremain"],
+}
+
+rust_proc_macro {
+    name: "libenumn",
+    crate_name: "enumn",
+    edition: "2018",
+    srcs: ["enumn/src/lib.rs"],
+    host_supported: true,
+
+    rlibs: [
+        "libproc_macro2",
+        "libquote",
+        "libsyn",
+    ],
+
+}
+
+rust_library_host_rlib {
+    name: "libgpu_buffer",
+    crate_name: "gpu_buffer",
+    edition: "2018",
+    srcs: ["gpu_buffer/src/lib.rs"],
+
+    rlibs: [
+        "libdata_model",
+        "libsys_util",
+    ],
+}
+
+rust_library_rlib {
+    name: "libsync_rust",
+    crate_name: "sync",
+    edition: "2018",
+    srcs: ["sync/src/lib.rs"],
+    stem: "libsync",
+    host_supported: true,
+}
+
+rust_library_host_rlib {
+    name: "libp9",
+    crate_name: "p9",
+    edition: "2018",
+    srcs: ["p9/src/lib.rs"],
+
+    features: ["trace"],
+
+    rlibs: ["libc_rust"],
+    proc_macros: ["libwire_format_derive"],
+}
+
+rust_proc_macro {
+    name: "libwire_format_derive",
+    crate_name: "wire_format_derive",
+    edition: "2018",
+    srcs: ["p9/wire_format_derive/wire_format_derive.rs"],
+    host_supported: true,
+
+    rlibs: [
+        "libproc_macro2",
+        "libquote",
+        "libsyn",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "librand_ish",
+    crate_name: "rand_ish",
+    edition: "2018",
+    srcs: ["rand_ish/src/lib.rs"],
+}
+
+rust_library_host_rlib {
+    name: "libx86_64_rust",
+    crate_name: "x86_64",
+    edition: "2018",
+    srcs: ["x86_64/src/lib.rs"],
+    stem: "libx86_64",
+
+    rlibs: [
+        "libarch",
+        "libassertions",
+        "libbyteorder",
+        "libdata_model",
+        "libdevices",
+        "libio_jail",
+        "libkernel_cmdline",
+        "libkernel_loader",
+        "libkvm",
+        "libkvm_sys",
+        "libc_rust",
+        "libresources",
+        "libsync_rust",
+        "libsys_util",
+    ],
+    proc_macros: ["libremain"],
+    static_libs: ["libhost_cpuid"],
+}
+
+cc_library_host_static {
+    name: "libhost_cpuid",
+    srcs: ["x86_64/host_cpuid.c"],
+}
+
+rust_library_host_rlib {
+    name: "libgpu_display",
+    crate_name: "gpu_display",
+    edition: "2018",
+    srcs: ["gpu_display/src/lib.rs"],
+
+    rlibs: [
+        "libdata_model",
+        "libc_rust",
+        "libsys_util",
+    ],
+    static_libs: ["libdisplay_wl"],
+}
+
+cc_library_host_static {
+    name: "libdisplay_wl",
+    c_std: "c11",
+    srcs: ["gpu_display/src/display_wl.c"],
+
+    generated_sources: ["gpu_display_protocol_sources"],
+    generated_headers: ["gpu_display_client_protocol_headers"],
+    export_generated_headers: ["gpu_display_client_protocol_headers"],
+
+    static_libs: ["libwayland_client"],
+}
+
+wayland_protocol_codegen {
+    name: "gpu_display_protocol_sources",
+    cmd: "$(location wayland_scanner) code < $(in) > $(out)",
+    suffix: ".c",
+    srcs: [
+        "gpu_display/protocol/aura-shell.xml",
+        "gpu_display/protocol/linux-dmabuf-unstable-v1.xml",
+        "gpu_display/protocol/viewporter.xml",
+        "gpu_display/protocol/xdg-shell-unstable-v6.xml",
+    ],
+    tools: ["wayland_scanner"],
+}
+
+wayland_protocol_codegen {
+    name: "gpu_display_client_protocol_headers",
+    cmd: "$(location wayland_scanner) client-header < $(in) > $(out)",
+    suffix: ".h",
+    srcs: [
+        "gpu_display/protocol/aura-shell.xml",
+        "gpu_display/protocol/linux-dmabuf-unstable-v1.xml",
+        "gpu_display/protocol/viewporter.xml",
+        "gpu_display/protocol/xdg-shell-unstable-v6.xml",
+    ],
+    tools: ["wayland_scanner"],
+}
+
+rust_library_host_rlib {
+    name: "libkernel_loader",
+    crate_name: "kernel_loader",
+    edition: "2018",
+    srcs: ["kernel_loader/src/lib.rs"],
+
+    rlibs: [
+        "libsys_util",
+        "libc_rust",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libkernel_cmdline",
+    crate_name: "kernel_cmdline",
+    edition: "2018",
+    srcs: ["kernel_cmdline/src/kernel_cmdline.rs"],
+
+    rlibs: ["libc_rust"],
+}
