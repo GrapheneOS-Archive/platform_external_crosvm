@@ -24,13 +24,12 @@ use sys_util::{
     debug, error, warn, Error, EventFd, GuestAddress, GuestMemory, PollContext, PollToken,
 };
 
-use gpu_buffer::Device;
 use gpu_display::*;
 use gpu_renderer::{Renderer, RendererFlags};
 
 use super::{
-    resource_bridge::*, AvailIter, Queue, VirtioDevice, INTERRUPT_STATUS_USED_RING, TYPE_GPU,
-    VIRTIO_F_VERSION_1,
+    copy_config, resource_bridge::*, AvailIter, Queue, VirtioDevice, INTERRUPT_STATUS_USED_RING,
+    TYPE_GPU, VIRTIO_F_VERSION_1,
 };
 
 use self::backend::Backend;
@@ -486,19 +485,13 @@ impl Worker {
             ResourceBridge { index: usize },
         }
 
-        let poll_ctx: PollContext<Token> = match PollContext::new()
-            .and_then(|pc| pc.add(&self.ctrl_evt, Token::CtrlQueue).and(Ok(pc)))
-            .and_then(|pc| pc.add(&self.cursor_evt, Token::CursorQueue).and(Ok(pc)))
-            .and_then(|pc| {
-                pc.add(&*self.state.display().borrow(), Token::Display)
-                    .and(Ok(pc))
-            })
-            .and_then(|pc| {
-                pc.add(&self.interrupt_resample_evt, Token::InterruptResample)
-                    .and(Ok(pc))
-            })
-            .and_then(|pc| pc.add(&self.kill_evt, Token::Kill).and(Ok(pc)))
-        {
+        let poll_ctx: PollContext<Token> = match PollContext::build_with(&[
+            (&self.ctrl_evt, Token::CtrlQueue),
+            (&self.cursor_evt, Token::CursorQueue),
+            (&*self.state.display().borrow(), Token::Display),
+            (&self.interrupt_resample_evt, Token::InterruptResample),
+            (&self.kill_evt, Token::Kill),
+        ]) {
             Ok(pc) => pc,
             Err(e) => {
                 error!("failed creating PollContext: {}", e);
@@ -628,32 +621,12 @@ impl DisplayBackend {
     }
 }
 
-/// Builds a Device for doing buffer allocation and sharing via dmabuf.
-fn build_buffer_device() -> Option<Device> {
-    const UNDESIRED_CARDS: &[&str] = &["vgem", "pvr"];
-    let drm_card = match gpu_buffer::rendernode::open_device(UNDESIRED_CARDS) {
-        Ok(f) => f,
-        Err(()) => {
-            error!("failed to open render node for GBM");
-            return None;
-        }
-    };
-    match Device::new(drm_card) {
-        Ok(d) => Some(d),
-        Err(()) => {
-            error!("failed to create GBM device from render node");
-            None
-        }
-    }
-}
-
 // Builds a gpu backend with one of the given possible display backends, or None if they all
 // failed.
 fn build_backend(
     possible_displays: &[DisplayBackend],
     gpu_device_socket: VmMemoryControlRequestSocket,
 ) -> Option<Backend> {
-    let mut buffer_device = None;
     let mut renderer_flags = RendererFlags::default();
     let mut display_opt = None;
     for display in possible_displays {
@@ -666,8 +639,6 @@ fn build_backend(
                 // more configurable
                 if display.is_x() {
                     renderer_flags = RendererFlags::new().use_glx(true);
-                } else {
-                    buffer_device = build_buffer_device();
                 }
                 display_opt = Some(c);
                 break;
@@ -698,12 +669,7 @@ fn build_backend(
         }
     };
 
-    Some(Backend::new(
-        buffer_device,
-        display,
-        renderer,
-        gpu_device_socket,
-    ))
+    Some(Backend::new(display, renderer, gpu_device_socket))
 }
 
 pub struct Gpu {
@@ -796,23 +762,12 @@ impl VirtioDevice for Gpu {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        let offset = offset as usize;
-        let len = data.len();
-        let cfg = self.get_config();
-        let cfg_slice = cfg.as_slice();
-        if offset + len <= cfg_slice.len() {
-            data.copy_from_slice(&cfg_slice[offset..offset + len]);
-        }
+        copy_config(data, 0, self.get_config().as_slice(), offset);
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        let offset = offset as usize;
-        let len = data.len();
         let mut cfg = self.get_config();
-        let cfg_slice = cfg.as_mut_slice();
-        if offset + len <= cfg_slice.len() {
-            cfg_slice[offset..offset + len].copy_from_slice(data);
-        }
+        copy_config(cfg.as_mut_slice(), offset, data, 0);
         if (cfg.events_clear.to_native() & VIRTIO_GPU_EVENT_DISPLAY) != 0 {
             self.config_event = false;
         }

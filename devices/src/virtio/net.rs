@@ -19,7 +19,9 @@ use sys_util::{error, warn, EventFd, GuestMemory, PollContext, PollToken};
 use virtio_sys::virtio_net::virtio_net_hdr_v1;
 use virtio_sys::{vhost, virtio_net};
 
-use super::{Queue, Reader, VirtioDevice, Writer, INTERRUPT_STATUS_USED_RING, TYPE_NET};
+use super::{
+    DescriptorError, Queue, Reader, VirtioDevice, Writer, INTERRUPT_STATUS_USED_RING, TYPE_NET,
+};
 
 /// The maximum buffer size when segmentation offload is enabled. This
 /// includes the 12-byte virtio net header.
@@ -118,7 +120,7 @@ where
 
         match writer.write_all(&self.rx_buf[0..self.rx_count]) {
             Ok(()) => (),
-            Err(MemoryError::ShortWrite { .. }) => {
+            Err(DescriptorError::GuestMemoryError(MemoryError::ShortWrite { .. })) => {
                 warn!(
                     "net: rx: buffer is too small to hold frame of size {}",
                     self.rx_count
@@ -209,16 +211,14 @@ where
             Kill,
         }
 
-        let poll_ctx: PollContext<Token> = PollContext::new()
-            .and_then(|pc| pc.add(&self.tap, Token::RxTap).and(Ok(pc)))
-            .and_then(|pc| pc.add(&rx_queue_evt, Token::RxQueue).and(Ok(pc)))
-            .and_then(|pc| pc.add(&tx_queue_evt, Token::TxQueue).and(Ok(pc)))
-            .and_then(|pc| {
-                pc.add(&self.interrupt_resample_evt, Token::InterruptResample)
-                    .and(Ok(pc))
-            })
-            .and_then(|pc| pc.add(&kill_evt, Token::Kill).and(Ok(pc)))
-            .map_err(NetError::CreatePollContext)?;
+        let poll_ctx: PollContext<Token> = PollContext::build_with(&[
+            (&self.tap, Token::RxTap),
+            (&rx_queue_evt, Token::RxQueue),
+            (&tx_queue_evt, Token::TxQueue),
+            (&self.interrupt_resample_evt, Token::InterruptResample),
+            (&kill_evt, Token::Kill),
+        ])
+        .map_err(NetError::CreatePollContext)?;
 
         'poll: loop {
             let events = poll_ctx.wait().map_err(NetError::PollError)?;

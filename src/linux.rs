@@ -612,11 +612,25 @@ fn create_gpu_device(
             let drm_dri_path = Path::new("/dev/dri");
             jail.mount_bind(drm_dri_path, drm_dri_path, false)?;
 
+            // If the ARM specific devices exist on the host, bind mount them in.
+            let mali0_path = Path::new("/dev/mali0");
+            if mali0_path.exists() {
+                jail.mount_bind(mali0_path, mali0_path, true)?;
+            }
+
+            let pvr_sync_path = Path::new("/dev/pvr_sync");
+            if pvr_sync_path.exists() {
+                jail.mount_bind(pvr_sync_path, pvr_sync_path, true)?;
+            }
+
             // Libraries that are required when mesa drivers are dynamically loaded.
-            let lib_path = Path::new("/lib64");
-            jail.mount_bind(lib_path, lib_path, false)?;
-            let usr_lib_path = Path::new("/usr/lib64");
-            jail.mount_bind(usr_lib_path, usr_lib_path, false)?;
+            let lib_dirs = &["/usr/lib", "/usr/lib64", "/lib", "/lib64"];
+            for dir in lib_dirs {
+                let dir_path = Path::new(dir);
+                if dir_path.exists() {
+                    jail.mount_bind(dir_path, dir_path, false)?;
+                }
+            }
 
             // Bind mount the wayland socket into jail's root. This is necessary since each
             // new wayland context must open() the socket.
@@ -625,6 +639,15 @@ fn create_gpu_device(
             }
 
             add_crosvm_user_to_jail(&mut jail, "gpu")?;
+
+            // pvr driver requires read access to /proc/self/task/*/comm.
+            let proc_path = Path::new("/proc");
+            jail.mount(
+                proc_path,
+                proc_path,
+                "proc",
+                (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RDONLY) as usize,
+            )?;
 
             Some(jail)
         }
@@ -1448,16 +1471,15 @@ fn run_control(
         .set_raw_mode()
         .expect("failed to set terminal raw mode");
 
-    let poll_ctx = PollContext::new().map_err(Error::CreatePollContext)?;
-    poll_ctx
-        .add(&linux.exit_evt, Token::Exit)
-        .map_err(Error::PollContextAdd)?;
+    let poll_ctx = PollContext::build_with(&[
+        (&linux.exit_evt, Token::Exit),
+        (&sigchld_fd, Token::ChildSignal),
+    ])
+    .map_err(Error::PollContextAdd)?;
+
     if let Err(e) = poll_ctx.add(&stdin_handle, Token::Stdin) {
         warn!("failed to add stdin to poll context: {}", e);
     }
-    poll_ctx
-        .add(&sigchld_fd, Token::ChildSignal)
-        .map_err(Error::PollContextAdd)?;
 
     if let Some(socket_server) = &control_server_socket {
         poll_ctx

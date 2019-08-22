@@ -1,4 +1,4 @@
-# Copyright 2018 The Chromium OS Authors. All rights reserved.
+# Copyright 2019 The Chromium OS Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
@@ -23,12 +23,15 @@ madvise: arg2 == MADV_DONTNEED || arg2 == MADV_DONTDUMP || arg2 == MADV_REMOVE
 mremap: 1
 munmap: 1
 nanosleep: 1
+open: return ENOENT
+openat: return ENOENT
 pipe2: 1
 poll: 1
 ppoll: 1
 prctl: arg0 == PR_SET_NAME
 read: 1
 readv: 1
+recv: 1
 recvfrom: 1
 recvmsg: 1
 restart_syscall: 1
@@ -43,32 +46,30 @@ sigaltstack: 1
 write: 1
 writev: 1
 
-# Rules specific to gpu
+## Rules specific to gpu
 connect: 1
-fcntl: arg1 == F_DUPFD_CLOEXEC
-fstat: 1
-# Used to set of size new memfd.
-ftruncate: 1
-getdents: 1
-geteuid: 1
 getrandom: 1
-getuid: 1
-ioctl: arg1 == FIONBIO || arg1 == FIOCLEX || arg1 == 0x40086200 || arg1 & 0x6400
-lseek: 1
-lstat: 1
-# Used for sharing memory with wayland. arg1 == MFD_CLOEXEC|MFD_ALLOW_SEALING
-memfd_create: arg1 == 3
-# mmap/mprotect/open/openat differ from the common_device.policy
-mmap: arg2 == PROT_READ|PROT_WRITE || arg2 == PROT_NONE || arg2 == PROT_READ|PROT_EXEC || arg2 == PROT_WRITE || arg2 == PROT_READ
-mprotect: arg2 == PROT_READ|PROT_WRITE || arg2 == PROT_NONE || arg2 == PROT_READ
-open: 1
 openat: 1
-readlink: 1
 socket: arg0 == 1 && arg1 == 0x80001 && arg2 == 0
-stat: 1
-sysinfo: 1
+_llseek: 1
+ftruncate64: 1
+stat64: 1
+fstat64: 1
+getdents64: 1
 
-# Rules specific to AMD gpus.
-uname: 1
-sched_setscheduler: 1
-sched_setaffinity: 1
+# 0x6400 == DRM_IOCTL_BASE, 0x8000 = KBASE_IOCTL_TYPE (mali)
+ioctl: arg1 & 0x6400 || arg1 & 0x8000
+
+## mmap/mprotect/open/openat differ from the common_device.policy
+mmap2: arg2 == PROT_READ|PROT_WRITE || arg2 == PROT_NONE || arg2 == PROT_READ|PROT_EXEC || arg2 == PROT_WRITE || arg2 == PROT_READ
+mprotect: arg2 == PROT_READ|PROT_WRITE || arg2 == PROT_NONE || arg2 == PROT_READ
+
+## Rules specific to pvr
+geteuid32: 1
+getuid32: 1
+lstat64: 1
+readlink: 1
+gettid: 1
+fcntl64: 1
+tgkill: 1
+clock_gettime: 1

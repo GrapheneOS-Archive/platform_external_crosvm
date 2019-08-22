@@ -3,14 +3,42 @@
 // found in the LICENSE file.
 
 use std::cmp;
+use std::convert::TryFrom;
+use std::fmt::{self, Display};
 use std::io;
 use std::os::unix::io::AsRawFd;
+use std::result;
 
-use data_model::DataInit;
-use sys_util::guest_memory::{Error, Result};
-use sys_util::{GuestAddress, GuestMemory};
+use data_model::{DataInit, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError};
+use sys_util::guest_memory::Error as GuestMemoryError;
+use sys_util::{FileReadWriteVolatile, GuestAddress, GuestMemory};
 
 use super::DescriptorChain;
+
+#[derive(Debug)]
+pub enum Error {
+    GuestMemoryError(sys_util::GuestMemoryError),
+    InvalidChain,
+    IoError(io::Error),
+    VolatileMemoryError(VolatileMemoryError),
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Error::*;
+
+        match self {
+            GuestMemoryError(e) => write!(f, "descriptor guest memory error: {}", e),
+            InvalidChain => write!(f, "invalid descriptor chain"),
+            IoError(e) => write!(f, "descriptor I/O error: {}", e),
+            VolatileMemoryError(e) => write!(f, "volatile memory error: {}", e),
+        }
+    }
+}
+
+pub type Result<T> = result::Result<T, Error>;
+
+impl std::error::Error for Error {}
 
 #[derive(PartialEq, Eq)]
 enum DescriptorFilter {
@@ -21,6 +49,7 @@ enum DescriptorFilter {
 struct DescriptorChainConsumer<'a> {
     offset: usize,
     desc_chain: Option<DescriptorChain<'a>>,
+    desc_chain_start: Option<DescriptorChain<'a>>,
     bytes_consumed: usize,
     avail_bytes: Option<usize>,
     filter: DescriptorFilter,
@@ -33,7 +62,8 @@ impl<'a> DescriptorChainConsumer<'a> {
     ) -> DescriptorChainConsumer<'a> {
         DescriptorChainConsumer {
             offset: 0,
-            desc_chain,
+            desc_chain: desc_chain.clone(),
+            desc_chain_start: desc_chain,
             bytes_consumed: 0,
             avail_bytes: None,
             filter,
@@ -70,7 +100,9 @@ impl<'a> DescriptorChainConsumer<'a> {
                 let addr = current
                     .addr
                     .checked_add(self.offset as u64)
-                    .ok_or_else(|| Error::InvalidGuestAddress(current.addr))?;
+                    .ok_or_else(|| {
+                        Error::GuestMemoryError(GuestMemoryError::InvalidGuestAddress(current.addr))
+                    })?;
                 let len = cmp::min(count, current.len as usize - self.offset);
                 fnc(addr, len)?;
 
@@ -103,6 +135,61 @@ impl<'a> DescriptorChainConsumer<'a> {
             desc_chain = desc_chain.filter(DescriptorChain::is_read_only);
         }
         desc_chain
+    }
+
+    fn seek_from_start(&mut self, offset: usize) -> Result<()> {
+        if offset < self.bytes_consumed {
+            // Restart from the beginning of the descriptor chain.
+            self.bytes_consumed = 0;
+            self.avail_bytes = None;
+            self.desc_chain = self.desc_chain_start.clone();
+        }
+
+        let mut count = offset - self.bytes_consumed;
+        while count > 0 {
+            let bytes_consumed = self.consume(|_, _| Ok(()), count)?;
+            if bytes_consumed == 0 {
+                break;
+            }
+            count -= bytes_consumed;
+        }
+
+        Ok(())
+    }
+
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        fn apply_signed_offset(base: usize, offset: i64) -> io::Result<u64> {
+            let base = i64::try_from(base).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "seek position out of i64 range")
+            })?;
+            let result = base.checked_add(offset).ok_or(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "seek offset overflowed",
+            ))?;
+            if result < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "seek offset < 0",
+                ));
+            }
+            Ok(result as u64)
+        }
+
+        let offset = match pos {
+            io::SeekFrom::Start(o) => o,
+            io::SeekFrom::Current(o) => apply_signed_offset(self.bytes_consumed(), o)?,
+            io::SeekFrom::End(o) => {
+                apply_signed_offset(self.bytes_consumed() + self.available_bytes(), o)?
+            }
+        };
+
+        let offset = usize::try_from(offset).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "seek offset overflowed usize")
+        })?;
+        self.seek_from_start(offset)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+        Ok(self.bytes_consumed() as u64)
     }
 }
 
@@ -147,7 +234,7 @@ impl<'a> Reader<'a> {
                 if result.is_ok() {
                     read_count += count;
                 }
-                result
+                result.map_err(Error::GuestMemoryError)
             },
             len,
         )
@@ -162,10 +249,10 @@ impl<'a> Reader<'a> {
         if count == buf.len() {
             Ok(())
         } else {
-            Err(Error::ShortRead {
+            Err(Error::GuestMemoryError(GuestMemoryError::ShortRead {
                 expected: buf.len(),
                 completed: count,
-            })
+            }))
         }
     }
 
@@ -179,10 +266,38 @@ impl<'a> Reader<'a> {
     /// Returns the number of bytes read from the descriptor chain buffer.
     /// The number of bytes read can be less than `count` if there isn't
     /// enough data in the descriptor chain buffer.
-    pub fn read_to(&mut self, dst: &AsRawFd, count: usize) -> Result<usize> {
+    pub fn read_to(&mut self, dst: &dyn AsRawFd, count: usize) -> Result<usize> {
         let mem = self.mem;
-        self.buffer
-            .consume(|addr, count| mem.write_from_memory(addr, dst, count), count)
+        self.buffer.consume(
+            |addr, count| {
+                mem.write_from_memory(addr, dst, count)
+                    .map_err(Error::GuestMemoryError)
+            },
+            count,
+        )
+    }
+
+    /// Reads data from the descriptor chain buffer into a FileReadWriteVolatile.
+    /// Returns the number of bytes read from the descriptor chain buffer.
+    /// The number of bytes read can be less than `count` if there isn't
+    /// enough data in the descriptor chain buffer.
+    pub fn read_to_volatile(
+        &mut self,
+        dst: &mut dyn FileReadWriteVolatile,
+        count: usize,
+    ) -> Result<usize> {
+        let mem = self.mem;
+        self.buffer.consume(
+            |addr, count| {
+                let mem_volatile_slice = mem
+                    .get_slice(addr.offset(), count as u64)
+                    .map_err(Error::VolatileMemoryError)?;
+                dst.write_all_volatile(mem_volatile_slice)
+                    .map_err(Error::IoError)?;
+                Ok(())
+            },
+            count,
+        )
     }
 
     /// Returns number of bytes available for reading.
@@ -233,7 +348,7 @@ impl<'a> Writer<'a> {
                 if result.is_ok() {
                     write_count += count;
                 }
-                result
+                result.map_err(Error::GuestMemoryError)
             },
             len,
         )
@@ -248,10 +363,10 @@ impl<'a> Writer<'a> {
         if count == buf.len() {
             Ok(())
         } else {
-            Err(Error::ShortRead {
+            Err(Error::GuestMemoryError(GuestMemoryError::ShortRead {
                 expected: buf.len(),
                 completed: count,
-            })
+            }))
         }
     }
 
@@ -269,10 +384,38 @@ impl<'a> Writer<'a> {
     /// Returns the number of bytes written to the descriptor chain buffer.
     /// The number of bytes written can be less than `count` if
     /// there isn't enough data in the descriptor chain buffer.
-    pub fn write_from(&mut self, src: &AsRawFd, count: usize) -> Result<usize> {
+    pub fn write_from(&mut self, src: &dyn AsRawFd, count: usize) -> Result<usize> {
         let mem = self.mem;
-        self.buffer
-            .consume(|addr, count| mem.read_to_memory(addr, src, count), count)
+        self.buffer.consume(
+            |addr, count| {
+                mem.read_to_memory(addr, src, count)
+                    .map_err(Error::GuestMemoryError)
+            },
+            count,
+        )
+    }
+
+    /// Writes data to the descriptor chain buffer from a FileReadWriteVolatile.
+    /// Returns the number of bytes written to the descriptor chain buffer.
+    /// The number of bytes written can be less than `count` if
+    /// there isn't enough data in the descriptor chain buffer.
+    pub fn write_from_volatile(
+        &mut self,
+        src: &mut dyn FileReadWriteVolatile,
+        count: usize,
+    ) -> Result<usize> {
+        let mem = self.mem;
+        self.buffer.consume(
+            |addr, count| {
+                let mem_volatile_slice = mem
+                    .get_slice(addr.offset(), count as u64)
+                    .map_err(Error::VolatileMemoryError)?;
+                src.read_exact_volatile(mem_volatile_slice)
+                    .map_err(Error::IoError)?;
+                Ok(())
+            },
+            count,
+        )
     }
 
     /// Returns number of bytes already written to the descriptor chain buffer.
@@ -300,71 +443,86 @@ impl<'a> io::Write for Writer<'a> {
     }
 }
 
+impl<'a> io::Seek for Reader<'a> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.buffer.seek(pos)
+    }
+}
+
+impl<'a> io::Seek for Writer<'a> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.buffer.seek(pos)
+    }
+}
+
+const VIRTQ_DESC_F_NEXT: u16 = 0x1;
+const VIRTQ_DESC_F_WRITE: u16 = 0x2;
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum DescriptorType {
+    Readable,
+    Writable,
+}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+struct virtq_desc {
+    addr: Le64,
+    len: Le32,
+    flags: Le16,
+    next: Le16,
+}
+
+// Safe because it only has data and has no implicit padding.
+unsafe impl DataInit for virtq_desc {}
+
+/// Test utility function to create a descriptor chain in guest memory.
+pub fn create_descriptor_chain(
+    memory: &GuestMemory,
+    descriptor_array_addr: GuestAddress,
+    mut buffers_start_addr: GuestAddress,
+    descriptors: Vec<(DescriptorType, u32)>,
+    spaces_between_regions: u32,
+) -> Result<DescriptorChain> {
+    let descriptors_len = descriptors.len();
+    for (index, (type_, size)) in descriptors.into_iter().enumerate() {
+        let mut flags = 0;
+        if let DescriptorType::Writable = type_ {
+            flags |= VIRTQ_DESC_F_WRITE;
+        }
+        if index + 1 < descriptors_len {
+            flags |= VIRTQ_DESC_F_NEXT;
+        }
+
+        let index = index as u16;
+        let desc = virtq_desc {
+            addr: buffers_start_addr.offset().into(),
+            len: size.into(),
+            flags: flags.into(),
+            next: (index + 1).into(),
+        };
+
+        let offset = size + spaces_between_regions;
+        buffers_start_addr = buffers_start_addr
+            .checked_add(offset as u64)
+            .ok_or(Error::InvalidChain)?;
+
+        let _ = memory.write_obj_at_addr(
+            desc,
+            descriptor_array_addr
+                .checked_add(index as u64 * std::mem::size_of::<virtq_desc>() as u64)
+                .ok_or(Error::InvalidChain)?,
+        );
+    }
+
+    DescriptorChain::checked_new(memory, descriptor_array_addr, 0x100, 0).ok_or(Error::InvalidChain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_model::{Le16, Le32, Le64};
+    use std::io::{Seek, SeekFrom};
     use sys_util::{MemfdSeals, SharedMemory};
-
-    const VIRTQ_DESC_F_NEXT: u16 = 0x1;
-    const VIRTQ_DESC_F_WRITE: u16 = 0x2;
-
-    #[derive(Copy, Clone, PartialEq, Eq)]
-    enum DescriptorType {
-        Readable,
-        Writable,
-    }
-
-    #[derive(Copy, Clone, Debug)]
-    #[repr(C)]
-    struct virtq_desc {
-        addr: Le64,
-        len: Le32,
-        flags: Le16,
-        next: Le16,
-    }
-
-    // Safe because it only has data and has no implicit padding.
-    unsafe impl DataInit for virtq_desc {}
-
-    fn create_descriptor_chain(
-        memory: &GuestMemory,
-        descriptor_array_addr: GuestAddress,
-        mut buffers_start_addr: GuestAddress,
-        descriptors: Vec<(DescriptorType, u32)>,
-        spaces_between_regions: u32,
-    ) -> DescriptorChain {
-        let descriptors_len = descriptors.len();
-        for (index, (type_, size)) in descriptors.into_iter().enumerate() {
-            let mut flags = 0;
-            if let DescriptorType::Writable = type_ {
-                flags |= VIRTQ_DESC_F_WRITE;
-            }
-            if index + 1 < descriptors_len {
-                flags |= VIRTQ_DESC_F_NEXT;
-            }
-
-            let index = index as u16;
-            let desc = virtq_desc {
-                addr: buffers_start_addr.offset().into(),
-                len: size.into(),
-                flags: flags.into(),
-                next: (index + 1).into(),
-            };
-
-            let offset = size + spaces_between_regions;
-            buffers_start_addr = buffers_start_addr.checked_add(offset as u64).unwrap();
-
-            let _ = memory.write_obj_at_addr(
-                desc,
-                descriptor_array_addr
-                    .checked_add(index as u64 * std::mem::size_of::<virtq_desc>() as u64)
-                    .unwrap(),
-            );
-        }
-
-        DescriptorChain::checked_new(memory, descriptor_array_addr, 0x100, 0).unwrap()
-    }
 
     #[test]
     fn reader_test_simple_chain() {
@@ -384,7 +542,8 @@ mod tests {
                 (Readable, 64),
             ],
             0,
-        );
+        )
+        .expect("create_descriptor_chain failed");
         let mut reader = Reader::new(&memory, chain);
         assert_eq!(reader.available_bytes(), 106);
         assert_eq!(reader.bytes_read(), 0);
@@ -424,7 +583,8 @@ mod tests {
                 (Writable, 64),
             ],
             0,
-        );
+        )
+        .expect("create_descriptor_chain failed");;
         let mut writer = Writer::new(&memory, chain);
         assert_eq!(writer.available_bytes(), 106);
         assert_eq!(writer.bytes_written(), 0);
@@ -459,7 +619,8 @@ mod tests {
             GuestAddress(0x100),
             vec![(Writable, 8)],
             0,
-        );
+        )
+        .expect("create_descriptor_chain failed");;
         let mut reader = Reader::new(&memory, chain);
         assert_eq!(reader.available_bytes(), 0);
         assert_eq!(reader.bytes_read(), 0);
@@ -483,7 +644,8 @@ mod tests {
             GuestAddress(0x100),
             vec![(Readable, 8)],
             0,
-        );
+        )
+        .expect("create_descriptor_chain failed");;
         let mut writer = Writer::new(&memory, chain);
         assert_eq!(writer.available_bytes(), 0);
         assert_eq!(writer.bytes_written(), 0);
@@ -507,7 +669,8 @@ mod tests {
             GuestAddress(0x100),
             vec![(Readable, 256), (Readable, 256)],
             0,
-        );
+        )
+        .expect("create_descriptor_chain failed");;
 
         let mut reader = Reader::new(&memory, chain);
 
@@ -543,7 +706,8 @@ mod tests {
             GuestAddress(0x100),
             vec![(Writable, 256), (Writable, 256)],
             0,
-        );
+        )
+        .expect("create_descriptor_chain failed");;
 
         let mut writer = Writer::new(&memory, chain);
 
@@ -581,7 +745,8 @@ mod tests {
                 (Writable, 3),
             ],
             0,
-        );
+        )
+        .expect("create_descriptor_chain failed");;
         let mut reader = Reader::new(&memory, chain.clone());
         let mut writer = Writer::new(&memory, chain);
 
@@ -622,7 +787,8 @@ mod tests {
             GuestAddress(0x100),
             vec![(Writable, 1), (Writable, 1), (Writable, 1), (Writable, 1)],
             123,
-        );
+        )
+        .expect("create_descriptor_chain failed");;
         let mut writer = Writer::new(&memory, chain_writer);
         if let Err(_) = writer.write_obj(secret) {
             panic!("write_obj should not fail here");
@@ -635,11 +801,73 @@ mod tests {
             GuestAddress(0x100),
             vec![(Readable, 1), (Readable, 1), (Readable, 1), (Readable, 1)],
             123,
-        );
+        )
+        .expect("create_descriptor_chain failed");
         let mut reader = Reader::new(&memory, chain_reader);
         match reader.read_obj::<Le32>() {
             Err(_) => panic!("read_obj should not fail here"),
             Ok(read_secret) => assert_eq!(read_secret, secret),
         }
+    }
+
+    #[test]
+    fn reader_seek_simple_chain() {
+        use DescriptorType::*;
+
+        let memory_start_addr = GuestAddress(0x0);
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
+
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            GuestAddress(0x100),
+            vec![
+                (Readable, 8),
+                (Readable, 16),
+                (Readable, 18),
+                (Readable, 64),
+            ],
+            0,
+        )
+        .expect("create_descriptor_chain failed");;
+        let mut reader = Reader::new(&memory, chain);
+        assert_eq!(reader.available_bytes(), 106);
+        assert_eq!(reader.bytes_read(), 0);
+
+        // Skip some bytes.  available_bytes() and bytes_read() should update accordingly.
+        reader
+            .seek(SeekFrom::Current(64))
+            .expect("seek should not fail here");
+        assert_eq!(reader.available_bytes(), 42);
+        assert_eq!(reader.bytes_read(), 64);
+
+        // Seek past end of chain - position should point just past the last byte.
+        reader
+            .seek(SeekFrom::Current(64))
+            .expect("seek should not fail here");
+        assert_eq!(reader.available_bytes(), 0);
+        assert_eq!(reader.bytes_read(), 106);
+
+        // Seek back to the beginning.
+        reader
+            .seek(SeekFrom::Start(0))
+            .expect("seek should not fail here");
+        assert_eq!(reader.available_bytes(), 106);
+        assert_eq!(reader.bytes_read(), 0);
+
+        // Seek to one byte before the end.
+        reader
+            .seek(SeekFrom::End(-1))
+            .expect("seek should not fail here");
+        assert_eq!(reader.available_bytes(), 1);
+        assert_eq!(reader.bytes_read(), 105);
+
+        // Read the last byte.
+        let mut buffer = [0 as u8; 1];
+        reader
+            .read_exact(&mut buffer)
+            .expect("read_exact should not fail here");
+        assert_eq!(reader.available_bytes(), 0);
+        assert_eq!(reader.bytes_read(), 106);
     }
 }

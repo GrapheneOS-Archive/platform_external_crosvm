@@ -4,6 +4,13 @@ version = "0.1.0"
 authors = ["The Chromium OS Authors"]
 edition = "2018"
 
+[lib]
+path = "src/crosvm.rs"
+
+[[bin]]
+name = "crosvm"
+path = "src/main.rs"
+
 [profile.release]
 panic = 'abort'
 overflow-checks = true
@@ -28,6 +35,7 @@ plugin = ["protos/plugin", "crosvm_plugin", "protobuf"]
 sandboxed-libusb = ["devices/sandboxed-libusb", "vm_control/sandboxed-libusb"]
 tpm = ["devices/tpm"]
 wl-dmabuf = ["devices/wl-dmabuf", "gpu_buffer", "resources/wl-dmabuf"]
+x = ["devices/x"]
 
 [dependencies]
 arch = { path = "arch" }

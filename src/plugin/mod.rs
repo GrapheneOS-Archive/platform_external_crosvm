@@ -322,9 +322,9 @@ fn create_plugin_jail(root: &Path, log_failures: bool, seccomp_policy: &Path) ->
 /// These variant methods must be done by matching the variant to the expected type for that method.
 /// For example, getting the dirty log from a `Memory` object starting with an ID:
 ///
-/// ```
+/// ```ignore
 /// match objects.get(&request_id) {
-///    Some(&PluginObject::Memory { slot, length }) => vm.get_dirty_log(slot, &mut dirty_log[..])
+///    Some(&PluginObject::Memory { slot, length }) => vm.get_dirty_log(slot, &mut dirty_log[..]),
 ///    _ => return Err(SysError::new(ENOENT)),
 /// }
 /// ```
@@ -525,7 +525,7 @@ pub fn run_config(cfg: Config) -> Result<()> {
         // An empty directory for jailed plugin pivot root.
         let root_path = match &cfg.plugin_root {
             Some(dir) => dir,
-            None => Path::new("/var/empty"),
+            None => Path::new(option_env!("DEFAULT_PIVOT_ROOT").unwrap_or("/var/empty")),
         };
 
         if root_path.is_relative() {
@@ -624,13 +624,9 @@ pub fn run_config(cfg: Config) -> Result<()> {
     let kill_signaled = Arc::new(AtomicBool::new(false));
     let mut vcpu_handles = Vec::with_capacity(vcpu_count as usize);
 
-    let poll_ctx = PollContext::new().map_err(Error::CreatePollContext)?;
-    poll_ctx
-        .add(&exit_evt, Token::Exit)
-        .map_err(Error::PollContextAdd)?;
-    poll_ctx
-        .add(&sigchld_fd, Token::ChildSignal)
-        .map_err(Error::PollContextAdd)?;
+    let poll_ctx =
+        PollContext::build_with(&[(&exit_evt, Token::Exit), (&sigchld_fd, Token::ChildSignal)])
+            .map_err(Error::PollContextAdd)?;
 
     let mut sockets_to_drop = Vec::new();
     let mut redo_poll_ctx_sockets = true;

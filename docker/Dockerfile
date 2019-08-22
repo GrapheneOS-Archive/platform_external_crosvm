@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y \
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH \
-    RUST_VERSION=1.35.0 \
+    RUST_VERSION=1.36.0 \
     RUSTFLAGS='--cfg hermetic'
 
 # Debian usually has an old rust version in the repository. Instead of using that, we use rustup to
@@ -89,9 +89,11 @@ RUN git clone https://github.com/anholt/libepoxy.git \
     && meson \
     && ninja install
 
-# virglrenderer is under heavy development on master and we want the very latest.
-RUN git clone https://gitlab.freedesktop.org/virgl/virglrenderer.git \
+# We've forked virglrenderer to accomodate differences in the GBM header.
+# Until we can upstream our changes, build based on this downstream tree.
+RUN git clone https://gitlab.freedesktop.org/gurchetansingh/virglrenderer.git \
     && cd virglrenderer \
+    && git checkout keep-kokoro-happy \
     && ./autogen.sh \
     && make install -j$(nproc)
 
