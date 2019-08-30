@@ -1,14 +1,14 @@
 [package]
-name = "qcow"
+name = "disk"
 version = "0.1.0"
 authors = ["The Chromium OS Authors"]
 edition = "2018"
 
 [lib]
-path = "src/qcow.rs"
+path = "src/disk.rs"
 
 [dependencies]
 libc = "*"
 remain = "*"
+qcow = { path = "../qcow" }
 sys_util = { path = "../sys_util" }
-data_model = { path = "../data_model" }

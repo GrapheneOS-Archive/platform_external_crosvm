@@ -15,5 +15,6 @@ path = "src/qcow_img.rs"
 [dependencies]
 getopts = "*"
 libc = "*"
+disk = { path = "../disk" }
 qcow = { path = "../qcow" }
 sys_util = { path = "../sys_util" }

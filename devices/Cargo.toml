@@ -14,8 +14,8 @@ x = ["gpu_display/x"]
 [dependencies]
 audio_streams = "*"
 bit_field = { path = "../bit_field" }
-byteorder = "*"
 data_model = { path = "../data_model" }
+disk = { path = "../disk" }
 enumn = { path = "../enumn" }
 gpu_buffer = { path = "../gpu_buffer", optional = true }
 gpu_display = { path = "../gpu_display", optional = true }
