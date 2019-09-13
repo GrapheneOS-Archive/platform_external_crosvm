@@ -1,24 +1,15 @@
-rust_binary_host {
-    name: "crosvm.experimental",
-    crate_name: "crosvm",
+rust_defaults {
+    name: "crosvm_defaults",
     edition: "2018",
     enabled: false,
-    relative_install_path: "x86_64-linux-gnu",
-    srcs: ["src/main.rs"],
 
     target: {
         linux_glibc_x86_64: {
             rlibs: ["libx86_64_rust"],
             enabled: true,
+            relative_install_path: "x86_64-linux-gnu",
         },
     },
-
-    // Install the crosvm prebuilts as requirements until we're building these as well.
-    required: [
-        "x86_64_linux_gnu_libepoxy.so.0_for_crosvm",
-        "x86_64_linux_gnu_libgbm.so.1_for_crosvm",
-        "x86_64_linux_gnu_libvirglrenderer.so.0_for_crosvm",
-    ],
 
     features: [
         "default-no-sandbox",
@@ -29,10 +20,6 @@ rust_binary_host {
         "-C panic=abort",
         "-L device/google/cuttlefish_vmm/x86_64-linux-gnu/bin/",
     ],
-    ld_flags: [
-        "-Wl,--rpath,\\$$ORIGIN",
-        "-Wl,--rpath,\\$$ORIGIN/../../lib64",
-    ],
 
     rlibs: [
         "libassertions",
@@ -42,6 +29,7 @@ rust_binary_host {
         "libbyteorder",
         "libdata_model",
         "libdevices",
+        "libdisk",
         "libgpu_buffer",
         "libio_jail",
         "libkernel_cmdline",
@@ -75,6 +63,35 @@ rust_binary_host {
         "libwayland_client",
         "libffi",
         "libfdt",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libcrosvm",
+    crate_name: "crosvm",
+    defaults: ["crosvm_defaults"],
+    srcs: ["src/crosvm.rs"],
+}
+
+rust_binary_host {
+    name: "crosvm.experimental",
+    crate_name: "crosvm",
+    defaults: ["crosvm_defaults"],
+    srcs: ["src/main.rs"],
+
+    // Install the crosvm prebuilts as requirements until we're building these as well.
+    required: [
+        "x86_64_linux_gnu_libepoxy.so.0_for_crosvm",
+        "x86_64_linux_gnu_libgbm.so.1_for_crosvm",
+        "x86_64_linux_gnu_libvirglrenderer.so.0_for_crosvm",
+    ],
+
+    ld_flags: [
+        "-Wl,--rpath,\\$$ORIGIN",
+        "-Wl,--rpath,\\$$ORIGIN/../../lib64",
+    ],
+    rlibs: [
+        "libcrosvm",
     ],
 }
 
@@ -131,6 +148,7 @@ rust_library_host_rlib {
         "libbit_field",
         "libbyteorder",
         "libdata_model",
+        "libdisk",
         "libgpu_buffer",
         "libgpu_display",
         "libgpu_renderer",
@@ -580,4 +598,18 @@ rust_library_host_rlib {
     srcs: ["kernel_cmdline/src/kernel_cmdline.rs"],
 
     rlibs: ["libc_rust"],
+}
+
+rust_library_host_rlib {
+    name: "libdisk",
+    crate_name: "disk",
+    edition: "2018",
+    srcs: ["disk/src/disk.rs"],
+
+    rlibs: [
+        "libc_rust",
+        "libqcow",
+        "libsys_util",
+    ],
+    proc_macros: ["libremain"],
 }
