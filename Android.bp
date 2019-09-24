@@ -186,7 +186,6 @@ rust_proc_macro {
     crate_name: "poll_token_derive",
     edition: "2018",
     srcs: ["sys_util/poll_token_derive/poll_token_derive.rs"],
-    host_supported: true,
 
     rlibs: [
         "libsyn",
@@ -210,12 +209,11 @@ rust_library_host_rlib {
     ],
 }
 
-rust_library_rlib {
+rust_library_host_rlib {
     name: "libsys_util",
     edition: "2018",
     crate_name: "sys_util",
     srcs: ["sys_util/src/lib.rs"],
-    host_supported: true,
 
     rlibs: [
         "libdata_model",
@@ -226,11 +224,10 @@ rust_library_rlib {
     proc_macros: ["libpoll_token_derive"],
 }
 
-rust_library_rlib {
+rust_library_host_rlib {
     name: "libsyscall_defines",
     crate_name: "syscall_defines",
     edition: "2018",
-    host_supported: true,
     srcs: ["syscall_defines/src/lib.rs"],
 }
 
@@ -252,7 +249,6 @@ rust_proc_macro {
     crate_name: "bit_field_derive",
     edition: "2018",
     srcs: ["bit_field/bit_field_derive/bit_field_derive.rs"],
-    host_supported: true,
 
     rlibs: [
         "libproc_macro2",
@@ -270,11 +266,10 @@ rust_library_host_rlib {
     proc_macros: ["libbit_field_derive"],
 }
 
-rust_library_rlib {
+rust_library_host_rlib {
     name: "libdata_model",
     crate_name: "data_model",
     srcs: ["data_model/src/lib.rs"],
-    host_supported: true,
 
     rlibs: ["libassertions"],
 }
@@ -288,11 +283,10 @@ rust_library_host_rlib {
     rlibs: ["librand_ish"],
 }
 
-rust_library_rlib {
+rust_library_host_rlib {
     name: "libassertions",
     crate_name: "assertions",
     srcs: ["assertions/src/lib.rs"],
-    host_supported: true,
 }
 
 rust_library_host_rlib {
@@ -384,7 +378,6 @@ rust_proc_macro {
     crate_name: "msg_on_socket_derive",
     edition: "2018",
     srcs: ["msg_socket/msg_on_socket_derive/msg_on_socket_derive.rs"],
-    host_supported: true,
 
     rlibs: [
         "libproc_macro2",
@@ -413,7 +406,6 @@ rust_proc_macro {
     crate_name: "enumn",
     edition: "2018",
     srcs: ["enumn/src/lib.rs"],
-    host_supported: true,
 
     rlibs: [
         "libproc_macro2",
@@ -435,13 +427,12 @@ rust_library_host_rlib {
     ],
 }
 
-rust_library_rlib {
+rust_library_host_rlib {
     name: "libsync_rust",
     crate_name: "sync",
     edition: "2018",
     srcs: ["sync/src/lib.rs"],
     stem: "libsync",
-    host_supported: true,
 }
 
 rust_library_host_rlib {
@@ -461,7 +452,6 @@ rust_proc_macro {
     crate_name: "wire_format_derive",
     edition: "2018",
     srcs: ["p9/wire_format_derive/wire_format_derive.rs"],
-    host_supported: true,
 
     rlibs: [
         "libproc_macro2",
