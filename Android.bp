@@ -117,6 +117,7 @@ rust_library_host_rlib {
 
 rust_library_host_rlib {
     name: "libdevices",
+    deny_warnings: false,
     crate_name: "devices",
     edition: "2018",
     srcs: ["devices/src/lib.rs"],
@@ -211,6 +212,7 @@ rust_library_host_rlib {
 
 rust_library_host_rlib {
     name: "libsys_util",
+    deny_warnings: false,
     edition: "2018",
     crate_name: "sys_util",
     srcs: ["sys_util/src/lib.rs"],
@@ -310,6 +312,7 @@ rust_library_host_rlib {
 
 rust_library_host_rlib {
     name: "libresources",
+    deny_warnings: false,
     crate_name: "resources",
     edition: "2018",
     srcs: ["resources/src/lib.rs"],
@@ -565,6 +568,7 @@ rust_library_host_rlib {
 
 rust_library_host_rlib {
     name: "libkernel_cmdline",
+    deny_warnings: false,
     crate_name: "kernel_cmdline",
     edition: "2018",
     srcs: ["kernel_cmdline/src/kernel_cmdline.rs"],
