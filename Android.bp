@@ -135,6 +135,7 @@ rust_library_host_rlib {
 rust_library_host_rlib {
     name: "libdevices",
     crate_name: "devices",
+    deny_warnings: false,
     edition: "2018",
     srcs: ["devices/src/lib.rs"],
 
@@ -329,6 +330,7 @@ rust_library_host_rlib {
 rust_library_host_rlib {
     name: "libresources",
     crate_name: "resources",
+    deny_warnings: false,
     edition: "2018",
     srcs: ["resources/src/lib.rs"],
 
@@ -520,6 +522,7 @@ cc_library_host_static {
 rust_library_host_rlib {
     name: "libgpu_display",
     crate_name: "gpu_display",
+    deny_warnings: false,
     edition: "2018",
     srcs: ["gpu_display/src/lib.rs"],
 
