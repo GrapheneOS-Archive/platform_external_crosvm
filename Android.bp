@@ -93,6 +93,12 @@ rust_binary_host {
     rlibs: [
         "libcrosvm",
     ],
+
+    dist: {
+       targets: [
+           "crosvm.experimental"
+       ]
+    },
 }
 
 rust_library_host_rlib {
