@@ -271,6 +271,7 @@ rust_library_host_rlib {
 rust_library_host_rlib {
     name: "libdata_model",
     crate_name: "data_model",
+    edition: "2018",
     srcs: ["data_model/src/lib.rs"],
 
     rlibs: ["libassertions"],
