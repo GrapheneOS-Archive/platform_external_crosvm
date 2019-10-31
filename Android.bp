@@ -51,7 +51,7 @@ rust_binary_host {
         "libkernel_loader",
         "libkvm",
         "libkvm_sys",
-        "libc_rust",
+        "liblibc",
         "liblibcras",
         "libmsg_socket",
         "libnet_util",
