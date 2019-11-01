@@ -8,7 +8,7 @@ rust_library_host_rlib {
     edition: "2018",
     rlibs: [
         "libdata_model",
-        "libc_rust",
+        "liblibc",
         "libsync_rust",
         "libsyscall_defines",
     ],

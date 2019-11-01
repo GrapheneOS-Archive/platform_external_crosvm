@@ -8,7 +8,7 @@ rust_library_host_rlib {
     rlibs: [
         "libbyteorder",
         "libdata_model",
-        "libc_rust",
+        "liblibc",
         "libsys_util",
     ],
     proc_macros: [
