@@ -9,7 +9,7 @@ rust_library_host_rlib {
         "libbyteorder",
         "libdata_model",
         "libkvm",
-        "libc_rust",
+        "liblibc",
         "libmsg_socket",
         "libresources",
         "libsys_util",
