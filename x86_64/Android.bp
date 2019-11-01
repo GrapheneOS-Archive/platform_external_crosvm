@@ -17,7 +17,7 @@ rust_library_host_rlib {
         "libkernel_loader",
         "libkvm",
         "libkvm_sys",
-        "libc_rust",
+        "liblibc",
         "libresources",
         "libsync_rust",
         "libsys_util",

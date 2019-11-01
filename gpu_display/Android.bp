@@ -13,7 +13,7 @@ rust_library_host_rlib {
 
     rlibs: [
         "libdata_model",
-        "libc_rust",
+        "liblibc",
         "libsys_util",
     ],
     static_libs: ["libdisplay_wl"],

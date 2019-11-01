@@ -6,7 +6,7 @@ rust_library_host_rlib {
     srcs: ["src/lib.rs"],
     edition: "2018",
     rlibs: [
-        "libc_rust",
+        "liblibc",
         "libnet_sys",
         "libsys_util",
     ],
