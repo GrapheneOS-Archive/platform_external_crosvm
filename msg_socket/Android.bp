@@ -13,3 +13,38 @@ rust_library_host_rlib {
         "libmsg_on_socket_derive",
     ],
 }
+
+rust_test_host {
+    name: "msg_socket_tests",
+    crate_name: "msg_socket",
+    srcs: [
+        "tests/enum.rs",
+        "tests/struct.rs",
+        "tests/tuple.rs",
+        "tests/unit.rs",
+    ],
+    relative_install_path: "msg_socket_tests",
+    edition: "2018",
+    rlibs: [
+        "libdata_model",
+        "libmsg_socket",
+        "libsys_util",
+    ],
+    proc_macros: [
+        "libmsg_on_socket_derive",
+    ],
+}
+
+rust_test_host {
+    name: "msg_socket_tests_msg_socket",
+    crate_name: "msg_socket",
+    srcs: ["src/lib.rs"],
+    relative_install_path: "msg_socket_tests",
+    rlibs: [
+        "libdata_model",
+        "libsys_util",
+    ],
+    proc_macros: [
+        "libmsg_on_socket_derive",
+    ],
+}
