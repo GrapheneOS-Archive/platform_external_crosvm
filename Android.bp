@@ -36,7 +36,7 @@ rust_defaults {
         "libkernel_loader",
         "libkvm",
         "libkvm_sys",
-        "libc_rust",
+        "liblibc",
         "liblibcras",
         "libmsg_socket",
         "libnet_util",
@@ -113,7 +113,7 @@ rust_library_host_rlib {
         "libbyteorder",
         "libdata_model",
         "libkvm",
-        "libc_rust",
+        "liblibc",
         "libmsg_socket",
         "libresources",
         "libsys_util",
@@ -135,7 +135,7 @@ rust_library_host_rlib {
     edition: "2018",
     srcs: ["io_jail/src/lib.rs"],
 
-    rlibs: ["libc_rust"],
+    rlibs: ["liblibc"],
 }
 
 rust_library_host_rlib {
@@ -161,7 +161,7 @@ rust_library_host_rlib {
         "libgpu_renderer",
         "libio_jail",
         "libkvm",
-        "libc_rust",
+        "liblibc",
         "libmsg_socket",
         "libnet_sys",
         "libnet_util",
@@ -188,7 +188,7 @@ rust_library_host_rlib {
     srcs: ["net_util/src/lib.rs"],
 
     rlibs: [
-        "libc_rust",
+        "liblibc",
         "libnet_sys",
         "libsys_util",
     ],
@@ -201,7 +201,7 @@ rust_library_host_rlib {
     srcs: ["kvm_sys/src/lib.rs"],
 
     rlibs: [
-        "libc_rust",
+        "liblibc",
         "libsys_util",
     ],
 }
@@ -227,7 +227,7 @@ rust_library_host_rlib {
 
     rlibs: [
         "libassertions",
-        "libc_rust",
+        "liblibc",
         "libnet_util",
         "libsys_util",
         "libvirtio_sys",
@@ -242,7 +242,7 @@ rust_library_host_rlib {
 
     rlibs: [
         "libdata_model",
-        "libc_rust",
+        "liblibc",
         "libsync_rust",
         "libsyscall_defines",
     ],
@@ -306,7 +306,7 @@ rust_library_host_rlib {
     edition: "2018",
     srcs: ["tempfile/src/lib.rs"],
 
-    rlibs: ["librand_ish"],
+    rlibs: ["liblibc"],
 }
 
 rust_library_host_rlib {
@@ -327,7 +327,7 @@ rust_library_host_rlib {
         "libio_jail",
         "libkernel_cmdline",
         "libkvm",
-        "libc_rust",
+        "liblibc",
         "libresources",
         "libsync_rust",
         "libsys_util",
@@ -345,7 +345,7 @@ rust_library_host_rlib {
 
     rlibs: [
         "libgpu_buffer",
-        "libc_rust",
+        "liblibc",
         "libmsg_socket",
         "libsys_util",
     ],
@@ -369,7 +369,7 @@ rust_library_host_rlib {
     rlibs: [
         "libkvm_sys",
         "libmsg_socket",
-        "libc_rust",
+        "liblibc",
         "libsys_util",
     ],
 }
@@ -382,7 +382,7 @@ rust_library_host_rlib {
 
     rlibs: [
         "libdata_model",
-        "libc_rust",
+        "liblibc",
         "libsys_util",
     ],
 }
@@ -421,7 +421,7 @@ rust_library_host_rlib {
 
     rlibs: [
         "libbyteorder",
-        "libc_rust",
+        "liblibc",
         "libsys_util",
         "libdata_model",
     ],
@@ -470,7 +470,7 @@ rust_library_host_rlib {
 
     features: ["trace"],
 
-    rlibs: ["libc_rust"],
+    rlibs: ["liblibc"],
     proc_macros: ["libwire_format_derive"],
 }
 
@@ -512,7 +512,7 @@ rust_library_host_rlib {
         "libkernel_loader",
         "libkvm",
         "libkvm_sys",
-        "libc_rust",
+        "liblibc",
         "libresources",
         "libsync_rust",
         "libsys_util",
@@ -535,7 +535,7 @@ rust_library_host_rlib {
 
     rlibs: [
         "libdata_model",
-        "libc_rust",
+        "liblibc",
         "libsys_util",
     ],
     static_libs: ["libdisplay_wl"],
@@ -587,7 +587,7 @@ rust_library_host_rlib {
 
     rlibs: [
         "libsys_util",
-        "libc_rust",
+        "liblibc",
     ],
 }
 
@@ -597,7 +597,7 @@ rust_library_host_rlib {
     edition: "2018",
     srcs: ["kernel_cmdline/src/kernel_cmdline.rs"],
 
-    rlibs: ["libc_rust"],
+    rlibs: ["liblibc"],
 }
 
 rust_library_host_rlib {
@@ -607,7 +607,7 @@ rust_library_host_rlib {
     srcs: ["disk/src/disk.rs"],
 
     rlibs: [
-        "libc_rust",
+        "liblibc",
         "libqcow",
         "libsys_util",
     ],
