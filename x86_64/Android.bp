@@ -2,10 +2,10 @@
 
 rust_library_host_rlib {
     name: "libx86_64_rust",
+    defaults: ["crosvm_defaults"],
     stem: "libx86_64",
     crate_name: "x86_64",
     srcs: ["src/lib.rs"],
-    edition: "2018",
     rlibs: [
         "libarch",
         "libassertions",

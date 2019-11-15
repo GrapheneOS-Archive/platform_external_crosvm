@@ -2,9 +2,9 @@
 
 rust_proc_macro {
     name: "libwire_format_derive",
+    defaults: ["crosvm_defaults"],
     crate_name: "wire_format_derive",
     srcs: ["wire_format_derive.rs"],
-    edition: "2018",
     rlibs: [
         "libproc_macro2",
         "libquote",

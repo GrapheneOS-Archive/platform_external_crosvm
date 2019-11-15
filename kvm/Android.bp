@@ -2,9 +2,9 @@
 
 rust_library_host_rlib {
     name: "libkvm",
+    defaults: ["crosvm_defaults"],
     crate_name: "kvm",
     srcs: ["src/lib.rs"],
-    edition: "2018",
     rlibs: [
         "libkvm_sys",
         "liblibc",
