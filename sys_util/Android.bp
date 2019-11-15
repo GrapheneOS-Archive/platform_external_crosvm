@@ -2,10 +2,10 @@
 
 rust_library_host_rlib {
     name: "libsys_util",
+    defaults: ["crosvm_defaults"],
     deny_warnings: false,
     crate_name: "sys_util",
     srcs: ["src/lib.rs"],
-    edition: "2018",
     rlibs: [
         "libdata_model",
         "liblibc",

@@ -7,8 +7,8 @@
 
 rust_library_host_rlib {
     name: "libgpu_display",
+    defaults: ["crosvm_defaults"],
     crate_name: "gpu_display",
-    edition: "2018",
     srcs: ["src/lib.rs"],
 
     rlibs: [
