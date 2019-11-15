@@ -2,18 +2,27 @@
 //   module name, enabled, relative_install_path, target, required,
 //   flags, ld_flags, shared_libs, static_libs.
 
-rust_binary_host {
-    name: "crosvm.experimental",
-    crate_name: "crosvm",
+rust_defaults {
+    name: "crosvm_defaults",
     edition: "2018",
     enabled: false,
-    relative_install_path: "x86_64-linux-gnu",
+    target: {
+        linux_glibc_x86_64: {
+            enabled: true,
+        },
+    },
+}
+
+rust_binary_host {
+    name: "crosvm.experimental",
+    defaults: ["crosvm_defaults"],
+    crate_name: "crosvm",
     srcs: ["src/main.rs"],
 
     target: {
         linux_glibc_x86_64: {
+            relative_install_path: "x86_64-linux-gnu",
             rlibs: ["libx86_64_rust"],
-            enabled: true,
         },
     },
 

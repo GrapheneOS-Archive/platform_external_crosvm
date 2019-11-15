@@ -2,9 +2,9 @@
 
 rust_proc_macro {
     name: "libpoll_token_derive",
+    defaults: ["crosvm_defaults"],
     crate_name: "poll_token_derive",
     srcs: ["poll_token_derive.rs"],
-    edition: "2018",
     rlibs: [
         "libproc_macro2",
         "libquote",

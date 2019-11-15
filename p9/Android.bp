@@ -2,9 +2,9 @@
 
 rust_library_host_rlib {
     name: "libp9",
+    defaults: ["crosvm_defaults"],
     crate_name: "p9",
     srcs: ["src/lib.rs"],
-    edition: "2018",
     rlibs: [
         "liblibc",
     ],

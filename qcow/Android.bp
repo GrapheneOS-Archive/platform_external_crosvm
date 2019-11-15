@@ -2,9 +2,9 @@
 
 rust_library_host_rlib {
     name: "libqcow",
+    defaults: ["crosvm_defaults"],
     crate_name: "qcow",
     srcs: ["src/qcow.rs"],
-    edition: "2018",
     rlibs: [
         "libbyteorder",
         "libdata_model",

@@ -2,9 +2,9 @@
 
 rust_library_host_rlib {
     name: "libgpu_renderer",
+    defaults: ["crosvm_defaults"],
     crate_name: "gpu_renderer",
     srcs: ["src/lib.rs"],
-    edition: "2018",
     rlibs: [
         "libdata_model",
         "liblibc",
