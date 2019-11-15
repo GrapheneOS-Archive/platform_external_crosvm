@@ -2,9 +2,9 @@
 
 rust_library_host_rlib {
     name: "libvirtio_sys",
+    defaults: ["crosvm_defaults"],
     crate_name: "virtio_sys",
     srcs: ["src/lib.rs"],
-    edition: "2018",
     rlibs: [
         "libsys_util",
     ],
