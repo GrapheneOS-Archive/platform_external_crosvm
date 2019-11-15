@@ -2,7 +2,7 @@
 
 rust_library_host_rlib {
     name: "libassertions",
+    defaults: ["crosvm_defaults"],
     crate_name: "assertions",
     srcs: ["src/lib.rs"],
-    edition: "2018",
 }

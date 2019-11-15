@@ -2,9 +2,9 @@
 
 rust_library_host_rlib {
     name: "libresources",
+    defaults: ["crosvm_defaults"],
     crate_name: "resources",
     srcs: ["src/lib.rs"],
-    edition: "2018",
     rlibs: [
         "liblibc",
         "libmsg_socket",

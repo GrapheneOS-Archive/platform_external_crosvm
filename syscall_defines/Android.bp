@@ -2,7 +2,7 @@
 
 rust_library_host_rlib {
     name: "libsyscall_defines",
+    defaults: ["crosvm_defaults"],
     crate_name: "syscall_defines",
     srcs: ["src/lib.rs"],
-    edition: "2018",
 }
