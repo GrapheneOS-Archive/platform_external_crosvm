@@ -7,7 +7,7 @@ rust_library_host_rlib {
     edition: "2018",
     rlibs: [
         "libassertions",
-        "libc_rust",
+        "liblibc",
         "libnet_util",
         "libsys_util",
         "libvirtio_sys",

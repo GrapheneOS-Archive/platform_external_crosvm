@@ -7,7 +7,7 @@ rust_library_host_rlib {
     edition: "2018",
     rlibs: [
         "libkvm_sys",
-        "libc_rust",
+        "liblibc",
         "libmsg_socket",
         "libsys_util",
     ],
