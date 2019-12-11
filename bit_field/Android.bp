@@ -2,9 +2,9 @@
 
 rust_library_host_rlib {
     name: "libbit_field",
+    defaults: ["crosvm_defaults"],
     crate_name: "bit_field",
     srcs: ["src/lib.rs"],
-    edition: "2018",
     proc_macros: [
         "libbit_field_derive",
     ],

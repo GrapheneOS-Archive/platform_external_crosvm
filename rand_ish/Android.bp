@@ -2,7 +2,7 @@
 
 rust_library_host_rlib {
     name: "librand_ish",
+    defaults: ["crosvm_defaults"],
     crate_name: "rand_ish",
     srcs: ["src/lib.rs"],
-    edition: "2018",
 }

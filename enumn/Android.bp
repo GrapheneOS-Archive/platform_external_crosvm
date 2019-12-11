@@ -2,9 +2,9 @@
 
 rust_proc_macro {
     name: "libenumn",
+    defaults: ["crosvm_defaults"],
     crate_name: "enumn",
     srcs: ["src/lib.rs"],
-    edition: "2018",
     rlibs: [
         "libproc_macro2",
         "libquote",
