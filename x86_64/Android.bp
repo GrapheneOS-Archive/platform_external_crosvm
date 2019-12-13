@@ -9,7 +9,6 @@ rust_library_host_rlib {
     rlibs: [
         "libarch",
         "libassertions",
-        "libbyteorder",
         "libdata_model",
         "libdevices",
         "libio_jail",

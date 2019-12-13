@@ -6,7 +6,6 @@ rust_library_host_rlib {
     crate_name: "qcow",
     srcs: ["src/qcow.rs"],
     rlibs: [
-        "libbyteorder",
         "libdata_model",
         "liblibc",
         "libsys_util",
