@@ -10,7 +10,8 @@ use data_model::{VolatileMemory, VolatileSlice};
 use libc::{EINVAL, ENOSPC, ENOTSUP};
 use remain::sorted;
 use sys_util::{
-    error, FileReadWriteVolatile, FileSetLen, FileSync, PunchHole, SeekHole, WriteZeroes,
+    error, FileGetLen, FileReadWriteAtVolatile, FileReadWriteVolatile, FileSetLen, FileSync,
+    PunchHole, SeekHole, WriteZeroesAt,
 };
 
 use std::cmp::{max, min};
@@ -741,11 +742,14 @@ impl QcowFile {
             let mut ref_table = vec![0; refcount_table_entries as usize];
             let mut first_free_cluster: u64 = 0;
             for refblock_addr in &mut ref_table {
-                while refcounts[first_free_cluster as usize] != 0 {
-                    first_free_cluster += 1;
+                loop {
                     if first_free_cluster >= refcounts.len() as u64 {
                         return Err(Error::NotEnoughSpaceForRefcounts);
                     }
+                    if refcounts[first_free_cluster as usize] == 0 {
+                        break;
+                    }
+                    first_free_cluster += 1;
                 }
 
                 *refblock_addr = first_free_cluster * cluster_size;
@@ -1059,10 +1063,10 @@ impl QcowFile {
 
         let max_valid_cluster_offset = self.refcounts.max_valid_cluster_offset();
         if let Some(new_cluster) = self.raw_file.add_cluster_end(max_valid_cluster_offset)? {
-            return Ok(new_cluster);
+            Ok(new_cluster)
         } else {
             error!("No free clusters in get_new_cluster()");
-            return Err(std::io::Error::from_raw_os_error(ENOSPC));
+            Err(std::io::Error::from_raw_os_error(ENOSPC))
         }
     }
 
@@ -1238,8 +1242,9 @@ impl QcowFile {
                 // unallocated clusters already read back as zeroes.
                 if let Some(offset) = self.file_offset_read(curr_addr)? {
                     // Partial cluster - zero it out.
-                    self.raw_file.file_mut().seek(SeekFrom::Start(offset))?;
-                    self.raw_file.file_mut().write_zeroes(count)?;
+                    self.raw_file
+                        .file_mut()
+                        .write_zeroes_all_at(offset, count)?;
                 }
             }
 
@@ -1358,15 +1363,14 @@ impl QcowFile {
         Ok(())
     }
 
-    // Reads `count` bytes from the cursor position, calling `cb` repeatedly with the backing file,
+    // Reads `count` bytes starting at `address`, calling `cb` repeatedly with the backing file,
     // number of bytes read so far, and number of bytes to read from the file in that invocation. If
     // None is given to `cb` in place of the backing file, the `cb` should infer zeros would have
     // been read.
-    fn read_cb<F>(&mut self, count: usize, mut cb: F) -> std::io::Result<usize>
+    fn read_cb<F>(&mut self, address: u64, count: usize, mut cb: F) -> std::io::Result<usize>
     where
         F: FnMut(Option<&mut File>, usize, usize) -> std::io::Result<()>,
     {
-        let address: u64 = self.current_offset as u64;
         let read_count: usize = self.limit_range_file(address, count);
 
         let mut nread: usize = 0;
@@ -1384,17 +1388,15 @@ impl QcowFile {
 
             nread += count;
         }
-        self.current_offset += read_count as u64;
         Ok(read_count)
     }
 
-    // Writes `count` bytes to the cursor position, calling `cb` repeatedly with the backing file,
+    // Writes `count` bytes starting at `address`, calling `cb` repeatedly with the backing file,
     // number of bytes written so far, and number of bytes to write to the file in that invocation.
-    fn write_cb<F>(&mut self, count: usize, mut cb: F) -> std::io::Result<usize>
+    fn write_cb<F>(&mut self, address: u64, count: usize, mut cb: F) -> std::io::Result<usize>
     where
         F: FnMut(&mut File, usize, usize) -> std::io::Result<()>,
     {
-        let address: u64 = self.current_offset as u64;
         let write_count: usize = self.limit_range_file(address, count);
 
         let mut nwritten: usize = 0;
@@ -1412,7 +1414,6 @@ impl QcowFile {
 
             nwritten += count;
         }
-        self.current_offset += write_count as u64;
         Ok(write_count)
     }
 }
@@ -1431,15 +1432,22 @@ impl AsRawFd for QcowFile {
 
 impl Read for QcowFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.read_cb(buf.len(), |file, offset, count| match file {
-            Some(f) => f.read_exact(&mut buf[offset..(offset + count)]),
-            None => {
-                for b in &mut buf[offset..(offset + count)] {
-                    *b = 0;
-                }
-                Ok(())
-            }
-        })
+        let read_count =
+            self.read_cb(
+                self.current_offset,
+                buf.len(),
+                |file, offset, count| match file {
+                    Some(f) => f.read_exact(&mut buf[offset..(offset + count)]),
+                    None => {
+                        for b in &mut buf[offset..(offset + count)] {
+                            *b = 0;
+                        }
+                        Ok(())
+                    }
+                },
+            )?;
+        self.current_offset += read_count as u64;
+        Ok(read_count)
     }
 }
 
@@ -1477,9 +1485,12 @@ impl Seek for QcowFile {
 
 impl Write for QcowFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_cb(buf.len(), |file, offset, count| {
-            file.write_all(&buf[offset..(offset + count)])
-        })
+        let write_count =
+            self.write_cb(self.current_offset, buf.len(), |file, offset, count| {
+                file.write_all(&buf[offset..(offset + count)])
+            })?;
+        self.current_offset += write_count as u64;
+        Ok(write_count)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1491,7 +1502,41 @@ impl Write for QcowFile {
 
 impl FileReadWriteVolatile for QcowFile {
     fn read_volatile(&mut self, slice: VolatileSlice) -> io::Result<usize> {
-        self.read_cb(slice.size() as usize, |file, offset, count| {
+        let read_count = self.read_cb(
+            self.current_offset,
+            slice.size() as usize,
+            |file, offset, count| {
+                let sub_slice = slice.get_slice(offset as u64, count as u64).unwrap();
+                match file {
+                    Some(f) => f.read_exact_volatile(sub_slice),
+                    None => {
+                        sub_slice.write_bytes(0);
+                        Ok(())
+                    }
+                }
+            },
+        )?;
+        self.current_offset += read_count as u64;
+        Ok(read_count)
+    }
+
+    fn write_volatile(&mut self, slice: VolatileSlice) -> io::Result<usize> {
+        let write_count = self.write_cb(
+            self.current_offset,
+            slice.size() as usize,
+            |file, offset, count| {
+                let sub_slice = slice.get_slice(offset as u64, count as u64).unwrap();
+                file.write_all_volatile(sub_slice)
+            },
+        )?;
+        self.current_offset += write_count as u64;
+        Ok(write_count)
+    }
+}
+
+impl FileReadWriteAtVolatile for QcowFile {
+    fn read_at_volatile(&mut self, slice: VolatileSlice, offset: u64) -> io::Result<usize> {
+        self.read_cb(offset, slice.size() as usize, |file, offset, count| {
             let sub_slice = slice.get_slice(offset as u64, count as u64).unwrap();
             match file {
                 Some(f) => f.read_exact_volatile(sub_slice),
@@ -1503,8 +1548,8 @@ impl FileReadWriteVolatile for QcowFile {
         })
     }
 
-    fn write_volatile(&mut self, slice: VolatileSlice) -> io::Result<usize> {
-        self.write_cb(slice.size() as usize, |file, offset, count| {
+    fn write_at_volatile(&mut self, slice: VolatileSlice, offset: u64) -> io::Result<usize> {
+        self.write_cb(offset, slice.size() as usize, |file, offset, count| {
             let sub_slice = slice.get_slice(offset as u64, count as u64).unwrap();
             file.write_all_volatile(sub_slice)
         })
@@ -1526,6 +1571,12 @@ impl FileSetLen for QcowFile {
     }
 }
 
+impl FileGetLen for QcowFile {
+    fn get_len(&self) -> io::Result<u64> {
+        Ok(self.virtual_size())
+    }
+}
+
 impl PunchHole for QcowFile {
     fn punch_hole(&mut self, offset: u64, length: u64) -> std::io::Result<()> {
         let mut remaining = length;
@@ -1537,6 +1588,13 @@ impl PunchHole for QcowFile {
             offset += chunk_length as u64;
         }
         Ok(())
+    }
+}
+
+impl WriteZeroesAt for QcowFile {
+    fn write_zeroes_at(&mut self, offset: u64, length: usize) -> io::Result<usize> {
+        self.punch_hole(offset, length as u64)?;
+        Ok(length)
     }
 }
 
@@ -1593,7 +1651,7 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom, Write};
-    use sys_util::SharedMemory;
+    use sys_util::{SharedMemory, WriteZeroes};
 
     fn valid_header() -> Vec<u8> {
         vec![
@@ -1646,7 +1704,7 @@ mod tests {
     where
         F: FnMut(File),
     {
-        let shm = SharedMemory::new(None).unwrap();
+        let shm = SharedMemory::anon().unwrap();
         let mut disk_file: File = shm.into();
         disk_file.write_all(&header).unwrap();
         disk_file.set_len(0x1_0000_0000).unwrap();
@@ -1659,7 +1717,7 @@ mod tests {
     where
         F: FnMut(QcowFile),
     {
-        let shm = SharedMemory::new(None).unwrap();
+        let shm = SharedMemory::anon().unwrap();
         let qcow_file = QcowFile::new(shm.into(), file_size).unwrap();
 
         testfn(qcow_file); // File closed when the function exits.
@@ -1668,7 +1726,7 @@ mod tests {
     #[test]
     fn default_header() {
         let header = QcowHeader::create_for_size(0x10_0000);
-        let shm = SharedMemory::new(None).unwrap();
+        let shm = SharedMemory::anon().unwrap();
         let mut disk_file: File = shm.into();
         header
             .write_to(&mut disk_file)
@@ -1822,8 +1880,7 @@ mod tests {
             q.write(&b).expect("Failed to write test string.");
             // Overwrite the test data with zeroes.
             q.seek(SeekFrom::Start(0xfff2000)).expect("Failed to seek.");
-            let nwritten = q.write_zeroes(0x200).expect("Failed to write zeroes.");
-            assert_eq!(nwritten, 0x200);
+            q.write_zeroes_all(0x200).expect("Failed to write zeroes.");
             // Verify that the correct part of the data was zeroed out.
             let mut buf = [0u8; 0x1000];
             q.seek(SeekFrom::Start(0xfff2000)).expect("Failed to seek.");
@@ -1848,8 +1905,8 @@ mod tests {
             q.write(&b).expect("Failed to write test string.");
             // Overwrite the full cluster with zeroes.
             q.seek(SeekFrom::Start(0)).expect("Failed to seek.");
-            let nwritten = q.write_zeroes(CHUNK_SIZE).expect("Failed to write zeroes.");
-            assert_eq!(nwritten, CHUNK_SIZE);
+            q.write_zeroes_all(CHUNK_SIZE)
+                .expect("Failed to write zeroes.");
             // Verify that the data was zeroed out.
             let mut buf = [0u8; CHUNK_SIZE];
             q.seek(SeekFrom::Start(0)).expect("Failed to seek.");

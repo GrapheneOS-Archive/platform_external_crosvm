@@ -3,26 +3,22 @@
 // found in the LICENSE file.
 
 use std::os::raw::c_ulonglong;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use sys_util::{EventFd, PollContext, PollToken};
 use vhost::Vhost;
 
 use super::{Error, Result};
-use crate::virtio::{Queue, INTERRUPT_STATUS_USED_RING};
+use crate::virtio::{Interrupt, Queue};
 
 /// Worker that takes care of running the vhost device.  This mainly involves forwarding interrupts
 /// from the vhost driver to the guest VM because crosvm only supports the virtio-mmio transport,
 /// which requires a bit to be set in the interrupt status register before triggering the interrupt
 /// and the vhost driver doesn't do this for us.
 pub struct Worker<T: Vhost> {
+    interrupt: Interrupt,
     queues: Vec<Queue>,
     vhost_handle: T,
-    vhost_interrupt: EventFd,
-    interrupt_status: Arc<AtomicUsize>,
-    interrupt_evt: EventFd,
-    interrupt_resample_evt: EventFd,
+    vhost_interrupt: Vec<EventFd>,
     acked_features: u64,
 }
 
@@ -30,27 +26,17 @@ impl<T: Vhost> Worker<T> {
     pub fn new(
         queues: Vec<Queue>,
         vhost_handle: T,
-        vhost_interrupt: EventFd,
-        interrupt_status: Arc<AtomicUsize>,
-        interrupt_evt: EventFd,
-        interrupt_resample_evt: EventFd,
+        vhost_interrupt: Vec<EventFd>,
+        interrupt: Interrupt,
         acked_features: u64,
     ) -> Worker<T> {
         Worker {
+            interrupt,
             queues,
             vhost_handle,
             vhost_interrupt,
-            interrupt_status,
-            interrupt_evt,
-            interrupt_resample_evt,
             acked_features,
         }
-    }
-
-    fn signal_used_queue(&self) {
-        self.interrupt_status
-            .fetch_or(INTERRUPT_STATUS_USED_RING as usize, Ordering::SeqCst);
-        self.interrupt_evt.write(1).unwrap();
     }
 
     pub fn run<F>(
@@ -103,7 +89,7 @@ impl<T: Vhost> Worker<T> {
                 .set_vring_base(queue_index, 0)
                 .map_err(Error::VhostSetVringBase)?;
             self.vhost_handle
-                .set_vring_call(queue_index, &self.vhost_interrupt)
+                .set_vring_call(queue_index, &self.vhost_interrupt[queue_index])
                 .map_err(Error::VhostSetVringCall)?;
             self.vhost_handle
                 .set_vring_kick(queue_index, &queue_evts[queue_index])
@@ -114,39 +100,39 @@ impl<T: Vhost> Worker<T> {
 
         #[derive(PollToken)]
         enum Token {
-            VhostIrq,
+            VhostIrqi { index: usize },
             InterruptResample,
             Kill,
         }
 
         let poll_ctx: PollContext<Token> = PollContext::build_with(&[
-            (&self.vhost_interrupt, Token::VhostIrq),
-            (&self.interrupt_resample_evt, Token::InterruptResample),
+            (self.interrupt.get_resample_evt(), Token::InterruptResample),
             (&kill_evt, Token::Kill),
         ])
         .map_err(Error::CreatePollContext)?;
 
+        for (index, vhost_int) in self.vhost_interrupt.iter().enumerate() {
+            poll_ctx
+                .add(vhost_int, Token::VhostIrqi { index })
+                .map_err(Error::CreatePollContext)?;
+        }
+
         'poll: loop {
             let events = poll_ctx.wait().map_err(Error::PollError)?;
 
-            let mut needs_interrupt = false;
             for event in events.iter_readable() {
                 match event.token() {
-                    Token::VhostIrq => {
-                        needs_interrupt = true;
-                        self.vhost_interrupt.read().map_err(Error::VhostIrqRead)?;
+                    Token::VhostIrqi { index } => {
+                        self.vhost_interrupt[index]
+                            .read()
+                            .map_err(Error::VhostIrqRead)?;
+                        self.interrupt.signal_used_queue(self.queues[index].vector);
                     }
                     Token::InterruptResample => {
-                        let _ = self.interrupt_resample_evt.read();
-                        if self.interrupt_status.load(Ordering::SeqCst) != 0 {
-                            self.interrupt_evt.write(1).unwrap();
-                        }
+                        self.interrupt.interrupt_resample();
                     }
                     Token::Kill => break 'poll,
                 }
-            }
-            if needs_interrupt {
-                self.signal_used_queue();
             }
         }
         Ok(())

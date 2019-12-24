@@ -3,7 +3,6 @@
 // found in the LICENSE file.
 
 use std::cmp::{max, min};
-use std::convert::TryFrom;
 use std::fmt::{self, Display};
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
@@ -14,7 +13,9 @@ use crate::{create_disk_file, DiskFile, ImageType};
 use data_model::VolatileSlice;
 use protos::cdisk_spec;
 use remain::sorted;
-use sys_util::{AsRawFds, FileReadWriteVolatile, FileSetLen, FileSync, PunchHole, WriteZeroes};
+use sys_util::{
+    AsRawFds, FileGetLen, FileReadWriteAtVolatile, FileSetLen, FileSync, PunchHole, WriteZeroesAt,
+};
 
 #[sorted]
 #[derive(Debug)]
@@ -68,24 +69,18 @@ impl ComponentDiskPart {
 /// and not overlapping.
 pub struct CompositeDiskFile {
     component_disks: Vec<ComponentDiskPart>,
-    cursor_location: u64,
 }
 
 fn ranges_overlap(a: &Range<u64>, b: &Range<u64>) -> bool {
-    a.contains(&b.start)
-        || a.contains(&(b.end - 1))
-        || b.contains(&a.start)
-        || b.contains(&(a.end - 1))
+    // essentially !range_intersection(a, b).is_empty(), but that's experimental
+    let intersection = range_intersection(a, b);
+    intersection.start < intersection.end
 }
 
 fn range_intersection(a: &Range<u64>, b: &Range<u64>) -> Range<u64> {
-    if ranges_overlap(a, b) {
-        Range {
-            start: max(a.start, b.start),
-            end: min(a.end, b.end),
-        }
-    } else {
-        Range { start: 0, end: 0 }
+    Range {
+        start: max(a.start, b.start),
+        end: min(a.end, b.end),
     }
 }
 
@@ -114,7 +109,6 @@ impl CompositeDiskFile {
         }
         Ok(CompositeDiskFile {
             component_disks: disks,
-            cursor_location: 0,
         })
     }
 
@@ -139,7 +133,7 @@ impl CompositeDiskFile {
         open_options.read(true);
         let mut disks: Vec<ComponentDiskPart> = proto
             .get_component_disks()
-            .into_iter()
+            .iter()
             .map(|disk| {
                 open_options.write(
                     disk.get_read_write_capability() == cdisk_spec::ReadWriteCapability::READ_WRITE,
@@ -216,6 +210,12 @@ impl CompositeDiskFile {
     }
 }
 
+impl FileGetLen for CompositeDiskFile {
+    fn get_len(&self) -> io::Result<u64> {
+        Ok(self.length())
+    }
+}
+
 impl FileSetLen for CompositeDiskFile {
     fn set_len(&self, _len: u64) -> io::Result<()> {
         Err(io::Error::new(ErrorKind::Other, "unsupported operation"))
@@ -231,12 +231,19 @@ impl FileSync for CompositeDiskFile {
     }
 }
 
-impl FileReadWriteVolatile for CompositeDiskFile {
-    fn read_volatile(&mut self, slice: VolatileSlice) -> io::Result<usize> {
-        let cursor_location = self.cursor_location;
+// Implements Read and Write targeting volatile storage for composite disks.
+//
+// Note that reads and writes will return early if crossing component disk boundaries.
+// This is allowed by the read and write specifications, which only say read and write
+// have to return how many bytes were actually read or written. Use read_exact_volatile
+// or write_all_volatile to make sure all bytes are received/transmitted.
+//
+// If one of the component disks does a partial read or write, that also gets passed
+// transparently to the parent.
+impl FileReadWriteAtVolatile for CompositeDiskFile {
+    fn read_at_volatile(&mut self, slice: VolatileSlice, offset: u64) -> io::Result<usize> {
+        let cursor_location = offset;
         let disk = self.disk_at_offset(cursor_location)?;
-        disk.file
-            .seek(SeekFrom::Start(cursor_location - disk.offset))?;
         let subslice = if cursor_location + slice.size() > disk.offset + disk.length {
             let new_size = disk.offset + disk.length - cursor_location;
             slice
@@ -245,17 +252,12 @@ impl FileReadWriteVolatile for CompositeDiskFile {
         } else {
             slice
         };
-        let result = disk.file.read_volatile(subslice);
-        if let Ok(size) = result {
-            self.cursor_location += size as u64;
-        }
-        result
+        disk.file
+            .read_at_volatile(subslice, cursor_location - disk.offset)
     }
-    fn write_volatile(&mut self, slice: VolatileSlice) -> io::Result<usize> {
-        let cursor_location = self.cursor_location;
+    fn write_at_volatile(&mut self, slice: VolatileSlice, offset: u64) -> io::Result<usize> {
+        let cursor_location = offset;
         let disk = self.disk_at_offset(cursor_location)?;
-        disk.file
-            .seek(SeekFrom::Start(cursor_location - disk.offset))?;
         let subslice = if cursor_location + slice.size() > disk.offset + disk.length {
             let new_size = disk.offset + disk.length - cursor_location;
             slice
@@ -264,11 +266,8 @@ impl FileReadWriteVolatile for CompositeDiskFile {
         } else {
             slice
         };
-        let result = disk.file.write_volatile(subslice);
-        if let Ok(size) = result {
-            self.cursor_location += size as u64;
-        }
-        result
+        disk.file
+            .write_at_volatile(subslice, cursor_location - disk.offset)
     }
 }
 
@@ -278,6 +277,9 @@ impl PunchHole for CompositeDiskFile {
         let disks = self.disks_in_range(&range);
         for disk in disks {
             let intersection = range_intersection(&range, &disk.range());
+            if intersection.start >= intersection.end {
+                continue;
+            }
             let result = disk.file.punch_hole(
                 intersection.start - disk.offset,
                 intersection.end - intersection.start,
@@ -290,35 +292,17 @@ impl PunchHole for CompositeDiskFile {
     }
 }
 
-impl Seek for CompositeDiskFile {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let cursor_location = match pos {
-            SeekFrom::Start(offset) => Ok(offset),
-            SeekFrom::End(offset) => u64::try_from(self.length() as i64 + offset),
-            SeekFrom::Current(offset) => u64::try_from(self.cursor_location as i64 + offset),
-        }
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-        self.cursor_location = cursor_location;
-        Ok(cursor_location)
-    }
-}
-
-impl WriteZeroes for CompositeDiskFile {
-    fn write_zeroes(&mut self, length: usize) -> io::Result<usize> {
-        let cursor_location = self.cursor_location;
+impl WriteZeroesAt for CompositeDiskFile {
+    fn write_zeroes_at(&mut self, offset: u64, length: usize) -> io::Result<usize> {
+        let cursor_location = offset;
         let disk = self.disk_at_offset(cursor_location)?;
-        disk.file
-            .seek(SeekFrom::Start(cursor_location - disk.offset))?;
+        let offset_within_disk = cursor_location - disk.offset;
         let new_length = if cursor_location + length as u64 > disk.offset + disk.length {
             (disk.offset + disk.length - cursor_location) as usize
         } else {
             length
         };
-        let result = disk.file.write_zeroes(new_length);
-        if let Ok(size) = result {
-            self.cursor_location += size as u64;
-        }
-        result
+        disk.file.write_zeroes_at(offset_within_disk, new_length)
     }
 }
 
@@ -357,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn seek_to_end() {
+    fn get_len() {
         let file1: File = SharedMemory::new(None).unwrap().into();
         let file2: File = SharedMemory::new(None).unwrap().into();
         let disk_part1 = ComponentDiskPart {
@@ -370,9 +354,9 @@ mod tests {
             offset: 100,
             length: 100,
         };
-        let mut composite = CompositeDiskFile::new(vec![disk_part1, disk_part2]).unwrap();
-        let location = composite.seek(SeekFrom::End(0)).unwrap();
-        assert_eq!(location, 200);
+        let composite = CompositeDiskFile::new(vec![disk_part1, disk_part2]).unwrap();
+        let len = composite.get_len().unwrap();
+        assert_eq!(len, 200);
     }
 
     #[test]
@@ -387,13 +371,12 @@ mod tests {
         let mut input_memory = [55u8; 5];
         let input_volatile_memory = &mut input_memory[..];
         composite
-            .write_all_volatile(input_volatile_memory.get_slice(0, 5).unwrap())
+            .write_all_at_volatile(input_volatile_memory.get_slice(0, 5).unwrap(), 0)
             .unwrap();
-        composite.seek(SeekFrom::Start(0)).unwrap();
         let mut output_memory = [0u8; 5];
         let output_volatile_memory = &mut output_memory[..];
         composite
-            .read_exact_volatile(output_volatile_memory.get_slice(0, 5).unwrap())
+            .read_exact_at_volatile(output_volatile_memory.get_slice(0, 5).unwrap(), 0)
             .unwrap();
         assert_eq!(input_memory, output_memory);
     }
@@ -448,17 +431,15 @@ mod tests {
         };
         let mut composite =
             CompositeDiskFile::new(vec![disk_part1, disk_part2, disk_part3]).unwrap();
-        composite.seek(SeekFrom::Start(50)).unwrap();
         let mut input_memory = [55u8; 200];
         let input_volatile_memory = &mut input_memory[..];
         composite
-            .write_all_volatile(input_volatile_memory.get_slice(0, 200).unwrap())
+            .write_all_at_volatile(input_volatile_memory.get_slice(0, 200).unwrap(), 50)
             .unwrap();
-        composite.seek(SeekFrom::Start(50)).unwrap();
         let mut output_memory = [0u8; 200];
         let output_volatile_memory = &mut output_memory[..];
         composite
-            .read_exact_volatile(output_volatile_memory.get_slice(0, 200).unwrap())
+            .read_exact_at_volatile(output_volatile_memory.get_slice(0, 200).unwrap(), 50)
             .unwrap();
         assert!(input_memory.into_iter().eq(output_memory.into_iter()));
     }
@@ -485,18 +466,16 @@ mod tests {
         };
         let mut composite =
             CompositeDiskFile::new(vec![disk_part1, disk_part2, disk_part3]).unwrap();
-        composite.seek(SeekFrom::Start(0)).unwrap();
         let mut input_memory = [55u8; 300];
         let input_volatile_memory = &mut input_memory[..];
         composite
-            .write_all_volatile(input_volatile_memory.get_slice(0, 300).unwrap())
+            .write_all_at_volatile(input_volatile_memory.get_slice(0, 300).unwrap(), 0)
             .unwrap();
         composite.punch_hole(50, 200).unwrap();
-        composite.seek(SeekFrom::Start(0)).unwrap();
         let mut output_memory = [0u8; 300];
         let output_volatile_memory = &mut output_memory[..];
         composite
-            .read_exact_volatile(output_volatile_memory.get_slice(0, 300).unwrap())
+            .read_exact_at_volatile(output_volatile_memory.get_slice(0, 300).unwrap(), 0)
             .unwrap();
 
         for i in 50..250 {
@@ -527,22 +506,21 @@ mod tests {
         };
         let mut composite =
             CompositeDiskFile::new(vec![disk_part1, disk_part2, disk_part3]).unwrap();
-        composite.seek(SeekFrom::Start(0)).unwrap();
         let mut input_memory = [55u8; 300];
         let input_volatile_memory = &mut input_memory[..];
         composite
-            .write_all_volatile(input_volatile_memory.get_slice(0, 300).unwrap())
+            .write_all_at_volatile(input_volatile_memory.get_slice(0, 300).unwrap(), 0)
             .unwrap();
-        composite.seek(SeekFrom::Start(50)).unwrap();
         let mut zeroes_written = 0;
         while zeroes_written < 200 {
-            zeroes_written += composite.write_zeroes(200 - zeroes_written).unwrap();
+            zeroes_written += composite
+                .write_zeroes_at(50 + zeroes_written as u64, 200 - zeroes_written)
+                .unwrap();
         }
-        composite.seek(SeekFrom::Start(0)).unwrap();
         let mut output_memory = [0u8; 300];
         let output_volatile_memory = &mut output_memory[..];
         composite
-            .read_exact_volatile(output_volatile_memory.get_slice(0, 300).unwrap())
+            .read_exact_at_volatile(output_volatile_memory.get_slice(0, 300).unwrap(), 0)
             .unwrap();
 
         for i in 50..250 {

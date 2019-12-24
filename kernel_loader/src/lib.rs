@@ -164,7 +164,7 @@ pub fn load_cmdline(
         .checked_add(len as u64 + 1)
         .ok_or(Error::CommandLineOverflow)?; // Extra for null termination.
     if end > guest_mem.end_addr() {
-        return Err(Error::CommandLineOverflow)?;
+        return Err(Error::CommandLineOverflow);
     }
 
     guest_mem
@@ -232,7 +232,7 @@ mod test {
     // Elf64 image that prints hello world on x86_64.
     fn make_elf_bin() -> File {
         let elf_bytes = include_bytes!("test_elf.bin");
-        let mut shm = SharedMemory::new(None).expect("failed to create shared memory");
+        let mut shm = SharedMemory::anon().expect("failed to create shared memory");
         shm.set_size(elf_bytes.len() as u64)
             .expect("failed to set shared memory size");
         shm.write_all(elf_bytes)

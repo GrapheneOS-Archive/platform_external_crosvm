@@ -8,6 +8,8 @@ use std::sync::atomic::{fence, Ordering};
 
 use sys_util::{error, GuestAddress, GuestMemory};
 
+use super::VIRTIO_MSI_NO_VECTOR;
+
 const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 const VIRTQ_DESC_F_WRITE: u16 = 0x2;
 #[allow(dead_code)]
@@ -75,6 +77,7 @@ impl<'a> DescriptorChain<'a> {
         desc_table: GuestAddress,
         queue_size: u16,
         index: u16,
+        required_flags: u16,
     ) -> Option<DescriptorChain> {
         if index >= queue_size {
             return None;
@@ -104,7 +107,7 @@ impl<'a> DescriptorChain<'a> {
             next,
         };
 
-        if chain.is_valid() {
+        if chain.is_valid() && chain.flags & required_flags == required_flags {
             Some(chain)
         } else {
             None
@@ -154,12 +157,19 @@ impl<'a> DescriptorChain<'a> {
     /// the head of the next _available_ descriptor chain.
     pub fn next_descriptor(&self) -> Option<DescriptorChain<'a>> {
         if self.has_next() {
-            DescriptorChain::checked_new(self.mem, self.desc_table, self.queue_size, self.next).map(
-                |mut c| {
-                    c.ttl = self.ttl - 1;
-                    c
-                },
+            // Once we see a write-only descriptor, all subsequent descriptors must be write-only.
+            let required_flags = self.flags & VIRTQ_DESC_F_WRITE;
+            DescriptorChain::checked_new(
+                self.mem,
+                self.desc_table,
+                self.queue_size,
+                self.next,
+                required_flags,
             )
+            .map(|mut c| {
+                c.ttl = self.ttl - 1;
+                c
+            })
         } else {
             None
         }
@@ -197,6 +207,9 @@ pub struct Queue {
     /// Inidcates if the queue is finished with configuration
     pub ready: bool,
 
+    /// MSI-X vector for the queue. Don't care for INTx
+    pub vector: u16,
+
     /// Guest physical address of the descriptor table
     pub desc_table: GuestAddress,
 
@@ -217,6 +230,7 @@ impl Queue {
             max_size,
             size: max_size,
             ready: false,
+            vector: VIRTIO_MSI_NO_VECTOR,
             desc_table: GuestAddress(0),
             avail_ring: GuestAddress(0),
             used_ring: GuestAddress(0),
@@ -281,8 +295,9 @@ impl Queue {
         }
     }
 
-    /// If a new DescriptorHead is available, returns one and removes it from the queue.
-    pub fn pop<'a>(&mut self, mem: &'a GuestMemory) -> Option<DescriptorChain<'a>> {
+    /// Get the first available descriptor chain without removing it from the queue.
+    /// Call `pop_peeked` to remove the returned descriptor chain from the queue.
+    pub fn peek<'a>(&mut self, mem: &'a GuestMemory) -> Option<DescriptorChain<'a>> {
         if !self.is_valid(mem) {
             return None;
         }
@@ -296,16 +311,26 @@ impl Queue {
             return None;
         }
 
-        let desc_idx_addr_offset = (4 + (self.next_avail.0 % queue_size) * 2) as u64;
+        let desc_idx_addr_offset = 4 + (u64::from(self.next_avail.0 % queue_size) * 2);
         let desc_idx_addr = mem.checked_offset(self.avail_ring, desc_idx_addr_offset)?;
 
         // This index is checked below in checked_new.
         let descriptor_index: u16 = mem.read_obj_from_addr(desc_idx_addr).unwrap();
 
-        let descriptor_chain =
-            DescriptorChain::checked_new(mem, self.desc_table, queue_size, descriptor_index);
+        DescriptorChain::checked_new(mem, self.desc_table, queue_size, descriptor_index, 0)
+    }
+
+    /// Remove the first available descriptor chain from the queue.
+    /// This function should only be called immediately following `peek`.
+    pub fn pop_peeked(&mut self) {
+        self.next_avail += Wrapping(1);
+    }
+
+    /// If a new DescriptorHead is available, returns one and removes it from the queue.
+    pub fn pop<'a>(&mut self, mem: &'a GuestMemory) -> Option<DescriptorChain<'a>> {
+        let descriptor_chain = self.peek(mem);
         if descriptor_chain.is_some() {
-            self.next_avail += Wrapping(1);
+            self.pop_peeked();
         }
         descriptor_chain
     }

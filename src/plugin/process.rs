@@ -363,7 +363,7 @@ impl Process {
         }
         let mem = MemoryMapping::from_fd_offset(&shm, length as usize, offset as usize)
             .map_err(mmap_to_sys_err)?;
-        let slot = vm.add_device_memory(GuestAddress(start), mem, read_only, dirty_log)?;
+        let slot = vm.add_mmio_memory(GuestAddress(start), mem, read_only, dirty_log)?;
         entry.insert(PluginObject::Memory {
             slot,
             length: length as usize,
@@ -380,7 +380,12 @@ impl Process {
                 };
                 match reserve_range.length {
                     0 => lock.unreserve_range(space, reserve_range.start),
-                    _ => lock.reserve_range(space, reserve_range.start, reserve_range.length),
+                    _ => lock.reserve_range(
+                        space,
+                        reserve_range.start,
+                        reserve_range.length,
+                        reserve_range.async_write,
+                    ),
                 }
             }
             Err(_) => Err(SysError::new(EDEADLK)),
@@ -416,6 +421,35 @@ impl Process {
             });
         }
         vm.set_gsi_routing(&routes[..])
+    }
+
+    fn handle_set_call_hint(&mut self, hints: &MainRequest_SetCallHint) -> SysResult<()> {
+        let mut regs: Vec<CallHintDetails> = vec![];
+        for hint in &hints.hints {
+            regs.push(CallHintDetails {
+                match_rax: hint.match_rax,
+                match_rbx: hint.match_rbx,
+                match_rcx: hint.match_rcx,
+                match_rdx: hint.match_rdx,
+                rax: hint.rax,
+                rbx: hint.rbx,
+                rcx: hint.rcx,
+                rdx: hint.rdx,
+                send_sregs: hint.send_sregs,
+                send_debugregs: hint.send_debugregs,
+            });
+        }
+        match self.shared_vcpu_state.write() {
+            Ok(mut lock) => {
+                let space = match hints.space {
+                    AddressSpace::IOPORT => IoSpace::Ioport,
+                    AddressSpace::MMIO => IoSpace::Mmio,
+                };
+                lock.set_hint(space, hints.address, hints.on_write, regs);
+                Ok(())
+            }
+            Err(_) => Err(SysError::new(EDEADLK)),
+        }
     }
 
     fn handle_pause_vcpus(&self, vcpu_handles: &[JoinHandle<()>], cpu_mask: u64, user_data: u64) {
@@ -631,6 +665,9 @@ impl Process {
                 }
                 None => Err(SysError::new(ENODATA)),
             }
+        } else if request.has_set_call_hint() {
+            response.mut_set_call_hint();
+            self.handle_set_call_hint(request.get_set_call_hint())
         } else if request.has_dirty_log() {
             let dirty_log_response = response.mut_dirty_log();
             match self.objects.get(&request.get_dirty_log().id) {

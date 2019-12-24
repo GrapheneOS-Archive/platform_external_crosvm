@@ -8,6 +8,7 @@ pub mod panic_hook;
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader};
 use std::num::ParseIntError;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -17,8 +18,10 @@ use std::time::Duration;
 
 use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
-    linux, BindMount, Config, DiskOption, Executable, GidMap, TouchDeviceOption,
+    linux, BindMount, Config, DiskOption, Executable, GidMap, SharedDir, TouchDeviceOption,
 };
+#[cfg(feature = "gpu")]
+use devices::virtio::gpu::{GpuParameters, DEFAULT_GPU_PARAMS};
 use devices::{SerialParameters, SerialType};
 use msg_socket::{MsgReceiver, MsgSender, MsgSocket};
 use qcow::QcowFile;
@@ -108,6 +111,104 @@ fn parse_cpu_set(s: &str) -> argument::Result<Vec<usize>> {
     Ok(cpuset)
 }
 
+#[cfg(feature = "gpu")]
+fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
+    let mut gpu_params = DEFAULT_GPU_PARAMS;
+
+    if let Some(s) = s {
+        let opts = s
+            .split(",")
+            .map(|frag| frag.split("="))
+            .map(|mut kv| (kv.next().unwrap_or(""), kv.next().unwrap_or("")));
+
+        for (k, v) in opts {
+            match k {
+                "egl" => match v {
+                    "true" | "" => {
+                        gpu_params.renderer_use_egl = true;
+                    }
+                    "false" => {
+                        gpu_params.renderer_use_egl = false;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: "gpu parameter 'egl' should be a boolean",
+                        });
+                    }
+                },
+                "gles" => match v {
+                    "true" | "" => {
+                        gpu_params.renderer_use_gles = true;
+                    }
+                    "false" => {
+                        gpu_params.renderer_use_gles = false;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: "gpu parameter 'gles' should be a boolean",
+                        });
+                    }
+                },
+                "glx" => match v {
+                    "true" | "" => {
+                        gpu_params.renderer_use_glx = true;
+                    }
+                    "false" => {
+                        gpu_params.renderer_use_glx = false;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: "gpu parameter 'glx' should be a boolean",
+                        });
+                    }
+                },
+                "surfaceless" => match v {
+                    "true" | "" => {
+                        gpu_params.renderer_use_surfaceless = true;
+                    }
+                    "false" => {
+                        gpu_params.renderer_use_surfaceless = false;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: "gpu parameter 'surfaceless' should be a boolean",
+                        });
+                    }
+                },
+                "width" => {
+                    gpu_params.display_width =
+                        v.parse::<u32>()
+                            .map_err(|_| argument::Error::InvalidValue {
+                                value: v.to_string(),
+                                expected: "gpu parameter 'width' must be a valid integer",
+                            })?;
+                }
+                "height" => {
+                    gpu_params.display_height =
+                        v.parse::<u32>()
+                            .map_err(|_| argument::Error::InvalidValue {
+                                value: v.to_string(),
+                                expected: "gpu parameter 'height' must be a valid integer",
+                            })?;
+                }
+                "" => {}
+                _ => {
+                    return Err(argument::Error::UnknownArgument(format!(
+                        "gpu parameter {}",
+                        k
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(gpu_params)
+}
+
 fn parse_serial_options(s: &str) -> argument::Result<SerialParameters> {
     let mut serial_setting = SerialParameters {
         type_: SerialType::Sink,
@@ -165,6 +266,91 @@ fn parse_serial_options(s: &str) -> argument::Result<SerialParameters> {
     }
 
     Ok(serial_setting)
+}
+
+fn parse_plugin_mount_option(value: &str) -> argument::Result<BindMount> {
+    let components: Vec<&str> = value.split(":").collect();
+    if components.is_empty() || components.len() > 3 || components[0].is_empty() {
+        return Err(argument::Error::InvalidValue {
+            value: value.to_owned(),
+            expected: "`plugin-mount` should be in a form of: <src>[:[<dst>][:<writable>]]",
+        });
+    }
+
+    let src = PathBuf::from(components[0]);
+    if src.is_relative() {
+        return Err(argument::Error::InvalidValue {
+            value: components[0].to_owned(),
+            expected: "the source path for `plugin-mount` must be absolute",
+        });
+    }
+    if !src.exists() {
+        return Err(argument::Error::InvalidValue {
+            value: components[0].to_owned(),
+            expected: "the source path for `plugin-mount` does not exist",
+        });
+    }
+
+    let dst = PathBuf::from(match components.get(1) {
+        None | Some(&"") => components[0],
+        Some(path) => path,
+    });
+    if dst.is_relative() {
+        return Err(argument::Error::InvalidValue {
+            value: components[1].to_owned(),
+            expected: "the destination path for `plugin-mount` must be absolute",
+        });
+    }
+
+    let writable: bool = match components.get(2) {
+        None => false,
+        Some(s) => s.parse().map_err(|_| argument::Error::InvalidValue {
+            value: components[2].to_owned(),
+            expected: "the <writable> component for `plugin-mount` is not valid bool",
+        })?,
+    };
+
+    Ok(BindMount { src, dst, writable })
+}
+
+fn parse_plugin_gid_map_option(value: &str) -> argument::Result<GidMap> {
+    let components: Vec<&str> = value.split(":").collect();
+    if components.is_empty() || components.len() > 3 || components[0].is_empty() {
+        return Err(argument::Error::InvalidValue {
+            value: value.to_owned(),
+            expected:
+                "`plugin-gid-map` must have exactly 3 components: <inner>[:[<outer>][:<count>]]",
+        });
+    }
+
+    let inner: libc::gid_t = components[0]
+        .parse()
+        .map_err(|_| argument::Error::InvalidValue {
+            value: components[0].to_owned(),
+            expected: "the <inner> component for `plugin-gid-map` is not valid gid",
+        })?;
+
+    let outer: libc::gid_t = match components.get(1) {
+        None | Some(&"") => inner,
+        Some(s) => s.parse().map_err(|_| argument::Error::InvalidValue {
+            value: components[1].to_owned(),
+            expected: "the <outer> component for `plugin-gid-map` is not valid gid",
+        })?,
+    };
+
+    let count: u32 = match components.get(2) {
+        None => 1,
+        Some(s) => s.parse().map_err(|_| argument::Error::InvalidValue {
+            value: components[2].to_owned(),
+            expected: "the <count> component for `plugin-gid-map` is not valid number",
+        })?,
+    };
+
+    Ok(GidMap {
+        inner,
+        outer,
+        count,
+    })
 }
 
 fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::Result<()> {
@@ -299,11 +485,21 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.syslog_tag = Some(value.unwrap().to_owned());
         }
         "root" | "rwroot" | "disk" | "rwdisk" | "qcow" | "rwqcow" => {
+            let param = value.unwrap();
+            let mut components = param.split(',');
             let read_only = !name.starts_with("rw");
-            let disk_path = PathBuf::from(value.unwrap());
+            let disk_path =
+                PathBuf::from(
+                    components
+                        .next()
+                        .ok_or_else(|| argument::Error::InvalidValue {
+                            value: param.to_owned(),
+                            expected: "missing disk path",
+                        })?,
+                );
             if !disk_path.exists() {
                 return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
+                    value: param.to_owned(),
                     expected: "this disk path does not exist",
                 });
             }
@@ -319,10 +515,51 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                     if read_only { "ro" } else { "rw" }
                 ));
             }
-            cfg.disks.push(DiskOption {
+
+            let mut disk = DiskOption {
                 path: disk_path,
                 read_only,
-            });
+                sparse: true,
+                block_size: 512,
+            };
+
+            for opt in components {
+                let mut o = opt.splitn(2, '=');
+                let kind = o.next().ok_or_else(|| argument::Error::InvalidValue {
+                    value: opt.to_owned(),
+                    expected: "disk options must not be empty",
+                })?;
+                let value = o.next().ok_or_else(|| argument::Error::InvalidValue {
+                    value: opt.to_owned(),
+                    expected: "disk options must be of the form `kind=value`",
+                })?;
+
+                match kind {
+                    "sparse" => {
+                        let sparse = value.parse().map_err(|_| argument::Error::InvalidValue {
+                            value: value.to_owned(),
+                            expected: "`sparse` must be a boolean",
+                        })?;
+                        disk.sparse = sparse;
+                    }
+                    "block_size" => {
+                        let block_size =
+                            value.parse().map_err(|_| argument::Error::InvalidValue {
+                                value: value.to_owned(),
+                                expected: "`block_size` must be an integer",
+                            })?;
+                        disk.block_size = block_size;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: kind.to_owned(),
+                            expected: "unrecognized disk option",
+                        });
+                    }
+                }
+            }
+
+            cfg.disks.push(disk);
         }
         "pmem-device" | "rw-pmem-device" => {
             let disk_path = PathBuf::from(value.unwrap());
@@ -336,6 +573,8 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.pmem_devices.push(DiskOption {
                 path: disk_path,
                 read_only: !name.starts_with("rw"),
+                sparse: false,
+                block_size: sys_util::pagesize() as u32,
             });
         }
         "host_ip" => {
@@ -414,6 +653,12 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.x_display = Some(value.unwrap().to_owned());
         }
+        "display-window-keyboard" => {
+            cfg.display_window_keyboard = true;
+        }
+        "display-window-mouse" => {
+            cfg.display_window_mouse = true;
+        }
         "socket" => {
             if cfg.socket_path.is_some() {
                 return Err(argument::Error::TooManyArguments(
@@ -452,9 +697,20 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             );
         }
         "shared-dir" => {
-            // Formatted as <src:tag>.
+            // This is formatted as multiple fields, each separated by ":". The first 2 fields are
+            // fixed (src:tag).  The rest may appear in any order:
+            //
+            // * type=TYPE - must be one of "p9" or "fs" (default: p9)
+            // * uidmap=UIDMAP - a uid map in the format "inner outer count[,inner outer count]"
+            //   (default: "0 <current euid> 1")
+            // * gidmap=GIDMAP - a gid map in the same format as uidmap
+            //   (default: "0 <current egid> 1")
+            // * timeout=TIMEOUT - a timeout value in seconds, which indicates how long attributes
+            //   and directory contents should be considered valid (default: 5)
+            // * cache=CACHE - one of "never", "always", or "auto" (default: auto)
+            // * writeback=BOOL - indicates whether writeback caching should be enabled (default: false)
             let param = value.unwrap();
-            let mut components = param.splitn(2, ':');
+            let mut components = param.split(':');
             let src =
                 PathBuf::from(
                     components
@@ -479,7 +735,66 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 });
             }
 
-            cfg.shared_dirs.push((src, tag));
+            let mut shared_dir = SharedDir {
+                src,
+                tag,
+                ..Default::default()
+            };
+            for opt in components {
+                let mut o = opt.splitn(2, '=');
+                let kind = o.next().ok_or_else(|| argument::Error::InvalidValue {
+                    value: opt.to_owned(),
+                    expected: "`shared-dir` options must not be empty",
+                })?;
+                let value = o.next().ok_or_else(|| argument::Error::InvalidValue {
+                    value: opt.to_owned(),
+                    expected: "`shared-dir` options must be of the form `kind=value`",
+                })?;
+
+                match kind {
+                    "type" => {
+                        shared_dir.kind =
+                            value.parse().map_err(|_| argument::Error::InvalidValue {
+                                value: value.to_owned(),
+                                expected: "`type` must be one of `fs` or `9p`",
+                            })?
+                    }
+                    "uidmap" => shared_dir.uid_map = value.into(),
+                    "gidmap" => shared_dir.gid_map = value.into(),
+                    "timeout" => {
+                        let seconds = value.parse().map_err(|_| argument::Error::InvalidValue {
+                            value: value.to_owned(),
+                            expected: "`timeout` must be an integer",
+                        })?;
+
+                        let dur = Duration::from_secs(seconds);
+                        shared_dir.cfg.entry_timeout = dur.clone();
+                        shared_dir.cfg.attr_timeout = dur;
+                    }
+                    "cache" => {
+                        let policy = value.parse().map_err(|_| argument::Error::InvalidValue {
+                            value: value.to_owned(),
+                            expected: "`cache` must be one of `never`, `always`, or `auto`",
+                        })?;
+                        shared_dir.cfg.cache_policy = policy;
+                    }
+                    "writeback" => {
+                        let writeback =
+                            value.parse().map_err(|_| argument::Error::InvalidValue {
+                                value: value.to_owned(),
+                                expected: "`writeback` must be a boolean",
+                            })?;
+                        shared_dir.cfg.writeback = writeback;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: kind.to_owned(),
+                            expected: "unrecognized option for `shared-dir`",
+                        })
+                    }
+                }
+            }
+            cfg.shared_dirs.push(shared_dir);
         }
         "seccomp-policy-dir" => {
             // `value` is Some because we are in this match so it's safe to unwrap.
@@ -508,85 +823,42 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.plugin_root = Some(PathBuf::from(value.unwrap().to_owned()));
         }
         "plugin-mount" => {
-            let components: Vec<&str> = value.unwrap().split(":").collect();
-            if components.len() != 3 {
-                return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
-                    expected:
-                        "`plugin-mount` must have exactly 3 components: <src>:<dst>:<writable>",
-                });
+            let mount = parse_plugin_mount_option(value.unwrap())?;
+            cfg.plugin_mounts.push(mount);
+        }
+        "plugin-mount-file" => {
+            let file = File::open(value.unwrap()).map_err(|_| argument::Error::InvalidValue {
+                value: value.unwrap().to_owned(),
+                expected: "unable to open `plugin-mount-file` file",
+            })?;
+            let reader = BufReader::new(file);
+            for l in reader.lines() {
+                let line = l.unwrap();
+                let trimmed_line = line.splitn(2, '#').nth(0).unwrap().trim();
+                if !trimmed_line.is_empty() {
+                    let mount = parse_plugin_mount_option(trimmed_line)?;
+                    cfg.plugin_mounts.push(mount);
+                }
             }
-
-            let src = PathBuf::from(components[0]);
-            if src.is_relative() {
-                return Err(argument::Error::InvalidValue {
-                    value: components[0].to_owned(),
-                    expected: "the source path for `plugin-mount` must be absolute",
-                });
-            }
-            if !src.exists() {
-                return Err(argument::Error::InvalidValue {
-                    value: components[0].to_owned(),
-                    expected: "the source path for `plugin-mount` does not exist",
-                });
-            }
-
-            let dst = PathBuf::from(components[1]);
-            if dst.is_relative() {
-                return Err(argument::Error::InvalidValue {
-                    value: components[1].to_owned(),
-                    expected: "the destination path for `plugin-mount` must be absolute",
-                });
-            }
-
-            let writable: bool =
-                components[2]
-                    .parse()
-                    .map_err(|_| argument::Error::InvalidValue {
-                        value: components[2].to_owned(),
-                        expected: "the <writable> component for `plugin-mount` is not valid bool",
-                    })?;
-
-            cfg.plugin_mounts.push(BindMount { src, dst, writable });
         }
         "plugin-gid-map" => {
-            let components: Vec<&str> = value.unwrap().split(":").collect();
-            if components.len() != 3 {
-                return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
-                    expected:
-                        "`plugin-gid-map` must have exactly 3 components: <inner>:<outer>:<count>",
-                });
+            let map = parse_plugin_gid_map_option(value.unwrap())?;
+            cfg.plugin_gid_maps.push(map);
+        }
+        "plugin-gid-map-file" => {
+            let file = File::open(value.unwrap()).map_err(|_| argument::Error::InvalidValue {
+                value: value.unwrap().to_owned(),
+                expected: "unable to open `plugin-gid-map-file` file",
+            })?;
+            let reader = BufReader::new(file);
+            for l in reader.lines() {
+                let line = l.unwrap();
+                let trimmed_line = line.splitn(2, '#').nth(0).unwrap().trim();
+                if !trimmed_line.is_empty() {
+                    let map = parse_plugin_gid_map_option(trimmed_line)?;
+                    cfg.plugin_gid_maps.push(map);
+                }
             }
-
-            let inner: libc::gid_t =
-                components[0]
-                    .parse()
-                    .map_err(|_| argument::Error::InvalidValue {
-                        value: components[0].to_owned(),
-                        expected: "the <inner> component for `plugin-gid-map` is not valid gid",
-                    })?;
-
-            let outer: libc::gid_t =
-                components[1]
-                    .parse()
-                    .map_err(|_| argument::Error::InvalidValue {
-                        value: components[1].to_owned(),
-                        expected: "the <outer> component for `plugin-gid-map` is not valid gid",
-                    })?;
-
-            let count: u32 = components[2]
-                .parse()
-                .map_err(|_| argument::Error::InvalidValue {
-                    value: components[2].to_owned(),
-                    expected: "the <count> component for `plugin-gid-map` is not valid number",
-                })?;
-
-            cfg.plugin_gid_maps.push(GidMap {
-                inner,
-                outer,
-                count,
-            });
         }
         "vhost-net" => cfg.vhost_net = true,
         "tap-fd" => {
@@ -600,8 +872,10 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                     })?,
             );
         }
+        #[cfg(feature = "gpu")]
         "gpu" => {
-            cfg.gpu = true;
+            let params = parse_gpu_options(value)?;
+            cfg.gpu_parameters = Some(params);
         }
         "software-tpm" => {
             cfg.software_tpm = true;
@@ -685,6 +959,24 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.executable_path = Some(Executable::Bios(PathBuf::from(value.unwrap().to_owned())));
         }
+        "vfio" => {
+            let vfio_path = PathBuf::from(value.unwrap());
+            if !vfio_path.exists() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: "the vfio path does not exist",
+                });
+            }
+            if !vfio_path.is_dir() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: "the vfio path should be directory",
+                });
+            }
+
+            cfg.vfio = Some(vfio_path);
+        }
+
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
     }
@@ -708,12 +1000,19 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                                 "Amount of guest memory in MiB. (default: 256)"),
           Argument::short_value('r',
                                 "root",
-                                "PATH",
-                                "Path to a root disk image. Like `--disk` but adds appropriate kernel command line option."),
-          Argument::value("rwroot", "PATH", "Path to a writable root disk image."),
-          Argument::short_value('d', "disk", "PATH", "Path to a disk image."),
+                                "PATH[,key=value[,key=value[,...]]",
+                                "Path to a root disk image followed by optional comma-separated options.
+                              Like `--disk` but adds appropriate kernel command line option.
+                              See --disk for valid options."),
+          Argument::value("rwroot", "PATH[,key=value[,key=value[,...]]", "Path to a writable root disk image followed by optional comma-separated options.
+                              See --disk for valid options."),
+          Argument::short_value('d', "disk", "PATH[,key=value[,key=value[,...]]", "Path to a disk image followed by optional comma-separated options.
+                              Valid keys:
+                              sparse=BOOL - Indicates whether the disk should support the discard operation (default: true)
+                              block_size=BYTES - Set the reported block size of the disk (default: 512)"),
           Argument::value("qcow", "PATH", "Path to a qcow2 disk image. (Deprecated; use --disk instead.)"),
-          Argument::value("rwdisk", "PATH", "Path to a writable disk image."),
+          Argument::value("rwdisk", "PATH[,key=value[,key=value[,...]]", "Path to a writable disk image followed by optional comma-separated options.
+                              See --disk for valid options."),
           Argument::value("rwqcow", "PATH", "Path to a writable qcow2 disk image. (Deprecated; use --rwdisk instead.)"),
           Argument::value("rw-pmem-device", "PATH", "Path to a writable disk image."),
           Argument::value("pmem-device", "PATH", "Path to a disk image."),
@@ -727,7 +1026,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::flag("null-audio", "Add an audio device to the VM that plays samples to /dev/null"),
           Argument::value("serial",
                           "type=TYPE,[num=NUM,path=PATH,console,stdin]",
-                          "Comma seperated key=value pairs for setting up serial devices. Can be given more than once.
+                          "Comma separated key=value pairs for setting up serial devices. Can be given more than once.
                           Possible key values:
                           type=(stdout,syslog,sink,file) - Where to route the serial device
                           num=(1,2,3,4) - Serial Device Number. If not provided, num will default to 1.
@@ -737,6 +1036,8 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                           "),
           Argument::value("syslog-tag", "TAG", "When logging to syslog, use the provided tag."),
           Argument::value("x-display", "DISPLAY", "X11 display name to use."),
+          Argument::flag("display-window-keyboard", "Capture keyboard input from the display window."),
+          Argument::flag("display-window-mouse", "Capture keyboard input from the display window."),
           Argument::value("wayland-sock", "PATH", "Path to the Wayland socket to use."),
           #[cfg(feature = "wl-dmabuf")]
           Argument::flag("wayland-dmabuf", "Enable support for DMABufs in Wayland device."),
@@ -746,8 +1047,17 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                                 "Path to put the control socket. If PATH is a directory, a name will be generated."),
           Argument::flag("disable-sandbox", "Run all devices in one, non-sandboxed process."),
           Argument::value("cid", "CID", "Context ID for virtual sockets."),
-          Argument::value("shared-dir", "PATH:TAG",
-                          "Directory to be shared with a VM as a source:tag pair. Can be given more than once."),
+          Argument::value("shared-dir", "PATH:TAG[:type=TYPE:writeback=BOOL:timeout=SECONDS:uidmap=UIDMAP:gidmap=GIDMAP:cache=CACHE]",
+                          "Colon-separated options for configuring a directory to be shared with the VM.
+The first field is the directory to be shared and the second field is the tag that the VM can use to identify the device.
+The remaining fields are key=value pairs that may appear in any order.  Valid keys are:
+type=(p9, fs) - Indicates whether the directory should be shared via virtio-9p or virtio-fs (default: p9).
+uidmap=UIDMAP - The uid map to use for the device's jail in the format \"inner outer count[,inner outer count]\" (default: 0 <current euid> 1).
+gidmap=GIDMAP - The gid map to use for the device's jail in the format \"inner outer count[,inner outer count]\" (default: 0 <current egid> 1).
+cache=(never, auto, always) - Indicates whether the VM can cache the contents of the shared directory (default: auto).  When set to \"auto\" and the type is \"fs\", the VM will use close-to-open consistency for file contents.
+timeout=SECONDS - How long the VM should consider file attributes and directory entries to be valid (default: 5).  If the VM has exclusive access to the directory, then this should be a large value.  If the directory can be modified by other processes, then this should be 0.
+writeback=BOOL - Indicates whether the VM can use writeback caching (default: false).  This is only safe to do when the VM has exclusive access to the files in a directory.  Additionally, the server should have read permission for all files as the VM may issue read requests even for files that are opened write-only.
+"),
           Argument::value("seccomp-policy-dir", "PATH", "Path to seccomp .policy files."),
           Argument::flag("seccomp-log-failures", "Instead of seccomp filter failures being fatal, they will be logged instead."),
           #[cfg(feature = "plugin")]
@@ -757,13 +1067,26 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           #[cfg(feature = "plugin")]
           Argument::value("plugin-mount", "PATH:PATH:BOOL", "Path to be mounted into the plugin's root filesystem.  Can be given more than once."),
           #[cfg(feature = "plugin")]
+          Argument::value("plugin-mount-file", "PATH", "Path to the file listing paths be mounted into the plugin's root filesystem.  Can be given more than once."),
+          #[cfg(feature = "plugin")]
           Argument::value("plugin-gid-map", "GID:GID:INT", "Supplemental GIDs that should be mapped in plugin jail.  Can be given more than once."),
+          #[cfg(feature = "plugin")]
+          Argument::value("plugin-gid-map-file", "PATH", "Path to the file listing supplemental GIDs that should be mapped in plugin jail.  Can be given more than once."),
           Argument::flag("vhost-net", "Use vhost for networking."),
           Argument::value("tap-fd",
                           "fd",
                           "File descriptor for configured tap device. A different virtual network card will be added each time this argument is given."),
           #[cfg(feature = "gpu")]
-          Argument::flag("gpu", "(EXPERIMENTAL) enable virtio-gpu device"),
+          Argument::flag_or_value("gpu",
+                                  "[width=INT,height=INT]",
+                                  "(EXPERIMENTAL) Comma separated key=value pairs for setting up a virtio-gpu device
+                                  Possible key values:
+                                  width=INT - The width of the virtual display connected to the virtio-gpu.
+                                  height=INT - The height of the virtual display connected to the virtio-gpu.
+                                  egl[=true|=false] - If the virtio-gpu backend should use a EGL context for rendering.
+                                  glx[=true|=false] - If the virtio-gpu backend should use a GLX context for rendering.
+                                  surfaceless[=true|=false] - If the virtio-gpu backend should use a surfaceless context for rendering.
+                                  "),
           #[cfg(feature = "tpm")]
           Argument::flag("software-tpm", "enable a software emulated trusted platform module device"),
           Argument::value("evdev", "PATH", "Path to an event device node. The device will be grabbed (unusable from the host) and made available to the guest with the same configuration it shows on the host"),
@@ -774,6 +1097,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("split-irqchip", "(EXPERIMENTAL) enable split-irqchip support"),
           Argument::value("bios", "PATH", "Path to BIOS/firmware ROM"),
+          Argument::value("vfio", "PATH", "Path to sysfs of pass through or mdev device"),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -1354,5 +1678,93 @@ mod tests {
             .expect("should parse the first serial argument");
         set_argument(&mut config, "serial", Some("num=2,type=stdout,stdin=true"))
             .expect_err("should fail to parse a second serial port connected to stdin");
+    }
+
+    #[test]
+    fn parse_plugin_mount_valid() {
+        let mut config = Config::default();
+        set_argument(
+            &mut config,
+            "plugin-mount",
+            Some("/dev/null:/dev/zero:true"),
+        )
+        .expect("parse should succeed");
+        assert_eq!(config.plugin_mounts[0].src, PathBuf::from("/dev/null"));
+        assert_eq!(config.plugin_mounts[0].dst, PathBuf::from("/dev/zero"));
+        assert_eq!(config.plugin_mounts[0].writable, true);
+    }
+
+    #[test]
+    fn parse_plugin_mount_valid_shorthand() {
+        let mut config = Config::default();
+        set_argument(&mut config, "plugin-mount", Some("/dev/null")).expect("parse should succeed");
+        assert_eq!(config.plugin_mounts[0].dst, PathBuf::from("/dev/null"));
+        assert_eq!(config.plugin_mounts[0].writable, false);
+        set_argument(&mut config, "plugin-mount", Some("/dev/null:/dev/zero"))
+            .expect("parse should succeed");
+        assert_eq!(config.plugin_mounts[1].dst, PathBuf::from("/dev/zero"));
+        assert_eq!(config.plugin_mounts[1].writable, false);
+        set_argument(&mut config, "plugin-mount", Some("/dev/null::true"))
+            .expect("parse should succeed");
+        assert_eq!(config.plugin_mounts[2].dst, PathBuf::from("/dev/null"));
+        assert_eq!(config.plugin_mounts[2].writable, true);
+    }
+
+    #[test]
+    fn parse_plugin_mount_invalid() {
+        let mut config = Config::default();
+        set_argument(&mut config, "plugin-mount", Some("")).expect_err("parse should fail");
+        set_argument(
+            &mut config,
+            "plugin-mount",
+            Some("/dev/null:/dev/null:true:false"),
+        )
+        .expect_err("parse should fail because too many arguments");
+        set_argument(&mut config, "plugin-mount", Some("null:/dev/null:true"))
+            .expect_err("parse should fail because source is not absolute");
+        set_argument(&mut config, "plugin-mount", Some("/dev/null:null:true"))
+            .expect_err("parse should fail because source is not absolute");
+        set_argument(&mut config, "plugin-mount", Some("/dev/null:null:blah"))
+            .expect_err("parse should fail because flag is not boolean");
+    }
+
+    #[test]
+    fn parse_plugin_gid_map_valid() {
+        let mut config = Config::default();
+        set_argument(&mut config, "plugin-gid-map", Some("1:2:3")).expect("parse should succeed");
+        assert_eq!(config.plugin_gid_maps[0].inner, 1);
+        assert_eq!(config.plugin_gid_maps[0].outer, 2);
+        assert_eq!(config.plugin_gid_maps[0].count, 3);
+    }
+
+    #[test]
+    fn parse_plugin_gid_map_valid_shorthand() {
+        let mut config = Config::default();
+        set_argument(&mut config, "plugin-gid-map", Some("1")).expect("parse should succeed");
+        assert_eq!(config.plugin_gid_maps[0].inner, 1);
+        assert_eq!(config.plugin_gid_maps[0].outer, 1);
+        assert_eq!(config.plugin_gid_maps[0].count, 1);
+        set_argument(&mut config, "plugin-gid-map", Some("1:2")).expect("parse should succeed");
+        assert_eq!(config.plugin_gid_maps[1].inner, 1);
+        assert_eq!(config.plugin_gid_maps[1].outer, 2);
+        assert_eq!(config.plugin_gid_maps[1].count, 1);
+        set_argument(&mut config, "plugin-gid-map", Some("1::3")).expect("parse should succeed");
+        assert_eq!(config.plugin_gid_maps[2].inner, 1);
+        assert_eq!(config.plugin_gid_maps[2].outer, 1);
+        assert_eq!(config.plugin_gid_maps[2].count, 3);
+    }
+
+    #[test]
+    fn parse_plugin_gid_map_invalid() {
+        let mut config = Config::default();
+        set_argument(&mut config, "plugin-gid-map", Some("")).expect_err("parse should fail");
+        set_argument(&mut config, "plugin-gid-map", Some("1:2:3:4"))
+            .expect_err("parse should fail because too many arguments");
+        set_argument(&mut config, "plugin-gid-map", Some("blah:2:3"))
+            .expect_err("parse should fail because inner is not a number");
+        set_argument(&mut config, "plugin-gid-map", Some("1:blah:3"))
+            .expect_err("parse should fail because outer is not a number");
+        set_argument(&mut config, "plugin-gid-map", Some("1:2:blah"))
+            .expect_err("parse should fail because count is not a number");
     }
 }

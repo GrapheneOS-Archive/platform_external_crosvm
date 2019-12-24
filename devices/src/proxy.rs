@@ -37,7 +37,7 @@ impl Display for Error {
 
 const SOCKET_TIMEOUT_MS: u64 = 2000;
 
-#[derive(MsgOnSocket)]
+#[derive(Debug, MsgOnSocket)]
 enum Command {
     Read {
         len: u32,
@@ -56,6 +56,7 @@ enum Command {
         data: [u8; 4],
     },
     Shutdown,
+    RunUserCommand,
 }
 
 #[derive(MsgOnSocket)]
@@ -65,7 +66,11 @@ enum CommandResult {
     ReadConfigResult(u32),
 }
 
-fn child_proc(sock: UnixSeqpacket, device: &mut dyn BusDevice) {
+fn child_proc<D: BusDevice, F: FnMut(&mut D)>(
+    sock: UnixSeqpacket,
+    device: &mut D,
+    mut user_command: F,
+) {
     let mut running = true;
     let sock = MsgSocket::<CommandResult, Command>::new(sock);
 
@@ -87,7 +92,8 @@ fn child_proc(sock: UnixSeqpacket, device: &mut dyn BusDevice) {
             Command::Write { len, offset, data } => {
                 let len = len as usize;
                 device.write(offset, &data[0..len]);
-                sock.send(&CommandResult::Ok)
+                // Command::Write does not have a result.
+                Ok(())
             }
             Command::ReadConfig(idx) => {
                 let val = device.config_register_read(idx as usize);
@@ -101,10 +107,15 @@ fn child_proc(sock: UnixSeqpacket, device: &mut dyn BusDevice) {
             } => {
                 let len = len as usize;
                 device.config_register_write(reg_idx as usize, offset as u64, &data[0..len]);
-                sock.send(&CommandResult::Ok)
+                // Command::WriteConfig does not have a result.
+                Ok(())
             }
             Command::Shutdown => {
                 running = false;
+                sock.send(&CommandResult::Ok)
+            }
+            Command::RunUserCommand => {
+                user_command(device);
                 sock.send(&CommandResult::Ok)
             }
         };
@@ -132,11 +143,34 @@ impl ProxyDevice {
     ///
     /// # Arguments
     /// * `device` - The device to isolate to another process.
-    /// * `keep_fds` - File descriptors that will be kept open in the child
+    /// * `jail` - The jail to use for isolating the given device.
+    /// * `keep_fds` - File descriptors that will be kept open in the child.
     pub fn new<D: BusDevice>(
+        device: D,
+        jail: &Minijail,
+        keep_fds: Vec<RawFd>,
+    ) -> Result<ProxyDevice> {
+        Self::new_with_user_command(device, jail, keep_fds, |_| {})
+    }
+
+    /// Similar to `ProxyDevice::new`, but adds an additional custom command to be run in the forked
+    /// process when `run_user_command` is called.
+    ///
+    /// Note that the custom command closure is run in the main thread of the child process, which
+    /// also services `BusDevice` requests. Therefore, do not run blocking calls in the closure
+    /// without a timeout, or you will block any VCPU which touches this device, and every other
+    /// thread which needs to lock this device's mutex.
+    ///
+    /// # Arguments
+    /// * `device` - The device to isolate to another process.
+    /// * `jail` - The jail to use for isolating the given device.
+    /// * `keep_fds` - File descriptors that will be kept open in the child.
+    /// * `user_command` - Closure to be run in the forked process.
+    pub fn new_with_user_command<D: BusDevice, F: FnMut(&mut D)>(
         mut device: D,
         jail: &Minijail,
         mut keep_fds: Vec<RawFd>,
+        user_command: F,
     ) -> Result<ProxyDevice> {
         let debug_label = device.debug_label();
         let (child_sock, parent_sock) = UnixSeqpacket::pair().map_err(Error::Io)?;
@@ -147,7 +181,7 @@ impl ProxyDevice {
             match jail.fork(Some(&keep_fds)).map_err(Error::ForkingJail)? {
                 0 => {
                     device.on_sandboxed();
-                    child_proc(child_sock, &mut device);
+                    child_proc(child_sock, &mut device, user_command);
 
                     // We're explicitly not using std::process::exit here to avoid the cleanup of
                     // stdout/stderr globals. This can cause cascading panics and SIGILL if a worker
@@ -180,19 +214,30 @@ impl ProxyDevice {
         self.pid
     }
 
-    fn sync_send(&self, cmd: Command) -> Option<CommandResult> {
-        let res = self.sock.send(&cmd);
+    /// Runs the callback given in `new_with_custom_command` in the child device process.
+    pub fn run_user_command(&self) {
+        self.sync_send(&Command::RunUserCommand);
+    }
+
+    /// Send a command that does not expect a response from the child device process.
+    fn send_no_result(&self, cmd: &Command) {
+        let res = self.sock.send(cmd);
         if let Err(e) = res {
             error!(
                 "failed write to child device process {}: {}",
                 self.debug_label, e,
             );
-        };
+        }
+    }
+
+    /// Send a command and read its response from the child device process.
+    fn sync_send(&self, cmd: &Command) -> Option<CommandResult> {
+        self.send_no_result(cmd);
         match self.sock.recv() {
             Err(e) => {
                 error!(
-                    "failed read from child device process {}: {}",
-                    self.debug_label, e,
+                    "failed to read result of {:?} from child device process {}: {}",
+                    cmd, self.debug_label, e,
                 );
                 None
             }
@@ -212,7 +257,7 @@ impl BusDevice for ProxyDevice {
         buffer[0..data.len()].clone_from_slice(data);
         let reg_idx = reg_idx as u32;
         let offset = offset as u32;
-        self.sync_send(Command::WriteConfig {
+        self.send_no_result(&Command::WriteConfig {
             reg_idx,
             offset,
             len,
@@ -221,7 +266,7 @@ impl BusDevice for ProxyDevice {
     }
 
     fn config_register_read(&self, reg_idx: usize) -> u32 {
-        let res = self.sync_send(Command::ReadConfig(reg_idx as u32));
+        let res = self.sync_send(&Command::ReadConfig(reg_idx as u32));
         if let Some(CommandResult::ReadConfigResult(val)) = res {
             val
         } else {
@@ -232,7 +277,7 @@ impl BusDevice for ProxyDevice {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
         let len = data.len() as u32;
         if let Some(CommandResult::ReadResult(buffer)) =
-            self.sync_send(Command::Read { len, offset })
+            self.sync_send(&Command::Read { len, offset })
         {
             let len = data.len();
             data.clone_from_slice(&buffer[0..len]);
@@ -243,7 +288,7 @@ impl BusDevice for ProxyDevice {
         let mut buffer = [0u8; 8];
         let len = data.len() as u32;
         buffer[0..data.len()].clone_from_slice(data);
-        self.sync_send(Command::Write {
+        self.send_no_result(&Command::Write {
             len,
             offset,
             data: buffer,
@@ -253,6 +298,6 @@ impl BusDevice for ProxyDevice {
 
 impl Drop for ProxyDevice {
     fn drop(&mut self) {
-        self.sync_send(Command::Shutdown);
+        self.sync_send(&Command::Shutdown);
     }
 }

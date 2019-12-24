@@ -11,31 +11,34 @@ use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use std::usize;
 
+use libc::EINVAL;
+
 use data_model::*;
 
 use msg_socket::{MsgReceiver, MsgSender};
+use resources::Alloc;
 use sys_util::{error, GuestAddress, GuestMemory};
 
 use gpu_display::*;
 use gpu_renderer::{
-    Box3, Context as RendererContext, Renderer, Resource as GpuRendererResource, ResourceCreateArgs,
+    Box3, Context as RendererContext, Error as GpuRendererError, Renderer,
+    Resource as GpuRendererResource, ResourceCreateArgs,
 };
 
 use super::protocol::{
-    GpuResponse, GpuResponsePlaneInfo, VIRTIO_GPU_CAPSET3, VIRTIO_GPU_CAPSET_VIRGL,
-    VIRTIO_GPU_CAPSET_VIRGL2,
+    AllocationMetadataResponse, GpuResponse, GpuResponsePlaneInfo, VIRTIO_GPU_CAPSET3,
+    VIRTIO_GPU_CAPSET_VIRGL, VIRTIO_GPU_CAPSET_VIRGL2, VIRTIO_GPU_MEMORY_HOST_COHERENT,
 };
 use crate::virtio::resource_bridge::*;
-use vm_control::VmMemoryControlRequestSocket;
 
-const DEFAULT_WIDTH: u32 = 1280;
-const DEFAULT_HEIGHT: u32 = 1024;
+use vm_control::{MaybeOwnedFd, VmMemoryControlRequestSocket, VmMemoryRequest, VmMemoryResponse};
 
 struct VirtioGpuResource {
     width: u32,
     height: u32,
     gpu_resource: GpuRendererResource,
     display_import: Option<(Rc<RefCell<GpuDisplay>>, u32)>,
+    kvm_slot: Option<u32>,
 }
 
 impl VirtioGpuResource {
@@ -45,6 +48,22 @@ impl VirtioGpuResource {
             height,
             gpu_resource,
             display_import: None,
+            kvm_slot: None,
+        }
+    }
+
+    pub fn v2_new(
+        width: u32,
+        height: u32,
+        kvm_slot: u32,
+        gpu_resource: GpuRendererResource,
+    ) -> VirtioGpuResource {
+        VirtioGpuResource {
+            width,
+            height,
+            gpu_resource,
+            display_import: None,
+            kvm_slot: Some(kvm_slot),
         }
     }
 
@@ -57,6 +76,7 @@ impl VirtioGpuResource {
 
         let (query, dmabuf) = match self.gpu_resource.export() {
             Ok(export) => (export.0, export.1),
+            Err(GpuRendererError::Virglrenderer(e)) if e == -EINVAL => return None,
             Err(e) => {
                 error!("failed to query resource: {}", e);
                 return None;
@@ -139,15 +159,19 @@ impl VirtioGpuResource {
 /// failure, or requested data for the given command.
 pub struct Backend {
     display: Rc<RefCell<GpuDisplay>>,
+    display_width: u32,
+    display_height: u32,
     renderer: Renderer,
     resources: Map<u32, VirtioGpuResource>,
     contexts: Map<u32, RendererContext>,
-    #[allow(dead_code)]
+    // Maps event devices to scanout number.
+    event_devices: Map<u32, u32>,
     gpu_device_socket: VmMemoryControlRequestSocket,
     scanout_surface: Option<u32>,
     cursor_surface: Option<u32>,
     scanout_resource: u32,
     cursor_resource: u32,
+    pci_bar: Alloc,
 }
 
 impl Backend {
@@ -158,25 +182,51 @@ impl Backend {
     /// data is copied as needed.
     pub fn new(
         display: GpuDisplay,
+        display_width: u32,
+        display_height: u32,
         renderer: Renderer,
         gpu_device_socket: VmMemoryControlRequestSocket,
+        pci_bar: Alloc,
     ) -> Backend {
         Backend {
             display: Rc::new(RefCell::new(display)),
+            display_width,
+            display_height,
             renderer,
-            gpu_device_socket,
             resources: Default::default(),
             contexts: Default::default(),
+            event_devices: Default::default(),
+            gpu_device_socket,
             scanout_surface: None,
             cursor_surface: None,
             scanout_resource: 0,
             cursor_resource: 0,
+            pci_bar,
         }
     }
 
     /// Gets a reference to the display passed into `new`.
     pub fn display(&self) -> &Rc<RefCell<GpuDisplay>> {
         &self.display
+    }
+
+    pub fn import_event_device(&mut self, event_device: EventDevice, scanout: u32) {
+        // TODO(zachr): support more than one scanout.
+        if scanout != 0 {
+            return;
+        }
+
+        let mut display = self.display.borrow_mut();
+        let event_device_id = match display.import_event_device(event_device) {
+            Ok(id) => id,
+            Err(e) => {
+                error!("error importing event device: {}", e);
+                return;
+            }
+        };
+        self.scanout_surface
+            .map(|s| display.attach_event_device(s, event_device_id));
+        self.event_devices.insert(event_device_id, scanout);
     }
 
     /// Processes the internal `display` events and returns `true` if the main display was closed.
@@ -213,8 +263,8 @@ impl Backend {
     }
 
     /// Gets the list of supported display resolutions as a slice of `(width, height)` tuples.
-    pub fn display_info(&self) -> &[(u32, u32)] {
-        &[(DEFAULT_WIDTH, DEFAULT_HEIGHT)]
+    pub fn display_info(&self) -> [(u32, u32); 1] {
+        [(self.display_width, self.display_height)]
     }
 
     /// Creates a 2D resource with the given properties and associated it with the given id.
@@ -257,9 +307,9 @@ impl Backend {
     }
 
     /// Sets the given resource id as the source of scanout to the display.
-    pub fn set_scanout(&mut self, id: u32) -> GpuResponse {
+    pub fn set_scanout(&mut self, _scanout_id: u32, resource_id: u32) -> GpuResponse {
         let mut display = self.display.borrow_mut();
-        if id == 0 {
+        if resource_id == 0 {
             if let Some(surface) = self.scanout_surface.take() {
                 display.release_surface(surface);
             }
@@ -269,12 +319,19 @@ impl Backend {
             }
             self.cursor_resource = 0;
             GpuResponse::OkNoData
-        } else if self.resources.get_mut(&id).is_some() {
-            self.scanout_resource = id;
+        } else if self.resources.get_mut(&resource_id).is_some() {
+            self.scanout_resource = resource_id;
 
             if self.scanout_surface.is_none() {
-                match display.create_surface(None, DEFAULT_WIDTH, DEFAULT_HEIGHT) {
-                    Ok(surface) => self.scanout_surface = Some(surface),
+                match display.create_surface(None, self.display_width, self.display_height) {
+                    Ok(surface) => {
+                        // TODO(zachr): do not assume every event device belongs to this scanout_id;
+                        // in other words, support multiple display outputs.
+                        for &event_device in self.event_devices.keys() {
+                            display.attach_event_device(surface, event_device);
+                        }
+                        self.scanout_surface = Some(surface);
+                    }
                     Err(e) => error!("failed to create display surface: {}", e),
                 }
             }
@@ -310,7 +367,13 @@ impl Backend {
             return GpuResponse::OkNoData;
         }
 
-        let fb = match display.framebuffer_region(surface_id, 0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT) {
+        let fb = match display.framebuffer_region(
+            surface_id,
+            0,
+            0,
+            self.display_width,
+            self.display_height,
+        ) {
             Some(fb) => fb,
             None => {
                 error!("failed to access framebuffer for surface {}", surface_id);
@@ -321,8 +384,8 @@ impl Backend {
         resource.read_to_volatile(
             0,
             0,
-            DEFAULT_WIDTH,
-            DEFAULT_HEIGHT,
+            self.display_width,
+            self.display_height,
             fb.as_volatile_slice(),
             fb.stride(),
         );
@@ -772,5 +835,157 @@ impl Backend {
 
     pub fn force_ctx_0(&mut self) {
         self.renderer.force_ctx_0();
+    }
+
+    pub fn allocation_metadata(
+        &mut self,
+        request_id: u32,
+        request: Vec<u8>,
+        mut response: Vec<u8>,
+    ) -> GpuResponse {
+        let res = self.renderer.allocation_metadata(&request, &mut response);
+
+        match res {
+            Ok(_) => {
+                let res_info = AllocationMetadataResponse {
+                    request_id,
+                    response,
+                };
+
+                GpuResponse::OkAllocationMetadata { res_info }
+            }
+            Err(_) => {
+                error!("failed to get metadata");
+                GpuResponse::ErrUnspec
+            }
+        }
+    }
+
+    pub fn resource_create_v2(
+        &mut self,
+        resource_id: u32,
+        guest_memory_type: u32,
+        guest_caching_type: u32,
+        size: u64,
+        pci_addr: u64,
+        mem: &GuestMemory,
+        vecs: Vec<(GuestAddress, usize)>,
+        args: Vec<u8>,
+    ) -> GpuResponse {
+        match self.resources.entry(resource_id) {
+            Entry::Vacant(entry) => {
+                let resource = match self.renderer.resource_create_v2(
+                    resource_id,
+                    guest_memory_type,
+                    guest_caching_type,
+                    size,
+                    mem,
+                    &vecs,
+                    &args,
+                ) {
+                    Ok(resource) => resource,
+                    Err(e) => {
+                        error!("failed to create resource: {}", e);
+                        return GpuResponse::ErrUnspec;
+                    }
+                };
+
+                match guest_memory_type {
+                    VIRTIO_GPU_MEMORY_HOST_COHERENT => {
+                        let dma_buf_fd = match resource.export() {
+                            Ok(export) => export.1,
+                            Err(e) => {
+                                error!("failed to export plane fd: {}", e);
+                                return GpuResponse::ErrUnspec;
+                            }
+                        };
+
+                        let request = VmMemoryRequest::RegisterMemoryAtAddress(
+                            self.pci_bar,
+                            MaybeOwnedFd::Borrowed(dma_buf_fd.as_raw_fd()),
+                            size as usize,
+                            pci_addr,
+                        );
+
+                        match self.gpu_device_socket.send(&request) {
+                            Ok(_resq) => match self.gpu_device_socket.recv() {
+                                Ok(response) => match response {
+                                    VmMemoryResponse::RegisterMemory { pfn: _, slot } => {
+                                        entry.insert(VirtioGpuResource::v2_new(
+                                            self.display_width,
+                                            self.display_height,
+                                            slot,
+                                            resource,
+                                        ));
+                                        GpuResponse::OkNoData
+                                    }
+                                    VmMemoryResponse::Err(e) => {
+                                        error!("received an error: {}", e);
+                                        GpuResponse::ErrUnspec
+                                    }
+                                    _ => {
+                                        error!("recieved an unexpected response");
+                                        GpuResponse::ErrUnspec
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("failed to receive data: {}", e);
+                                    GpuResponse::ErrUnspec
+                                }
+                            },
+                            Err(e) => {
+                                error!("failed to send request: {}", e);
+                                GpuResponse::ErrUnspec
+                            }
+                        }
+                    }
+                    _ => {
+                        entry.insert(VirtioGpuResource::new(
+                            self.display_width,
+                            self.display_height,
+                            resource,
+                        ));
+
+                        GpuResponse::OkNoData
+                    }
+                }
+            }
+            Entry::Occupied(_) => GpuResponse::ErrInvalidResourceId,
+        }
+    }
+
+    pub fn resource_v2_unref(&mut self, resource_id: u32) -> GpuResponse {
+        match self.resources.remove(&resource_id) {
+            Some(entry) => match entry.kvm_slot {
+                Some(kvm_slot) => {
+                    let request = VmMemoryRequest::UnregisterMemory(kvm_slot);
+                    match self.gpu_device_socket.send(&request) {
+                        Ok(_resq) => match self.gpu_device_socket.recv() {
+                            Ok(response) => match response {
+                                VmMemoryResponse::Ok => GpuResponse::OkNoData,
+                                VmMemoryResponse::Err(e) => {
+                                    error!("received an error: {}", e);
+                                    GpuResponse::ErrUnspec
+                                }
+                                _ => {
+                                    error!("recieved an unexpected response");
+                                    GpuResponse::ErrUnspec
+                                }
+                            },
+                            Err(e) => {
+                                error!("failed to receive data: {}", e);
+                                GpuResponse::ErrUnspec
+                            }
+                        },
+                        Err(e) => {
+                            error!("failed to send request: {}", e);
+                            GpuResponse::ErrUnspec
+                        }
+                    }
+                }
+                None => GpuResponse::OkNoData,
+            },
+            None => GpuResponse::ErrInvalidResourceId,
+        }
     }
 }

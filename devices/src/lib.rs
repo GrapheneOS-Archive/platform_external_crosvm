@@ -19,6 +19,7 @@ mod serial;
 pub mod split_irqchip_common;
 pub mod usb;
 mod utils;
+pub mod vfio;
 pub mod virtio;
 
 pub use self::bus::Error as BusError;
@@ -28,6 +29,7 @@ pub use self::i8042::I8042Device;
 pub use self::ioapic::Ioapic;
 pub use self::pci::{
     Ac97Dev, PciConfigIo, PciConfigMmio, PciDevice, PciDeviceError, PciInterruptPin, PciRoot,
+    VfioPciDevice,
 };
 pub use self::pic::Pic;
 pub use self::pit::{Pit, PitError};
@@ -36,8 +38,10 @@ pub use self::proxy::Error as ProxyError;
 pub use self::proxy::ProxyDevice;
 pub use self::serial::Error as SerialError;
 pub use self::serial::{
-    get_serial_tty_string, Serial, SerialParameters, SerialType, DEFAULT_SERIAL_PARAMS, SERIAL_ADDR,
+    get_serial_tty_string, Serial, SerialInput, SerialParameters, SerialType,
+    DEFAULT_SERIAL_PARAMS, SERIAL_ADDR,
 };
 pub use self::usb::host_backend::host_backend_device_provider::HostBackendDeviceProvider;
 pub use self::usb::xhci::xhci_controller::XhciController;
+pub use self::vfio::VfioDevice;
 pub use self::virtio::VirtioPciDevice;

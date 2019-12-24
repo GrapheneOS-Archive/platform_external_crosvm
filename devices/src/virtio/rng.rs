@@ -7,13 +7,11 @@ use std::fmt::{self, Display};
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread;
 
-use sys_util::{error, EventFd, GuestMemory, PollContext, PollToken};
+use sys_util::{error, warn, EventFd, GuestMemory, PollContext, PollToken};
 
-use super::{Queue, VirtioDevice, INTERRUPT_STATUS_USED_RING, TYPE_RNG};
+use super::{Interrupt, Queue, VirtioDevice, Writer, TYPE_RNG};
 
 const QUEUE_SIZE: u16 = 256;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
@@ -36,12 +34,10 @@ impl Display for RngError {
 }
 
 struct Worker {
+    interrupt: Interrupt,
     queue: Queue,
     mem: GuestMemory,
     random_file: File,
-    interrupt_status: Arc<AtomicUsize>,
-    interrupt_evt: EventFd,
-    interrupt_resample_evt: EventFd,
 }
 
 impl Worker {
@@ -50,31 +46,24 @@ impl Worker {
 
         let mut needs_interrupt = false;
         while let Some(avail_desc) = queue.pop(&self.mem) {
-            let mut len = 0;
-
-            // Drivers can only read from the random device.
-            if avail_desc.is_write_only() {
-                // Fill the read with data from the random device on the host.
-                if self
-                    .mem
-                    .read_to_memory(avail_desc.addr, &self.random_file, avail_desc.len as usize)
-                    .is_ok()
-                {
-                    len = avail_desc.len;
+            let index = avail_desc.index;
+            let random_file = &mut self.random_file;
+            let written = match Writer::new(&self.mem, avail_desc)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+                .and_then(|mut writer| writer.write_from(random_file, std::usize::MAX))
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("Failed to write random data to the guest: {}", e);
+                    0
                 }
-            }
+            };
 
-            queue.add_used(&self.mem, avail_desc.index, len);
+            queue.add_used(&self.mem, index, written as u32);
             needs_interrupt = true;
         }
 
         needs_interrupt
-    }
-
-    fn signal_used_queue(&self) {
-        self.interrupt_status
-            .fetch_or(INTERRUPT_STATUS_USED_RING as usize, Ordering::SeqCst);
-        self.interrupt_evt.write(1).unwrap();
     }
 
     fn run(&mut self, queue_evt: EventFd, kill_evt: EventFd) {
@@ -87,7 +76,7 @@ impl Worker {
 
         let poll_ctx: PollContext<Token> = match PollContext::build_with(&[
             (&queue_evt, Token::QueueAvailable),
-            (&self.interrupt_resample_evt, Token::InterruptResample),
+            (self.interrupt.get_resample_evt(), Token::InterruptResample),
             (&kill_evt, Token::Kill),
         ]) {
             Ok(pc) => pc,
@@ -117,16 +106,13 @@ impl Worker {
                         needs_interrupt |= self.process_queue();
                     }
                     Token::InterruptResample => {
-                        let _ = self.interrupt_resample_evt.read();
-                        if self.interrupt_status.load(Ordering::SeqCst) != 0 {
-                            self.interrupt_evt.write(1).unwrap();
-                        }
+                        self.interrupt.interrupt_resample();
                     }
                     Token::Kill => break 'poll,
                 }
             }
             if needs_interrupt {
-                self.signal_used_queue();
+                self.interrupt.signal_used_queue(self.queue.vector);
             }
         }
     }
@@ -135,6 +121,7 @@ impl Worker {
 /// Virtio device for exposing entropy to the guest OS through virtio.
 pub struct Rng {
     kill_evt: Option<EventFd>,
+    worker_thread: Option<thread::JoinHandle<()>>,
     random_file: Option<File>,
 }
 
@@ -144,6 +131,7 @@ impl Rng {
         let random_file = File::open("/dev/urandom").map_err(RngError::AccessingRandomDev)?;
         Ok(Rng {
             kill_evt: None,
+            worker_thread: None,
             random_file: Some(random_file),
         })
     }
@@ -154,6 +142,10 @@ impl Drop for Rng {
         if let Some(kill_evt) = self.kill_evt.take() {
             // Ignore the result because there is nothing we can do about it.
             let _ = kill_evt.write(1);
+        }
+
+        if let Some(worker_thread) = self.worker_thread.take() {
+            let _ = worker_thread.join();
         }
     }
 }
@@ -180,9 +172,7 @@ impl VirtioDevice for Rng {
     fn activate(
         &mut self,
         mem: GuestMemory,
-        interrupt_evt: EventFd,
-        interrupt_resample_evt: EventFd,
-        status: Arc<AtomicUsize>,
+        interrupt: Interrupt,
         mut queues: Vec<Queue>,
         mut queue_evts: Vec<EventFd>,
     ) {
@@ -207,19 +197,22 @@ impl VirtioDevice for Rng {
                     .name("virtio_rng".to_string())
                     .spawn(move || {
                         let mut worker = Worker {
+                            interrupt,
                             queue,
                             mem,
                             random_file,
-                            interrupt_status: status,
-                            interrupt_evt,
-                            interrupt_resample_evt,
                         };
                         worker.run(queue_evts.remove(0), kill_evt);
                     });
 
-            if let Err(e) = worker_result {
-                error!("failed to spawn virtio_rng worker: {}", e);
-                return;
+            match worker_result {
+                Err(e) => {
+                    error!("failed to spawn virtio_rng worker: {}", e);
+                    return;
+                }
+                Ok(join_handle) => {
+                    self.worker_thread = Some(join_handle);
+                }
             }
         }
     }

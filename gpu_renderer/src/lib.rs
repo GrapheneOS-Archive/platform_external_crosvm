@@ -19,6 +19,8 @@ use std::rc::Rc;
 use std::result;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use libc::close;
+
 use data_model::{VolatileMemory, VolatileSlice};
 use sys_util::{GuestAddress, GuestMemory};
 
@@ -29,7 +31,6 @@ use crate::generated::p_format::PIPE_FORMAT_B8G8R8X8_UNORM;
 use crate::generated::virglrenderer::*;
 
 pub use crate::command_buffer::CommandBufferBuilder;
-pub use crate::generated::virtgpu_hw::virtgpu_caps;
 
 /// Arguments used in `Renderer::create_resource`..
 pub type ResourceCreateArgs = virgl_renderer_resource_create_args;
@@ -49,6 +50,8 @@ pub enum Error {
     InvalidIovec,
     /// A command size was submitted that was invalid.
     InvalidCommandSize(usize),
+    /// The command is unsupported.
+    Unsupported,
 }
 
 impl Display for Error {
@@ -61,6 +64,7 @@ impl Display for Error {
             ExportedResourceDmabuf => write!(f, "failed to export dmabuf"),
             InvalidIovec => write!(f, "an iovec is outside of guest memory's range"),
             InvalidCommandSize(s) => write!(f, "command buffer submitted with invalid size: {}", s),
+            Unsupported => write!(f, "gpu renderer function unsupported"),
         }
     }
 }
@@ -260,10 +264,6 @@ impl Renderer {
 
     /// Gets the version and size for the given capability set ID.
     pub fn get_cap_set_info(&self, id: u32) -> (u32, u32) {
-        if id == 3 {
-            return (0 as u32, size_of::<virtgpu_caps>() as u32);
-        }
-
         let mut version = 0;
         let mut size = 0;
         // Safe because virglrenderer is initialized by now and properly size stack variables are
@@ -394,6 +394,80 @@ impl Renderer {
     pub fn force_ctx_0(&self) {
         unsafe { virgl_renderer_force_ctx_0() };
     }
+
+    #[allow(unused_variables)]
+    pub fn allocation_metadata(&self, request: &[u8], response: &mut Vec<u8>) -> Result<()> {
+        #[cfg(feature = "virtio-gpu-next")]
+        {
+            let ret = unsafe {
+                virgl_renderer_allocation_metadata(
+                    request.as_ptr() as *const c_void,
+                    response.as_mut_ptr() as *mut c_void,
+                    request.len() as u32,
+                    response.len() as u32,
+                )
+            };
+            ret_to_res(ret)
+        }
+        #[cfg(not(feature = "virtio-gpu-next"))]
+        Err(Error::Unsupported)
+    }
+
+    #[allow(unused_variables)]
+    pub fn resource_create_v2(
+        &self,
+        resource_id: u32,
+        guest_memory_type: u32,
+        guest_caching_type: u32,
+        size: u64,
+        mem: &GuestMemory,
+        iovecs: &[(GuestAddress, usize)],
+        args: &[u8],
+    ) -> Result<Resource> {
+        #[cfg(feature = "virtio-gpu-next")]
+        {
+            if iovecs
+                .iter()
+                .any(|&(addr, len)| mem.get_slice(addr.offset(), len as u64).is_err())
+            {
+                return Err(Error::InvalidIovec);
+            }
+
+            let mut vecs = Vec::new();
+            for &(addr, len) in iovecs {
+                // Unwrap will not panic because we already checked the slices.
+                let slice = mem.get_slice(addr.offset(), len as u64).unwrap();
+                vecs.push(VirglVec {
+                    base: slice.as_ptr() as *mut c_void,
+                    len,
+                });
+            }
+
+            let ret = unsafe {
+                virgl_renderer_resource_create_v2(
+                    resource_id,
+                    guest_memory_type,
+                    guest_caching_type,
+                    size,
+                    vecs.as_ptr() as *const iovec,
+                    vecs.len() as u32,
+                    args.as_ptr() as *const c_void,
+                    args.len() as u32,
+                )
+            };
+
+            ret_to_res(ret)?;
+
+            Ok(Resource {
+                id: resource_id,
+                backing_iovecs: vecs,
+                backing_mem: None,
+                no_sync_send: PhantomData,
+            })
+        }
+        #[cfg(not(feature = "virtio-gpu-next"))]
+        Err(Error::Unsupported)
+    }
 }
 
 /// A context in which resources can be attached/detached and commands can be submitted.
@@ -492,6 +566,13 @@ impl Resource {
     pub fn export(&self) -> Result<(Query, File)> {
         let query = self.export_query(true)?;
         if query.out_num_fds != 1 || query.out_fds[0] < 0 {
+            for fd in &query.out_fds {
+                if *fd >= 0 {
+                    // Safe because the FD was just returned by a successful virglrenderer
+                    // call so it must be valid and owned by us.
+                    unsafe { close(*fd) };
+                }
+            }
             return Err(Error::ExportedResourceDmabuf);
         }
 

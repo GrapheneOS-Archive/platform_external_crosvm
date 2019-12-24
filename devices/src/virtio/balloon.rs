@@ -17,8 +17,7 @@ use sys_util::{
 use vm_control::{BalloonControlCommand, BalloonControlResponseSocket};
 
 use super::{
-    copy_config, DescriptorChain, Queue, VirtioDevice, INTERRUPT_STATUS_CONFIG_CHANGED,
-    INTERRUPT_STATUS_USED_RING, TYPE_BALLOON, VIRTIO_F_VERSION_1,
+    copy_config, Interrupt, Queue, Reader, VirtioDevice, TYPE_BALLOON, VIRTIO_F_VERSION_1,
 };
 
 #[derive(Debug)]
@@ -71,18 +70,12 @@ struct BalloonConfig {
 }
 
 struct Worker {
+    interrupt: Interrupt,
     mem: GuestMemory,
     inflate_queue: Queue,
     deflate_queue: Queue,
-    interrupt_status: Arc<AtomicUsize>,
-    interrupt_evt: EventFd,
-    interrupt_resample_evt: EventFd,
     config: Arc<BalloonConfig>,
     command_socket: BalloonControlResponseSocket,
-}
-
-fn valid_inflate_desc(desc: &DescriptorChain) -> bool {
-    !desc.is_write_only() && desc.len % 4 == 0
 }
 
 impl Worker {
@@ -95,19 +88,38 @@ impl Worker {
 
         let mut needs_interrupt = false;
         while let Some(avail_desc) = queue.pop(&self.mem) {
-            if inflate && valid_inflate_desc(&avail_desc) {
-                let num_addrs = avail_desc.len / 4;
-                for i in 0..num_addrs as usize {
-                    let addr = match avail_desc.addr.checked_add((i * 4) as u64) {
-                        Some(a) => a,
-                        None => break,
-                    };
-                    let guest_input: u32 = match self.mem.read_obj_from_addr(addr) {
-                        Ok(a) => a,
-                        Err(_) => continue,
+            let index = avail_desc.index;
+
+            if inflate {
+                let mut reader = match Reader::new(&self.mem, avail_desc) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("balloon: failed to create reader: {}", e);
+                        queue.add_used(&self.mem, index, 0);
+                        needs_interrupt = true;
+                        continue;
+                    }
+                };
+                let data_length = reader.available_bytes();
+
+                if data_length % 4 != 0 {
+                    error!("invalid inflate buffer size: {}", data_length);
+                    queue.add_used(&self.mem, index, 0);
+                    needs_interrupt = true;
+                    continue;
+                }
+
+                let num_addrs = data_length / 4;
+                for _ in 0..num_addrs as usize {
+                    let guest_input = match reader.read_obj::<Le32>() {
+                        Ok(a) => a.to_native(),
+                        Err(err) => {
+                            error!("error while reading unused pages: {}", err);
+                            break;
+                        }
                     };
                     let guest_address =
-                        GuestAddress((guest_input as u64) << VIRTIO_BALLOON_PFN_SHIFT);
+                        GuestAddress((u64::from(guest_input)) << VIRTIO_BALLOON_PFN_SHIFT);
 
                     if self
                         .mem
@@ -120,23 +132,11 @@ impl Worker {
                 }
             }
 
-            queue.add_used(&self.mem, avail_desc.index, 0);
+            queue.add_used(&self.mem, index, 0);
             needs_interrupt = true;
         }
 
         needs_interrupt
-    }
-
-    fn signal_used_queue(&self) {
-        self.interrupt_status
-            .fetch_or(INTERRUPT_STATUS_USED_RING as usize, Ordering::SeqCst);
-        self.interrupt_evt.write(1).unwrap();
-    }
-
-    fn signal_config_changed(&self) {
-        self.interrupt_status
-            .fetch_or(INTERRUPT_STATUS_CONFIG_CHANGED as usize, Ordering::SeqCst);
-        self.interrupt_evt.write(1).unwrap();
     }
 
     fn run(&mut self, mut queue_evts: Vec<EventFd>, kill_evt: EventFd) {
@@ -156,7 +156,7 @@ impl Worker {
             (&inflate_queue_evt, Token::Inflate),
             (&deflate_queue_evt, Token::Deflate),
             (&self.command_socket, Token::CommandSocket),
-            (&self.interrupt_resample_evt, Token::InterruptResample),
+            (self.interrupt.get_resample_evt(), Token::InterruptResample),
             (&kill_evt, Token::Kill),
         ]) {
             Ok(pc) => pc,
@@ -175,7 +175,8 @@ impl Worker {
                 }
             };
 
-            let mut needs_interrupt = false;
+            let mut needs_interrupt_inflate = false;
+            let mut needs_interrupt_deflate = false;
             for event in events.iter_readable() {
                 match event.token() {
                     Token::Inflate => {
@@ -183,14 +184,14 @@ impl Worker {
                             error!("failed reading inflate queue EventFd: {}", e);
                             break 'poll;
                         }
-                        needs_interrupt |= self.process_inflate_deflate(true);
+                        needs_interrupt_inflate |= self.process_inflate_deflate(true);
                     }
                     Token::Deflate => {
                         if let Err(e) = deflate_queue_evt.read() {
                             error!("failed reading deflate queue EventFd: {}", e);
                             break 'poll;
                         }
-                        needs_interrupt |= self.process_inflate_deflate(false);
+                        needs_interrupt_deflate |= self.process_inflate_deflate(false);
                     }
                     Token::CommandSocket => {
                         if let Ok(req) = self.command_socket.recv() {
@@ -201,16 +202,13 @@ impl Worker {
                                     info!("ballon config changed to consume {} pages", num_pages);
 
                                     self.config.num_pages.store(num_pages, Ordering::Relaxed);
-                                    self.signal_config_changed();
+                                    self.interrupt.signal_config_changed();
                                 }
                             };
                         }
                     }
                     Token::InterruptResample => {
-                        let _ = self.interrupt_resample_evt.read();
-                        if self.interrupt_status.load(Ordering::SeqCst) != 0 {
-                            self.interrupt_evt.write(1).unwrap();
-                        }
+                        self.interrupt.interrupt_resample();
                     }
                     Token::Kill => break 'poll,
                 }
@@ -222,8 +220,13 @@ impl Worker {
                     let _ = poll_ctx.delete(&self.command_socket);
                 }
             }
-            if needs_interrupt {
-                self.signal_used_queue();
+
+            if needs_interrupt_inflate {
+                self.interrupt.signal_used_queue(self.inflate_queue.vector);
+            }
+
+            if needs_interrupt_deflate {
+                self.interrupt.signal_used_queue(self.deflate_queue.vector);
             }
         }
     }
@@ -235,6 +238,7 @@ pub struct Balloon {
     config: Arc<BalloonConfig>,
     features: u64,
     kill_evt: Option<EventFd>,
+    worker_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Balloon {
@@ -247,6 +251,7 @@ impl Balloon {
                 actual_pages: AtomicUsize::new(0),
             }),
             kill_evt: None,
+            worker_thread: None,
             // TODO(dgreid) - Add stats queue feature.
             features: 1 << VIRTIO_BALLOON_F_MUST_TELL_HOST | 1 << VIRTIO_BALLOON_F_DEFLATE_ON_OOM,
         })
@@ -267,6 +272,10 @@ impl Drop for Balloon {
         if let Some(kill_evt) = self.kill_evt.take() {
             // Ignore the result because there is nothing we can do with a failure.
             let _ = kill_evt.write(1);
+        }
+
+        if let Some(worker_thread) = self.worker_thread.take() {
+            let _ = worker_thread.join();
         }
     }
 }
@@ -309,9 +318,7 @@ impl VirtioDevice for Balloon {
     fn activate(
         &mut self,
         mem: GuestMemory,
-        interrupt_evt: EventFd,
-        interrupt_resample_evt: EventFd,
-        status: Arc<AtomicUsize>,
+        interrupt: Interrupt,
         mut queues: Vec<Queue>,
         queue_evts: Vec<EventFd>,
     ) {
@@ -334,20 +341,23 @@ impl VirtioDevice for Balloon {
             .name("virtio_balloon".to_string())
             .spawn(move || {
                 let mut worker = Worker {
+                    interrupt,
                     mem,
                     inflate_queue: queues.remove(0),
                     deflate_queue: queues.remove(0),
-                    interrupt_status: status,
-                    interrupt_evt,
-                    interrupt_resample_evt,
                     command_socket,
                     config,
                 };
                 worker.run(queue_evts, kill_evt);
             });
-        if let Err(e) = worker_result {
-            error!("failed to spawn virtio_balloon worker: {}", e);
-            return;
+
+        match worker_result {
+            Err(e) => {
+                error!("failed to spawn virtio_balloon worker: {}", e);
+            }
+            Ok(join_handle) => {
+                self.worker_thread = Some(join_handle);
+            }
         }
     }
 }

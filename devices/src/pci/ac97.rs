@@ -5,7 +5,7 @@
 use std::os::unix::io::RawFd;
 
 use audio_streams::StreamSource;
-use resources::{Alloc, SystemAllocator};
+use resources::{Alloc, MmioType, SystemAllocator};
 use sys_util::{error, EventFd, GuestMemory};
 
 use crate::pci::ac97_bus_master::Ac97BusMaster;
@@ -149,7 +149,7 @@ impl PciDevice for Ac97Dev {
             .expect("assign_bus_dev must be called prior to allocate_io_bars");
         let mut ranges = Vec::new();
         let mixer_regs_addr = resources
-            .mmio_allocator()
+            .mmio_allocator(MmioType::Low)
             .allocate_with_align(
                 MIXER_REGS_SIZE,
                 Alloc::PciBar { bus, dev, bar: 0 },
@@ -167,7 +167,7 @@ impl PciDevice for Ac97Dev {
         ranges.push((mixer_regs_addr, MIXER_REGS_SIZE));
 
         let master_regs_addr = resources
-            .mmio_allocator()
+            .mmio_allocator(MmioType::Low)
             .allocate_with_align(
                 MASTER_REGS_SIZE,
                 Alloc::PciBar { bus, dev, bar: 1 },
@@ -203,8 +203,8 @@ impl PciDevice for Ac97Dev {
     }
 
     fn read_bar(&mut self, addr: u64, data: &mut [u8]) {
-        let bar0 = u64::from(self.config_regs.get_bar_addr(0));
-        let bar1 = u64::from(self.config_regs.get_bar_addr(1));
+        let bar0 = self.config_regs.get_bar_addr(0);
+        let bar1 = self.config_regs.get_bar_addr(1);
         match addr {
             a if a >= bar0 && a < bar0 + MIXER_REGS_SIZE => self.read_mixer(addr - bar0, data),
             a if a >= bar1 && a < bar1 + MASTER_REGS_SIZE => {
@@ -215,8 +215,8 @@ impl PciDevice for Ac97Dev {
     }
 
     fn write_bar(&mut self, addr: u64, data: &[u8]) {
-        let bar0 = u64::from(self.config_regs.get_bar_addr(0));
-        let bar1 = u64::from(self.config_regs.get_bar_addr(1));
+        let bar0 = self.config_regs.get_bar_addr(0);
+        let bar1 = self.config_regs.get_bar_addr(1);
         match addr {
             a if a >= bar0 && a < bar0 + MIXER_REGS_SIZE => self.write_mixer(addr - bar0, data),
             a if a >= bar1 && a < bar1 + MASTER_REGS_SIZE => {
@@ -245,8 +245,8 @@ mod tests {
         let mut ac97_dev = Ac97Dev::new(mem, Box::new(DummyStreamSource::new()));
         let mut allocator = SystemAllocator::builder()
             .add_io_addresses(0x1000_0000, 0x1000_0000)
-            .add_mmio_addresses(0x2000_0000, 0x1000_0000)
-            .add_device_addresses(0x3000_0000, 0x1000_0000)
+            .add_low_mmio_addresses(0x2000_0000, 0x1000_0000)
+            .add_high_mmio_addresses(0x3000_0000, 0x1000_0000)
             .create_allocator(5, false)
             .unwrap();
         ac97_dev.assign_bus_dev(0, 0);

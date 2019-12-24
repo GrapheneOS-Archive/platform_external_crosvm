@@ -12,7 +12,7 @@ mod dwl;
 
 use dwl::*;
 
-use crate::{DisplayT, GpuDisplayError, GpuDisplayFramebuffer};
+use crate::{DisplayT, EventDevice, GpuDisplayError, GpuDisplayFramebuffer};
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -204,10 +204,8 @@ impl DisplayT for DisplayWl {
         let row_size = width * BYTES_PER_PIXEL;
         let fb_size = row_size * height;
         let buffer_size = round_up_to_page_size(fb_size as usize * BUFFER_COUNT);
-        let mut buffer_shm = SharedMemory::new(Some(
-            CStr::from_bytes_with_nul(b"GpuDisplaySurface\0").unwrap(),
-        ))
-        .map_err(GpuDisplayError::CreateShm)?;
+        let mut buffer_shm =
+            SharedMemory::named("GpuDisplaySurface").map_err(GpuDisplayError::CreateShm)?;
         buffer_shm
             .set_size(buffer_size as u64)
             .map_err(GpuDisplayError::SetSize)?;
@@ -342,6 +340,16 @@ impl DisplayT for DisplayWl {
             }
             None => debug_assert!(false, "invalid surface_id {}", surface_id),
         }
+    }
+
+    fn import_event_device(&mut self, _event_device: EventDevice) -> Result<u32, GpuDisplayError> {
+        Err(GpuDisplayError::Unsupported)
+    }
+    fn release_event_device(&mut self, _event_device_id: u32) {
+        // unsupported
+    }
+    fn attach_event_device(&mut self, surface_id: u32, event_device_id: u32) {
+        // unsupported
     }
 }
 

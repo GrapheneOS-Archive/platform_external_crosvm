@@ -6,7 +6,6 @@ edition = "2018"
 
 [features]
 gpu = ["gpu_buffer", "gpu_display", "gpu_renderer"]
-sandboxed-libusb = ["usb_util/sandboxed-libusb"]
 tpm = ["protos/trunks", "tpm2"]
 wl-dmabuf = []
 x = ["gpu_display/x"]
@@ -14,6 +13,7 @@ x = ["gpu_display/x"]
 [dependencies]
 audio_streams = "*"
 bit_field = { path = "../bit_field" }
+bitflags = "1"
 data_model = { path = "../data_model" }
 disk = { path = "../disk" }
 enumn = { path = "../enumn" }
@@ -22,6 +22,7 @@ gpu_display = { path = "../gpu_display", optional = true }
 gpu_renderer = { path = "../gpu_renderer", optional = true }
 io_jail = { path = "../io_jail" }
 kvm = { path = "../kvm" }
+kvm_sys = { path = "../kvm_sys" }
 libc = "*"
 msg_on_socket_derive = { path = "../msg_socket/msg_on_socket_derive" }
 msg_socket = { path = "../msg_socket" }
@@ -33,8 +34,10 @@ remain = "*"
 resources = { path = "../resources" }
 sync = { path = "../sync" }
 sys_util = { path = "../sys_util" }
+syscall_defines = { path = "../syscall_defines" }
 tpm2 = { path = "../tpm2", optional = true }
 usb_util = { path = "../usb_util" }
+vfio_sys = { path = "../vfio_sys" }
 vhost = { path = "../vhost" }
 virtio_sys = { path = "../virtio_sys" }
 vm_control = { path = "../vm_control" }
