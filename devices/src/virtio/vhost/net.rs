@@ -206,8 +206,14 @@ where
                                     }
                                     Ok(())
                                 };
-                                let result =
-                                    worker.run(queue_evts, QUEUE_SIZES, kill_evt, activate_vqs);
+                                let cleanup_vqs = |_handle: &U| -> Result<()> { Ok(()) };
+                                let result = worker.run(
+                                    queue_evts,
+                                    QUEUE_SIZES,
+                                    kill_evt,
+                                    activate_vqs,
+                                    cleanup_vqs,
+                                );
                                 if let Err(e) = result {
                                     error!("net worker thread exited with error: {}", e);
                                 }
@@ -224,6 +230,18 @@ where
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn on_device_sandboxed(&mut self) {
+        // ignore the error but to log the error. We don't need to do
+        // anything here because when activate, the other vhost set up
+        // will be failed to stop the activate thread.
+        if let Some(vhost_net_handle) = &self.vhost_net_handle {
+            match vhost_net_handle.set_owner() {
+                Ok(_) => {}
+                Err(e) => error!("{}: failed to set owner: {:?}", self.debug_label(), e),
             }
         }
     }

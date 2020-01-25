@@ -15,11 +15,12 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use data_model::{DataInit, Le16, Le32};
 use sys_util::{error, warn, EventFd, GuestMemory, PollContext, PollToken};
 
-use self::event_source::{input_event, EvdevEventSource, EventSource, SocketEventSource};
+use self::event_source::{EvdevEventSource, EventSource, SocketEventSource};
 use super::{
     copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer,
     TYPE_INPUT,
 };
+use linux_input_sys::input_event;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display};
 use std::io::Read;
@@ -309,6 +310,12 @@ impl VirtioInputConfig {
             }
             VIRTIO_INPUT_CFG_ID_DEVIDS => {
                 cfg.set_device_ids(&self.device_ids);
+            }
+            VIRTIO_INPUT_CFG_UNSET => {
+                // Per the virtio spec at https://docs.oasis-open.org/virtio/virtio/v1.1/cs01/virtio-v1.1-cs01.html#x1-3390008,
+                // there is no action required of us when this is set. It's unclear whether we
+                // should be zeroing the virtio_input_config, but empirically we know that the
+                // existing behavior of doing nothing works with the Linux virtio-input frontend.
             }
             _ => {
                 warn!("Unsuported virtio input config selection: {}", self.select);

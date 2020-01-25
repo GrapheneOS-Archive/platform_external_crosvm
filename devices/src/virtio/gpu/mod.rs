@@ -511,7 +511,7 @@ struct Worker {
 
 impl Worker {
     fn run(&mut self) {
-        #[derive(PartialEq, PollToken)]
+        #[derive(PollToken)]
         enum Token {
             CtrlQueue,
             CursorQueue,
@@ -577,7 +577,8 @@ impl Worker {
             // This display isn't typically used when the virt-wl device is available and it can
             // lead to hung fds (crbug.com/1027379). Disable if it's hung.
             for event in events.iter_hungup() {
-                if event.token() == Token::Display {
+                if let Token::Display = event.token() {
+                    error!("default display hang-up detected");
                     let _ = poll_ctx.delete(&*self.state.display().borrow());
                 }
             }
@@ -665,7 +666,7 @@ pub enum DisplayBackend {
     /// Open a connection to the X server at the given display if given.
     X(Option<String>),
     /// Emulate a display without actually displaying it.
-    Null,
+    Stub,
 }
 
 impl DisplayBackend {
@@ -673,7 +674,7 @@ impl DisplayBackend {
         match self {
             DisplayBackend::Wayland(path) => GpuDisplay::open_wayland(path.as_ref()),
             DisplayBackend::X(display) => GpuDisplay::open_x(display.as_ref()),
-            DisplayBackend::Null => unimplemented!(),
+            DisplayBackend::Stub => GpuDisplay::open_stub(),
         }
     }
 

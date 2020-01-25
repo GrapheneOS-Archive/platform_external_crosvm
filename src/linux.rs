@@ -50,7 +50,7 @@ use sys_util::{
     self, block_signal, clear_signal, drop_capabilities, error, flock, get_blocked_signals,
     get_group_id, get_user_id, getegid, geteuid, info, register_rt_signal_handler,
     set_cpu_affinity, validate_raw_fd, warn, EventFd, FlockOperation, GuestAddress, GuestMemory,
-    Killable, MemoryMapping, PollContext, PollToken, Protection, SignalFd, Terminal, TimerFd,
+    Killable, MemoryMappingArena, PollContext, PollToken, Protection, SignalFd, Terminal, TimerFd,
     WatchingEvents, SIGRTMIN,
 };
 use vhost;
@@ -274,9 +274,9 @@ impl AsRef<UnixSeqpacket> for TaggedControlSocket {
     fn as_ref(&self) -> &UnixSeqpacket {
         use self::TaggedControlSocket::*;
         match &self {
-            Vm(ref socket) => socket,
-            VmMemory(ref socket) => socket,
-            VmIrq(ref socket) => socket,
+            Vm(ref socket) => socket.as_ref(),
+            VmMemory(ref socket) => socket.as_ref(),
+            VmIrq(ref socket) => socket.as_ref(),
         }
     }
 }
@@ -320,18 +320,33 @@ fn create_base_minijail(
     // Run in an empty network namespace.
     j.namespace_net();
     // Most devices don't need to open many fds.
-    j.set_rlimit(libc::RLIMIT_NOFILE, 1024, 1024)
+    j.set_rlimit(libc::RLIMIT_NOFILE as i32, 1024, 1024)
         .map_err(Error::SettingMaxOpenFiles)?;
     // Apply the block device seccomp policy.
     j.no_new_privs();
-    // Use TSYNC only for the side effect of it using SECCOMP_RET_TRAP, which will correctly kill
-    // the entire device process if a worker thread commits a seccomp violation.
-    j.set_seccomp_filter_tsync();
-    if log_failures {
-        j.log_seccomp_filter_failures();
+
+    // By default we'll prioritize using the pre-compiled .bpf over the .policy
+    // file (the .bpf is expected to be compiled using "trap" as the failure
+    // behavior instead of the default "kill" behavior).
+    // Refer to the code comment for the "seccomp-log-failures"
+    // command-line parameter for an explanation about why the |log_failures|
+    // flag forces the use of .policy files (and the build-time alternative to
+    // this run-time flag).
+    let bpf_policy_file = seccomp_policy.with_extension("bpf");
+    if bpf_policy_file.exists() && !log_failures {
+        j.parse_seccomp_program(&bpf_policy_file)
+            .map_err(Error::DeviceJail)?;
+    } else {
+        // Use TSYNC only for the side effect of it using SECCOMP_RET_TRAP,
+        // which will correctly kill the entire device process if a worker
+        // thread commits a seccomp violation.
+        j.set_seccomp_filter_tsync();
+        if log_failures {
+            j.log_seccomp_filter_failures();
+        }
+        j.parse_seccomp_filters(&seccomp_policy.with_extension("policy"))
+            .map_err(Error::DeviceJail)?;
     }
-    j.parse_seccomp_filters(seccomp_policy)
-        .map_err(Error::DeviceJail)?;
     j.use_seccomp_filter();
     // Don't do init setup.
     j.run_as_init();
@@ -395,7 +410,7 @@ fn create_block_device(
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "block_device.policy")?,
+        jail: simple_jail(&cfg, "block_device")?,
     })
 }
 
@@ -404,7 +419,7 @@ fn create_rng_device(cfg: &Config) -> DeviceResult {
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "rng_device.policy")?,
+        jail: simple_jail(&cfg, "rng_device")?,
     })
 }
 
@@ -416,7 +431,7 @@ fn create_tpm_device(cfg: &Config) -> DeviceResult {
     use sys_util::chown;
 
     let tpm_storage: PathBuf;
-    let mut tpm_jail = simple_jail(&cfg, "tpm_device.policy")?;
+    let mut tpm_jail = simple_jail(&cfg, "tpm_device")?;
 
     match &mut tpm_jail {
         Some(jail) => {
@@ -467,7 +482,7 @@ fn create_single_touch_device(cfg: &Config, single_touch_spec: &TouchDeviceOptio
         .map_err(Error::InputDeviceNew)?;
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device.policy")?,
+        jail: simple_jail(&cfg, "input_device")?,
     })
 }
 
@@ -482,7 +497,7 @@ fn create_trackpad_device(cfg: &Config, trackpad_spec: &TouchDeviceOption) -> De
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device.policy")?,
+        jail: simple_jail(&cfg, "input_device")?,
     })
 }
 
@@ -496,7 +511,7 @@ fn create_mouse_device<T: IntoUnixStream>(cfg: &Config, mouse_socket: T) -> Devi
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device.policy")?,
+        jail: simple_jail(&cfg, "input_device")?,
     })
 }
 
@@ -510,7 +525,7 @@ fn create_keyboard_device<T: IntoUnixStream>(cfg: &Config, keyboard_socket: T) -
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device.policy")?,
+        jail: simple_jail(&cfg, "input_device")?,
     })
 }
 
@@ -525,7 +540,7 @@ fn create_vinput_device(cfg: &Config, dev_path: &Path) -> DeviceResult {
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device.policy")?,
+        jail: simple_jail(&cfg, "input_device")?,
     })
 }
 
@@ -534,7 +549,7 @@ fn create_balloon_device(cfg: &Config, socket: BalloonControlResponseSocket) -> 
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "balloon_device.policy")?,
+        jail: simple_jail(&cfg, "balloon_device")?,
     })
 }
 
@@ -549,7 +564,7 @@ fn create_tap_net_device(cfg: &Config, tap_fd: RawFd) -> DeviceResult {
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "net_device.policy")?,
+        jail: simple_jail(&cfg, "net_device")?,
     })
 }
 
@@ -572,9 +587,9 @@ fn create_net_device(
     };
 
     let policy = if cfg.vhost_net {
-        "vhost_net_device.policy"
+        "vhost_net_device"
     } else {
-        "net_device.policy"
+        "net_device"
     };
 
     Ok(VirtioDeviceStub {
@@ -589,7 +604,7 @@ fn create_gpu_device(
     exit_evt: &EventFd,
     gpu_device_socket: VmMemoryControlRequestSocket,
     gpu_sockets: Vec<virtio::resource_bridge::ResourceResponseSocket>,
-    wayland_socket_path: Option<PathBuf>,
+    wayland_socket_path: Option<&PathBuf>,
     x_display: Option<String>,
     event_devices: Vec<EventDevice>,
 ) -> DeviceResult {
@@ -597,10 +612,10 @@ fn create_gpu_device(
 
     let mut display_backends = vec![
         virtio::DisplayBackend::X(x_display),
-        virtio::DisplayBackend::Null,
+        virtio::DisplayBackend::Stub,
     ];
 
-    if let Some(socket_path) = wayland_socket_path.as_ref() {
+    if let Some(socket_path) = wayland_socket_path {
         display_backends.insert(
             0,
             virtio::DisplayBackend::Wayland(if cfg.sandbox {
@@ -621,7 +636,7 @@ fn create_gpu_device(
         event_devices,
     );
 
-    let jail = match simple_jail(&cfg, "gpu_device.policy")? {
+    let jail = match simple_jail(&cfg, "gpu_device")? {
         Some(mut jail) => {
             // Create a tmpfs in the device's root directory so that we can bind mount the
             // dri directory into it.  The size=67108864 is size=64*1024*1024 or size=64MB.
@@ -664,7 +679,7 @@ fn create_gpu_device(
             // Bind mount the wayland socket into jail's root. This is necessary since each
             // new wayland context must open() the socket.
             if let Some(path) = wayland_socket_path {
-                jail.mount_bind(path.as_ref(), jailed_wayland_path, true)?;
+                jail.mount_bind(path, jailed_wayland_path, true)?;
             }
 
             add_crosvm_user_to_jail(&mut jail, "gpu")?;
@@ -691,27 +706,20 @@ fn create_gpu_device(
 
 fn create_wayland_device(
     cfg: &Config,
-    socket_path: &Path,
     socket: VmMemoryControlRequestSocket,
     resource_bridge: Option<virtio::resource_bridge::ResourceRequestSocket>,
 ) -> DeviceResult {
-    let wayland_socket_dir = socket_path.parent().ok_or(Error::InvalidWaylandPath)?;
-    let wayland_socket_name = socket_path.file_name().ok_or(Error::InvalidWaylandPath)?;
-    let jailed_wayland_dir = Path::new("/wayland");
-    let jailed_wayland_path = jailed_wayland_dir.join(wayland_socket_name);
+    let wayland_socket_dirs = cfg
+        .wayland_socket_paths
+        .iter()
+        .map(|(_name, path)| path.parent())
+        .collect::<Option<Vec<_>>>()
+        .ok_or(Error::InvalidWaylandPath)?;
 
-    let dev = virtio::Wl::new(
-        if cfg.sandbox {
-            &jailed_wayland_path
-        } else {
-            socket_path
-        },
-        socket,
-        resource_bridge,
-    )
-    .map_err(Error::WaylandDeviceNew)?;
+    let dev = virtio::Wl::new(cfg.wayland_socket_paths.clone(), socket, resource_bridge)
+        .map_err(Error::WaylandDeviceNew)?;
 
-    let jail = match simple_jail(&cfg, "wl_device.policy")? {
+    let jail = match simple_jail(&cfg, "wl_device")? {
         Some(mut jail) => {
             // Create a tmpfs in the device's root directory so that we can bind mount the wayland
             // socket directory into it. The size=67108864 is size=64*1024*1024 or size=64MB.
@@ -727,8 +735,9 @@ fn create_wayland_device(
             // each new wayland context must open() the socket. If the wayland socket is ever
             // destroyed and remade in the same host directory, new connections will be possible
             // without restarting the wayland device.
-            jail.mount_bind(wayland_socket_dir, jailed_wayland_dir, true)?;
-
+            for dir in &wayland_socket_dirs {
+                jail.mount_bind(dir, dir, true)?;
+            }
             add_crosvm_user_to_jail(&mut jail, "Wayland")?;
 
             Some(jail)
@@ -747,7 +756,7 @@ fn create_vhost_vsock_device(cfg: &Config, cid: u64, mem: &GuestMemory) -> Devic
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "vhost_vsock_device.policy")?,
+        jail: simple_jail(&cfg, "vhost_vsock_device")?,
     })
 }
 
@@ -775,7 +784,7 @@ fn create_fs_device(
 
         // Use TSYNC only for the side effect of it using SECCOMP_RET_TRAP, which will correctly kill
         // the entire device process if a worker thread commits a seccomp violation.
-        let seccomp_policy = cfg.seccomp_policy_dir.join("fs_device.policy");
+        let seccomp_policy = cfg.seccomp_policy_dir.join("fs_device");
         j.set_seccomp_filter_tsync();
         if cfg.seccomp_log_failures {
             j.log_seccomp_filter_failures();
@@ -796,7 +805,7 @@ fn create_fs_device(
 
     // The file server opens a lot of fds and needs a really high open file limit.
     let max_open_files = get_max_open_files()?;
-    j.set_rlimit(libc::RLIMIT_NOFILE, max_open_files, max_open_files)
+    j.set_rlimit(libc::RLIMIT_NOFILE as i32, max_open_files, max_open_files)
         .map_err(Error::SettingMaxOpenFiles)?;
 
     // TODO(chirantan): Use more than one worker once the kernel driver has been fixed to not panic
@@ -810,7 +819,7 @@ fn create_fs_device(
 }
 
 fn create_9p_device(cfg: &Config, src: &Path, tag: &str) -> DeviceResult {
-    let (jail, root) = match simple_jail(&cfg, "9p_device.policy")? {
+    let (jail, root) = match simple_jail(&cfg, "9p_device")? {
         Some(mut jail) => {
             //  The shared directory becomes the root of the device's file system.
             let root = Path::new("/");
@@ -847,9 +856,26 @@ fn create_pmem_device(
         .open(&disk.path)
         .map_err(Error::Disk)?;
 
-    let image_size = {
+    let (disk_size, arena_size) = {
         let metadata = std::fs::metadata(&disk.path).map_err(Error::Disk)?;
-        metadata.len()
+        let disk_len = metadata.len();
+        // Linux requires pmem region sizes to be 2 MiB aligned. Linux will fill any partial page
+        // at the end of an mmap'd file and won't write back beyond the actual file length, but if
+        // we just align the size of the file to 2 MiB then access beyond the last page of the
+        // mapped file will generate SIGBUS. So use a memory mapping arena that will provide
+        // padding up to 2 MiB.
+        let alignment = 2 * 1024 * 1024;
+        let align_adjust = if disk_len % alignment != 0 {
+            alignment - (disk_len % alignment)
+        } else {
+            0
+        };
+        (
+            disk_len,
+            disk_len
+                .checked_add(align_adjust)
+                .ok_or(Error::PmemDeviceImageTooBig)?,
+        )
     };
 
     let protection = {
@@ -860,18 +886,22 @@ fn create_pmem_device(
         }
     };
 
-    let memory_mapping = {
+    let arena = {
         // Conversion from u64 to usize may fail on 32bit system.
-        let image_size = usize::try_from(image_size).map_err(|_| Error::PmemDeviceImageTooBig)?;
+        let arena_size = usize::try_from(arena_size).map_err(|_| Error::PmemDeviceImageTooBig)?;
+        let disk_size = usize::try_from(disk_size).map_err(|_| Error::PmemDeviceImageTooBig)?;
 
-        MemoryMapping::from_fd_offset_protection(&fd, image_size, 0, protection)
-            .map_err(Error::ReservePmemMemory)?
+        let mut arena = MemoryMappingArena::new(arena_size).map_err(Error::ReservePmemMemory)?;
+        arena
+            .add_fd_offset_protection(0, disk_size, &fd, 0, protection)
+            .map_err(Error::ReservePmemMemory)?;
+        arena
     };
 
     let mapping_address = resources
         .mmio_allocator(MmioType::High)
         .allocate_with_align(
-            image_size,
+            arena_size,
             Alloc::PmemDevice(index),
             format!("pmem_disk_image_{}", index),
             // Linux kernel requires pmem namespaces to be 128 MiB aligned.
@@ -879,20 +909,20 @@ fn create_pmem_device(
         )
         .map_err(Error::AllocatePmemDeviceAddress)?;
 
-    vm.add_mmio_memory(
+    vm.add_mmap_arena(
         GuestAddress(mapping_address),
-        memory_mapping,
+        arena,
         /* read_only = */ disk.read_only,
         /* log_dirty_pages = */ false,
     )
     .map_err(Error::AddPmemDeviceMemory)?;
 
-    let dev = virtio::Pmem::new(fd, GuestAddress(mapping_address), image_size)
+    let dev = virtio::Pmem::new(fd, GuestAddress(mapping_address), arena_size)
         .map_err(Error::PmemDeviceNew)?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev) as Box<dyn VirtioDevice>,
-        jail: simple_jail(&cfg, "pmem_device.policy")?,
+        jail: simple_jail(&cfg, "pmem_device")?,
     })
 }
 
@@ -965,7 +995,7 @@ fn create_virtio_devices(
     #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
     let mut resource_bridges = Vec::<virtio::resource_bridge::ResourceResponseSocket>::new();
 
-    if let Some(wayland_socket_path) = cfg.wayland_socket_path.as_ref() {
+    if !cfg.wayland_socket_paths.is_empty() {
         #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
         let mut wl_resource_bridge = None::<virtio::resource_bridge::ResourceRequestSocket>;
 
@@ -981,7 +1011,6 @@ fn create_virtio_devices(
 
         devs.push(create_wayland_device(
             cfg,
-            wayland_socket_path,
             wayland_device_socket,
             wl_resource_bridge,
         )?);
@@ -1001,7 +1030,7 @@ fn create_virtio_devices(
                     .map_err(Error::InputDeviceNew)?;
                 devs.push(VirtioDeviceStub {
                     dev: Box::new(dev),
-                    jail: simple_jail(&cfg, "input_device.policy")?,
+                    jail: simple_jail(&cfg, "input_device")?,
                 });
                 event_devices.push(EventDevice::touchscreen(event_device_socket));
             }
@@ -1011,7 +1040,7 @@ fn create_virtio_devices(
                 let dev = virtio::new_keyboard(virtio_dev_socket).map_err(Error::InputDeviceNew)?;
                 devs.push(VirtioDeviceStub {
                     dev: Box::new(dev),
-                    jail: simple_jail(&cfg, "input_device.policy")?,
+                    jail: simple_jail(&cfg, "input_device")?,
                 });
                 event_devices.push(EventDevice::keyboard(event_device_socket));
             }
@@ -1020,7 +1049,8 @@ fn create_virtio_devices(
                 _exit_evt,
                 gpu_device_socket,
                 resource_bridges,
-                cfg.wayland_socket_path.clone(),
+                // Use the unnamed socket for GPU display screens.
+                cfg.wayland_socket_paths.get(""),
                 cfg.x_display.clone(),
                 event_devices,
             )?);
@@ -1097,7 +1127,7 @@ fn create_devices(
 
         pci_devices.push((
             Box::new(cras_audio),
-            simple_jail(&cfg, "cras_audio_device.policy")?,
+            simple_jail(&cfg, "cras_audio_device")?,
         ));
     }
 
@@ -1107,12 +1137,12 @@ fn create_devices(
 
         pci_devices.push((
             Box::new(null_audio),
-            simple_jail(&cfg, "null_audio_device.policy")?,
+            simple_jail(&cfg, "null_audio_device")?,
         ));
     }
     // Create xhci controller.
     let usb_controller = Box::new(XhciController::new(mem.clone(), usb_provider));
-    pci_devices.push((usb_controller, simple_jail(&cfg, "xhci.policy")?));
+    pci_devices.push((usb_controller, simple_jail(&cfg, "xhci")?));
 
     if cfg.vfio.is_some() {
         let (vfio_host_socket_irq, vfio_device_socket_irq) =
@@ -1131,7 +1161,7 @@ fn create_devices(
             vfio_device_socket_irq,
             vfio_device_socket_mem,
         ));
-        pci_devices.push((vfiopcidevice, simple_jail(&cfg, "vfio_device.policy")?));
+        pci_devices.push((vfiopcidevice, simple_jail(&cfg, "vfio_device")?));
     }
 
     Ok(pci_devices)
@@ -1523,7 +1553,7 @@ pub fn run_config(cfg: Config) -> Result<()> {
         components,
         cfg.split_irqchip,
         &cfg.serial_parameters,
-        simple_jail(&cfg, "serial.policy")?,
+        simple_jail(&cfg, "serial")?,
         |mem, vm, sys_allocator, exit_evt| {
             create_devices(
                 &cfg,
@@ -1587,7 +1617,6 @@ fn run_control(
     #[derive(PollToken)]
     enum Token {
         Exit,
-        Stdin,
         ChildSignal,
         CheckAvailableMemory,
         LowMemory,
@@ -1596,9 +1625,7 @@ fn run_control(
         VmControl { index: usize },
     }
 
-    let stdin_handle = stdin();
-    let stdin_lock = stdin_handle.lock();
-    stdin_lock
+    stdin()
         .set_raw_mode()
         .expect("failed to set terminal raw mode");
 
@@ -1607,10 +1634,6 @@ fn run_control(
         (&sigchld_fd, Token::ChildSignal),
     ])
     .map_err(Error::PollContextAdd)?;
-
-    if let Err(e) = poll_ctx.add(&stdin_handle, Token::Stdin) {
-        warn!("failed to add stdin to poll context: {}", e);
-    }
 
     if let Some(socket_server) = &control_server_socket {
         poll_ctx
@@ -1699,26 +1722,6 @@ fn run_control(
                 Token::Exit => {
                     info!("vcpu requested shutdown");
                     break 'poll;
-                }
-                Token::Stdin => {
-                    let mut out = [0u8; 64];
-                    match stdin_lock.read_raw(&mut out[..]) {
-                        Ok(0) => {
-                            // Zero-length read indicates EOF. Remove from pollables.
-                            let _ = poll_ctx.delete(&stdin_handle);
-                        }
-                        Err(e) => {
-                            warn!("error while reading stdin: {}", e);
-                            let _ = poll_ctx.delete(&stdin_handle);
-                        }
-                        Ok(count) => {
-                            if let Some(ref stdio_serial) = linux.stdio_serial {
-                                stdio_serial
-                                    .queue_input_bytes(&out[..count])
-                                    .expect("failed to queue bytes into serial port");
-                            }
-                        }
-                    }
                 }
                 Token::ChildSignal => {
                     // Print all available siginfo structs, then exit the loop.
@@ -1913,9 +1916,6 @@ fn run_control(
         for event in events.iter_hungup() {
             match event.token() {
                 Token::Exit => {}
-                Token::Stdin => {
-                    let _ = poll_ctx.delete(&stdin_handle);
-                }
                 Token::ChildSignal => {}
                 Token::CheckAvailableMemory => {}
                 Token::LowMemory => {}
@@ -1988,7 +1988,7 @@ fn run_control(
     // control sockets are closed when this function exits.
     mem::drop(linux);
 
-    stdin_lock
+    stdin()
         .set_canon_mode()
         .expect("failed to restore canonical mode for terminal");
 

@@ -3,17 +3,19 @@
 // found in the LICENSE file.
 
 use std::cmp::min;
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug, Display};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use libc::EINVAL;
-use qcow::{QcowFile, QCOW_MAGIC};
 use remain::sorted;
 use sys_util::{
-    AsRawFds, FileGetLen, FileReadWriteAtVolatile, FileSetLen, FileSync, PunchHole, SeekHole,
+    AsRawFds, FileAllocate, FileReadWriteAtVolatile, FileSetLen, FileSync, PunchHole, SeekHole,
     WriteZeroesAt,
 };
+
+mod qcow;
+pub use qcow::{QcowFile, QCOW_MAGIC};
 
 #[cfg(feature = "composite-disk")]
 mod composite;
@@ -38,28 +40,48 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A trait for getting the length of a disk image or raw block device.
+pub trait DiskGetLen {
+    /// Get the current length of the disk in bytes.
+    fn get_len(&self) -> io::Result<u64>;
+}
+
+impl DiskGetLen for File {
+    fn get_len(&self) -> io::Result<u64> {
+        let mut s = self;
+        let orig_seek = s.seek(SeekFrom::Current(0))?;
+        let end = s.seek(SeekFrom::End(0))? as u64;
+        s.seek(SeekFrom::Start(orig_seek))?;
+        Ok(end)
+    }
+}
+
 /// The prerequisites necessary to support a block device.
 #[rustfmt::skip] // rustfmt won't wrap the long list of trait bounds.
 pub trait DiskFile:
     FileSetLen
-    + FileGetLen
+    + DiskGetLen
     + FileSync
     + FileReadWriteAtVolatile
     + PunchHole
     + WriteZeroesAt
+    + FileAllocate
     + Send
     + AsRawFds
+    + Debug
 {
 }
 impl<
         D: FileSetLen
-            + FileGetLen
+            + DiskGetLen
             + FileSync
             + PunchHole
             + FileReadWriteAtVolatile
             + WriteZeroesAt
+            + FileAllocate
             + Send
-            + AsRawFds,
+            + AsRawFds
+            + Debug,
     > DiskFile for D
 {
 }

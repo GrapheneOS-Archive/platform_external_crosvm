@@ -9,12 +9,12 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::os::unix::io::RawFd;
 
-use crate::{create_disk_file, DiskFile, ImageType};
+use crate::{create_disk_file, DiskFile, DiskGetLen, ImageType};
 use data_model::VolatileSlice;
 use protos::cdisk_spec;
 use remain::sorted;
 use sys_util::{
-    AsRawFds, FileGetLen, FileReadWriteAtVolatile, FileSetLen, FileSync, PunchHole, WriteZeroesAt,
+    AsRawFds, FileAllocate, FileReadWriteAtVolatile, FileSetLen, FileSync, PunchHole, WriteZeroesAt,
 };
 
 #[sorted]
@@ -51,6 +51,7 @@ impl Display for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug)]
 struct ComponentDiskPart {
     file: Box<dyn DiskFile>,
     offset: u64,
@@ -67,6 +68,7 @@ impl ComponentDiskPart {
 /// disk by a protocol buffer file that lists out the component file locations and their offsets
 /// and lengths on the virtual disk. The spaces covered by the component disks must be contiguous
 /// and not overlapping.
+#[derive(Debug)]
 pub struct CompositeDiskFile {
     component_disks: Vec<ComponentDiskPart>,
 }
@@ -210,7 +212,7 @@ impl CompositeDiskFile {
     }
 }
 
-impl FileGetLen for CompositeDiskFile {
+impl DiskGetLen for CompositeDiskFile {
     fn get_len(&self) -> io::Result<u64> {
         Ok(self.length())
     }
@@ -281,6 +283,27 @@ impl PunchHole for CompositeDiskFile {
                 continue;
             }
             let result = disk.file.punch_hole(
+                intersection.start - disk.offset,
+                intersection.end - intersection.start,
+            );
+            if result.is_err() {
+                return result;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl FileAllocate for CompositeDiskFile {
+    fn allocate(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        let range = offset..(offset + length);
+        let disks = self.disks_in_range(&range);
+        for disk in disks {
+            let intersection = range_intersection(&range, &disk.range());
+            if intersection.start >= intersection.end {
+                continue;
+            }
+            let result = disk.file.allocate(
                 intersection.start - disk.offset,
                 intersection.end - intersection.start,
             );

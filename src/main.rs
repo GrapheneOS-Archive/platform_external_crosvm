@@ -23,8 +23,8 @@ use crosvm::{
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::{GpuParameters, DEFAULT_GPU_PARAMS};
 use devices::{SerialParameters, SerialType};
+use disk::QcowFile;
 use msg_socket::{MsgReceiver, MsgSender, MsgSocket};
-use qcow::QcowFile;
 use sys_util::{
     debug, error, getpid, info, kill_process_group, net::UnixSeqpacket, reap_child, syslog,
     validate_raw_fd, warn,
@@ -629,19 +629,45 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 )
         }
         "wayland-sock" => {
-            if cfg.wayland_socket_path.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`wayland-sock` already given".to_owned(),
-                ));
+            let mut components = value.unwrap().split(',');
+            let path =
+                PathBuf::from(
+                    components
+                        .next()
+                        .ok_or_else(|| argument::Error::InvalidValue {
+                            value: value.unwrap().to_owned(),
+                            expected: "missing socket path",
+                        })?,
+                );
+            let mut name = "";
+            for c in components {
+                let mut kv = c.splitn(2, '=');
+                let (kind, value) = match (kv.next(), kv.next()) {
+                    (Some(kind), Some(value)) => (kind, value),
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: c.to_owned(),
+                            expected: "option must be of the form `kind=value`",
+                        })
+                    }
+                };
+                match kind {
+                    "name" => name = value,
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: kind.to_owned(),
+                            expected: "unrecognized option",
+                        })
+                    }
+                }
             }
-            let wayland_socket_path = PathBuf::from(value.unwrap());
-            if !wayland_socket_path.exists() {
-                return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_string(),
-                    expected: "Wayland socket does not exist",
-                });
+            if cfg.wayland_socket_paths.contains_key(name) {
+                return Err(argument::Error::TooManyArguments(format!(
+                    "wayland socket name already used: '{}'",
+                    name
+                )));
             }
-            cfg.wayland_socket_path = Some(wayland_socket_path);
+            cfg.wayland_socket_paths.insert(name.to_string(), path);
         }
         #[cfg(feature = "wl-dmabuf")]
         "wayland-dmabuf" => cfg.wayland_dmabuf = true,
@@ -801,6 +827,23 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.seccomp_policy_dir = PathBuf::from(value.unwrap());
         }
         "seccomp-log-failures" => {
+            // A side-effect of this flag is to force the use of .policy files
+            // instead of .bpf files (.bpf files are expected and assumed to be
+            // compiled to fail an unpermitted action with "trap").
+            // Normally crosvm will first attempt to use a .bpf file, and if
+            // not present it will then try to use a .policy file.  It's up
+            // to the build to decide which of these files is present for
+            // crosvm to use (for CrOS the build will use .bpf files for
+            // x64 builds and .policy files for arm/arm64 builds).
+            //
+            // This flag will likely work as expected for builds that use
+            // .policy files.  For builds that only use .bpf files the initial
+            // result when using this flag is likely to be a file-not-found
+            // error (since the .policy files are not present).
+            // For .bpf builds you can either 1) manually add the .policy files,
+            // or 2) do not use this command-line parameter and instead
+            // temporarily change the build by passing "log" rather than
+            // "trap" as the "--default-action" to compile_seccomp_policy.py.
             cfg.seccomp_log_failures = true;
         }
         "plugin" => {
@@ -1038,7 +1081,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::value("x-display", "DISPLAY", "X11 display name to use."),
           Argument::flag("display-window-keyboard", "Capture keyboard input from the display window."),
           Argument::flag("display-window-mouse", "Capture keyboard input from the display window."),
-          Argument::value("wayland-sock", "PATH", "Path to the Wayland socket to use."),
+          Argument::value("wayland-sock", "PATH[,name=NAME]", "Path to the Wayland socket to use. The unnamed one is used for displaying virtual screens. Named ones are only for IPC."),
           #[cfg(feature = "wl-dmabuf")]
           Argument::flag("wayland-dmabuf", "Enable support for DMABufs in Wayland device."),
           Argument::short_value('s',
@@ -1162,7 +1205,7 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
             Ok(())
         }
         Err(e) => {
-            println!("{}", e);
+            error!("{}", e);
             Err(())
         }
     }
@@ -1516,6 +1559,19 @@ fn print_usage() {
     println!("    create_qcow2  - Create a new qcow2 disk image file.");
     println!("    disk - Manage attached virtual disk devices.");
     println!("    usb - Manage attached virtual USB devices.");
+    println!("    version - Show package version.");
+}
+
+fn pkg_version() -> std::result::Result<(), ()> {
+    const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
+    const PKG_VERSION: Option<&'static str> = option_env!("PKG_VERSION");
+
+    print!("crosvm {}", VERSION.unwrap_or("UNKNOWN"));
+    match PKG_VERSION {
+        Some(v) => println!("-{}", v),
+        None => println!(""),
+    }
+    Ok(())
 }
 
 fn crosvm_main() -> std::result::Result<(), ()> {
@@ -1546,6 +1602,7 @@ fn crosvm_main() -> std::result::Result<(), ()> {
         Some("create_qcow2") => create_qcow2(args),
         Some("disk") => disk_cmd(args),
         Some("usb") => modify_usb(args),
+        Some("version") => pkg_version(),
         Some(c) => {
             println!("invalid subcommand: {:?}", c);
             print_usage();

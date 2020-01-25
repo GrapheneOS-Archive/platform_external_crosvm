@@ -39,21 +39,18 @@ impl<T: Vhost> Worker<T> {
         }
     }
 
-    pub fn run<F>(
+    pub fn run<F1, F2>(
         &mut self,
         queue_evts: Vec<EventFd>,
         queue_sizes: &[u16],
         kill_evt: EventFd,
-        activate_vqs: F,
+        activate_vqs: F1,
+        cleanup_vqs: F2,
     ) -> Result<()>
     where
-        F: FnOnce(&T) -> Result<()>,
+        F1: FnOnce(&T) -> Result<()>,
+        F2: FnOnce(&T) -> Result<()>,
     {
-        // Preliminary setup for vhost net.
-        self.vhost_handle
-            .set_owner()
-            .map_err(Error::VhostSetOwner)?;
-
         let avail_features = self
             .vhost_handle
             .get_features()
@@ -135,6 +132,7 @@ impl<T: Vhost> Worker<T> {
                 }
             }
         }
+        cleanup_vqs(&self.vhost_handle)?;
         Ok(())
     }
 }
