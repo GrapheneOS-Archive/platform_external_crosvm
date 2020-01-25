@@ -6,8 +6,8 @@ rust_library_host_rlib {
     crate_name: "disk",
     srcs: ["src/disk.rs"],
     rlibs: [
+        "libdata_model",
         "liblibc",
-        "libqcow",
         "libsys_util",
     ],
     proc_macros: [
