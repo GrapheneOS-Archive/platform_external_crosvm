@@ -16,12 +16,13 @@ use std::string::String;
 use std::thread::sleep;
 use std::time::Duration;
 
+use arch::Pstore;
 use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
     linux, BindMount, Config, DiskOption, Executable, GidMap, SharedDir, TouchDeviceOption,
 };
 #[cfg(feature = "gpu")]
-use devices::virtio::gpu::{GpuParameters, DEFAULT_GPU_PARAMS};
+use devices::virtio::gpu::{GpuMode, GpuParameters, DEFAULT_GPU_PARAMS};
 use devices::{SerialParameters, SerialType};
 use disk::QcowFile;
 use msg_socket::{MsgReceiver, MsgSender, MsgSocket};
@@ -123,6 +124,12 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
 
         for (k, v) in opts {
             match k {
+                "2d" | "2D" => {
+                    gpu_params.mode = GpuMode::Mode2D;
+                }
+                "3d" | "3D" => {
+                    gpu_params.mode = GpuMode::Mode3D;
+                }
                 "egl" => match v {
                     "true" | "" => {
                         gpu_params.renderer_use_egl = true;
@@ -575,6 +582,47 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 read_only: !name.starts_with("rw"),
                 sparse: false,
                 block_size: sys_util::pagesize() as u32,
+            });
+        }
+        "pstore" => {
+            if cfg.pstore.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`pstore` already given".to_owned(),
+                ));
+            }
+
+            let value = value.unwrap();
+            let components: Vec<&str> = value.split(',').collect();
+            if components.len() != 2 {
+                return Err(argument::Error::InvalidValue {
+                    value: value.to_owned(),
+                    expected: "pstore must have exactly 2 components: path=<path>,size=<size>",
+                });
+            }
+            cfg.pstore = Some(Pstore {
+                path: {
+                    if components[0].len() <= 5 || !components[0].starts_with("path=") {
+                        return Err(argument::Error::InvalidValue {
+                            value: components[0].to_owned(),
+                            expected: "pstore path must follow with `path=`",
+                        });
+                    };
+                    PathBuf::from(&components[0][5..])
+                },
+                size: {
+                    if components[1].len() <= 5 || !components[1].starts_with("size=") {
+                        return Err(argument::Error::InvalidValue {
+                            value: components[1].to_owned(),
+                            expected: "pstore size must follow with `size=`",
+                        });
+                    };
+                    components[1][5..]
+                        .parse()
+                        .map_err(|_| argument::Error::InvalidValue {
+                            value: value.to_owned(),
+                            expected: "pstore size must be an integer",
+                        })?
+                },
             });
         }
         "host_ip" => {
@@ -1059,6 +1107,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::value("rwqcow", "PATH", "Path to a writable qcow2 disk image. (Deprecated; use --rwdisk instead.)"),
           Argument::value("rw-pmem-device", "PATH", "Path to a writable disk image."),
           Argument::value("pmem-device", "PATH", "Path to a disk image."),
+          Argument::value("pstore", "path=PATH,size=SIZE", "Path to pstore buffer backend file follewed by size."),
           Argument::value("host_ip",
                           "IP",
                           "IP address to assign to host tap interface."),
