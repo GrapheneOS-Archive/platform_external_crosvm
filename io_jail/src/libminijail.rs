@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 use libc::{gid_t, pid_t, rlim64_t, uid_t};
-use std::os::raw::{c_char, c_int, c_long, c_ulong};
+use std::os::raw::{c_char, c_int, c_ulong};
 
 /// Struct minijail is an opaque type inside libminijail.
 /// See the minijail man page for a description of functions.
@@ -38,7 +38,7 @@ extern "C" {
     pub fn minijail_new_session_keyring(j: *mut minijail);
     pub fn minijail_skip_setting_securebits(j: *mut minijail, securebits_skip_mask: u64);
     pub fn minijail_skip_remount_private(j: *mut minijail);
-    pub fn minijail_remount_mode(j: *mut minijail, mode: c_long);
+    pub fn minijail_remount_mode(j: *mut minijail, mode: c_ulong);
     pub fn minijail_namespace_ipc(j: *mut minijail);
     pub fn minijail_namespace_uts(j: *mut minijail);
     pub fn minijail_namespace_set_hostname(j: *mut minijail, name: *const c_char) -> c_int;

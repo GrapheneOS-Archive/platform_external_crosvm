@@ -62,7 +62,10 @@ use vm_control::{
     VmRunMode,
 };
 
-use crate::{Config, DiskOption, Executable, SharedDir, SharedDirKind, TouchDeviceOption};
+use crate::{
+    Config, DiskOption, Executable, SharedDir, SharedDirKind, TouchDeviceOption,
+    DEFAULT_TOUCH_DEVICE_HEIGHT, DEFAULT_TOUCH_DEVICE_WIDTH,
+};
 
 use arch::{self, LinuxArch, RunnableLinuxVm, VirtioDeviceStub, VmComponents, VmImage};
 
@@ -301,55 +304,78 @@ fn get_max_open_files() -> Result<libc::rlim64_t> {
     }
 }
 
+struct SandboxConfig<'a> {
+    limit_caps: bool,
+    log_failures: bool,
+    seccomp_policy: &'a Path,
+    uid_map: Option<&'a str>,
+    gid_map: Option<&'a str>,
+}
+
 fn create_base_minijail(
     root: &Path,
-    log_failures: bool,
-    seccomp_policy: &Path,
+    r_limit: Option<u64>,
+    config: Option<&SandboxConfig>,
 ) -> Result<Minijail> {
     // All child jails run in a new user namespace without any users mapped,
     // they run as nobody unless otherwise configured.
     let mut j = Minijail::new().map_err(Error::DeviceJail)?;
-    j.namespace_pids();
-    j.namespace_user();
-    j.namespace_user_disable_setgroups();
-    // Don't need any capabilities.
-    j.use_caps(0);
+
+    if let Some(config) = config {
+        j.namespace_pids();
+        j.namespace_user();
+        j.namespace_user_disable_setgroups();
+        if config.limit_caps {
+            // Don't need any capabilities.
+            j.use_caps(0);
+        }
+        if let Some(uid_map) = config.uid_map {
+            j.uidmap(uid_map).map_err(Error::SettingUidMap)?;
+        }
+        if let Some(gid_map) = config.gid_map {
+            j.gidmap(gid_map).map_err(Error::SettingGidMap)?;
+        }
+        // Run in an empty network namespace.
+        j.namespace_net();
+        // Apply the block device seccomp policy.
+        j.no_new_privs();
+
+        // By default we'll prioritize using the pre-compiled .bpf over the .policy
+        // file (the .bpf is expected to be compiled using "trap" as the failure
+        // behavior instead of the default "kill" behavior).
+        // Refer to the code comment for the "seccomp-log-failures"
+        // command-line parameter for an explanation about why the |log_failures|
+        // flag forces the use of .policy files (and the build-time alternative to
+        // this run-time flag).
+        let bpf_policy_file = config.seccomp_policy.with_extension("bpf");
+        if bpf_policy_file.exists() && !config.log_failures {
+            j.parse_seccomp_program(&bpf_policy_file)
+                .map_err(Error::DeviceJail)?;
+        } else {
+            // Use TSYNC only for the side effect of it using SECCOMP_RET_TRAP,
+            // which will correctly kill the entire device process if a worker
+            // thread commits a seccomp violation.
+            j.set_seccomp_filter_tsync();
+            if config.log_failures {
+                j.log_seccomp_filter_failures();
+            }
+            j.parse_seccomp_filters(&config.seccomp_policy.with_extension("policy"))
+                .map_err(Error::DeviceJail)?;
+        }
+        j.use_seccomp_filter();
+        // Don't do init setup.
+        j.run_as_init();
+    }
+
     // Create a new mount namespace with an empty root FS.
     j.namespace_vfs();
     j.enter_pivot_root(root).map_err(Error::DevicePivotRoot)?;
-    // Run in an empty network namespace.
-    j.namespace_net();
-    // Most devices don't need to open many fds.
-    j.set_rlimit(libc::RLIMIT_NOFILE as i32, 1024, 1024)
-        .map_err(Error::SettingMaxOpenFiles)?;
-    // Apply the block device seccomp policy.
-    j.no_new_privs();
 
-    // By default we'll prioritize using the pre-compiled .bpf over the .policy
-    // file (the .bpf is expected to be compiled using "trap" as the failure
-    // behavior instead of the default "kill" behavior).
-    // Refer to the code comment for the "seccomp-log-failures"
-    // command-line parameter for an explanation about why the |log_failures|
-    // flag forces the use of .policy files (and the build-time alternative to
-    // this run-time flag).
-    let bpf_policy_file = seccomp_policy.with_extension("bpf");
-    if bpf_policy_file.exists() && !log_failures {
-        j.parse_seccomp_program(&bpf_policy_file)
-            .map_err(Error::DeviceJail)?;
-    } else {
-        // Use TSYNC only for the side effect of it using SECCOMP_RET_TRAP,
-        // which will correctly kill the entire device process if a worker
-        // thread commits a seccomp violation.
-        j.set_seccomp_filter_tsync();
-        if log_failures {
-            j.log_seccomp_filter_failures();
-        }
-        j.parse_seccomp_filters(&seccomp_policy.with_extension("policy"))
-            .map_err(Error::DeviceJail)?;
-    }
-    j.use_seccomp_filter();
-    // Don't do init setup.
-    j.run_as_init();
+    // Most devices don't need to open many fds.
+    let limit = if let Some(r) = r_limit { r } else { 1024u64 };
+    j.set_rlimit(libc::RLIMIT_NOFILE as i32, limit, limit)
+        .map_err(Error::SettingMaxOpenFiles)?;
+
     Ok(j)
 }
 
@@ -362,11 +388,14 @@ fn simple_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
             return Err(Error::PivotRootDoesntExist(pivot_root));
         }
         let policy_path: PathBuf = cfg.seccomp_policy_dir.join(policy);
-        Ok(Some(create_base_minijail(
-            root_path,
-            cfg.seccomp_log_failures,
-            &policy_path,
-        )?))
+        let config = SandboxConfig {
+            limit_caps: true,
+            log_failures: cfg.seccomp_log_failures,
+            seccomp_policy: &policy_path,
+            uid_map: None,
+            gid_map: None,
+        };
+        Ok(Some(create_base_minijail(root_path, None, Some(&config))?))
     } else {
         Ok(None)
     }
@@ -473,13 +502,16 @@ fn create_tpm_device(cfg: &Config) -> DeviceResult {
 }
 
 fn create_single_touch_device(cfg: &Config, single_touch_spec: &TouchDeviceOption) -> DeviceResult {
-    let socket = single_touch_spec.path.into_unix_stream().map_err(|e| {
-        error!("failed configuring virtio single touch: {:?}", e);
-        e
-    })?;
+    let socket = single_touch_spec
+        .get_path()
+        .into_unix_stream()
+        .map_err(|e| {
+            error!("failed configuring virtio single touch: {:?}", e);
+            e
+        })?;
 
-    let dev = virtio::new_single_touch(socket, single_touch_spec.width, single_touch_spec.height)
-        .map_err(Error::InputDeviceNew)?;
+    let (width, height) = single_touch_spec.get_size();
+    let dev = virtio::new_single_touch(socket, width, height).map_err(Error::InputDeviceNew)?;
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
         jail: simple_jail(&cfg, "input_device")?,
@@ -487,13 +519,13 @@ fn create_single_touch_device(cfg: &Config, single_touch_spec: &TouchDeviceOptio
 }
 
 fn create_trackpad_device(cfg: &Config, trackpad_spec: &TouchDeviceOption) -> DeviceResult {
-    let socket = trackpad_spec.path.into_unix_stream().map_err(|e| {
+    let socket = trackpad_spec.get_path().into_unix_stream().map_err(|e| {
         error!("failed configuring virtio trackpad: {}", e);
         e
     })?;
 
-    let dev = virtio::new_trackpad(socket, trackpad_spec.width, trackpad_spec.height)
-        .map_err(Error::InputDeviceNew)?;
+    let (width, height) = trackpad_spec.get_size();
+    let dev = virtio::new_trackpad(socket, width, height).map_err(Error::InputDeviceNew)?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
@@ -768,45 +800,20 @@ fn create_fs_device(
     tag: &str,
     fs_cfg: virtio::fs::passthrough::Config,
 ) -> DeviceResult {
-    let mut j = Minijail::new().map_err(Error::DeviceJail)?;
-
-    if cfg.sandbox {
-        j.namespace_pids();
-        j.namespace_user();
-        j.namespace_user_disable_setgroups();
-        j.uidmap(uid_map).map_err(Error::SettingUidMap)?;
-        j.gidmap(gid_map).map_err(Error::SettingGidMap)?;
-
-        // Run in an empty network namespace.
-        j.namespace_net();
-
-        j.no_new_privs();
-
-        // Use TSYNC only for the side effect of it using SECCOMP_RET_TRAP, which will correctly kill
-        // the entire device process if a worker thread commits a seccomp violation.
-        let seccomp_policy = cfg.seccomp_policy_dir.join("fs_device");
-        j.set_seccomp_filter_tsync();
-        if cfg.seccomp_log_failures {
-            j.log_seccomp_filter_failures();
-        }
-        j.parse_seccomp_filters(&seccomp_policy)
-            .map_err(Error::DeviceJail)?;
-        j.use_seccomp_filter();
-
-        // Don't do init setup.
-        j.run_as_init();
-    }
-
-    // Create a new mount namespace with the source directory as the root. We need this even when
-    // sandboxing is disabled as the server relies on the host kernel to prevent path traversals
-    // from leaking out of the shared directory.
-    j.namespace_vfs();
-    j.enter_pivot_root(src).map_err(Error::DevicePivotRoot)?;
-
-    // The file server opens a lot of fds and needs a really high open file limit.
     let max_open_files = get_max_open_files()?;
-    j.set_rlimit(libc::RLIMIT_NOFILE as i32, max_open_files, max_open_files)
-        .map_err(Error::SettingMaxOpenFiles)?;
+    let j = if cfg.sandbox {
+        let seccomp_policy = cfg.seccomp_policy_dir.join("fs_device");
+        let config = SandboxConfig {
+            limit_caps: false,
+            uid_map: Some(uid_map),
+            gid_map: Some(gid_map),
+            log_failures: cfg.seccomp_log_failures,
+            seccomp_policy: &seccomp_policy,
+        };
+        create_base_minijail(src, Some(max_open_files), Some(&config))?
+    } else {
+        create_base_minijail(src, Some(max_open_files), None)?
+    };
 
     // TODO(chirantan): Use more than one worker once the kernel driver has been fixed to not panic
     // when num_queues > 1.
@@ -824,6 +831,10 @@ fn create_9p_device(cfg: &Config, src: &Path, tag: &str) -> DeviceResult {
             //  The shared directory becomes the root of the device's file system.
             let root = Path::new("/");
             jail.mount_bind(src, root, true)?;
+
+            // We want bind mounts from the parent namespaces to propagate into the 9p server's
+            // namespace.
+            jail.set_remount_mode(libc::MS_SLAVE);
 
             add_crosvm_user_to_jail(&mut jail, "p9")?;
             (Some(jail), root)
@@ -1026,8 +1037,17 @@ fn create_virtio_devices(
                 // TODO(nkgold): the width/height here should match the display's height/width. When
                 // those settings are available as CLI options, we should use the CLI options here
                 // as well.
-                let dev = virtio::new_single_touch(virtio_dev_socket, 1280, 1024)
-                    .map_err(Error::InputDeviceNew)?;
+                let (single_touch_width, single_touch_height) = cfg
+                    .virtio_single_touch
+                    .as_ref()
+                    .map(|single_touch_spec| single_touch_spec.get_size())
+                    .unwrap_or((DEFAULT_TOUCH_DEVICE_WIDTH, DEFAULT_TOUCH_DEVICE_HEIGHT));
+                let dev = virtio::new_single_touch(
+                    virtio_dev_socket,
+                    single_touch_width,
+                    single_touch_height,
+                )
+                .map_err(Error::InputDeviceNew)?;
                 devs.push(VirtioDeviceStub {
                     dev: Box::new(dev),
                     jail: simple_jail(&cfg, "input_device")?,
@@ -1619,6 +1639,7 @@ fn run_control(
     #[derive(PollToken)]
     enum Token {
         Exit,
+        Suspend,
         ChildSignal,
         CheckAvailableMemory,
         LowMemory,
@@ -1633,6 +1654,7 @@ fn run_control(
 
     let poll_ctx = PollContext::build_with(&[
         (&linux.exit_evt, Token::Exit),
+        (&linux.suspend_evt, Token::Suspend),
         (&sigchld_fd, Token::ChildSignal),
     ])
     .map_err(Error::PollContextAdd)?;
@@ -1724,6 +1746,14 @@ fn run_control(
                 Token::Exit => {
                     info!("vcpu requested shutdown");
                     break 'poll;
+                }
+                Token::Suspend => {
+                    info!("VM requested suspend");
+                    linux.suspend_evt.read().unwrap();
+                    run_mode_arc.set_and_notify(VmRunMode::Suspending);
+                    for handle in &vcpu_handles {
+                        let _ = handle.kill(SIGRTMIN() + 0);
+                    }
                 }
                 Token::ChildSignal => {
                     // Print all available siginfo structs, then exit the loop.
@@ -1860,6 +1890,17 @@ fn run_control(
                                             VmRunMode::Exiting => {
                                                 break 'poll;
                                             }
+                                            VmRunMode::Running => {
+                                                if let VmRunMode::Suspending =
+                                                    *run_mode_arc.mtx.lock()
+                                                {
+                                                    linux.io_bus.notify_resume();
+                                                }
+                                                run_mode_arc.set_and_notify(VmRunMode::Running);
+                                                for handle in &vcpu_handles {
+                                                    let _ = handle.kill(SIGRTMIN() + 0);
+                                                }
+                                            }
                                             other => {
                                                 run_mode_arc.set_and_notify(other);
                                                 for handle in &vcpu_handles {
@@ -1918,6 +1959,7 @@ fn run_control(
         for event in events.iter_hungup() {
             match event.token() {
                 Token::Exit => {}
+                Token::Suspend => {}
                 Token::ChildSignal => {}
                 Token::CheckAvailableMemory => {}
                 Token::LowMemory => {}

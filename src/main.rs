@@ -22,7 +22,7 @@ use crosvm::{
     linux, BindMount, Config, DiskOption, Executable, GidMap, SharedDir, TouchDeviceOption,
 };
 #[cfg(feature = "gpu")]
-use devices::virtio::gpu::{GpuMode, GpuParameters, DEFAULT_GPU_PARAMS};
+use devices::virtio::gpu::{GpuMode, GpuParameters};
 use devices::{SerialParameters, SerialType};
 use disk::QcowFile;
 use msg_socket::{MsgReceiver, MsgSender, MsgSocket};
@@ -114,7 +114,7 @@ fn parse_cpu_set(s: &str) -> argument::Result<Vec<usize>> {
 
 #[cfg(feature = "gpu")]
 fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
-    let mut gpu_params = DEFAULT_GPU_PARAMS;
+    let mut gpu_params: GpuParameters = Default::default();
 
     if let Some(s) = s {
         let opts = s
@@ -124,12 +124,37 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
 
         for (k, v) in opts {
             match k {
+                // Deprecated: Specifying --gpu=<mode> Not great as the mode can be set multiple
+                // times if the user specifies several modes (--gpu=2d,3d,gfxstream)
                 "2d" | "2D" => {
                     gpu_params.mode = GpuMode::Mode2D;
                 }
                 "3d" | "3D" => {
                     gpu_params.mode = GpuMode::Mode3D;
                 }
+                #[cfg(feature = "gfxstream")]
+                "gfxstream" => {
+                    gpu_params.mode = GpuMode::ModeGfxStream;
+                }
+                // Preferred: Specifying --gpu,backend=<mode>
+                "backend" => match v {
+                    "2d" | "2D" => {
+                        gpu_params.mode = GpuMode::Mode2D;
+                    }
+                    "3d" | "3D" => {
+                        gpu_params.mode = GpuMode::Mode3D;
+                    }
+                    #[cfg(feature = "gfxstream")]
+                    "gfxstream" => {
+                        gpu_params.mode = GpuMode::ModeGfxStream;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: "gpu parameter 'backend' should be one of (2d|3d|gfxstream)",
+                        });
+                    }
+                },
                 "egl" => match v {
                     "true" | "" => {
                         gpu_params.renderer_use_egl = true;
@@ -982,12 +1007,11 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             let mut single_touch_spec =
                 TouchDeviceOption::new(PathBuf::from(it.next().unwrap().to_owned()));
             if let Some(width) = it.next() {
-                single_touch_spec.width = width.trim().parse().unwrap();
+                single_touch_spec.set_width(width.trim().parse().unwrap());
             }
             if let Some(height) = it.next() {
-                single_touch_spec.height = height.trim().parse().unwrap();
+                single_touch_spec.set_height(height.trim().parse().unwrap());
             }
-
             cfg.virtio_single_touch = Some(single_touch_spec);
         }
         "trackpad" => {
@@ -1001,12 +1025,11 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             let mut trackpad_spec =
                 TouchDeviceOption::new(PathBuf::from(it.next().unwrap().to_owned()));
             if let Some(width) = it.next() {
-                trackpad_spec.width = width.trim().parse().unwrap();
+                trackpad_spec.set_width(width.trim().parse().unwrap());
             }
             if let Some(height) = it.next() {
-                trackpad_spec.height = height.trim().parse().unwrap();
+                trackpad_spec.set_height(height.trim().parse().unwrap());
             }
-
             cfg.virtio_trackpad = Some(trackpad_spec);
         }
         "mouse" => {
@@ -1070,6 +1093,44 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
 
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Error> {
+    if cfg.executable_path.is_none() {
+        return Err(argument::Error::ExpectedArgument("`KERNEL`".to_owned()));
+    }
+    if cfg.host_ip.is_some() || cfg.netmask.is_some() || cfg.mac_address.is_some() {
+        if cfg.host_ip.is_none() {
+            return Err(argument::Error::ExpectedArgument(
+                "`host_ip` missing from network config".to_owned(),
+            ));
+        }
+        if cfg.netmask.is_none() {
+            return Err(argument::Error::ExpectedArgument(
+                "`netmask` missing from network config".to_owned(),
+            ));
+        }
+        if cfg.mac_address.is_none() {
+            return Err(argument::Error::ExpectedArgument(
+                "`mac` missing from network config".to_owned(),
+            ));
+        }
+    }
+    if cfg.plugin_root.is_some() && !executable_is_plugin(&cfg.executable_path) {
+        return Err(argument::Error::ExpectedArgument(
+            "`plugin-root` requires `plugin`".to_owned(),
+        ));
+    }
+    #[cfg(feature = "gpu")]
+    {
+        if let Some(gpu_parameters) = cfg.gpu_parameters.as_ref() {
+            let (width, height) = (gpu_parameters.display_width, gpu_parameters.display_height);
+            if let Some(virtio_single_touch) = cfg.virtio_single_touch.as_mut() {
+                virtio_single_touch.set_default_size(width, height);
+            }
+        }
     }
     Ok(())
 }
@@ -1173,6 +1234,7 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
                                   "[width=INT,height=INT]",
                                   "(EXPERIMENTAL) Comma separated key=value pairs for setting up a virtio-gpu device
                                   Possible key values:
+                                  backend=(2d|3d|gfxstream) - Which backend to use for virtio-gpu (determining rendering protocol)
                                   width=INT - The width of the virtual display connected to the virtio-gpu.
                                   height=INT - The height of the virtual display connected to the virtio-gpu.
                                   egl[=true|=false] - If the virtio-gpu backend should use a EGL context for rendering.
@@ -1196,34 +1258,7 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
     let match_res = set_arguments(args, &arguments[..], |name, value| {
         set_argument(&mut cfg, name, value)
     })
-    .and_then(|_| {
-        if cfg.executable_path.is_none() {
-            return Err(argument::Error::ExpectedArgument("`KERNEL`".to_owned()));
-        }
-        if cfg.host_ip.is_some() || cfg.netmask.is_some() || cfg.mac_address.is_some() {
-            if cfg.host_ip.is_none() {
-                return Err(argument::Error::ExpectedArgument(
-                    "`host_ip` missing from network config".to_owned(),
-                ));
-            }
-            if cfg.netmask.is_none() {
-                return Err(argument::Error::ExpectedArgument(
-                    "`netmask` missing from network config".to_owned(),
-                ));
-            }
-            if cfg.mac_address.is_none() {
-                return Err(argument::Error::ExpectedArgument(
-                    "`mac` missing from network config".to_owned(),
-                ));
-            }
-        }
-        if cfg.plugin_root.is_some() && !executable_is_plugin(&cfg.executable_path) {
-            return Err(argument::Error::ExpectedArgument(
-                "`plugin-root` requires `plugin`".to_owned(),
-            ));
-        }
-        Ok(())
-    });
+    .and_then(|_| validate_arguments(&mut cfg));
 
     match match_res {
         #[cfg(feature = "plugin")]
@@ -1731,6 +1766,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crosvm::{DEFAULT_TOUCH_DEVICE_HEIGHT, DEFAULT_TOUCH_DEVICE_WIDTH};
 
     #[test]
     fn parse_cpu_set_single() {
@@ -1920,5 +1956,111 @@ mod tests {
             .expect_err("parse should fail because outer is not a number");
         set_argument(&mut config, "plugin-gid-map", Some("1:2:blah"))
             .expect_err("parse should fail because count is not a number");
+    }
+
+    #[test]
+    fn single_touch_spec_and_track_pad_spec_default_size() {
+        let mut config = Config::default();
+        config
+            .executable_path
+            .replace(Executable::Kernel(PathBuf::from("kernel")));
+        set_argument(&mut config, "single-touch", Some("/dev/single-touch-test")).unwrap();
+        set_argument(&mut config, "trackpad", Some("/dev/single-touch-test")).unwrap();
+        validate_arguments(&mut config).unwrap();
+        assert_eq!(
+            config.virtio_single_touch.unwrap().get_size(),
+            (DEFAULT_TOUCH_DEVICE_WIDTH, DEFAULT_TOUCH_DEVICE_HEIGHT)
+        );
+        assert_eq!(
+            config.virtio_trackpad.unwrap().get_size(),
+            (DEFAULT_TOUCH_DEVICE_WIDTH, DEFAULT_TOUCH_DEVICE_HEIGHT)
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn single_touch_spec_default_size_from_gpu() {
+        let width = 12345u32;
+        let height = 54321u32;
+        let mut config = Config::default();
+        config
+            .executable_path
+            .replace(Executable::Kernel(PathBuf::from("kernel")));
+        set_argument(&mut config, "single-touch", Some("/dev/single-touch-test")).unwrap();
+        set_argument(
+            &mut config,
+            "gpu",
+            Some(&format!("width={},height={}", width, height)),
+        )
+        .unwrap();
+        validate_arguments(&mut config).unwrap();
+        assert_eq!(
+            config.virtio_single_touch.unwrap().get_size(),
+            (width, height)
+        );
+    }
+
+    #[test]
+    fn single_touch_spec_and_track_pad_spec_with_size() {
+        let width = 12345u32;
+        let height = 54321u32;
+        let mut config = Config::default();
+        config
+            .executable_path
+            .replace(Executable::Kernel(PathBuf::from("kernel")));
+        set_argument(
+            &mut config,
+            "single-touch",
+            Some(&format!("/dev/single-touch-test:{}:{}", width, height)),
+        )
+        .unwrap();
+        set_argument(
+            &mut config,
+            "trackpad",
+            Some(&format!("/dev/single-touch-test:{}:{}", width, height)),
+        )
+        .unwrap();
+        validate_arguments(&mut config).unwrap();
+        assert_eq!(
+            config.virtio_single_touch.unwrap().get_size(),
+            (width, height)
+        );
+        assert_eq!(config.virtio_trackpad.unwrap().get_size(), (width, height));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn single_touch_spec_with_size_independent_from_gpu() {
+        let touch_width = 12345u32;
+        let touch_height = 54321u32;
+        let display_width = 1234u32;
+        let display_height = 5432u32;
+        let mut config = Config::default();
+        config
+            .executable_path
+            .replace(Executable::Kernel(PathBuf::from("kernel")));
+        set_argument(
+            &mut config,
+            "single-touch",
+            Some(&format!(
+                "/dev/single-touch-test:{}:{}",
+                touch_width, touch_height
+            )),
+        )
+        .unwrap();
+        set_argument(
+            &mut config,
+            "gpu",
+            Some(&format!(
+                "width={},height={}",
+                display_width, display_height
+            )),
+        )
+        .unwrap();
+        validate_arguments(&mut config).unwrap();
+        assert_eq!(
+            config.virtio_single_touch.unwrap().get_size(),
+            (touch_width, touch_height)
+        );
     }
 }

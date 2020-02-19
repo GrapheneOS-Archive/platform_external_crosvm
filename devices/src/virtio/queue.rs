@@ -8,12 +8,15 @@ use std::sync::atomic::{fence, Ordering};
 
 use sys_util::{error, GuestAddress, GuestMemory};
 
-use super::VIRTIO_MSI_NO_VECTOR;
+use super::{Interrupt, VIRTIO_MSI_NO_VECTOR};
 
 const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 const VIRTQ_DESC_F_WRITE: u16 = 0x2;
 #[allow(dead_code)]
 const VIRTQ_DESC_F_INDIRECT: u16 = 0x4;
+
+const VIRTQ_USED_F_NO_NOTIFY: u16 = 0x1;
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 0x1;
 
 /// An iterator over a single descriptor chain.  Not to be confused with AvailIter,
 /// which iterates over the descriptor chain heads in a queue.
@@ -317,6 +320,8 @@ impl Queue {
         let queue_size = self.actual_size();
         let avail_index_addr = mem.checked_offset(self.avail_ring, 2).unwrap();
         let avail_index: u16 = mem.read_obj_from_addr(avail_index_addr).unwrap();
+        // make sure desc_index read doesn't bypass avail_index read
+        fence(Ordering::Acquire);
         let avail_len = Wrapping(avail_index) - self.next_avail;
 
         if avail_len.0 > queue_size || self.next_avail == Wrapping(avail_index) {
@@ -378,5 +383,34 @@ impl Queue {
 
         mem.write_obj_at_addr(self.next_used.0 as u16, used_ring.unchecked_add(2))
             .unwrap();
+    }
+
+    /// Enable / Disable guest notify device that requests are available on
+    /// the descriptor chain.
+    pub fn set_notify(&mut self, mem: &GuestMemory, enable: bool) {
+        let mut used_flags: u16 = mem.read_obj_from_addr(self.used_ring).unwrap();
+        if enable {
+            used_flags &= !VIRTQ_USED_F_NO_NOTIFY;
+        } else {
+            used_flags |= VIRTQ_USED_F_NO_NOTIFY;
+        }
+        mem.write_obj_at_addr(used_flags, self.used_ring).unwrap();
+    }
+
+    // Check Whether guest enable interrupt injection or not.
+    fn available_interrupt_enabled(&self, mem: &GuestMemory) -> bool {
+        let avail_flags: u16 = mem.read_obj_from_addr(self.avail_ring).unwrap();
+        if avail_flags & VIRTQ_AVAIL_F_NO_INTERRUPT == VIRTQ_AVAIL_F_NO_INTERRUPT {
+            false
+        } else {
+            true
+        }
+    }
+
+    /// inject interrupt into guest on this queue
+    pub fn trigger_interrupt(&self, mem: &GuestMemory, interrupt: &Interrupt) {
+        if self.available_interrupt_enabled(mem) {
+            interrupt.signal_used_queue(self.vector);
+        }
     }
 }
