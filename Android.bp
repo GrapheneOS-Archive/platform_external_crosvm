@@ -24,6 +24,9 @@ rust_binary_host {
             relative_install_path: "x86_64-linux-gnu",
             rlibs: ["libx86_64_rust"],
         },
+        darwin: {
+            enabled: false,
+        },
     },
 
     // Install the crosvm prebuilts as requirements until we're building these as well.
@@ -38,6 +41,7 @@ rust_binary_host {
         "gpu",
         "x",
     ],
+
     flags: [
         "-C overflow-checks=y",
         "-C panic=abort",
@@ -53,9 +57,8 @@ rust_binary_host {
         "libassertions",
         "libaudio_streams",
         "libbit_field",
-        "libbyteorder",
-        "libdata_model",
         "libcrosvm",
+        "libdata_model",
         "libdevices",
         "libdisk",
         "libio_jail",
@@ -65,6 +68,7 @@ rust_binary_host {
         "libkvm_sys",
         "liblibc",
         "liblibcras",
+        "libminijail_sys",
         "libmsg_socket",
         "libnet_util",
         "libp9",
@@ -118,6 +122,7 @@ rust_library_host_rlib {
         "libkvm_sys",
         "liblibc",
         "liblibcras",
+        "libminijail_sys",
         "libmsg_socket",
         "libnet_util",
         "libp9",

@@ -7,6 +7,6 @@ rust_library_host_rlib {
     srcs: ["src/lib.rs"],
     rlibs: [
         "liblibc",
-        "libnet_sys",
+        "libminijail_sys",
     ],
 }
