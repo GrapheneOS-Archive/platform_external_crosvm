@@ -12,6 +12,6 @@ rust_library_host_rlib {
         "libsys_util",
     ],
     proc_macros: [
-        "libremain",
+        "libremain-0.1.3",
     ],
 }
