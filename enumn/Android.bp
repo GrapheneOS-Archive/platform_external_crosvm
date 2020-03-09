@@ -8,6 +8,6 @@ rust_proc_macro {
     rlibs: [
         "libproc_macro2",
         "libquote",
-        "libsyn",
+        "libsyn-0.15.42",
     ],
 }
