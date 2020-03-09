@@ -38,6 +38,6 @@ rust_library_host_rlib {
     proc_macros: [
         "libenumn",
         "libmsg_on_socket_derive",
-        "libremain",
+        "libremain-0.1.3",
     ],
 }
