@@ -59,6 +59,8 @@ const CROSVM_IRQ_ROUTE_MSI: u32 = 1;
 const CROSVM_VCPU_EVENT_KIND_INIT: u32 = 0;
 const CROSVM_VCPU_EVENT_KIND_IO_ACCESS: u32 = 1;
 const CROSVM_VCPU_EVENT_KIND_PAUSED: u32 = 2;
+const CROSVM_VCPU_EVENT_KIND_HYPERV_HCALL: u32 = 3;
+const CROSVM_VCPU_EVENT_KIND_HYPERV_SYNIC: u32 = 4;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -166,8 +168,11 @@ pub enum Stat {
     DestroyConnection,
     GetShutdownEventFd,
     CheckExtentsion,
+    EnableVmCapability,
+    EnableVcpuCapability,
     GetSupportedCpuid,
     GetEmulatedCpuid,
+    GetHypervCpuid,
     GetMsrIndexList,
     NetGetConfig,
     ReserveRange,
@@ -922,10 +927,30 @@ struct anon_io_access {
     __reserved1: [u8; 2],
 }
 
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct anon_hyperv_call {
+    input: u64,
+    result: *mut u8,
+    params: [u64; 2],
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct anon_hyperv_synic {
+    msr: u32,
+    reserved: u32,
+    control: u64,
+    evt_page: u64,
+    msg_page: u64,
+}
+
 #[repr(C)]
 union anon_vcpu_event {
     io_access: anon_io_access,
     user: *mut c_void,
+    hyperv_call: anon_hyperv_call,
+    hyperv_synic: anon_hyperv_synic,
     #[allow(dead_code)]
     __reserved: [u8; 64],
 }
@@ -1115,6 +1140,33 @@ impl crosvm_vcpu {
             self.sregs.get = false;
             self.debugregs.get = false;
             Ok(())
+        } else if wait.has_hyperv_call() {
+            let hv: &VcpuResponse_Wait_HypervCall = wait.get_hyperv_call();
+            event.kind = CROSVM_VCPU_EVENT_KIND_HYPERV_HCALL;
+            self.resume_data = vec![0; 8];
+            event.event.hyperv_call = anon_hyperv_call {
+                input: hv.input,
+                result: self.resume_data.as_mut_ptr(),
+                params: [hv.params0, hv.params1],
+            };
+            self.regs.get = false;
+            self.sregs.get = false;
+            self.debugregs.get = false;
+            Ok(())
+        } else if wait.has_hyperv_synic() {
+            let hv: &VcpuResponse_Wait_HypervSynic = wait.get_hyperv_synic();
+            event.kind = CROSVM_VCPU_EVENT_KIND_HYPERV_SYNIC;
+            event.event.hyperv_synic = anon_hyperv_synic {
+                msr: hv.msr,
+                reserved: 0,
+                control: hv.control,
+                evt_page: hv.evt_page,
+                msg_page: hv.msg_page,
+            };
+            self.regs.get = false;
+            self.sregs.get = false;
+            self.debugregs.get = false;
+            Ok(())
         } else {
             Err(EPROTO)
         }
@@ -1202,6 +1254,39 @@ impl crosvm_vcpu {
         Ok(())
     }
 
+    fn get_hyperv_cpuid(
+        &mut self,
+        cpuid_entries: &mut [kvm_cpuid_entry2],
+        cpuid_count: &mut usize,
+    ) -> result::Result<(), c_int> {
+        *cpuid_count = 0;
+
+        let mut r = VcpuRequest::new();
+        r.mut_get_hyperv_cpuid();
+
+        let response = self.vcpu_transaction(&r)?;
+        if !response.has_get_hyperv_cpuid() {
+            return Err(EPROTO);
+        }
+
+        let hyperv_cpuids: &VcpuResponse_CpuidResponse = response.get_get_hyperv_cpuid();
+
+        *cpuid_count = hyperv_cpuids.get_entries().len();
+        if *cpuid_count > cpuid_entries.len() {
+            return Err(E2BIG);
+        }
+
+        for (proto_entry, kvm_entry) in hyperv_cpuids
+            .get_entries()
+            .iter()
+            .zip(cpuid_entries.iter_mut())
+        {
+            *kvm_entry = cpuid_proto_to_kvm(proto_entry);
+        }
+
+        Ok(())
+    }
+
     fn get_msrs(
         &mut self,
         msr_entries: &mut [kvm_msr_entry],
@@ -1252,6 +1337,13 @@ impl crosvm_vcpu {
             set_cpuid_entries.push(cpuid_kvm_to_proto(cpuid_entry));
         }
 
+        self.vcpu_transaction(&r)?;
+        Ok(())
+    }
+
+    fn enable_capability(&mut self, capability: u32) -> result::Result<(), c_int> {
+        let mut r = VcpuRequest::new();
+        r.mut_enable_capability().capability = capability;
         self.vcpu_transaction(&r)?;
         Ok(())
     }
@@ -1334,6 +1426,17 @@ pub unsafe extern "C" fn crosvm_check_extension(
         *has_extension = supported;
     }
     to_crosvm_rc(ret)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn crosvm_enable_capability(
+    _self_: *mut crosvm,
+    _capability: u32,
+    _flags: u32,
+    _args: *const u64,
+) -> c_int {
+    let _u = record(Stat::EnableVmCapability);
+    -EINVAL
 }
 
 #[no_mangle]
@@ -1804,6 +1907,22 @@ pub unsafe extern "C" fn crosvm_vcpu_set_xcrs(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn crosvm_get_hyperv_cpuid(
+    this: *mut crosvm_vcpu,
+    entry_count: u32,
+    cpuid_entries: *mut kvm_cpuid_entry2,
+    out_count: *mut u32,
+) -> c_int {
+    let _u = record(Stat::GetHypervCpuid);
+    let this = &mut *this;
+    let cpuid_entries = from_raw_parts_mut(cpuid_entries, entry_count as usize);
+    let mut cpuid_count: usize = 0;
+    let ret = this.get_hyperv_cpuid(cpuid_entries, &mut cpuid_count);
+    *out_count = cpuid_count as u32;
+    to_crosvm_rc(ret)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn crosvm_vcpu_get_msrs(
     this: *mut crosvm_vcpu,
     msr_count: u32,
@@ -1842,6 +1961,25 @@ pub unsafe extern "C" fn crosvm_vcpu_set_cpuid(
     let this = &mut *this;
     let cpuid_entries = from_raw_parts(cpuid_entries, cpuid_count as usize);
     let ret = this.set_cpuid(cpuid_entries);
+    to_crosvm_rc(ret)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn crosvm_vcpu_enable_capability(
+    this: *mut crosvm_vcpu,
+    capability: u32,
+    flags: u32,
+    args: *const u64,
+) -> c_int {
+    let _u = record(Stat::EnableVcpuCapability);
+    let this = &mut *this;
+    let args = slice::from_raw_parts(args, 4);
+
+    if flags != 0 || args.iter().any(|v| *v != 0) {
+        return -EINVAL;
+    }
+
+    let ret = this.enable_capability(capability);
     to_crosvm_rc(ret)
 }
 
