@@ -5,11 +5,16 @@
 use std::collections::VecDeque;
 use std::fmt::{self, Display};
 use std::fs::File;
-use std::io::{self, stdout};
+use std::io::{self, stdin, stdout, Read, Write};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::thread::{self};
 
-use sys_util::{error, syslog, EventFd, Result};
+use sys_util::{error, read_raw_stdin, syslog, EventFd, Result};
 
 use crate::BusDevice;
 
@@ -127,6 +132,7 @@ pub struct SerialParameters {
     pub path: Option<PathBuf>,
     pub num: u8,
     pub console: bool,
+    pub stdin: bool,
 }
 
 impl SerialParameters {
@@ -134,28 +140,55 @@ impl SerialParameters {
     ///
     /// # Arguments
     /// * `evt_fd` - eventfd used for interrupt events
-    pub fn create_serial_device(&self, evt_fd: &EventFd) -> std::result::Result<Serial, Error> {
+    /// * `keep_fds` - Vector of FDs required by this device if it were sandboxed in a child
+    ///                process. `evt_fd` will always be added to this vector by this function.
+    pub fn create_serial_device(
+        &self,
+        evt_fd: &EventFd,
+        keep_fds: &mut Vec<RawFd>,
+    ) -> std::result::Result<Serial, Error> {
+        let evt_fd = evt_fd.try_clone().map_err(Error::CloneEventFd)?;
+        keep_fds.push(evt_fd.as_raw_fd());
         match self.type_ {
-            SerialType::Stdout => Ok(Serial::new_out(
-                evt_fd.try_clone().map_err(Error::CloneEventFd)?,
-                Box::new(stdout()),
-            )),
-            SerialType::Sink => Ok(Serial::new_sink(
-                evt_fd.try_clone().map_err(Error::CloneEventFd)?,
-            )),
-            SerialType::Syslog => Ok(Serial::new_out(
-                evt_fd.try_clone().map_err(Error::CloneEventFd)?,
-                Box::new(syslog::Syslogger::new(
-                    syslog::Priority::Info,
-                    syslog::Facility::Daemon,
-                )),
-            )),
+            SerialType::Stdout => {
+                keep_fds.push(stdout().as_raw_fd());
+                if self.stdin {
+                    keep_fds.push(stdin().as_raw_fd());
+                    // This wrapper is used in place of the libstd native version because we don't
+                    // want buffering for stdin.
+                    struct StdinWrapper;
+                    impl io::Read for StdinWrapper {
+                        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                            read_raw_stdin(out).map_err(|e| e.into())
+                        }
+                    }
+                    Ok(Serial::new_in_out(
+                        evt_fd,
+                        Box::new(StdinWrapper),
+                        Box::new(stdout()),
+                    ))
+                } else {
+                    Ok(Serial::new_out(evt_fd, Box::new(stdout())))
+                }
+            }
+            SerialType::Sink => Ok(Serial::new_sink(evt_fd)),
+            SerialType::Syslog => {
+                syslog::push_fds(keep_fds);
+                Ok(Serial::new_out(
+                    evt_fd,
+                    Box::new(syslog::Syslogger::new(
+                        syslog::Priority::Info,
+                        syslog::Facility::Daemon,
+                    )),
+                ))
+            }
             SerialType::File => match &self.path {
                 None => Err(Error::PathRequired),
-                Some(path) => Ok(Serial::new_out(
-                    evt_fd.try_clone().map_err(Error::CloneEventFd)?,
-                    Box::new(File::create(path.as_path()).map_err(Error::FileError)?),
-                )),
+                Some(path) => {
+                    let file = File::create(path.as_path()).map_err(Error::FileError)?;
+                    keep_fds.push(file.as_raw_fd());
+                    Ok(Serial::new_out(evt_fd, Box::new(file)))
+                }
             },
             SerialType::UnixSocket => Err(Error::Unimplemented(SerialType::UnixSocket)),
         }
@@ -169,24 +202,28 @@ pub const DEFAULT_SERIAL_PARAMS: [SerialParameters; 4] = [
         path: None,
         num: 1,
         console: true,
+        stdin: true,
     },
     SerialParameters {
         type_: SerialType::Sink,
         path: None,
         num: 2,
         console: false,
+        stdin: false,
     },
     SerialParameters {
         type_: SerialType::Sink,
         path: None,
         num: 3,
         console: false,
+        stdin: false,
     },
     SerialParameters {
         type_: SerialType::Sink,
         path: None,
         num: 4,
         console: false,
+        stdin: false,
     },
 ];
 
@@ -211,9 +248,11 @@ pub fn get_serial_tty_string(stdio_serial_num: u8) -> String {
 /// Emulates serial COM ports commonly seen on x86 I/O ports 0x3f8/0x2f8/0x3e8/0x2e8.
 ///
 /// This can optionally write the guest's output to a Write trait object. To send input to the
-/// guest, use `queue_input_bytes`.
+/// guest, use `queue_input_bytes` directly, or give a Read trait object which will be used queue
+/// bytes when `used_command` is called.
 pub struct Serial {
-    interrupt_enable: u8,
+    // Serial port registers
+    interrupt_enable: Arc<AtomicU8>,
     interrupt_identification: u8,
     interrupt_evt: EventFd,
     line_control: u8,
@@ -222,14 +261,22 @@ pub struct Serial {
     modem_status: u8,
     scratch: u8,
     baud_divisor: u16,
+
+    // Host input/output
     in_buffer: VecDeque<u8>,
+    in_channel: Option<Receiver<u8>>,
+    input: Option<Box<dyn io::Read + Send>>,
     out: Option<Box<dyn io::Write + Send>>,
 }
 
 impl Serial {
-    fn new(interrupt_evt: EventFd, out: Option<Box<dyn io::Write + Send>>) -> Serial {
+    fn new(
+        interrupt_evt: EventFd,
+        input: Option<Box<dyn io::Read + Send>>,
+        out: Option<Box<dyn io::Write + Send>>,
+    ) -> Serial {
         Serial {
-            interrupt_enable: 0,
+            interrupt_enable: Default::default(),
             interrupt_identification: DEFAULT_INTERRUPT_IDENTIFICATION,
             interrupt_evt,
             line_control: DEFAULT_LINE_CONTROL,
@@ -238,29 +285,134 @@ impl Serial {
             modem_status: DEFAULT_MODEM_STATUS,
             scratch: 0,
             baud_divisor: DEFAULT_BAUD_DIVISOR,
-            in_buffer: VecDeque::new(),
+            in_buffer: Default::default(),
+            in_channel: None,
+            input,
             out,
         }
     }
 
-    /// Constructs a Serial port ready for output.
-    pub fn new_out(interrupt_evt: EventFd, out: Box<dyn io::Write + Send>) -> Serial {
-        Self::new(interrupt_evt, Some(out))
+    /// Constructs a Serial port ready for input and output.
+    ///
+    /// The stream `input` should not block, instead returning 0 bytes if are no bytes available.
+    pub fn new_in_out(
+        interrupt_evt: EventFd,
+        input: Box<dyn io::Read + Send>,
+        out: Box<dyn io::Write + Send>,
+    ) -> Serial {
+        Self::new(interrupt_evt, Some(input), Some(out))
     }
 
-    /// Constructs a Serial port with no connected output.
+    /// Constructs a Serial port ready for output but not input.
+    pub fn new_out(interrupt_evt: EventFd, out: Box<dyn io::Write + Send>) -> Serial {
+        Self::new(interrupt_evt, None, Some(out))
+    }
+
+    /// Constructs a Serial port with no connected input or output.
     pub fn new_sink(interrupt_evt: EventFd) -> Serial {
-        Self::new(interrupt_evt, None)
+        Self::new(interrupt_evt, None, None)
     }
 
     /// Queues raw bytes for the guest to read and signals the interrupt if the line status would
-    /// change.
+    /// change. These bytes will be read by the guest before any bytes from the input stream that
+    /// have not already been queued.
     pub fn queue_input_bytes(&mut self, c: &[u8]) -> Result<()> {
-        if !self.is_loop() {
+        if !c.is_empty() && !self.is_loop() {
             self.in_buffer.extend(c);
-            self.recv_data()?;
+            self.set_data_bit();
+            self.trigger_recv_interrupt()?;
         }
+
         Ok(())
+    }
+
+    fn spawn_input_thread(&mut self) {
+        let mut rx = match self.input.take() {
+            Some(input) => input,
+            None => return,
+        };
+
+        let (send_channel, recv_channel) = channel();
+
+        // The interrupt enable and interrupt event are used to trigger the guest serial driver to
+        // read the serial device, which will give the VCPU threads time to queue input bytes from
+        // the input thread's buffer, changing the serial device state accordingly.
+        let interrupt_enable = self.interrupt_enable.clone();
+        let interrupt_evt = match self.interrupt_evt.try_clone() {
+            Ok(e) => e,
+            Err(e) => {
+                error!("failed to clone interrupt eventfd: {}", e);
+                return;
+            }
+        };
+
+        // The input thread runs in detached mode and will exit when channel is disconnected because
+        // the serial device has been dropped. Initial versions of this kept a `JoinHandle` and had
+        // the drop implementation of serial join on this thread, but the input thread can block
+        // indefinitely depending on the `Box<io::Read>` implementation.
+        let res = thread::Builder::new()
+            .name(format!("{} input thread", self.debug_label()))
+            .spawn(move || {
+                let mut rx_buf = [0u8; 1];
+                loop {
+                    match rx.read(&mut rx_buf) {
+                        Ok(0) => break, // Assume the stream of input has ended.
+                        Ok(_) => {
+                            if send_channel.send(rx_buf[0]).is_err() {
+                                // The receiver has disconnected.
+                                break;
+                            }
+                            if (interrupt_enable.load(Ordering::SeqCst) & IER_RECV_BIT) != 0 {
+                                interrupt_evt.write(1).unwrap();
+                            }
+                        }
+                        Err(e) => {
+                            // Being interrupted is not an error, but everything else is.
+                            if e.kind() != io::ErrorKind::Interrupted {
+                                error!(
+                                    "failed to read for bytes to queue into serial device: {}",
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        if let Err(e) = res {
+            error!("failed to spawn input thread: {}", e);
+            return;
+        }
+        self.in_channel = Some(recv_channel);
+    }
+
+    fn handle_input_thread(&mut self) {
+        if self.input.is_some() {
+            self.spawn_input_thread();
+        }
+
+        loop {
+            let in_channel = match self.in_channel.as_ref() {
+                Some(v) => v,
+                None => return,
+            };
+            match in_channel.try_recv() {
+                Ok(byte) => {
+                    self.queue_input_bytes(&[byte]).unwrap();
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.in_channel = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Gets the interrupt eventfd used to interrupt the driver when it needs to respond to this
+    /// device.
+    pub fn interrupt_eventfd(&self) -> &EventFd {
+        &self.interrupt_evt
     }
 
     fn is_dlab_set(&self) -> bool {
@@ -268,11 +420,11 @@ impl Serial {
     }
 
     fn is_recv_intr_enabled(&self) -> bool {
-        (self.interrupt_enable & IER_RECV_BIT) != 0
+        (self.interrupt_enable.load(Ordering::SeqCst) & IER_RECV_BIT) != 0
     }
 
     fn is_thr_intr_enabled(&self) -> bool {
-        (self.interrupt_enable & IER_THR_BIT) != 0
+        (self.interrupt_enable.load(Ordering::SeqCst) & IER_THR_BIT) != 0
     }
 
     fn is_loop(&self) -> bool {
@@ -291,7 +443,7 @@ impl Serial {
         }
     }
 
-    fn thr_empty(&mut self) -> Result<()> {
+    fn trigger_thr_empty(&mut self) -> Result<()> {
         if self.is_thr_intr_enabled() {
             self.add_intr_bit(IIR_THR_BIT);
             self.trigger_interrupt()?
@@ -299,17 +451,24 @@ impl Serial {
         Ok(())
     }
 
-    fn recv_data(&mut self) -> Result<()> {
+    fn trigger_recv_interrupt(&mut self) -> Result<()> {
         if self.is_recv_intr_enabled() {
-            self.add_intr_bit(IIR_RECV_BIT);
-            self.trigger_interrupt()?
+            // Only bother triggering the interrupt if the identification bit wasn't set or
+            // acknowledged.
+            if self.interrupt_identification & IIR_RECV_BIT == 0 {
+                self.add_intr_bit(IIR_RECV_BIT);
+                self.trigger_interrupt()?
+            }
         }
-        self.line_status |= LSR_DATA_BIT;
         Ok(())
     }
 
     fn trigger_interrupt(&mut self) -> Result<()> {
         self.interrupt_evt.write(1)
+    }
+
+    fn set_data_bit(&mut self) {
+        self.line_status |= LSR_DATA_BIT;
     }
 
     fn iir_reset(&mut self) {
@@ -328,17 +487,20 @@ impl Serial {
                 if self.is_loop() {
                     if self.in_buffer.len() < LOOP_SIZE {
                         self.in_buffer.push_back(v);
-                        self.recv_data()?;
+                        self.set_data_bit();
+                        self.trigger_recv_interrupt()?;
                     }
                 } else {
                     if let Some(out) = self.out.as_mut() {
                         out.write_all(&[v])?;
                         out.flush()?;
                     }
-                    self.thr_empty()?;
+                    self.trigger_thr_empty()?;
                 }
             }
-            IER => self.interrupt_enable = v & IER_FIFO_BITS,
+            IER => self
+                .interrupt_enable
+                .store(v & IER_FIFO_BITS, Ordering::SeqCst),
             LCR => self.line_control = v,
             MCR => self.modem_control = v,
             SCR => self.scratch = v,
@@ -368,6 +530,8 @@ impl BusDevice for Serial {
             return;
         }
 
+        self.handle_input_thread();
+
         data[0] = match offset as u8 {
             DLAB_LOW if self.is_dlab_set() => self.baud_divisor as u8,
             DLAB_HIGH if self.is_dlab_set() => (self.baud_divisor >> 8) as u8,
@@ -378,7 +542,7 @@ impl BusDevice for Serial {
                 }
                 self.in_buffer.pop_front().unwrap_or_default()
             }
-            IER => self.interrupt_enable,
+            IER => self.interrupt_enable.load(Ordering::SeqCst),
             IIR => {
                 let v = self.interrupt_identification | IIR_FIFO_BITS;
                 self.iir_reset();

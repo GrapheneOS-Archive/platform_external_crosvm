@@ -13,14 +13,15 @@
 use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
+use std::mem::ManuallyDrop;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
 use libc::{EINVAL, EIO, ENODEV};
 
-use kvm::Vm;
+use kvm::{IrqRoute, IrqSource, Vm};
 use msg_socket::{MsgOnSocket, MsgReceiver, MsgResult, MsgSender, MsgSocket};
-use resources::{GpuMemoryDesc, SystemAllocator};
-use sys_util::{error, Error as SysError, GuestAddress, MemoryMapping, MmapError, Result};
+use resources::{Alloc, GpuMemoryDesc, MmioType, SystemAllocator};
+use sys_util::{error, Error as SysError, EventFd, GuestAddress, MemoryMapping, MmapError, Result};
 
 /// A file descriptor either borrowed or owned by this.
 #[derive(Debug)]
@@ -189,6 +190,9 @@ pub enum VmMemoryRequest {
     /// Register shared memory represented by the given fd into guest address space. The response
     /// variant is `VmResponse::RegisterMemory`.
     RegisterMemory(MaybeOwnedFd, usize),
+    /// Similiar to `VmMemoryRequest::RegisterMemory`, but doesn't allocate new address space.
+    /// Useful for cases where the address space is already allocated (PCI regions).
+    RegisterMemoryAtAddress(Alloc, MaybeOwnedFd, usize, u64),
     /// Unregister the given memory slot that was previously registereed with `RegisterMemory`.
     UnregisterMemory(u32),
     /// Allocate GPU buffer of a given size/format and register the memory into guest address space.
@@ -197,6 +201,13 @@ pub enum VmMemoryRequest {
         width: u32,
         height: u32,
         format: u32,
+    },
+    /// Register mmaped memory into kvm's EPT.
+    RegisterMmapMemory {
+        fd: MaybeOwnedFd,
+        size: usize,
+        offset: usize,
+        gpa: u64,
     },
 }
 
@@ -213,11 +224,19 @@ impl VmMemoryRequest {
     pub fn execute(&self, vm: &mut Vm, sys_allocator: &mut SystemAllocator) -> VmMemoryResponse {
         use self::VmMemoryRequest::*;
         match *self {
-            RegisterMemory(ref fd, size) => match register_memory(vm, sys_allocator, fd, size) {
-                Ok((pfn, slot)) => VmMemoryResponse::RegisterMemory { pfn, slot },
-                Err(e) => VmMemoryResponse::Err(e),
-            },
-            UnregisterMemory(slot) => match vm.remove_device_memory(slot) {
+            RegisterMemory(ref fd, size) => {
+                match register_memory(vm, sys_allocator, fd, size, None) {
+                    Ok((pfn, slot)) => VmMemoryResponse::RegisterMemory { pfn, slot },
+                    Err(e) => VmMemoryResponse::Err(e),
+                }
+            }
+            RegisterMemoryAtAddress(alloc, ref fd, size, guest_addr) => {
+                match register_memory(vm, sys_allocator, fd, size, Some((alloc, guest_addr))) {
+                    Ok((pfn, slot)) => VmMemoryResponse::RegisterMemory { pfn, slot },
+                    Err(e) => VmMemoryResponse::Err(e),
+                }
+            }
+            UnregisterMemory(slot) => match vm.remove_mmio_memory(slot) {
                 Ok(_) => VmMemoryResponse::Ok,
                 Err(e) => VmMemoryResponse::Err(e),
             },
@@ -239,13 +258,28 @@ impl VmMemoryRequest {
                     Ok(v) => v,
                     Err(e) => return VmMemoryResponse::Err(SysError::from(e)),
                 };
-                match register_memory(vm, sys_allocator, &fd, size as usize) {
+                match register_memory(vm, sys_allocator, &fd, size as usize, None) {
                     Ok((pfn, slot)) => VmMemoryResponse::AllocateAndRegisterGpuMemory {
                         fd: MaybeOwnedFd::Owned(fd),
                         pfn,
                         slot,
                         desc,
                     },
+                    Err(e) => VmMemoryResponse::Err(e),
+                }
+            }
+            RegisterMmapMemory {
+                ref fd,
+                size,
+                offset,
+                gpa,
+            } => {
+                let mmap = match MemoryMapping::from_fd_offset(fd, size, offset) {
+                    Ok(v) => v,
+                    Err(_e) => return VmMemoryResponse::Err(SysError::new(EINVAL)),
+                };
+                match vm.add_mmio_memory(GuestAddress(gpa), mmap, false, false) {
+                    Ok(_) => VmMemoryResponse::Ok,
                     Err(e) => VmMemoryResponse::Err(e),
                 }
             }
@@ -273,6 +307,78 @@ pub enum VmMemoryResponse {
     Err(SysError),
 }
 
+#[derive(MsgOnSocket, Debug)]
+pub enum VmIrqRequest {
+    /// Allocate one gsi, and associate gsi to irqfd with register_irqfd()
+    AllocateOneMsi { irqfd: MaybeOwnedFd },
+    /// Add one msi route entry into kvm
+    AddMsiRoute {
+        gsi: u32,
+        msi_address: u64,
+        msi_data: u32,
+    },
+}
+
+impl VmIrqRequest {
+    /// Executes this request on the given Vm.
+    ///
+    /// # Arguments
+    /// * `vm` - The `Vm` to perform the request on.
+    ///
+    /// This does not return a result, instead encapsulating the success or failure in a
+    /// `VmIrqResponse` with the intended purpose of sending the response back over the socket
+    /// that received this `VmIrqResponse`.
+    pub fn execute(&self, vm: &mut Vm, sys_allocator: &mut SystemAllocator) -> VmIrqResponse {
+        use self::VmIrqRequest::*;
+        match *self {
+            AllocateOneMsi { ref irqfd } => {
+                if let Some(irq_num) = sys_allocator.allocate_irq() {
+                    // Beacuse of the limitation of `MaybeOwnedFd` not fitting into `register_irqfd`
+                    // which expects an `&EventFd`, we use the unsafe `from_raw_fd` to assume that
+                    // the fd given is an `EventFd`, and we ignore the ownership question using
+                    // `ManuallyDrop`. This is safe because `ManuallyDrop` prevents any Drop
+                    // implementation from triggering on `irqfd` which already has an owner, and the
+                    // `EventFd` methods are never called. The underlying fd is merely passed to the
+                    // kernel which doesn't care about ownership and deals with incorrect FDs, in
+                    // the case of bugs on our part.
+                    let evt = unsafe { ManuallyDrop::new(EventFd::from_raw_fd(irqfd.as_raw_fd())) };
+                    match vm.register_irqfd(&evt, irq_num) {
+                        Ok(_) => VmIrqResponse::AllocateOneMsi { gsi: irq_num },
+                        Err(e) => VmIrqResponse::Err(e),
+                    }
+                } else {
+                    VmIrqResponse::Err(SysError::new(EINVAL))
+                }
+            }
+            AddMsiRoute {
+                gsi,
+                msi_address,
+                msi_data,
+            } => {
+                let route = IrqRoute {
+                    gsi,
+                    source: IrqSource::Msi {
+                        address: msi_address,
+                        data: msi_data,
+                    },
+                };
+
+                match vm.add_irq_route_entry(route) {
+                    Ok(_) => VmIrqResponse::Ok,
+                    Err(e) => VmIrqResponse::Err(e),
+                }
+            }
+        }
+    }
+}
+
+#[derive(MsgOnSocket, Debug)]
+pub enum VmIrqResponse {
+    AllocateOneMsi { gsi: u32 },
+    Ok,
+    Err(SysError),
+}
+
 pub type BalloonControlRequestSocket = MsgSocket<BalloonControlCommand, ()>;
 pub type BalloonControlResponseSocket = MsgSocket<(), BalloonControlCommand>;
 
@@ -283,6 +389,9 @@ pub type UsbControlSocket = MsgSocket<UsbControlCommand, UsbControlResult>;
 
 pub type VmMemoryControlRequestSocket = MsgSocket<VmMemoryRequest, VmMemoryResponse>;
 pub type VmMemoryControlResponseSocket = MsgSocket<VmMemoryResponse, VmMemoryRequest>;
+
+pub type VmIrqRequestSocket = MsgSocket<VmIrqRequest, VmIrqResponse>;
+pub type VmIrqResponseSocket = MsgSocket<VmIrqResponse, VmIrqRequest>;
 
 pub type VmControlRequestSocket = MsgSocket<VmRequest, VmResponse>;
 pub type VmControlResponseSocket = MsgSocket<VmResponse, VmRequest>;
@@ -315,22 +424,46 @@ fn register_memory(
     allocator: &mut SystemAllocator,
     fd: &dyn AsRawFd,
     size: usize,
+    allocation: Option<(Alloc, u64)>,
 ) -> Result<(u64, u32)> {
     let mmap = match MemoryMapping::from_fd(fd, size) {
         Ok(v) => v,
         Err(MmapError::SystemCallFailed(e)) => return Err(e),
         _ => return Err(SysError::new(EINVAL)),
     };
-    let alloc = allocator.get_anon_alloc();
-    let addr = match allocator.device_allocator().allocate(
-        size as u64,
-        alloc,
-        "vmcontrol_register_memory".to_string(),
-    ) {
-        Ok(a) => a,
-        Err(_) => return Err(SysError::new(EINVAL)),
+
+    let addr = match allocation {
+        Some((Alloc::PciBar { bus, dev, bar }, address)) => {
+            match allocator
+                .mmio_allocator(MmioType::High)
+                .get(&Alloc::PciBar { bus, dev, bar })
+            {
+                Some((start_addr, length, _)) => {
+                    let range = *start_addr..*start_addr + *length;
+                    let end = address + (size as u64);
+                    match (range.contains(&address), range.contains(&end)) {
+                        (true, true) => address,
+                        _ => return Err(SysError::new(EINVAL)),
+                    }
+                }
+                None => return Err(SysError::new(EINVAL)),
+            }
+        }
+        None => {
+            let alloc = allocator.get_anon_alloc();
+            match allocator.mmio_allocator(MmioType::High).allocate(
+                size as u64,
+                alloc,
+                "vmcontrol_register_memory".to_string(),
+            ) {
+                Ok(a) => a,
+                _ => return Err(SysError::new(EINVAL)),
+            }
+        }
+        _ => return Err(SysError::new(EINVAL)),
     };
-    let slot = match vm.add_device_memory(GuestAddress(addr), mmap, false, false) {
+
+    let slot = match vm.add_mmio_memory(GuestAddress(addr), mmap, false, false) {
         Ok(v) => v,
         Err(e) => return Err(e),
     };

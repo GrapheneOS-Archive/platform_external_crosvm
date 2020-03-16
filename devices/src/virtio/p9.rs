@@ -2,25 +2,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cmp::min;
 use std::fmt::{self, Display};
-use std::io::{self, Read, Write};
-use std::iter::Peekable;
+use std::io::{self, Write};
 use std::mem;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::result;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread;
 
 use p9;
-use sys_util::{
-    error, warn, Error as SysError, EventFd, GuestAddress, GuestMemory, PollContext, PollToken,
-};
+use sys_util::{error, warn, Error as SysError, EventFd, GuestMemory, PollContext, PollToken};
 use virtio_sys::vhost::VIRTIO_F_VERSION_1;
 
-use super::{DescriptorChain, Queue, VirtioDevice, INTERRUPT_STATUS_USED_RING, TYPE_9P};
+use super::{
+    copy_config, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer, TYPE_9P,
+};
 
 const QUEUE_SIZE: u16 = 128;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
@@ -45,10 +41,10 @@ pub enum P9Error {
     NoReadableDescriptors,
     /// A request is missing writable descriptors.
     NoWritableDescriptors,
-    /// A descriptor contained an invalid guest address range.
-    InvalidGuestAddress(GuestAddress, u32),
     /// Failed to signal the virio used queue.
     SignalUsedQueue(SysError),
+    /// A DescriptorChain contains invalid data.
+    InvalidDescriptorChain(DescriptorError),
     /// An internal I/O error occurred.
     Internal(io::Error),
 }
@@ -76,12 +72,10 @@ impl Display for P9Error {
             ReadQueueEventFd(err) => write!(f, "failed to read from virtio queue EventFd: {}", err),
             NoReadableDescriptors => write!(f, "request does not have any readable descriptors"),
             NoWritableDescriptors => write!(f, "request does not have any writable descriptors"),
-            InvalidGuestAddress(addr, len) => write!(
-                f,
-                "descriptor contained invalid guest address range: address = {}, len = {}",
-                addr, len
-            ),
             SignalUsedQueue(err) => write!(f, "failed to signal used queue: {}", err),
+            InvalidDescriptorChain(err) => {
+                write!(f, "DescriptorChain contains invalid data: {}", err)
+            }
             Internal(err) => write!(f, "P9 internal server error: {}", err),
         }
     }
@@ -89,161 +83,30 @@ impl Display for P9Error {
 
 pub type P9Result<T> = result::Result<T, P9Error>;
 
-struct Reader<'a, I>
-where
-    I: Iterator<Item = DescriptorChain<'a>>,
-{
-    mem: &'a GuestMemory,
-    offset: u32,
-    iter: Peekable<I>,
-}
-
-impl<'a, I> Read for Reader<'a, I>
-where
-    I: Iterator<Item = DescriptorChain<'a>>,
-{
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let needs_advance = if let Some(current) = self.iter.peek() {
-            self.offset >= current.len
-        } else {
-            false
-        };
-
-        if needs_advance {
-            self.offset = 0;
-            self.iter.next();
-        }
-
-        if let Some(current) = self.iter.peek() {
-            debug_assert!(current.is_read_only());
-            let addr = current
-                .addr
-                .checked_add(self.offset as u64)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        P9Error::InvalidGuestAddress(current.addr, current.len),
-                    )
-                })?;
-            let len = min(buf.len(), (current.len - self.offset) as usize);
-            let count = self
-                .mem
-                .read_at_addr(&mut buf[..len], addr)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-            // |count| has to fit into a u32 because it must be less than or equal to
-            // |current.len|, which does fit into a u32.
-            self.offset += count as u32;
-
-            Ok(count)
-        } else {
-            // Nothing left to read.
-            Ok(0)
-        }
-    }
-}
-
-struct Writer<'a, I>
-where
-    I: Iterator<Item = DescriptorChain<'a>>,
-{
-    mem: &'a GuestMemory,
-    bytes_written: u32,
-    offset: u32,
-    iter: Peekable<I>,
-}
-
-impl<'a, I> Write for Writer<'a, I>
-where
-    I: Iterator<Item = DescriptorChain<'a>>,
-{
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let needs_advance = if let Some(current) = self.iter.peek() {
-            self.offset >= current.len
-        } else {
-            false
-        };
-
-        if needs_advance {
-            self.offset = 0;
-            self.iter.next();
-        }
-
-        if let Some(current) = self.iter.peek() {
-            debug_assert!(current.is_write_only());
-            let addr = current
-                .addr
-                .checked_add(self.offset as u64)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        P9Error::InvalidGuestAddress(current.addr, current.len),
-                    )
-                })?;
-
-            let len = min(buf.len(), (current.len - self.offset) as usize);
-            let count = self
-                .mem
-                .write_at_addr(&buf[..len], addr)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-            // |count| has to fit into a u32 because it must be less than or equal to
-            // |current.len|, which does fit into a u32.
-            self.offset += count as u32;
-            self.bytes_written += count as u32;
-
-            Ok(count)
-        } else {
-            // No more room in the descriptor chain.
-            Ok(0)
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        // Nothing to flush since the writes go straight into the buffer.
-        Ok(())
-    }
-}
-
 struct Worker {
+    interrupt: Interrupt,
     mem: GuestMemory,
     queue: Queue,
     server: p9::Server,
-    irq_status: Arc<AtomicUsize>,
-    irq_evt: EventFd,
-    interrupt_resample_evt: EventFd,
 }
 
 impl Worker {
-    fn signal_used_queue(&self) -> P9Result<()> {
-        self.irq_status
-            .fetch_or(INTERRUPT_STATUS_USED_RING as usize, Ordering::SeqCst);
-        self.irq_evt.write(1).map_err(P9Error::SignalUsedQueue)
-    }
-
     fn process_queue(&mut self) -> P9Result<()> {
         while let Some(avail_desc) = self.queue.pop(&self.mem) {
-            let mut reader = Reader {
-                mem: &self.mem,
-                offset: 0,
-                iter: avail_desc.clone().into_iter().readable().peekable(),
-            };
-            let mut writer = Writer {
-                mem: &self.mem,
-                bytes_written: 0,
-                offset: 0,
-                iter: avail_desc.clone().into_iter().writable().peekable(),
-            };
+            let mut reader = Reader::new(&self.mem, avail_desc.clone())
+                .map_err(P9Error::InvalidDescriptorChain)?;
+            let mut writer = Writer::new(&self.mem, avail_desc.clone())
+                .map_err(P9Error::InvalidDescriptorChain)?;
 
             self.server
                 .handle_message(&mut reader, &mut writer)
                 .map_err(P9Error::Internal)?;
 
             self.queue
-                .add_used(&self.mem, avail_desc.index, writer.bytes_written);
+                .add_used(&self.mem, avail_desc.index, writer.bytes_written() as u32);
         }
 
-        self.signal_used_queue()?;
+        self.interrupt.signal_used_queue(self.queue.vector);
 
         Ok(())
     }
@@ -259,14 +122,12 @@ impl Worker {
             Kill,
         }
 
-        let poll_ctx: PollContext<Token> = PollContext::new()
-            .and_then(|pc| pc.add(&queue_evt, Token::QueueReady).and(Ok(pc)))
-            .and_then(|pc| {
-                pc.add(&self.interrupt_resample_evt, Token::InterruptResample)
-                    .and(Ok(pc))
-            })
-            .and_then(|pc| pc.add(&kill_evt, Token::Kill).and(Ok(pc)))
-            .map_err(P9Error::CreatePollContext)?;
+        let poll_ctx: PollContext<Token> = PollContext::build_with(&[
+            (&queue_evt, Token::QueueReady),
+            (self.interrupt.get_resample_evt(), Token::InterruptResample),
+            (&kill_evt, Token::Kill),
+        ])
+        .map_err(P9Error::CreatePollContext)?;
 
         loop {
             let events = poll_ctx.wait().map_err(P9Error::PollError)?;
@@ -277,10 +138,7 @@ impl Worker {
                         self.process_queue()?;
                     }
                     Token::InterruptResample => {
-                        let _ = self.interrupt_resample_evt.read();
-                        if self.irq_status.load(Ordering::SeqCst) != 0 {
-                            self.irq_evt.write(1).unwrap();
-                        }
+                        self.interrupt.interrupt_resample();
                     }
                     Token::Kill => return Ok(()),
                 }
@@ -359,25 +217,13 @@ impl VirtioDevice for P9 {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        if offset >= self.config.len() as u64 {
-            // Nothing to see here.
-            return;
-        }
-
-        // The config length cannot be more than ::std::u16::MAX + mem::size_of::<u16>(), which
-        // is significantly smaller than ::std::usize::MAX on the architectures we care about so
-        // if we reach this point then we know that `offset` will fit into a usize.
-        let offset = offset as usize;
-        let len = min(data.len(), self.config.len() - offset);
-        data[..len].copy_from_slice(&self.config[offset..offset + len])
+        copy_config(data, 0, self.config.as_slice(), offset);
     }
 
     fn activate(
         &mut self,
         guest_mem: GuestMemory,
-        interrupt_evt: EventFd,
-        interrupt_resample_evt: EventFd,
-        status: Arc<AtomicUsize>,
+        interrupt: Interrupt,
         mut queues: Vec<Queue>,
         mut queue_evts: Vec<EventFd>,
     ) {
@@ -400,12 +246,10 @@ impl VirtioDevice for P9 {
                     .name("virtio_9p".to_string())
                     .spawn(move || {
                         let mut worker = Worker {
+                            interrupt,
                             mem: guest_mem,
                             queue: queues.remove(0),
                             server,
-                            irq_status: status,
-                            irq_evt: interrupt_evt,
-                            interrupt_resample_evt,
                         };
 
                         worker.run(queue_evts.remove(0), kill_evt)

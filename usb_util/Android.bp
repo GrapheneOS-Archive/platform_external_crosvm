@@ -8,6 +8,11 @@ rust_library_host_rlib {
     rlibs: [
         "libassertions",
         "libdata_model",
-        "libsync_rust",
+        "liblibc",
+        "libsys_util",
+        "libusb_sys",
+    ],
+    proc_macros: [
+        "libremain",
     ],
 }

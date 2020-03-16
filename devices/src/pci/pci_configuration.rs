@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::convert::TryInto;
 use std::fmt::{self, Display};
 
 use crate::pci::PciInterruptPin;
@@ -23,6 +24,7 @@ const CAPABILITY_MAX_OFFSET: usize = 192;
 const INTERRUPT_LINE_PIN_REG: usize = 15;
 
 /// Represents the types of PCI headers allowed in the configuration registers.
+#[allow(dead_code)]
 #[derive(Copy, Clone)]
 pub enum PciHeaderType {
     Device,
@@ -175,7 +177,7 @@ pub struct PciConfiguration {
 }
 
 /// See pci_regs.h in kernel
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PciBarRegionType {
     Memory32BitRegion = 0,
     IORegion = 0x01,
@@ -200,6 +202,7 @@ pub struct PciBarConfiguration {
 #[derive(Debug)]
 pub enum Error {
     BarAddressInvalid(u64, u64),
+    BarAlignmentInvalid(u64, u64),
     BarInUse(usize),
     BarInUse64(usize),
     BarInvalid(usize),
@@ -218,6 +221,7 @@ impl Display for Error {
         use self::Error::*;
         match self {
             BarAddressInvalid(a, s) => write!(f, "address {} size {} too big", a, s),
+            BarAlignmentInvalid(a, s) => write!(f, "address {} is not aligned to size {}", a, s),
             BarInUse(b) => write!(f, "bar {} already used", b),
             BarInUse64(b) => write!(f, "64bit bar {} already used(requires two regs)", b),
             BarInvalid(b) => write!(f, "bar {} invalid, max {}", b, NUM_BAR_REGS - 1),
@@ -286,22 +290,42 @@ impl PciConfiguration {
         *(self.registers.get(reg_idx).unwrap_or(&0xffff_ffff))
     }
 
-    /// Writes a 32bit register to `reg_idx` in the register map.
-    pub fn write_reg(&mut self, reg_idx: usize, value: u32) {
+    /// Writes data to PciConfiguration.registers.
+    /// `reg_idx` - index into PciConfiguration.registers.
+    /// `offset`  - PciConfiguration.registers is in unit of DWord, offset define byte
+    ///             offset in the DWrod.
+    /// `data`    - The data to write.
+    pub fn write_reg(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+        let reg_offset = reg_idx * 4 + offset as usize;
+        match data.len() {
+            1 => self.write_byte(reg_offset, data[0]),
+            2 => self.write_word(reg_offset, u16::from_le_bytes(data.try_into().unwrap())),
+            4 => self.write_dword(reg_offset, u32::from_le_bytes(data.try_into().unwrap())),
+            _ => (),
+        }
+    }
+
+    /// Writes a 32bit dword to `offset`. `offset` must be 32bit aligned.
+    fn write_dword(&mut self, offset: usize, value: u32) {
+        if offset % 4 != 0 {
+            warn!("bad PCI config dword write offset {}", offset);
+            return;
+        }
+        let reg_idx = offset / 4;
         if let Some(r) = self.registers.get_mut(reg_idx) {
-            *r = value & self.writable_bits[reg_idx];
+            *r = (*r & !self.writable_bits[reg_idx]) | (value & self.writable_bits[reg_idx]);
         } else {
-            warn!("bad PCI register write {}", reg_idx);
+            warn!("bad PCI dword write {}", offset);
         }
     }
 
     /// Writes a 16bit word to `offset`. `offset` must be 16bit aligned.
-    pub fn write_word(&mut self, offset: usize, value: u16) {
+    fn write_word(&mut self, offset: usize, value: u16) {
         let shift = match offset % 4 {
             0 => 0,
             2 => 16,
             _ => {
-                warn!("bad PCI config write offset {}", offset);
+                warn!("bad PCI config word write offset {}", offset);
                 return;
             }
         };
@@ -313,12 +337,12 @@ impl PciConfiguration {
             let shifted_value = (u32::from(value) << shift) & writable_mask;
             *r = *r & !mask | shifted_value;
         } else {
-            warn!("bad PCI config write offset {}", offset);
+            warn!("bad PCI config word write offset {}", offset);
         }
     }
 
     /// Writes a byte to `offset`.
-    pub fn write_byte(&mut self, offset: usize, value: u8) {
+    fn write_byte(&mut self, offset: usize, value: u8) {
         self.write_byte_internal(offset, value, true);
     }
 
@@ -337,7 +361,7 @@ impl PciConfiguration {
             let shifted_value = (u32::from(value) << shift) & writable_mask;
             *r = *r & !mask | shifted_value;
         } else {
-            warn!("bad PCI config write offset {}", offset);
+            warn!("bad PCI config byte write offset {}", offset);
         }
     }
 
@@ -356,6 +380,10 @@ impl PciConfiguration {
 
         if config.reg_idx >= NUM_BAR_REGS {
             return Err(Error::BarInvalid(config.reg_idx));
+        }
+
+        if config.addr % config.size != 0 {
+            return Err(Error::BarAlignmentInvalid(config.addr, config.size));
         }
 
         let bar_idx = BAR0_REG + config.reg_idx;
@@ -383,7 +411,7 @@ impl PciConfiguration {
                 }
 
                 self.registers[bar_idx + 1] = (config.addr >> 32) as u32;
-                self.writable_bits[bar_idx + 1] = !((config.size >> 32).wrapping_sub(1)) as u32;
+                self.writable_bits[bar_idx + 1] = !((config.size - 1) >> 32) as u32;
                 self.bar_used[config.reg_idx + 1] = true;
             }
         }
@@ -402,11 +430,38 @@ impl PciConfiguration {
         Ok(config.reg_idx)
     }
 
+    /// Returns the type of the given BAR region.
+    pub fn get_bar_type(&self, bar_num: usize) -> Option<PciBarRegionType> {
+        let reg_idx = BAR0_REG + bar_num;
+        let reg_value = self.registers.get(reg_idx)?;
+
+        match (reg_value & 1, (reg_value >> 1u32) & 3) {
+            (1, _) => Some(PciBarRegionType::IORegion),
+            (0, 0b00) => Some(PciBarRegionType::Memory32BitRegion),
+            (0, 0b10) => Some(PciBarRegionType::Memory64BitRegion),
+            _ => None,
+        }
+    }
+
     /// Returns the address of the given BAR region.
-    pub fn get_bar_addr(&self, bar_num: usize) -> u32 {
+    pub fn get_bar_addr(&self, bar_num: usize) -> u64 {
         let bar_idx = BAR0_REG + bar_num;
 
-        self.registers[bar_idx] & BAR_MEM_ADDR_MASK
+        let bar_type = match self.get_bar_type(bar_num) {
+            Some(t) => t,
+            None => return 0,
+        };
+
+        match bar_type {
+            PciBarRegionType::IORegion => u64::from(self.registers[bar_idx] & BAR_IO_ADDR_MASK),
+            PciBarRegionType::Memory32BitRegion => {
+                u64::from(self.registers[bar_idx] & BAR_MEM_ADDR_MASK)
+            }
+            PciBarRegionType::Memory64BitRegion => {
+                u64::from(self.registers[bar_idx] & BAR_MEM_ADDR_MASK)
+                    | u64::from(self.registers[bar_idx + 1]) << 32
+            }
+        }
     }
 
     /// Configures the IRQ line and pin used by this device.
@@ -619,5 +674,118 @@ mod tests {
         assert_eq!(class_code, 0x04);
         assert_eq!(subclass, 0x01);
         assert_eq!(prog_if, 0x5a);
+    }
+
+    #[test]
+    fn read_only_bits() {
+        let mut cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            Some(&TestPI::Test),
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+        );
+
+        // Attempt to overwrite vendor ID and device ID, which are read-only
+        cfg.write_reg(0, 0, &[0xBA, 0xAD, 0xF0, 0x0D]);
+        // The original vendor and device ID should remain.
+        assert_eq!(cfg.read_reg(0), 0x56781234);
+    }
+
+    #[test]
+    fn add_pci_bar_mem_64bit() {
+        let mut cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            Some(&TestPI::Test),
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+        );
+
+        cfg.add_pci_bar(
+            &PciBarConfiguration::new(
+                0,
+                0x4,
+                PciBarRegionType::Memory64BitRegion,
+                PciBarPrefetchable::NotPrefetchable,
+            )
+            .set_address(0x01234567_89ABCDE0),
+        )
+        .expect("add_pci_bar failed");
+
+        assert_eq!(
+            cfg.get_bar_type(0),
+            Some(PciBarRegionType::Memory64BitRegion)
+        );
+        assert_eq!(cfg.get_bar_addr(0), 0x01234567_89ABCDE0);
+        assert_eq!(cfg.writable_bits[BAR0_REG + 1], 0xFFFFFFFF);
+        assert_eq!(cfg.writable_bits[BAR0_REG + 0], 0xFFFFFFFC);
+    }
+
+    #[test]
+    fn add_pci_bar_mem_32bit() {
+        let mut cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            Some(&TestPI::Test),
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+        );
+
+        cfg.add_pci_bar(
+            &PciBarConfiguration::new(
+                0,
+                0x4,
+                PciBarRegionType::Memory32BitRegion,
+                PciBarPrefetchable::NotPrefetchable,
+            )
+            .set_address(0x12345670),
+        )
+        .expect("add_pci_bar failed");
+
+        assert_eq!(
+            cfg.get_bar_type(0),
+            Some(PciBarRegionType::Memory32BitRegion)
+        );
+        assert_eq!(cfg.get_bar_addr(0), 0x12345670);
+        assert_eq!(cfg.writable_bits[BAR0_REG], 0xFFFFFFFC);
+    }
+
+    #[test]
+    fn add_pci_bar_io() {
+        let mut cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            Some(&TestPI::Test),
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+        );
+
+        cfg.add_pci_bar(
+            &PciBarConfiguration::new(
+                0,
+                0x4,
+                PciBarRegionType::IORegion,
+                PciBarPrefetchable::NotPrefetchable,
+            )
+            .set_address(0x1230),
+        )
+        .expect("add_pci_bar failed");
+
+        assert_eq!(cfg.get_bar_type(0), Some(PciBarRegionType::IORegion));
+        assert_eq!(cfg.get_bar_addr(0), 0x1230);
+        assert_eq!(cfg.writable_bits[BAR0_REG], 0xFFFFFFFC);
     }
 }

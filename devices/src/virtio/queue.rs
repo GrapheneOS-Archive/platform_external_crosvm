@@ -8,10 +8,15 @@ use std::sync::atomic::{fence, Ordering};
 
 use sys_util::{error, GuestAddress, GuestMemory};
 
+use super::{Interrupt, VIRTIO_MSI_NO_VECTOR};
+
 const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 const VIRTQ_DESC_F_WRITE: u16 = 0x2;
 #[allow(dead_code)]
 const VIRTQ_DESC_F_INDIRECT: u16 = 0x4;
+
+const VIRTQ_USED_F_NO_NOTIFY: u16 = 0x1;
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 0x1;
 
 /// An iterator over a single descriptor chain.  Not to be confused with AvailIter,
 /// which iterates over the descriptor chain heads in a queue.
@@ -70,11 +75,12 @@ pub struct DescriptorChain<'a> {
 }
 
 impl<'a> DescriptorChain<'a> {
-    fn checked_new(
+    pub(crate) fn checked_new(
         mem: &GuestMemory,
         desc_table: GuestAddress,
         queue_size: u16,
         index: u16,
+        required_flags: u16,
     ) -> Option<DescriptorChain> {
         if index >= queue_size {
             return None;
@@ -104,7 +110,7 @@ impl<'a> DescriptorChain<'a> {
             next,
         };
 
-        if chain.is_valid() {
+        if chain.is_valid() && chain.flags & required_flags == required_flags {
             Some(chain)
         } else {
             None
@@ -113,10 +119,11 @@ impl<'a> DescriptorChain<'a> {
 
     #[allow(clippy::if_same_then_else)]
     fn is_valid(&self) -> bool {
-        if self
-            .mem
-            .checked_offset(self.addr, self.len as u64)
-            .is_none()
+        if self.len > 0
+            && self
+                .mem
+                .checked_offset(self.addr, self.len as u64 - 1u64)
+                .is_none()
         {
             false
         } else if self.has_next() && self.next >= self.queue_size {
@@ -153,12 +160,19 @@ impl<'a> DescriptorChain<'a> {
     /// the head of the next _available_ descriptor chain.
     pub fn next_descriptor(&self) -> Option<DescriptorChain<'a>> {
         if self.has_next() {
-            DescriptorChain::checked_new(self.mem, self.desc_table, self.queue_size, self.next).map(
-                |mut c| {
-                    c.ttl = self.ttl - 1;
-                    c
-                },
+            // Once we see a write-only descriptor, all subsequent descriptors must be write-only.
+            let required_flags = self.flags & VIRTQ_DESC_F_WRITE;
+            DescriptorChain::checked_new(
+                self.mem,
+                self.desc_table,
+                self.queue_size,
+                self.next,
+                required_flags,
             )
+            .map(|mut c| {
+                c.ttl = self.ttl - 1;
+                c
+            })
         } else {
             None
         }
@@ -196,6 +210,9 @@ pub struct Queue {
     /// Inidcates if the queue is finished with configuration
     pub ready: bool,
 
+    /// MSI-X vector for the queue. Don't care for INTx
+    pub vector: u16,
+
     /// Guest physical address of the descriptor table
     pub desc_table: GuestAddress,
 
@@ -216,6 +233,7 @@ impl Queue {
             max_size,
             size: max_size,
             ready: false,
+            vector: VIRTIO_MSI_NO_VECTOR,
             desc_table: GuestAddress(0),
             avail_ring: GuestAddress(0),
             used_ring: GuestAddress(0),
@@ -228,6 +246,18 @@ impl Queue {
     /// queue as big as the device allows.
     pub fn actual_size(&self) -> u16 {
         min(self.size, self.max_size)
+    }
+
+    /// Reset queue to a clean state
+    pub fn reset(&mut self) {
+        self.ready = false;
+        self.size = self.max_size;
+        self.vector = VIRTIO_MSI_NO_VECTOR;
+        self.desc_table = GuestAddress(0);
+        self.avail_ring = GuestAddress(0);
+        self.used_ring = GuestAddress(0);
+        self.next_avail = Wrapping(0);
+        self.next_used = Wrapping(0);
     }
 
     pub fn is_valid(&self, mem: &GuestMemory) -> bool {
@@ -280,8 +310,9 @@ impl Queue {
         }
     }
 
-    /// If a new DescriptorHead is available, returns one and removes it from the queue.
-    pub fn pop<'a>(&mut self, mem: &'a GuestMemory) -> Option<DescriptorChain<'a>> {
+    /// Get the first available descriptor chain without removing it from the queue.
+    /// Call `pop_peeked` to remove the returned descriptor chain from the queue.
+    pub fn peek<'a>(&mut self, mem: &'a GuestMemory) -> Option<DescriptorChain<'a>> {
         if !self.is_valid(mem) {
             return None;
         }
@@ -289,22 +320,34 @@ impl Queue {
         let queue_size = self.actual_size();
         let avail_index_addr = mem.checked_offset(self.avail_ring, 2).unwrap();
         let avail_index: u16 = mem.read_obj_from_addr(avail_index_addr).unwrap();
+        // make sure desc_index read doesn't bypass avail_index read
+        fence(Ordering::Acquire);
         let avail_len = Wrapping(avail_index) - self.next_avail;
 
         if avail_len.0 > queue_size || self.next_avail == Wrapping(avail_index) {
             return None;
         }
 
-        let desc_idx_addr_offset = (4 + (self.next_avail.0 % queue_size) * 2) as u64;
+        let desc_idx_addr_offset = 4 + (u64::from(self.next_avail.0 % queue_size) * 2);
         let desc_idx_addr = mem.checked_offset(self.avail_ring, desc_idx_addr_offset)?;
 
         // This index is checked below in checked_new.
         let descriptor_index: u16 = mem.read_obj_from_addr(desc_idx_addr).unwrap();
 
-        let descriptor_chain =
-            DescriptorChain::checked_new(mem, self.desc_table, queue_size, descriptor_index);
+        DescriptorChain::checked_new(mem, self.desc_table, queue_size, descriptor_index, 0)
+    }
+
+    /// Remove the first available descriptor chain from the queue.
+    /// This function should only be called immediately following `peek`.
+    pub fn pop_peeked(&mut self) {
+        self.next_avail += Wrapping(1);
+    }
+
+    /// If a new DescriptorHead is available, returns one and removes it from the queue.
+    pub fn pop<'a>(&mut self, mem: &'a GuestMemory) -> Option<DescriptorChain<'a>> {
+        let descriptor_chain = self.peek(mem);
         if descriptor_chain.is_some() {
-            self.next_avail += Wrapping(1);
+            self.pop_peeked();
         }
         descriptor_chain
     }
@@ -340,5 +383,34 @@ impl Queue {
 
         mem.write_obj_at_addr(self.next_used.0 as u16, used_ring.unchecked_add(2))
             .unwrap();
+    }
+
+    /// Enable / Disable guest notify device that requests are available on
+    /// the descriptor chain.
+    pub fn set_notify(&mut self, mem: &GuestMemory, enable: bool) {
+        let mut used_flags: u16 = mem.read_obj_from_addr(self.used_ring).unwrap();
+        if enable {
+            used_flags &= !VIRTQ_USED_F_NO_NOTIFY;
+        } else {
+            used_flags |= VIRTQ_USED_F_NO_NOTIFY;
+        }
+        mem.write_obj_at_addr(used_flags, self.used_ring).unwrap();
+    }
+
+    // Check Whether guest enable interrupt injection or not.
+    fn available_interrupt_enabled(&self, mem: &GuestMemory) -> bool {
+        let avail_flags: u16 = mem.read_obj_from_addr(self.avail_ring).unwrap();
+        if avail_flags & VIRTQ_AVAIL_F_NO_INTERRUPT == VIRTQ_AVAIL_F_NO_INTERRUPT {
+            false
+        } else {
+            true
+        }
+    }
+
+    /// inject interrupt into guest on this queue
+    pub fn trigger_interrupt(&self, mem: &GuestMemory, interrupt: &Interrupt) {
+        if self.available_interrupt_enabled(mem) {
+            interrupt.signal_used_queue(self.vector);
+        }
     }
 }
