@@ -10,17 +10,18 @@ RUN apt-get update && apt-get install -y \
     autoconf \
     automake \
     curl \
-    gcc \
     g++ \
+    gcc \
     git \
+    kmod \
     libcap-dev \
     libdbus-1-dev \
-    libdrm-dev \
-    libfdt-dev \
     libegl1-mesa-dev \
+    libfdt-dev \
     libgl1-mesa-dev \
     libgles1-mesa-dev \
     libgles2-mesa-dev \
+    libpciaccess-dev \
     libssl1.0-dev \
     libtool \
     libusb-1.0-0-dev \
@@ -35,7 +36,7 @@ RUN apt-get update && apt-get install -y \
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH \
-    RUST_VERSION=1.35.0 \
+    RUST_VERSION=1.41.0 \
     RUSTFLAGS='--cfg hermetic'
 
 # Debian usually has an old rust version in the repository. Instead of using that, we use rustup to
@@ -58,11 +59,21 @@ RUN cargo install thisiznotarealpackage -q || true
 # Used /scratch for building dependencies which are too new or don't exist on Debian stretch.
 WORKDIR /scratch
 
-# minijail does not exist in upstream linux distros.
-RUN git clone https://android.googlesource.com/platform/external/minijail \
-    && cd minijail \
-    && make -j$(nproc) \
-    && cp libminijail.so /usr/lib/x86_64-linux-gnu/
+# New libepoxy and libdrm-dev requires newer meson than is in Debian stretch.
+ARG MESON_COMMIT=master
+RUN git clone https://github.com/mesonbuild/meson \
+    && cd meson \
+    && git checkout $MESON_COMMIT \
+    && ln -s $PWD/meson.py /usr/bin/meson
+
+# The libdrm-dev in distro can be too old to build minigbm,
+# so we build it from upstream.
+ARG DRM_COMMIT=master
+RUN git clone https://gitlab.freedesktop.org/mesa/drm \
+    && cd drm \
+    && git checkout $DRM_COMMIT \
+    && meson build \
+    && ninja -C build/ install
 
 # The gbm used by upstream linux distros is not compatible with crosvm, which must use Chrome OS's
 # minigbm.
@@ -71,13 +82,6 @@ RUN git clone https://chromium.googlesource.com/chromiumos/platform/minigbm \
     && cd minigbm \
     && sed 's/-Wall/-Wno-maybe-uninitialized/g' -i Makefile \
     && make install -j$(nproc)
-
-# New libepoxy requires newer meson than is in Debian stretch.
-ARG MESON_COMMIT=master
-RUN git clone https://github.com/mesonbuild/meson \
-    && cd meson \
-    && git checkout $MESON_COMMIT \
-    && ln -s $PWD/meson.py /usr/bin/meson
 
 # New libepoxy has EGL_KHR_DEBUG entry points needed by crosvm.
 ARG LIBEPOXY_COMMIT=master
@@ -89,9 +93,11 @@ RUN git clone https://github.com/anholt/libepoxy.git \
     && meson \
     && ninja install
 
-# virglrenderer is under heavy development on master and we want the very latest.
-RUN git clone https://gitlab.freedesktop.org/virgl/virglrenderer.git \
+# We've forked virglrenderer to accomodate differences in the GBM header.
+# Until we can upstream our changes, build based on this downstream tree.
+RUN git clone https://gitlab.freedesktop.org/gurchetansingh/virglrenderer.git \
     && cd virglrenderer \
+    && git checkout keep-kokoro-happy \
     && ./autogen.sh \
     && make install -j$(nproc)
 
@@ -135,6 +141,14 @@ ENV THIRD_PARTY_ROOT=$CROS_ROOT/third_party
 RUN mkdir -p $THIRD_PARTY_ROOT
 ENV PLATFORM_ROOT=$CROS_ROOT/platform
 RUN mkdir -p $PLATFORM_ROOT
+ENV AOSP_EXTERNAL_ROOT=$CROS_ROOT/aosp/external
+RUN mkdir -p $AOSP_EXTERNAL_ROOT
+
+# minijail does not exist in upstream linux distros.
+RUN git clone https://android.googlesource.com/platform/external/minijail $AOSP_EXTERNAL_ROOT/minijail \
+    && cd $AOSP_EXTERNAL_ROOT/minijail \
+    && make -j$(nproc) \
+    && cp libminijail.so /usr/lib/x86_64-linux-gnu/
 
 # Pull the cras library for audio access.
 ARG ADHD_COMMIT=master

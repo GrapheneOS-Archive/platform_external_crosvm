@@ -5,7 +5,7 @@
 use std::os::unix::io::RawFd;
 
 use audio_streams::StreamSource;
-use resources::{Alloc, SystemAllocator};
+use resources::{Alloc, MmioType, SystemAllocator};
 use sys_util::{error, EventFd, GuestMemory};
 
 use crate::pci::ac97_bus_master::Ac97BusMaster;
@@ -149,11 +149,12 @@ impl PciDevice for Ac97Dev {
             .expect("assign_bus_dev must be called prior to allocate_io_bars");
         let mut ranges = Vec::new();
         let mixer_regs_addr = resources
-            .mmio_allocator()
-            .allocate(
+            .mmio_allocator(MmioType::Low)
+            .allocate_with_align(
                 MIXER_REGS_SIZE,
                 Alloc::PciBar { bus, dev, bar: 0 },
                 "ac97-mixer_regs".to_string(),
+                MIXER_REGS_SIZE,
             )
             .map_err(|e| pci_device::Error::IoAllocationFailed(MIXER_REGS_SIZE, e))?;
         let mixer_config = PciBarConfiguration::default()
@@ -166,11 +167,12 @@ impl PciDevice for Ac97Dev {
         ranges.push((mixer_regs_addr, MIXER_REGS_SIZE));
 
         let master_regs_addr = resources
-            .mmio_allocator()
-            .allocate(
+            .mmio_allocator(MmioType::Low)
+            .allocate_with_align(
                 MASTER_REGS_SIZE,
                 Alloc::PciBar { bus, dev, bar: 1 },
                 "ac97-master_regs".to_string(),
+                MASTER_REGS_SIZE,
             )
             .map_err(|e| pci_device::Error::IoAllocationFailed(MASTER_REGS_SIZE, e))?;
         let master_config = PciBarConfiguration::default()
@@ -184,12 +186,12 @@ impl PciDevice for Ac97Dev {
         Ok(ranges)
     }
 
-    fn config_registers(&self) -> &PciConfiguration {
-        &self.config_regs
+    fn read_config_register(&self, reg_idx: usize) -> u32 {
+        self.config_regs.read_reg(reg_idx)
     }
 
-    fn config_registers_mut(&mut self) -> &mut PciConfiguration {
-        &mut self.config_regs
+    fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+        (&mut self.config_regs).write_reg(reg_idx, offset, data)
     }
 
     fn keep_fds(&self) -> Vec<RawFd> {
@@ -201,8 +203,8 @@ impl PciDevice for Ac97Dev {
     }
 
     fn read_bar(&mut self, addr: u64, data: &mut [u8]) {
-        let bar0 = u64::from(self.config_regs.get_bar_addr(0));
-        let bar1 = u64::from(self.config_regs.get_bar_addr(1));
+        let bar0 = self.config_regs.get_bar_addr(0);
+        let bar1 = self.config_regs.get_bar_addr(1);
         match addr {
             a if a >= bar0 && a < bar0 + MIXER_REGS_SIZE => self.read_mixer(addr - bar0, data),
             a if a >= bar1 && a < bar1 + MASTER_REGS_SIZE => {
@@ -213,8 +215,8 @@ impl PciDevice for Ac97Dev {
     }
 
     fn write_bar(&mut self, addr: u64, data: &[u8]) {
-        let bar0 = u64::from(self.config_regs.get_bar_addr(0));
-        let bar1 = u64::from(self.config_regs.get_bar_addr(1));
+        let bar0 = self.config_regs.get_bar_addr(0);
+        let bar1 = self.config_regs.get_bar_addr(1);
         match addr {
             a if a >= bar0 && a < bar0 + MIXER_REGS_SIZE => self.write_mixer(addr - bar0, data),
             a if a >= bar1 && a < bar1 + MASTER_REGS_SIZE => {
@@ -243,8 +245,8 @@ mod tests {
         let mut ac97_dev = Ac97Dev::new(mem, Box::new(DummyStreamSource::new()));
         let mut allocator = SystemAllocator::builder()
             .add_io_addresses(0x1000_0000, 0x1000_0000)
-            .add_mmio_addresses(0x2000_0000, 0x1000_0000)
-            .add_device_addresses(0x3000_0000, 0x1000_0000)
+            .add_low_mmio_addresses(0x2000_0000, 0x1000_0000)
+            .add_high_mmio_addresses(0x3000_0000, 0x1000_0000)
             .create_allocator(5, false)
             .unwrap();
         ac97_dev.assign_bus_dev(0, 0);

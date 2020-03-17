@@ -3,14 +3,12 @@
 rust_library_host_rlib {
     name: "libx86_64_rust",
     defaults: ["crosvm_defaults"],
-    deny_warnings: false,
     stem: "libx86_64",
     crate_name: "x86_64",
     srcs: ["src/lib.rs"],
     rlibs: [
         "libarch",
         "libassertions",
-        "libbyteorder",
         "libdata_model",
         "libdevices",
         "libio_jail",
@@ -24,7 +22,7 @@ rust_library_host_rlib {
         "libsys_util",
     ],
     proc_macros: [
-        "libremain-0.1.3",
+        "libremain",
     ],
     static_libs: [
         "libhost_cpuid",

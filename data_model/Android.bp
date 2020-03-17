@@ -2,7 +2,6 @@
 
 rust_library_host_rlib {
     name: "libdata_model",
-    deny_warnings: false,
     defaults: ["crosvm_defaults"],
     crate_name: "data_model",
     srcs: ["src/lib.rs"],

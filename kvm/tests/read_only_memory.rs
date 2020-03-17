@@ -20,7 +20,7 @@ fn test_run() {
     let mem_size = 0x2000;
     let load_addr = GuestAddress(0x1000);
     let guest_mem = GuestMemory::new(&[]).unwrap();
-    let mut mem = SharedMemory::new(None).expect("failed to create shared memory");
+    let mut mem = SharedMemory::anon().expect("failed to create shared memory");
     mem.set_size(mem_size)
         .expect("failed to set shared memory size");
     let mmap =
@@ -45,7 +45,7 @@ fn test_run() {
     vcpu_regs.rax = 0x66;
     vcpu_regs.rbx = 0;
     vcpu.set_regs(&vcpu_regs).expect("set regs failed");
-    vm.add_device_memory(
+    vm.add_mmio_memory(
         GuestAddress(0),
         MemoryMapping::from_fd(&mem, mem_size as usize).expect("failed to create memory mapping"),
         false,
@@ -55,7 +55,7 @@ fn test_run() {
 
     // Give some read only memory for the test code to read from and force a vcpu exit when it reads
     // from it.
-    let mut mem_ro = SharedMemory::new(None).expect("failed to create shared memory");
+    let mut mem_ro = SharedMemory::anon().expect("failed to create shared memory");
     mem_ro
         .set_size(0x1000)
         .expect("failed to set shared memory size");
@@ -63,7 +63,7 @@ fn test_run() {
     mmap_ro
         .write_obj(vcpu_regs.rax as u8, 0)
         .expect("failed writing data to ro memory");
-    vm.add_device_memory(
+    vm.add_mmio_memory(
         GuestAddress(vcpu_sregs.es.base),
         MemoryMapping::from_fd(&mem_ro, 0x1000).expect("failed to create memory mapping"),
         true,
@@ -74,8 +74,9 @@ fn test_run() {
     // Ensure we get exactly 1 exit from attempting to write to read only memory.
     let mut exits = 0;
 
+    let runnable_vcpu = vcpu.to_runnable(None).unwrap();
     loop {
-        match vcpu.run().expect("run failed") {
+        match runnable_vcpu.run().expect("run failed") {
             VcpuExit::Hlt => break,
             VcpuExit::MmioWrite {
                 address,

@@ -26,6 +26,7 @@ pub enum Error {
     InvalidProgramHeaderSize,
     InvalidProgramHeaderOffset,
     InvalidProgramHeaderAddress,
+    InvalidProgramHeaderMemSize,
     ReadElfHeader,
     ReadKernelImage,
     ReadProgramHeader,
@@ -49,6 +50,7 @@ impl Display for Error {
             InvalidProgramHeaderSize => "invalid program header size",
             InvalidProgramHeaderOffset => "invalid program header offset",
             InvalidProgramHeaderAddress => "invalid Program Header Address",
+            InvalidProgramHeaderMemSize => "invalid Program Header memory size",
             ReadElfHeader => "unable to read elf header",
             ReadKernelImage => "unable to read kernel image",
             ReadProgramHeader => "unable to read program header",
@@ -132,7 +134,10 @@ where
             .read_to_memory(mem_offset, kernel_image, phdr.p_filesz as usize)
             .map_err(|_| Error::ReadKernelImage)?;
 
-        kernel_end = mem_offset.offset() + phdr.p_memsz;
+        kernel_end = mem_offset
+            .offset()
+            .checked_add(phdr.p_memsz)
+            .ok_or(Error::InvalidProgramHeaderMemSize)?;
     }
 
     Ok(kernel_end)
@@ -159,7 +164,7 @@ pub fn load_cmdline(
         .checked_add(len as u64 + 1)
         .ok_or(Error::CommandLineOverflow)?; // Extra for null termination.
     if end > guest_mem.end_addr() {
-        return Err(Error::CommandLineOverflow)?;
+        return Err(Error::CommandLineOverflow);
     }
 
     guest_mem
@@ -227,7 +232,7 @@ mod test {
     // Elf64 image that prints hello world on x86_64.
     fn make_elf_bin() -> File {
         let elf_bytes = include_bytes!("test_elf.bin");
-        let mut shm = SharedMemory::new(None).expect("failed to create shared memory");
+        let mut shm = SharedMemory::anon().expect("failed to create shared memory");
         shm.set_size(elf_bytes.len() as u64)
             .expect("failed to set shared memory size");
         shm.write_all(elf_bytes)

@@ -10,20 +10,21 @@ extern crate libc;
 extern crate msg_socket;
 extern crate sys_util;
 
+use msg_socket::MsgOnSocket;
 use std::fmt::Display;
 
 pub use crate::address_allocator::AddressAllocator;
 pub use crate::gpu_allocator::{
     GpuAllocatorError, GpuMemoryAllocator, GpuMemoryDesc, GpuMemoryPlaneDesc,
 };
-pub use crate::system_allocator::SystemAllocator;
+pub use crate::system_allocator::{MmioType, SystemAllocator};
 
 mod address_allocator;
 mod gpu_allocator;
 mod system_allocator;
 
 /// Used to tag SystemAllocator allocations.
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq, Hash, MsgOnSocket, Copy, Clone)]
 pub enum Alloc {
     /// An anonymous resource allocation.
     /// Should only be instantiated through `SystemAllocator::get_anon_alloc()`.
@@ -35,6 +36,8 @@ pub enum Alloc {
     GpuRenderNode,
     /// Pmem device region with associated device index.
     PmemDevice(usize),
+    /// pstore region.
+    Pstore,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -43,8 +46,8 @@ pub enum Error {
     BadAlignment,
     CreateGpuAllocator(GpuAllocatorError),
     ExistingAlloc(Alloc),
-    MissingDeviceAddresses,
-    MissingMMIOAddresses,
+    MissingHighMMIOAddresses,
+    MissingLowMMIOAddresses,
     NoIoAllocator,
     OutOfSpace,
     PoolOverflow { base: u64, size: u64 },
@@ -61,8 +64,8 @@ impl Display for Error {
             BadAlignment => write!(f, "Pool alignment must be a power of 2"),
             CreateGpuAllocator(e) => write!(f, "Failed to create GPU allocator: {:?}", e),
             ExistingAlloc(tag) => write!(f, "Alloc already exists: {:?}", tag),
-            MissingDeviceAddresses => write!(f, "Device address range not specified"),
-            MissingMMIOAddresses => write!(f, "MMIO address range not specified"),
+            MissingHighMMIOAddresses => write!(f, "High MMIO address range not specified"),
+            MissingLowMMIOAddresses => write!(f, "Low MMIO address range not specified"),
             NoIoAllocator => write!(f, "No IO address range specified"),
             OutOfSpace => write!(f, "Out of space"),
             PoolOverflow { base, size } => write!(f, "base={} + size={} overflows", base, size),

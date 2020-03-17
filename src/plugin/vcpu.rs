@@ -23,6 +23,7 @@ use kvm_sys::{
     kvm_debugregs, kvm_fpu, kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_msrs, kvm_regs,
     kvm_sregs, kvm_vcpu_events, kvm_xcrs, KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
 };
+use protobuf::stream::CodedOutputStream;
 use protos::plugin::*;
 use sync::Mutex;
 use sys_util::{error, LayoutAllocation};
@@ -30,14 +31,14 @@ use sys_util::{error, LayoutAllocation};
 use super::*;
 
 /// Identifier for an address space in the VM.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 pub enum IoSpace {
     Ioport,
     Mmio,
 }
 
 #[derive(Debug, Copy, Clone)]
-struct Range(u64, u64);
+struct Range(u64, u64, bool);
 
 impl Eq for Range {}
 
@@ -137,18 +138,45 @@ fn set_vcpu_state(vcpu: &Vcpu, state_set: VcpuRequest_StateSet, state: &[u8]) ->
     }
 }
 
+pub struct CallHintDetails {
+    pub match_rax: bool,
+    pub match_rbx: bool,
+    pub match_rcx: bool,
+    pub match_rdx: bool,
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub send_sregs: bool,
+    pub send_debugregs: bool,
+}
+
+pub struct CallHint {
+    io_space: IoSpace,
+    addr: u64,
+    on_write: bool,
+    regs: Vec<CallHintDetails>,
+}
+
 /// State shared by every VCPU, grouped together to make edits to the state coherent across VCPUs.
 #[derive(Default)]
 pub struct SharedVcpuState {
     ioport_regions: BTreeSet<Range>,
     mmio_regions: BTreeSet<Range>,
+    hint: Option<CallHint>,
 }
 
 impl SharedVcpuState {
     /// Reserves the given range for handling by the plugin process.
     ///
     /// This will reject any reservation that overlaps with an existing reservation.
-    pub fn reserve_range(&mut self, space: IoSpace, start: u64, length: u64) -> SysResult<()> {
+    pub fn reserve_range(
+        &mut self,
+        space: IoSpace,
+        start: u64,
+        length: u64,
+        async_write: bool,
+    ) -> SysResult<()> {
         if length == 0 {
             return Err(SysError::new(EINVAL));
         }
@@ -168,10 +196,16 @@ impl SharedVcpuState {
             IoSpace::Mmio => &mut self.mmio_regions,
         };
 
-        match space.range(..Range(last_address, 0)).next_back().cloned() {
-            Some(Range(existing_start, _)) if existing_start >= start => Err(SysError::new(EPERM)),
+        match space
+            .range(..Range(last_address, 0, false))
+            .next_back()
+            .cloned()
+        {
+            Some(Range(existing_start, _, _)) if existing_start >= start => {
+                Err(SysError::new(EPERM))
+            }
             _ => {
-                space.insert(Range(start, length));
+                space.insert(Range(start, length, async_write));
                 Ok(())
             }
         }
@@ -179,7 +213,7 @@ impl SharedVcpuState {
 
     //// Releases a reservation previously made at `start` in the given `space`.
     pub fn unreserve_range(&mut self, space: IoSpace, start: u64) -> SysResult<()> {
-        let range = Range(start, 0);
+        let range = Range(start, 0, false);
         let space = match space {
             IoSpace::Ioport => &mut self.ioport_regions,
             IoSpace::Mmio => &mut self.mmio_regions,
@@ -191,8 +225,28 @@ impl SharedVcpuState {
         }
     }
 
+    pub fn set_hint(
+        &mut self,
+        space: IoSpace,
+        addr: u64,
+        on_write: bool,
+        regs: Vec<CallHintDetails>,
+    ) {
+        if addr == 0 {
+            self.hint = None;
+        } else {
+            let hint = CallHint {
+                io_space: space,
+                addr,
+                on_write,
+                regs,
+            };
+            self.hint = Some(hint);
+        }
+    }
+
     fn is_reserved(&self, space: IoSpace, addr: u64) -> bool {
-        if let Some(Range(start, len)) = self.first_before(space, addr) {
+        if let Some(Range(start, len, _)) = self.first_before(space, addr) {
             let offset = addr - start;
             if offset < len {
                 return true;
@@ -208,9 +262,34 @@ impl SharedVcpuState {
         };
 
         match addr.checked_add(1) {
-            Some(next_addr) => space.range(..Range(next_addr, 0)).next_back().cloned(),
+            Some(next_addr) => space
+                .range(..Range(next_addr, 0, false))
+                .next_back()
+                .cloned(),
             None => None,
         }
+    }
+
+    fn matches_hint(&self, io_space: IoSpace, addr: u64, is_write: bool) -> bool {
+        if let Some(hint) = &self.hint {
+            return io_space == hint.io_space && addr == hint.addr && is_write == hint.on_write;
+        }
+        false
+    }
+
+    fn check_hint_details(&self, regs: &kvm_regs) -> (bool, bool) {
+        if let Some(hint) = &self.hint {
+            for entry in hint.regs.iter() {
+                if (!entry.match_rax || entry.rax == regs.rax)
+                    && (!entry.match_rbx || entry.rbx == regs.rbx)
+                    && (!entry.match_rcx || entry.rcx == regs.rcx)
+                    && (!entry.match_rdx || entry.rdx == regs.rdx)
+                {
+                    return (entry.send_sregs, entry.send_debugregs);
+                }
+            }
+        }
+        (false, false)
     }
 }
 
@@ -338,14 +417,14 @@ impl PluginVcpu {
         };
 
         let first_before_addr = vcpu_state_lock.first_before(io_space, addr);
-        // Drops the read lock as soon as possible, to prevent holding lock while blocked in
-        // `handle_until_resume`.
-        drop(vcpu_state_lock);
 
         match first_before_addr {
-            Some(Range(start, len)) => {
+            Some(Range(start, len, async_write)) => {
                 let offset = addr - start;
                 if offset >= len {
+                    return false;
+                }
+                if async_write && !data.is_write() {
                     return false;
                 }
 
@@ -358,12 +437,55 @@ impl PluginVcpu {
                 io.address = addr;
                 io.is_write = data.is_write();
                 io.data = data.as_slice().to_vec();
+                io.no_resume = async_write;
+                if !async_write && vcpu_state_lock.matches_hint(io_space, addr, io.is_write) {
+                    if let Ok(regs) = vcpu.get_regs() {
+                        let (has_sregs, has_debugregs) = vcpu_state_lock.check_hint_details(&regs);
+                        io.regs = VcpuRegs(regs).as_slice().to_vec();
+                        if has_sregs {
+                            if let Ok(state) = get_vcpu_state(vcpu, VcpuRequest_StateSet::SREGS) {
+                                io.sregs = state;
+                            }
+                        }
+                        if has_debugregs {
+                            if let Ok(state) = get_vcpu_state(vcpu, VcpuRequest_StateSet::DEBUGREGS)
+                            {
+                                io.debugregs = state;
+                            }
+                        }
+                    }
+                }
+                // don't hold lock while blocked in `handle_until_resume`.
+                drop(vcpu_state_lock);
 
-                self.wait_reason.set(Some(wait_reason));
-                match self.handle_until_resume(vcpu) {
-                    Ok(resume_data) => data.copy_from_slice(&resume_data),
-                    Err(e) if e.errno() == EPIPE => {}
-                    Err(e) => error!("failed to process vcpu requests: {}", e),
+                if async_write {
+                    let mut response = VcpuResponse::new();
+                    response.set_wait(wait_reason);
+
+                    let mut response_buffer = self.response_buffer.borrow_mut();
+                    response_buffer.clear();
+                    let mut stream = CodedOutputStream::vec(&mut response_buffer);
+                    match response.write_length_delimited_to(&mut stream) {
+                        Ok(_) => {
+                            match stream.flush() {
+                                Ok(_) => {}
+                                Err(e) => error!("failed to flush to vec: {}", e),
+                            }
+                            let mut write_pipe = &self.write_pipe;
+                            match write_pipe.write(&response_buffer[..]) {
+                                Ok(_) => {}
+                                Err(e) => error!("failed to write to pipe: {}", e),
+                            }
+                        }
+                        Err(e) => error!("failed to write to buffer: {}", e),
+                    }
+                } else {
+                    self.wait_reason.set(Some(wait_reason));
+                    match self.handle_until_resume(vcpu) {
+                        Ok(resume_data) => data.copy_from_slice(&resume_data),
+                        Err(e) if e.errno() == EPIPE => {}
+                        Err(e) => error!("failed to process vcpu requests: {}", e),
+                    }
                 }
                 true
             }
@@ -396,6 +518,7 @@ impl PluginVcpu {
         let mut do_recv = true;
         let mut resume_data = None;
         let mut response = VcpuResponse::new();
+        let mut send_response = true;
 
         // Typically a response is sent for every request received.  The odd (yet common)
         // case is when a resume request is received.  This function will skip sending
@@ -442,7 +565,21 @@ impl PluginVcpu {
                 self.wait_reason.set(wait_reason);
                 Err(SysError::new(EPROTO))
             } else if request.has_resume() {
-                response.mut_resume();
+                send_response = false;
+                let resume = request.get_resume();
+                if !resume.get_regs().is_empty() {
+                    set_vcpu_state(vcpu, VcpuRequest_StateSet::REGS, resume.get_regs())?;
+                }
+                if !resume.get_sregs().is_empty() {
+                    set_vcpu_state(vcpu, VcpuRequest_StateSet::SREGS, resume.get_sregs())?;
+                }
+                if !resume.get_debugregs().is_empty() {
+                    set_vcpu_state(
+                        vcpu,
+                        VcpuRequest_StateSet::DEBUGREGS,
+                        resume.get_debugregs(),
+                    )?;
+                }
                 resume_data = Some(request.take_resume().take_data());
                 Ok(())
             } else if request.has_get_state() {
@@ -540,12 +677,14 @@ impl PluginVcpu {
 
         // Send the response, except if it's a resume response (in which case
         // we'll go run the VM and afterwards send a wait response message).
-        if !response.has_resume() {
+        if send_response {
             let mut response_buffer = self.response_buffer.borrow_mut();
             response_buffer.clear();
+            let mut stream = CodedOutputStream::vec(&mut response_buffer);
             response
-                .write_to_vec(&mut response_buffer)
+                .write_length_delimited_to(&mut stream)
                 .map_err(proto_to_sys_err)?;
+            stream.flush().map_err(proto_to_sys_err)?;
             let mut write_pipe = &self.write_pipe;
             write_pipe
                 .write(&response_buffer[..])
@@ -572,37 +711,37 @@ mod tests {
     fn shared_vcpu_reserve() {
         let mut shared_vcpu_state = SharedVcpuState::default();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x10, 0)
+            .reserve_range(IoSpace::Ioport, 0x10, 0, false)
             .unwrap_err();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x10, 0x10)
+            .reserve_range(IoSpace::Ioport, 0x10, 0x10, false)
             .unwrap();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x0f, 0x10)
+            .reserve_range(IoSpace::Ioport, 0x0f, 0x10, false)
             .unwrap_err();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x10, 0x10)
+            .reserve_range(IoSpace::Ioport, 0x10, 0x10, false)
             .unwrap_err();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x10, 0x15)
+            .reserve_range(IoSpace::Ioport, 0x10, 0x15, false)
             .unwrap_err();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x12, 0x15)
+            .reserve_range(IoSpace::Ioport, 0x12, 0x15, false)
             .unwrap_err();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x12, 0x01)
+            .reserve_range(IoSpace::Ioport, 0x12, 0x01, false)
             .unwrap_err();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x0, 0x20)
+            .reserve_range(IoSpace::Ioport, 0x0, 0x20, false)
             .unwrap_err();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x20, 0x05)
+            .reserve_range(IoSpace::Ioport, 0x20, 0x05, false)
             .unwrap();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x25, 0x05)
+            .reserve_range(IoSpace::Ioport, 0x25, 0x05, false)
             .unwrap();
         shared_vcpu_state
-            .reserve_range(IoSpace::Ioport, 0x0, 0x10)
+            .reserve_range(IoSpace::Ioport, 0x0, 0x10, false)
             .unwrap();
     }
 }
