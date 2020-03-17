@@ -25,7 +25,7 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ptr::{copy, null_mut, read_volatile, write_bytes, write_volatile};
 use std::result;
-use std::{isize, usize};
+use std::usize;
 
 use crate::DataInit;
 
@@ -163,7 +163,7 @@ impl<'a> VolatileSlice<'a> {
             return Err(VolatileMemoryError::Overflow {
                 base: self.addr as u64,
                 offset: count,
-            })?;
+            });
         }
         let new_size = self
             .size
@@ -172,6 +172,21 @@ impl<'a> VolatileSlice<'a> {
         // Safe because the memory has the same lifetime and points to a subset of the memory of the
         // original slice.
         unsafe { Ok(VolatileSlice::new(new_addr as *mut u8, new_size)) }
+    }
+
+    /// Similar to `get_slice` but the returned slice outlives this slice.
+    ///
+    /// The returned slice's lifetime is still limited by the underlying data's lifetime.
+    pub fn sub_slice(self, offset: u64, count: u64) -> Result<VolatileSlice<'a>> {
+        let mem_end = calc_offset(offset, count)?;
+        if mem_end > self.size {
+            return Err(Error::OutOfBounds { addr: mem_end });
+        }
+        Ok(VolatileSlice {
+            addr: (self.addr as u64 + offset) as *mut _,
+            size: count,
+            phantom: PhantomData,
+        })
     }
 
     /// Sets each byte of this slice with the given byte, similar to `memset`.
@@ -386,9 +401,8 @@ impl<'a, T: DataInit> VolatileRef<'a, T> {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
-    use std::thread::{sleep, spawn};
-    use std::time::Duration;
+    use std::sync::{Arc, Barrier};
+    use std::thread::spawn;
 
     #[derive(Clone)]
     struct VecMem {
@@ -457,35 +471,23 @@ mod tests {
         let a_clone = a.clone();
         let v_ref = a.get_ref::<u8>(0).unwrap();
         v_ref.store(99);
+
+        let start_barrier = Arc::new(Barrier::new(2));
+        let thread_start_barrier = start_barrier.clone();
+        let end_barrier = Arc::new(Barrier::new(2));
+        let thread_end_barrier = end_barrier.clone();
         spawn(move || {
-            sleep(Duration::from_millis(10));
+            thread_start_barrier.wait();
             let clone_v_ref = a_clone.get_ref::<u8>(0).unwrap();
             clone_v_ref.store(0);
+            thread_end_barrier.wait();
         });
 
-        // Technically this is a race condition but we have to observe the v_ref's value changing
-        // somehow and this helps to ensure the sleep actually happens before the store rather then
-        // being reordered by the compiler.
         assert_eq!(v_ref.load(), 99);
 
-        // Granted we could have a machine that manages to perform this many volatile loads in the
-        // amount of time the spawned thread sleeps, but the most likely reason the retry limit will
-        // get reached is because v_ref.load() is not actually performing the required volatile read
-        // or v_ref.store() is not doing a volatile write. A timer based solution was avoided
-        // because that might use a syscall which could hint the optimizer to reload v_ref's pointer
-        // regardless of volatile status. Note that we use a longer retry duration for optimized
-        // builds.
-        #[cfg(debug_assertions)]
-        const RETRY_MAX: u64 = 500_000_000;
-        #[cfg(not(debug_assertions))]
-        const RETRY_MAX: u64 = 10_000_000_000;
+        start_barrier.wait();
+        end_barrier.wait();
 
-        let mut retry = 0;
-        while v_ref.load() == 99 && retry < RETRY_MAX {
-            retry += 1;
-        }
-
-        assert_ne!(retry, RETRY_MAX, "maximum retry exceeded");
         assert_eq!(v_ref.load(), 0);
     }
 

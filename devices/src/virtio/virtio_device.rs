@@ -3,8 +3,6 @@
 // found in the LICENSE file.
 
 use std::os::unix::io::RawFd;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
 
 use sys_util::{EventFd, GuestMemory};
 
@@ -63,21 +61,21 @@ pub trait VirtioDevice: Send {
     fn activate(
         &mut self,
         mem: GuestMemory,
-        interrupt_evt: EventFd,
-        interrupt_resample_evt: EventFd,
-        status: Arc<AtomicUsize>,
+        interrupt: Interrupt,
         queues: Vec<Queue>,
         queue_evts: Vec<EventFd>,
     );
 
-    /// Optionally deactivates this device and returns ownership of the guest memory map, interrupt
-    /// event, and queue events.
-    fn reset(&mut self) -> Option<(EventFd, Vec<EventFd>)> {
-        None
+    /// Optionally deactivates this device. If the reset method is
+    /// not able to reset the virtio device, or the virtio device model doesn't
+    /// implement the reset method, a false value is returned to indicate
+    /// the reset is not successful. Otherwise a true value should be returned.
+    fn reset(&mut self) -> bool {
+        false
     }
 
     /// Returns any additional BAR configuration required by the device.
-    fn get_device_bars(&self) -> Vec<PciBarConfiguration> {
+    fn get_device_bars(&mut self, _bus: u8, _dev: u8) -> Vec<PciBarConfiguration> {
         Vec::new()
     }
 
@@ -85,4 +83,7 @@ pub trait VirtioDevice: Send {
     fn get_device_caps(&self) -> Vec<Box<dyn PciCapability>> {
         Vec::new()
     }
+
+    /// Invoked when the device is sandboxed.
+    fn on_device_sandboxed(&mut self) {}
 }

@@ -17,7 +17,7 @@ mod clock;
 mod errno;
 mod eventfd;
 mod file_flags;
-mod file_traits;
+pub mod file_traits;
 mod fork;
 mod guest_address;
 pub mod guest_memory;
@@ -33,7 +33,6 @@ pub mod signal;
 mod signalfd;
 mod sock_ctrl_msg;
 mod struct_util;
-mod tempdir;
 mod terminal;
 mod timerfd;
 mod write_zeroes;
@@ -60,17 +59,19 @@ pub use crate::signal::*;
 pub use crate::signalfd::*;
 pub use crate::sock_ctrl_msg::*;
 pub use crate::struct_util::*;
-pub use crate::tempdir::*;
 pub use crate::terminal::*;
 pub use crate::timerfd::*;
 pub use poll_token_derive::*;
 
-pub use crate::file_traits::{FileReadWriteVolatile, FileSetLen, FileSync};
+pub use crate::file_traits::{
+    AsRawFds, FileAllocate, FileGetLen, FileReadWriteAtVolatile, FileReadWriteVolatile, FileSetLen,
+    FileSync,
+};
 pub use crate::guest_memory::Error as GuestMemoryError;
 pub use crate::mmap::Error as MmapError;
 pub use crate::seek_hole::SeekHole;
 pub use crate::signalfd::Error as SignalFdError;
-pub use crate::write_zeroes::{PunchHole, WriteZeroes};
+pub use crate::write_zeroes::{PunchHole, WriteZeroes, WriteZeroesAt};
 
 use std::ffi::CStr;
 use std::fs::{remove_file, File};
@@ -79,8 +80,8 @@ use std::os::unix::net::UnixDatagram;
 use std::ptr;
 
 use libc::{
-    c_long, gid_t, kill, pid_t, pipe2, syscall, sysconf, uid_t, waitpid, O_CLOEXEC, SIGKILL,
-    WNOHANG, _SC_PAGESIZE,
+    c_int, c_long, fcntl, gid_t, kill, pid_t, pipe2, syscall, sysconf, uid_t, waitpid, F_GETFL,
+    F_SETFL, O_CLOEXEC, SIGKILL, WNOHANG, _SC_IOV_MAX, _SC_PAGESIZE,
 };
 
 use syscall_defines::linux::LinuxSyscall::SYS_getpid;
@@ -90,6 +91,12 @@ use syscall_defines::linux::LinuxSyscall::SYS_getpid;
 pub fn pagesize() -> usize {
     // Trivially safe
     unsafe { sysconf(_SC_PAGESIZE) as usize }
+}
+
+/// Safe wrapper for `sysconf(_SC_IOV_MAX)`.
+pub fn iov_max() -> usize {
+    // Trivially safe
+    unsafe { sysconf(_SC_IOV_MAX) as usize }
 }
 
 /// Uses the system's page size in bytes to round the given value up to the nearest page boundary.
@@ -169,6 +176,7 @@ pub fn flock(file: &dyn AsRawFd, op: FlockOperation, nonblocking: bool) -> Resul
 pub enum FallocateMode {
     PunchHole,
     ZeroRange,
+    Allocate,
 }
 
 /// Safe wrapper for `fallocate()`.
@@ -194,6 +202,7 @@ pub fn fallocate(
     let mut mode = match mode {
         FallocateMode::PunchHole => libc::FALLOC_FL_PUNCH_HOLE,
         FallocateMode::ZeroRange => libc::FALLOC_FL_ZERO_RANGE,
+        FallocateMode::Allocate => 0,
     };
 
     if keep_size {
@@ -320,4 +329,67 @@ pub fn validate_raw_fd(raw_fd: RawFd) -> Result<RawFd> {
         return Err(Error::last());
     }
     Ok(dup_fd as RawFd)
+}
+
+/// Utility function that returns true if the given FD is readable without blocking.
+///
+/// On an error, such as an invalid or incompatible FD, this will return false, which can not be
+/// distinguished from a non-ready to read FD.
+pub fn poll_in(fd: &dyn AsRawFd) -> bool {
+    let mut fds = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Safe because we give a valid pointer to a list (of 1) FD and check the return value.
+    let ret = unsafe { libc::poll(&mut fds, 1, 0) };
+    // An error probably indicates an invalid FD, or an FD that can't be polled. Returning false in
+    // that case is probably correct as such an FD is unlikely to be readable, although there are
+    // probably corner cases in which that is wrong.
+    if ret == -1 {
+        return false;
+    }
+    fds.revents & libc::POLLIN != 0
+}
+
+/// Returns the file flags set for the given `RawFD`
+///
+/// Returns an error if the OS indicates the flags can't be retrieved.
+fn get_fd_flags(fd: RawFd) -> Result<c_int> {
+    // Safe because no third parameter is expected and we check the return result.
+    let ret = unsafe { fcntl(fd, F_GETFL) };
+    if ret < 0 {
+        return errno_result();
+    }
+    Ok(ret)
+}
+
+/// Sets the file flags set for the given `RawFD`.
+///
+/// Returns an error if the OS indicates the flags can't be retrieved.
+fn set_fd_flags(fd: RawFd, flags: c_int) -> Result<()> {
+    // Safe because we supply the third parameter and we check the return result.
+    // fcntlt is trusted not to modify the memory of the calling process.
+    let ret = unsafe { fcntl(fd, F_SETFL, flags) };
+    if ret < 0 {
+        return errno_result();
+    }
+    Ok(())
+}
+
+/// Performs a logical OR of the given flags with the FD's flags, setting the given bits for the
+/// FD.
+///
+/// Returns an error if the OS indicates the flags can't be retrieved or set.
+pub fn add_fd_flags(fd: RawFd, set_flags: c_int) -> Result<()> {
+    let start_flags = get_fd_flags(fd)?;
+    set_fd_flags(fd, start_flags | set_flags)
+}
+
+/// Clears the given flags in the FD's flags.
+///
+/// Returns an error if the OS indicates the flags can't be retrieved or set.
+pub fn clear_fd_flags(fd: RawFd, clear_flags: c_int) -> Result<()> {
+    let start_flags = get_fd_flags(fd)?;
+    set_fd_flags(fd, start_flags & !clear_flags)
 }

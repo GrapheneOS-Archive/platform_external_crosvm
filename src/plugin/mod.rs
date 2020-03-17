@@ -20,18 +20,18 @@ use std::time::{Duration, Instant};
 use libc::{
     c_int, c_ulong, fcntl, ioctl, socketpair, AF_UNIX, EAGAIN, EBADF, EDEADLK, EEXIST, EINTR,
     EINVAL, ENOENT, EOVERFLOW, EPERM, FIOCLEX, F_SETPIPE_SZ, MS_NODEV, MS_NOEXEC, MS_NOSUID,
-    SIGCHLD, SOCK_SEQPACKET,
+    MS_RDONLY, SIGCHLD, SOCK_SEQPACKET,
 };
 
 use protobuf::ProtobufError;
 use remain::sorted;
 
 use io_jail::{self, Minijail};
-use kvm::{Datamatch, IoeventAddress, Kvm, Vcpu, VcpuExit, Vm};
+use kvm::{Cap, Datamatch, IoeventAddress, Kvm, Vcpu, VcpuExit, Vm};
 use net_util::{Error as TapError, Tap, TapT};
 use sys_util::{
     block_signal, clear_signal, drop_capabilities, error, getegid, geteuid, info, pipe,
-    register_signal_handler, validate_raw_fd, warn, Error as SysError, EventFd, GuestMemory,
+    register_rt_signal_handler, validate_raw_fd, warn, Error as SysError, EventFd, GuestMemory,
     Killable, MmapError, PollContext, PollToken, Result as SysResult, SignalFd, SignalFdError,
     SIGRTMIN,
 };
@@ -70,6 +70,7 @@ pub enum Error {
     MountLib64(io_jail::Error),
     MountPlugin(io_jail::Error),
     MountPluginLib(io_jail::Error),
+    MountProc(io_jail::Error),
     MountRoot(io_jail::Error),
     NoRootDir,
     ParsePivotRoot(io_jail::Error),
@@ -133,7 +134,9 @@ impl Display for Error {
             DropCapabilities(e) => write!(f, "failed to drop process capabilities: {}", e),
             EncodeResponse(e) => write!(f, "failed to encode plugin response: {}", e),
             Mount(e) | MountDev(e) | MountLib(e) | MountLib64(e) | MountPlugin(e)
-            | MountPluginLib(e) | MountRoot(e) => write!(f, "failed to mount: {}", e),
+            | MountPluginLib(e) | MountProc(e) | MountRoot(e) => {
+                write!(f, "failed to mount: {}", e)
+            }
             NoRootDir => write!(f, "no root directory for jailed process to pivot root into"),
             ParsePivotRoot(e) => write!(f, "failed to set jail pivot root: {}", e),
             ParseSeccomp(e) => write!(f, "failed to parse jail seccomp filter: {}", e),
@@ -265,7 +268,7 @@ fn mmap_to_sys_err(e: MmapError) -> SysError {
     }
 }
 
-fn create_plugin_jail(root: &Path, seccomp_policy: &Path) -> Result<Minijail> {
+fn create_plugin_jail(root: &Path, log_failures: bool, seccomp_policy: &Path) -> Result<Minijail> {
     // All child jails run in a new user namespace without any users mapped,
     // they run as nobody unless otherwise configured.
     let mut j = Minijail::new().map_err(Error::CreateJail)?;
@@ -284,13 +287,28 @@ fn create_plugin_jail(root: &Path, seccomp_policy: &Path) -> Result<Minijail> {
     // Run in an empty network namespace.
     j.namespace_net();
     j.no_new_privs();
-    // Use TSYNC only for the side effect of it using SECCOMP_RET_TRAP, which will correctly kill
-    // the entire plugin process if a worker thread commits a seccomp violation.
-    j.set_seccomp_filter_tsync();
-    #[cfg(debug_assertions)]
-    j.log_seccomp_filter_failures();
-    j.parse_seccomp_filters(seccomp_policy)
-        .map_err(Error::ParseSeccomp)?;
+    // By default we'll prioritize using the pre-compiled .bpf over the .policy
+    // file (the .bpf is expected to be compiled using "trap" as the failure
+    // behavior instead of the default "kill" behavior).
+    // Refer to the code comment for the "seccomp-log-failures"
+    // command-line parameter for an explanation about why the |log_failures|
+    // flag forces the use of .policy files (and the build-time alternative to
+    // this run-time flag).
+    let bpf_policy_file = seccomp_policy.with_extension("bpf");
+    if bpf_policy_file.exists() && !log_failures {
+        j.parse_seccomp_program(&bpf_policy_file)
+            .map_err(Error::ParseSeccomp)?;
+    } else {
+        // Use TSYNC only for the side effect of it using SECCOMP_RET_TRAP,
+        // which will correctly kill the entire device process if a worker
+        // thread commits a seccomp violation.
+        j.set_seccomp_filter_tsync();
+        if log_failures {
+            j.log_seccomp_filter_failures();
+        }
+        j.parse_seccomp_filters(&seccomp_policy.with_extension("policy"))
+            .map_err(Error::ParseSeccomp)?;
+    }
     j.use_seccomp_filter();
     // Don't do init setup.
     j.run_as_init();
@@ -305,6 +323,16 @@ fn create_plugin_jail(root: &Path, seccomp_policy: &Path) -> Result<Minijail> {
         "size=67108864",
     )
     .map_err(Error::MountRoot)?;
+
+    // Because we requested to "run as init", minijail will not mount /proc for us even though
+    // plugin will be running in its own PID namespace, so we have to mount it ourselves.
+    j.mount(
+        Path::new("proc"),
+        Path::new("/proc"),
+        "proc",
+        (MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RDONLY) as usize,
+    )
+    .map_err(Error::MountProc)?;
 
     Ok(j)
 }
@@ -321,9 +349,9 @@ fn create_plugin_jail(root: &Path, seccomp_policy: &Path) -> Result<Minijail> {
 /// These variant methods must be done by matching the variant to the expected type for that method.
 /// For example, getting the dirty log from a `Memory` object starting with an ID:
 ///
-/// ```
+/// ```ignore
 /// match objects.get(&request_id) {
-///    Some(&PluginObject::Memory { slot, length }) => vm.get_dirty_log(slot, &mut dirty_log[..])
+///    Some(&PluginObject::Memory { slot, length }) => vm.get_dirty_log(slot, &mut dirty_log[..]),
 ///    _ => return Err(SysError::new(ENOENT)),
 /// }
 /// ```
@@ -360,7 +388,7 @@ impl PluginObject {
                 8 => vm.unregister_ioevent(&evt, addr, Datamatch::U64(Some(datamatch as u64))),
                 _ => Err(SysError::new(EINVAL)),
             },
-            PluginObject::Memory { slot, .. } => vm.remove_device_memory(slot).and(Ok(())),
+            PluginObject::Memory { slot, .. } => vm.remove_mmio_memory(slot).and(Ok(())),
             PluginObject::IrqEvent { irq_id, evt } => vm.unregister_irqfd(&evt, irq_id),
         }
     }
@@ -376,6 +404,44 @@ pub fn run_vcpus(
     vcpu_handles: &mut Vec<thread::JoinHandle<()>>,
 ) -> Result<()> {
     let vcpu_thread_barrier = Arc::new(Barrier::new((vcpu_count) as usize));
+    let use_kvm_signals = !kvm.check_extension(Cap::ImmediateExit);
+
+    // If we need to force a vcpu to exit from a VM then a SIGRTMIN signal is sent
+    // to that vcpu's thread.  If KVM is running the VM then it'll return -EINTR.
+    // An issue is what to do when KVM isn't running the VM (where we could be
+    // in the kernel or in the app).
+    //
+    // If KVM supports "immediate exit" then we set a signal handler that will
+    // set the |immediate_exit| flag that tells KVM to return -EINTR before running
+    // the VM.
+    //
+    // If KVM doesn't support immediate exit then we'll block SIGRTMIN in the app
+    // and tell KVM to unblock SIGRTMIN before running the VM (at which point a blocked
+    // signal might get asserted).  There's overhead to have KVM unblock and re-block
+    // SIGRTMIN each time it runs the VM, so this mode should be avoided.
+
+    if use_kvm_signals {
+        unsafe {
+            extern "C" fn handle_signal() {}
+            // Our signal handler does nothing and is trivially async signal safe.
+            // We need to install this signal handler even though we do block
+            // the signal below, to ensure that this signal will interrupt
+            // execution of KVM_RUN (this is implementation issue).
+            register_rt_signal_handler(SIGRTMIN() + 0, handle_signal)
+                .expect("failed to register vcpu signal handler");
+        }
+        // We do not really want the signal handler to run...
+        block_signal(SIGRTMIN() + 0).expect("failed to block signal");
+    } else {
+        unsafe {
+            extern "C" fn handle_signal() {
+                Vcpu::set_local_immediate_exit(true);
+            }
+            register_rt_signal_handler(SIGRTMIN() + 0, handle_signal)
+                .expect("failed to register vcpu signal handler");
+        }
+    }
+
     for cpu_id in 0..vcpu_count {
         let kill_signaled = kill_signaled.clone();
         let vcpu_thread_barrier = vcpu_thread_barrier.clone();
@@ -387,22 +453,16 @@ pub fn run_vcpus(
             thread::Builder::new()
                 .name(format!("crosvm_vcpu{}", cpu_id))
                 .spawn(move || {
-                    unsafe {
-                        extern "C" fn handle_signal() {}
-                        // Our signal handler does nothing and is trivially async signal safe.
-                        // We need to install this signal handler even though we do block
-                        // the signal below, to ensure that this signal will interrupt
-                        // execution of KVM_RUN (this is implementation issue).
-                        register_signal_handler(SIGRTMIN() + 0, handle_signal)
-                            .expect("failed to register vcpu signal handler");
+                    if use_kvm_signals {
+                        // Tell KVM to not block anything when entering kvm run
+                        // because we will be using first RT signal to kick the VCPU.
+                        vcpu.set_signal_mask(&[])
+                            .expect("failed to set up KVM VCPU signal mask");
                     }
 
-                    // We do not really want the signal handler to run...
-                    block_signal(SIGRTMIN() + 0).expect("failed to block signal");
-                    // Tell KVM to not block anything when entering kvm run
-                    // because we will be using first RT signal to kick the VCPU.
-                    vcpu.set_signal_mask(&[])
-                        .expect("failed to set up KVM VCPU signal mask");
+                    let vcpu = vcpu
+                        .to_runnable(Some(SIGRTMIN() + 0))
+                        .expect("Failed to set thread id");
 
                     let res = vcpu_plugin.init(&vcpu);
                     vcpu_thread_barrier.wait();
@@ -478,16 +538,27 @@ pub fn run_vcpus(
                                 break;
                             }
 
-                            // Try to clear the signal that we use to kick VCPU if it is
-                            // pending before attempting to handle pause requests.
+                            // Only handle the pause request if kvm reported that it was
+                            // interrupted by a signal.  This helps to entire that KVM has had a chance
+                            // to finish emulating any IO that may have immediately happened.
+                            // If we eagerly check pre_run() then any IO that we
+                            // just reported to the plugin won't have been processed yet by KVM.
+                            // Not eagerly calling pre_run() also helps to reduce
+                            // any overhead from checking if a pause request is pending.
+                            // The assumption is that pause requests aren't common
+                            // or frequent so it's better to optimize for the non-pause execution paths.
                             if interrupted_by_signal {
-                                clear_signal(SIGRTMIN() + 0)
-                                    .expect("failed to clear pending signal");
-                            }
+                                if use_kvm_signals {
+                                    clear_signal(SIGRTMIN() + 0)
+                                        .expect("failed to clear pending signal");
+                                } else {
+                                    vcpu.set_immediate_exit(false);
+                                }
 
-                            if let Err(e) = vcpu_plugin.pre_run(&vcpu) {
-                                error!("failed to process pause on vcpu {}: {}", cpu_id, e);
-                                break;
+                                if let Err(e) = vcpu_plugin.pre_run(&vcpu) {
+                                    error!("failed to process pause on vcpu {}: {}", cpu_id, e);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -524,7 +595,7 @@ pub fn run_config(cfg: Config) -> Result<()> {
         // An empty directory for jailed plugin pivot root.
         let root_path = match &cfg.plugin_root {
             Some(dir) => dir,
-            None => Path::new("/var/empty"),
+            None => Path::new(option_env!("DEFAULT_PIVOT_ROOT").unwrap_or("/var/empty")),
         };
 
         if root_path.is_relative() {
@@ -539,8 +610,8 @@ pub fn run_config(cfg: Config) -> Result<()> {
             return Err(Error::RootNotDir);
         }
 
-        let policy_path = cfg.seccomp_policy_dir.join("plugin.policy");
-        let mut jail = create_plugin_jail(root_path, &policy_path)?;
+        let policy_path = cfg.seccomp_policy_dir.join("plugin");
+        let mut jail = create_plugin_jail(root_path, cfg.seccomp_log_failures, &policy_path)?;
 
         // Update gid map of the jail if caller provided supplemental groups.
         if !cfg.plugin_gid_maps.is_empty() {
@@ -623,13 +694,9 @@ pub fn run_config(cfg: Config) -> Result<()> {
     let kill_signaled = Arc::new(AtomicBool::new(false));
     let mut vcpu_handles = Vec::with_capacity(vcpu_count as usize);
 
-    let poll_ctx = PollContext::new().map_err(Error::CreatePollContext)?;
-    poll_ctx
-        .add(&exit_evt, Token::Exit)
-        .map_err(Error::PollContextAdd)?;
-    poll_ctx
-        .add(&sigchld_fd, Token::ChildSignal)
-        .map_err(Error::PollContextAdd)?;
+    let poll_ctx =
+        PollContext::build_with(&[(&exit_evt, Token::Exit), (&sigchld_fd, Token::ChildSignal)])
+            .map_err(Error::PollContextAdd)?;
 
     let mut sockets_to_drop = Vec::new();
     let mut redo_poll_ctx_sockets = true;

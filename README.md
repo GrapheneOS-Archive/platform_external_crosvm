@@ -1,11 +1,15 @@
 # crosvm - The Chrome OS Virtual Machine Monitor
 
 This component, known as crosvm, runs untrusted operating systems along with
-virtualized devices. No actual hardware is emulated. This only runs VMs
-through the Linux's KVM interface. What makes crosvm unique is a focus on
-safety within the programming language and a sandbox around the virtual
-devices to protect the kernel from attack in case of an exploit in the
-devices.
+virtualized devices. This only runs VMs through the Linux's KVM interface. What
+makes crosvm unique is a focus on safety within the programming language and a
+sandbox around the virtual devices to protect the kernel from attack in case of
+an exploit in the devices.
+
+## IRC
+
+The channel #crosvm on [freenode](https://webchat.freenode.net/#crosvm) is used
+for technical discussion related to crosvm development and integration.
 
 ## Building with Docker
 
@@ -157,7 +161,6 @@ binary size by including dozens of transitive dependencies. All these
 dependencies also must be reviewed to ensure their suitability to the crosvm
 project. Currently allowed crates are:
 
-* `byteorder` - A very small library used for endian swaps.
 * `cc` - Build time dependency needed to build C source code used in crosvm.
 * `libc` - Required to use the standard library, this crate is a simple wrapper around `libc`'s symbols.
 

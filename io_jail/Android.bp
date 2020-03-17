@@ -2,10 +2,11 @@
 
 rust_library_host_rlib {
     name: "libio_jail",
+    defaults: ["crosvm_defaults"],
     crate_name: "io_jail",
     srcs: ["src/lib.rs"],
-    defaults: ["crosvm_defaults"],
     rlibs: [
         "liblibc",
+        "libminijail_sys",
     ],
 }

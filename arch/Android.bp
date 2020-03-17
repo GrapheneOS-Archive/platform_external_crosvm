@@ -2,11 +2,10 @@
 
 rust_library_host_rlib {
     name: "libarch",
+    defaults: ["crosvm_defaults"],
     crate_name: "arch",
     srcs: ["src/lib.rs"],
-    defaults: ["crosvm_defaults"],
     rlibs: [
-        "libbyteorder",
         "libdevices",
         "libio_jail",
         "libkernel_cmdline",

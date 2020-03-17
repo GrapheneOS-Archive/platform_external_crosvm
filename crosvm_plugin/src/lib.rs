@@ -28,7 +28,6 @@ use std::slice;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use libc::{E2BIG, EINVAL, ENOENT, ENOTCONN, EPROTO};
 
@@ -45,6 +44,9 @@ use kvm_sys::{
 };
 
 use protos::plugin::*;
+
+#[cfg(feature = "stats")]
+mod stats;
 
 // Needs to be large enough to receive all the VCPU sockets.
 const MAX_DATAGRAM_FD: usize = 32;
@@ -96,6 +98,37 @@ pub struct crosvm_irq_route {
     route: anon_route,
 }
 
+const CROSVM_MAX_HINT_COUNT: u32 = 1;
+const CROSVM_MAX_HINT_DETAIL_COUNT: u32 = 32;
+const CROSVM_HINT_ON_WRITE: u16 = 1;
+
+#[repr(C)]
+pub struct crosvm_hint {
+    hint_version: u32,
+    reserved: u32,
+    address_space: u32,
+    address_flags: u16,
+    details_count: u16,
+    address: u64,
+    details: *const crosvm_hint_detail,
+}
+
+#[repr(C)]
+pub struct crosvm_hint_detail {
+    match_rax: bool,
+    match_rbx: bool,
+    match_rcx: bool,
+    match_rdx: bool,
+    reserved1: [u8; 4],
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    send_sregs: bool,
+    send_debugregs: bool,
+    reserved2: [u8; 6],
+}
+
 fn proto_error_to_int(e: protobuf::ProtobufError) -> c_int {
     match e {
         protobuf::ProtobufError::IoError(e) => e.raw_os_error().unwrap_or(EINVAL),
@@ -124,7 +157,7 @@ impl IdAllocator {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
-enum Stat {
+pub enum Stat {
     IoEventFd,
     MemoryGetDirtyLog,
     IrqEventGetFd,
@@ -138,6 +171,7 @@ enum Stat {
     GetMsrIndexList,
     NetGetConfig,
     ReserveRange,
+    ReserveAsyncWriteRange,
     SetIrq,
     SetIrqRouting,
     GetPicState,
@@ -174,87 +208,33 @@ enum Stat {
     VcpuGetVcpuEvents,
     VcpuSetVcpuEvents,
     NewConnection,
+    SetHypercallHint,
 
     Count,
 }
 
-#[derive(Clone, Copy)]
-struct StatEntry {
-    count: u64,
-    total: u64,
-    max: u64,
+#[cfg(feature = "stats")]
+fn record(a: Stat) -> stats::StatUpdater {
+    unsafe { stats::STATS.record(a) }
 }
 
-struct StatUpdater {
-    idx: usize,
-    start: Instant,
+#[cfg(not(feature = "stats"))]
+fn record(_a: Stat) -> u32 {
+    0
 }
 
-struct GlobalStats {
-    entries: [StatEntry; Stat::Count as usize],
-}
-
-static mut STATS: GlobalStats = GlobalStats {
-    entries: [StatEntry {
-        count: 0,
-        total: 0,
-        max: 0,
-    }; Stat::Count as usize],
-};
-
-impl GlobalStats {
-    // Record latency from this call until the end of block/function
-    // Example:
-    // pub fn foo() {
-    //     let _u = STATS.record(Stat::Foo);
-    //     // ... some operation ...
-    // }
-    // The added STATS.record will record latency of "some operation" and will
-    // update max and average latencies for it under Stats::Foo. Subsequent
-    // call to STATS.print() will print out max and average latencies for all
-    // operations that were performed.
-    fn record(&mut self, idx: Stat) -> StatUpdater {
-        StatUpdater {
-            idx: idx as usize,
-            start: Instant::now(),
-        }
-    }
-
-    fn print(&self) {
-        for idx in 0..Stat::Count as usize {
-            let e = &self.entries[idx as usize];
-            let stat = unsafe { std::mem::transmute::<u8, Stat>(idx as u8) };
-            if e.count > 0 {
-                println!(
-                    "Stat::{:?}: avg {}ns max {}ns",
-                    stat,
-                    e.total / e.count,
-                    e.max
-                );
-            }
-        }
-    }
-
-    fn update(&mut self, idx: usize, elapsed_nanos: u64) {
-        let e = &mut self.entries[idx as usize];
-        e.total += elapsed_nanos;
-        if e.max < elapsed_nanos {
-            e.max = elapsed_nanos;
-        }
-        e.count += 1;
-    }
-}
-
-impl Drop for StatUpdater {
-    fn drop(&mut self) {
-        let elapsed = self.start.elapsed();
-        let elapsed_nanos = elapsed.as_secs() * 1000000000 + elapsed.subsec_nanos() as u64;
-        // Unsafe due to racy access - OK for stats
+#[cfg(feature = "stats")]
+fn printstats() {
+    // Unsafe due to racy access - OK for stats
+    if std::env::var("CROSVM_STATS").is_ok() {
         unsafe {
-            STATS.update(self.idx, elapsed_nanos);
+            stats::STATS.print();
         }
     }
 }
+
+#[cfg(not(feature = "stats"))]
+fn printstats() {}
 
 pub struct crosvm {
     id_allocator: Arc<IdAllocator>,
@@ -346,12 +326,7 @@ impl crosvm {
         r.mut_destroy().id = id;
         self.main_transaction(&r, &[])?;
         self.get_id_allocator().free(id);
-        // Unsafe due to racy access - OK for stats
-        if std::env::var("CROSVM_STATS").is_ok() {
-            unsafe {
-                STATS.print();
-            }
-        }
+        printstats();
         Ok(())
     }
 
@@ -492,12 +467,19 @@ impl crosvm {
         Ok(())
     }
 
-    fn reserve_range(&mut self, space: u32, start: u64, length: u64) -> result::Result<(), c_int> {
+    fn reserve_range(
+        &mut self,
+        space: u32,
+        start: u64,
+        length: u64,
+        async_write: bool,
+    ) -> result::Result<(), c_int> {
         let mut r = MainRequest::new();
         let reserve: &mut MainRequest_ReserveRange = r.mut_reserve_range();
         reserve.space = AddressSpace::from_i32(space as i32).ok_or(EINVAL)?;
         reserve.start = start;
         reserve.length = length;
+        reserve.async_write = async_write;
 
         self.main_transaction(&r, &[])?;
         Ok(())
@@ -538,6 +520,38 @@ impl crosvm {
             }
             set_irq_routing.push(entry);
         }
+
+        self.main_transaction(&r, &[])?;
+        Ok(())
+    }
+
+    fn set_hint(
+        &mut self,
+        space: u32,
+        addr: u64,
+        on_write: bool,
+        hints: &[crosvm_hint_detail],
+    ) -> result::Result<(), c_int> {
+        let mut r = MainRequest::new();
+        let req: &mut MainRequest_SetCallHint = r.mut_set_call_hint();
+        let set_hints: &mut RepeatedField<MainRequest_SetCallHint_RegHint> = req.mut_hints();
+        for hint in hints {
+            let mut entry = MainRequest_SetCallHint_RegHint::new();
+            entry.match_rax = hint.match_rax;
+            entry.match_rbx = hint.match_rbx;
+            entry.match_rcx = hint.match_rcx;
+            entry.match_rdx = hint.match_rdx;
+            entry.rax = hint.rax;
+            entry.rbx = hint.rbx;
+            entry.rcx = hint.rcx;
+            entry.rdx = hint.rdx;
+            entry.send_sregs = hint.send_sregs;
+            entry.send_debugregs = hint.send_debugregs;
+            set_hints.push(entry);
+        }
+        req.space = AddressSpace::from_i32(space as i32).ok_or(EINVAL)?;
+        req.address = addr;
+        req.on_write = on_write;
 
         self.main_transaction(&r, &[])?;
         Ok(())
@@ -749,7 +763,7 @@ impl_ctor_dtor!(
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_io_event_fd(this: *mut crosvm_io_event) -> c_int {
-    let _u = STATS.record(Stat::IoEventFd);
+    let _u = record(Stat::IoEventFd);
     (*this).evt.as_raw_fd()
 }
 
@@ -822,7 +836,7 @@ pub unsafe extern "C" fn crosvm_memory_get_dirty_log(
     this: *mut crosvm_memory,
     log: *mut u8,
 ) -> c_int {
-    let _u = STATS.record(Stat::MemoryGetDirtyLog);
+    let _u = record(Stat::MemoryGetDirtyLog);
     let crosvm = &mut *crosvm;
     let this = &mut *this;
     let log_slice = slice::from_raw_parts_mut(log, dirty_log_bitmap_size(this.length as usize));
@@ -884,13 +898,13 @@ impl_ctor_dtor!(
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_irq_event_get_fd(this: *mut crosvm_irq_event) -> c_int {
-    let _u = STATS.record(Stat::IrqEventGetFd);
+    let _u = record(Stat::IrqEventGetFd);
     (*this).trigger_evt.as_raw_fd()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_irq_event_get_resample_fd(this: *mut crosvm_irq_event) -> c_int {
-    let _u = STATS.record(Stat::IrqEventGetResampleFd);
+    let _u = record(Stat::IrqEventGetResampleFd);
     (*this).resample_evt.as_raw_fd()
 }
 
@@ -904,7 +918,8 @@ struct anon_io_access {
     data: *mut u8,
     length: u32,
     is_write: u8,
-    __reserved1: u8,
+    no_resume: u8,
+    __reserved1: [u8; 2],
 }
 
 #[repr(C)]
@@ -922,13 +937,53 @@ pub struct crosvm_vcpu_event {
     event: anon_vcpu_event,
 }
 
+// |get| tracks if the |cache| contains a cached value that can service get()
+// requests.  A set() call will populate |cache| and |set| to true to record
+// that the next resume() should apply the state.  We've got two choices on
+// what to do about |get| on a set(): 1) leave it as true, or 2) clear it and
+// have any call to get() first apply any pending set.  Currently #2 is used
+// to favor correctness over performance (it gives KVM a chance to
+// modify/massage the values input to the set call). A plugin will rarely
+// (if ever) issue a get() after a set() on the same vcpu exit, so opting for
+// #1 is unlikely to provide a tangible performance gain.
+pub struct crosvm_vcpu_reg_cache {
+    get: bool,
+    set: bool,
+    cache: Vec<u8>,
+}
+
 pub struct crosvm_vcpu {
     read_pipe: File,
     write_pipe: File,
     send_init: bool,
     request_buffer: Vec<u8>,
     response_buffer: Vec<u8>,
+    response_base: usize,
+    response_length: usize,
     resume_data: Vec<u8>,
+
+    regs: crosvm_vcpu_reg_cache,
+    sregs: crosvm_vcpu_reg_cache,
+    debugregs: crosvm_vcpu_reg_cache,
+}
+
+fn read_varint32(data: &[u8]) -> (u32, usize) {
+    let mut value: u32 = 0;
+    let mut shift: u32 = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b < 0x80 {
+            return match (b as u32).checked_shl(shift) {
+                None => (0, 0),
+                Some(b) => (value | b, i + 1),
+            };
+        }
+        match ((b as u32) & 0x7F).checked_shl(shift) {
+            None => return (0, 0),
+            Some(b) => value |= b,
+        }
+        shift += 7;
+    }
+    (0, 0)
 }
 
 impl crosvm_vcpu {
@@ -939,7 +994,24 @@ impl crosvm_vcpu {
             send_init: true,
             request_buffer: Vec::new(),
             response_buffer: vec![0; MAX_DATAGRAM_SIZE],
+            response_base: 0,
+            response_length: 0,
             resume_data: Vec::new(),
+            regs: crosvm_vcpu_reg_cache {
+                get: false,
+                set: false,
+                cache: vec![],
+            },
+            sregs: crosvm_vcpu_reg_cache {
+                get: false,
+                set: false,
+                cache: vec![],
+            },
+            debugregs: crosvm_vcpu_reg_cache {
+                get: false,
+                set: false,
+                cache: vec![],
+            },
         }
     }
     fn vcpu_send(&mut self, request: &VcpuRequest) -> result::Result<(), c_int> {
@@ -954,13 +1026,30 @@ impl crosvm_vcpu {
     }
 
     fn vcpu_recv(&mut self) -> result::Result<VcpuResponse, c_int> {
-        let msg_size = self
-            .read_pipe
-            .read(&mut self.response_buffer)
-            .map_err(|e| -e.raw_os_error().unwrap_or(EINVAL))?;
-
-        let response: VcpuResponse =
-            parse_from_bytes(&self.response_buffer[..msg_size]).map_err(proto_error_to_int)?;
+        if self.response_length == 0 {
+            let msg_size = self
+                .read_pipe
+                .read(&mut self.response_buffer)
+                .map_err(|e| -e.raw_os_error().unwrap_or(EINVAL))?;
+            self.response_base = 0;
+            self.response_length = msg_size;
+        }
+        if self.response_length == 0 {
+            return Err(EINVAL);
+        }
+        let (value, bytes) = read_varint32(
+            &self.response_buffer[self.response_base..self.response_base + self.response_length],
+        );
+        let total_size: usize = bytes + value as usize;
+        if bytes == 0 || total_size > self.response_length {
+            return Err(EINVAL);
+        }
+        let response: VcpuResponse = parse_from_bytes(
+            &self.response_buffer[self.response_base + bytes..self.response_base + total_size],
+        )
+        .map_err(proto_error_to_int)?;
+        self.response_base += total_size;
+        self.response_length -= total_size;
         if response.errno != 0 {
             return Err(response.errno);
         }
@@ -987,6 +1076,9 @@ impl crosvm_vcpu {
         let wait: &mut VcpuResponse_Wait = response.mut_wait();
         if wait.has_init() {
             event.kind = CROSVM_VCPU_EVENT_KIND_INIT;
+            self.regs.get = false;
+            self.sregs.get = false;
+            self.debugregs.get = false;
             Ok(())
         } else if wait.has_io() {
             let mut io: VcpuResponse_Wait_Io = wait.take_io();
@@ -998,14 +1090,30 @@ impl crosvm_vcpu {
                 data: io.data.as_mut_ptr(),
                 length: io.data.len() as u32,
                 is_write: io.is_write as u8,
+                no_resume: io.no_resume as u8,
                 __reserved1: Default::default(),
             };
             self.resume_data = io.data;
+            self.regs.get = !io.regs.is_empty();
+            if self.regs.get {
+                swap(&mut self.regs.cache, &mut io.regs);
+            }
+            self.sregs.get = !io.sregs.is_empty();
+            if self.sregs.get {
+                swap(&mut self.sregs.cache, &mut io.sregs);
+            }
+            self.debugregs.get = !io.debugregs.is_empty();
+            if self.debugregs.get {
+                swap(&mut self.debugregs.cache, &mut io.debugregs);
+            }
             Ok(())
         } else if wait.has_user() {
             let user: &VcpuResponse_Wait_User = wait.get_user();
             event.kind = CROSVM_VCPU_EVENT_KIND_PAUSED;
             event.event.user = user.user as *mut c_void;
+            self.regs.get = false;
+            self.sregs.get = false;
+            self.debugregs.get = false;
             Ok(())
         } else {
             Err(EPROTO)
@@ -1016,6 +1124,19 @@ impl crosvm_vcpu {
         let mut r = VcpuRequest::new();
         let resume: &mut VcpuRequest_Resume = r.mut_resume();
         swap(&mut resume.data, &mut self.resume_data);
+
+        if self.regs.set {
+            swap(&mut resume.regs, &mut self.regs.cache);
+            self.regs.set = false;
+        }
+        if self.sregs.set {
+            swap(&mut resume.sregs, &mut self.sregs.cache);
+            self.sregs.set = false;
+        }
+        if self.debugregs.set {
+            swap(&mut resume.debugregs, &mut self.debugregs.cache);
+            self.debugregs.set = false;
+        }
 
         self.vcpu_send(&r)?;
         Ok(())
@@ -1049,6 +1170,33 @@ impl crosvm_vcpu {
         let set_state: &mut VcpuRequest_SetState = r.mut_set_state();
         set_state.set = state_set;
         set_state.state = new_state.to_vec();
+
+        self.vcpu_transaction(&r)?;
+        Ok(())
+    }
+
+    fn set_state_from_cache(
+        &mut self,
+        state_set: VcpuRequest_StateSet,
+    ) -> result::Result<(), c_int> {
+        let mut r = VcpuRequest::new();
+        let set_state: &mut VcpuRequest_SetState = r.mut_set_state();
+        set_state.set = state_set;
+        match state_set {
+            VcpuRequest_StateSet::REGS => {
+                swap(&mut set_state.state, &mut self.regs.cache);
+                self.regs.set = false;
+            }
+            VcpuRequest_StateSet::SREGS => {
+                swap(&mut set_state.state, &mut self.sregs.cache);
+                self.sregs.set = false;
+            }
+            VcpuRequest_StateSet::DEBUGREGS => {
+                swap(&mut set_state.state, &mut self.debugregs.cache);
+                self.debugregs.set = false;
+            }
+            _ => return Err(EINVAL),
+        }
 
         self.vcpu_transaction(&r)?;
         Ok(())
@@ -1120,7 +1268,7 @@ fn to_crosvm_rc<T>(r: result::Result<T, c_int>) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_connect(out: *mut *mut crosvm) -> c_int {
-    let _u = STATS.record(Stat::Connect);
+    let _u = record(Stat::Connect);
     let socket_name = match env::var("CROSVM_SOCKET") {
         Ok(v) => v,
         _ => return -ENOTCONN,
@@ -1143,7 +1291,7 @@ pub unsafe extern "C" fn crosvm_connect(out: *mut *mut crosvm) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_new_connection(self_: *mut crosvm, out: *mut *mut crosvm) -> c_int {
-    let _u = STATS.record(Stat::NewConnection);
+    let _u = record(Stat::NewConnection);
     let self_ = &mut (*self_);
     match self_.try_clone() {
         Ok(cloned) => {
@@ -1156,7 +1304,7 @@ pub unsafe extern "C" fn crosvm_new_connection(self_: *mut crosvm, out: *mut *mu
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_destroy_connection(self_: *mut *mut crosvm) -> c_int {
-    let _u = STATS.record(Stat::DestroyConnection);
+    let _u = record(Stat::DestroyConnection);
     Box::from_raw(*self_);
     *self_ = null_mut();
     0
@@ -1164,7 +1312,7 @@ pub unsafe extern "C" fn crosvm_destroy_connection(self_: *mut *mut crosvm) -> c
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_get_shutdown_eventfd(self_: *mut crosvm) -> c_int {
-    let _u = STATS.record(Stat::GetShutdownEventFd);
+    let _u = record(Stat::GetShutdownEventFd);
     let self_ = &mut (*self_);
     match self_.get_shutdown_eventfd() {
         Ok(f) => f.into_raw_fd(),
@@ -1178,7 +1326,7 @@ pub unsafe extern "C" fn crosvm_check_extension(
     extension: u32,
     has_extension: *mut bool,
 ) -> c_int {
-    let _u = STATS.record(Stat::CheckExtentsion);
+    let _u = record(Stat::CheckExtentsion);
     let self_ = &mut (*self_);
     let ret = self_.check_extension(extension);
 
@@ -1195,7 +1343,7 @@ pub unsafe extern "C" fn crosvm_get_supported_cpuid(
     cpuid_entries: *mut kvm_cpuid_entry2,
     out_count: *mut u32,
 ) -> c_int {
-    let _u = STATS.record(Stat::GetSupportedCpuid);
+    let _u = record(Stat::GetSupportedCpuid);
     let this = &mut *this;
     let cpuid_entries = from_raw_parts_mut(cpuid_entries, entry_count as usize);
     let mut cpuid_count: usize = 0;
@@ -1211,7 +1359,7 @@ pub unsafe extern "C" fn crosvm_get_emulated_cpuid(
     cpuid_entries: *mut kvm_cpuid_entry2,
     out_count: *mut u32,
 ) -> c_int {
-    let _u = STATS.record(Stat::GetEmulatedCpuid);
+    let _u = record(Stat::GetEmulatedCpuid);
     let this = &mut *this;
     let cpuid_entries = from_raw_parts_mut(cpuid_entries, entry_count as usize);
     let mut cpuid_count: usize = 0;
@@ -1227,7 +1375,7 @@ pub unsafe extern "C" fn crosvm_get_msr_index_list(
     msr_indices: *mut u32,
     out_count: *mut u32,
 ) -> c_int {
-    let _u = STATS.record(Stat::GetMsrIndexList);
+    let _u = record(Stat::GetMsrIndexList);
     let this = &mut *this;
     let msr_indices = from_raw_parts_mut(msr_indices, entry_count as usize);
     let mut msr_count: usize = 0;
@@ -1241,7 +1389,7 @@ pub unsafe extern "C" fn crosvm_net_get_config(
     self_: *mut crosvm,
     config: *mut crosvm_net_config,
 ) -> c_int {
-    let _u = STATS.record(Stat::NetGetConfig);
+    let _u = record(Stat::NetGetConfig);
     let self_ = &mut (*self_);
     let ret = self_.get_net_config();
 
@@ -1259,15 +1407,28 @@ pub unsafe extern "C" fn crosvm_reserve_range(
     start: u64,
     length: u64,
 ) -> c_int {
-    let _u = STATS.record(Stat::ReserveRange);
+    let _u = record(Stat::ReserveRange);
     let self_ = &mut (*self_);
-    let ret = self_.reserve_range(space, start, length);
+    let ret = self_.reserve_range(space, start, length, false);
+    to_crosvm_rc(ret)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn crosvm_reserve_async_write_range(
+    self_: *mut crosvm,
+    space: u32,
+    start: u64,
+    length: u64,
+) -> c_int {
+    let _u = record(Stat::ReserveAsyncWriteRange);
+    let self_ = &mut (*self_);
+    let ret = self_.reserve_range(space, start, length, true);
     to_crosvm_rc(ret)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_set_irq(self_: *mut crosvm, irq_id: u32, active: bool) -> c_int {
-    let _u = STATS.record(Stat::SetIrq);
+    let _u = record(Stat::SetIrq);
     let self_ = &mut (*self_);
     let ret = self_.set_irq(irq_id, active);
     to_crosvm_rc(ret)
@@ -1279,9 +1440,44 @@ pub unsafe extern "C" fn crosvm_set_irq_routing(
     route_count: u32,
     routes: *const crosvm_irq_route,
 ) -> c_int {
-    let _u = STATS.record(Stat::SetIrqRouting);
+    let _u = record(Stat::SetIrqRouting);
     let self_ = &mut (*self_);
     let ret = self_.set_irq_routing(slice::from_raw_parts(routes, route_count as usize));
+    to_crosvm_rc(ret)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn crosvm_set_hypercall_hint(
+    self_: *mut crosvm,
+    hints_count: u32,
+    hints: *const crosvm_hint,
+) -> c_int {
+    let _u = record(Stat::SetHypercallHint);
+    let self_ = &mut (*self_);
+
+    if hints_count < 1 {
+        let ret = self_.set_hint(0, 0, false, &[]);
+        return to_crosvm_rc(ret);
+    }
+    if hints_count > CROSVM_MAX_HINT_COUNT {
+        return -EINVAL;
+    }
+    let hints = slice::from_raw_parts(hints, hints_count as usize);
+    let hint = &hints[0];
+    if hint.hint_version != 0
+        || hint.reserved != 0
+        || hint.address == 0
+        || (hint.address_flags != 0 && hint.address_flags != CROSVM_HINT_ON_WRITE)
+        || hint.details_count > CROSVM_MAX_HINT_DETAIL_COUNT as u16
+    {
+        return -EINVAL;
+    }
+    let ret = self_.set_hint(
+        hint.address_space,
+        hint.address,
+        hint.address_flags == CROSVM_HINT_ON_WRITE,
+        slice::from_raw_parts(hint.details, hint.details_count as usize),
+    );
     to_crosvm_rc(ret)
 }
 
@@ -1291,7 +1487,7 @@ pub unsafe extern "C" fn crosvm_get_pic_state(
     primary: bool,
     state: *mut kvm_pic_state,
 ) -> c_int {
-    let _u = STATS.record(Stat::GetPicState);
+    let _u = record(Stat::GetPicState);
     let this = &mut *this;
     let state_set = if primary {
         MainRequest_StateSet::PIC0
@@ -1309,7 +1505,7 @@ pub unsafe extern "C" fn crosvm_set_pic_state(
     primary: bool,
     state: *mut kvm_pic_state,
 ) -> c_int {
-    let _u = STATS.record(Stat::SetPicState);
+    let _u = record(Stat::SetPicState);
     let this = &mut *this;
     let state_set = if primary {
         MainRequest_StateSet::PIC0
@@ -1326,7 +1522,7 @@ pub unsafe extern "C" fn crosvm_get_ioapic_state(
     this: *mut crosvm,
     state: *mut kvm_ioapic_state,
 ) -> c_int {
-    let _u = STATS.record(Stat::GetIoapicState);
+    let _u = record(Stat::GetIoapicState);
     let this = &mut *this;
     let state = from_raw_parts_mut(state as *mut u8, size_of::<kvm_ioapic_state>());
     let ret = this.get_state(MainRequest_StateSet::IOAPIC, state);
@@ -1338,7 +1534,7 @@ pub unsafe extern "C" fn crosvm_set_ioapic_state(
     this: *mut crosvm,
     state: *const kvm_ioapic_state,
 ) -> c_int {
-    let _u = STATS.record(Stat::SetIoapicState);
+    let _u = record(Stat::SetIoapicState);
     let this = &mut *this;
     let state = from_raw_parts(state as *mut u8, size_of::<kvm_ioapic_state>());
     let ret = this.set_state(MainRequest_StateSet::IOAPIC, state);
@@ -1350,7 +1546,7 @@ pub unsafe extern "C" fn crosvm_get_pit_state(
     this: *mut crosvm,
     state: *mut kvm_pit_state2,
 ) -> c_int {
-    let _u = STATS.record(Stat::GetPitState);
+    let _u = record(Stat::GetPitState);
     let this = &mut *this;
     let state = from_raw_parts_mut(state as *mut u8, size_of::<kvm_pit_state2>());
     let ret = this.get_state(MainRequest_StateSet::PIT, state);
@@ -1362,7 +1558,7 @@ pub unsafe extern "C" fn crosvm_set_pit_state(
     this: *mut crosvm,
     state: *const kvm_pit_state2,
 ) -> c_int {
-    let _u = STATS.record(Stat::SetPitState);
+    let _u = record(Stat::SetPitState);
     let this = &mut *this;
     let state = from_raw_parts(state as *mut u8, size_of::<kvm_pit_state2>());
     let ret = this.set_state(MainRequest_StateSet::PIT, state);
@@ -1374,7 +1570,7 @@ pub unsafe extern "C" fn crosvm_get_clock(
     this: *mut crosvm,
     clock_data: *mut kvm_clock_data,
 ) -> c_int {
-    let _u = STATS.record(Stat::GetClock);
+    let _u = record(Stat::GetClock);
     let this = &mut *this;
     let state = from_raw_parts_mut(clock_data as *mut u8, size_of::<kvm_clock_data>());
     let ret = this.get_state(MainRequest_StateSet::CLOCK, state);
@@ -1386,7 +1582,7 @@ pub unsafe extern "C" fn crosvm_set_clock(
     this: *mut crosvm,
     clock_data: *const kvm_clock_data,
 ) -> c_int {
-    let _u = STATS.record(Stat::SetClock);
+    let _u = record(Stat::SetClock);
     let this = &mut *this;
     let state = from_raw_parts(clock_data as *mut u8, size_of::<kvm_clock_data>());
     let ret = this.set_state(MainRequest_StateSet::CLOCK, state);
@@ -1395,7 +1591,7 @@ pub unsafe extern "C" fn crosvm_set_clock(
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_set_identity_map_addr(self_: *mut crosvm, addr: u32) -> c_int {
-    let _u = STATS.record(Stat::SetIdentityMapAddr);
+    let _u = record(Stat::SetIdentityMapAddr);
     let self_ = &mut (*self_);
     let ret = self_.set_identity_map_addr(addr);
     to_crosvm_rc(ret)
@@ -1407,7 +1603,7 @@ pub unsafe extern "C" fn crosvm_pause_vcpus(
     cpu_mask: u64,
     user: *mut c_void,
 ) -> c_int {
-    let _u = STATS.record(Stat::PauseVcpus);
+    let _u = record(Stat::PauseVcpus);
     let self_ = &mut (*self_);
     let ret = self_.pause_vcpus(cpu_mask, user);
     to_crosvm_rc(ret)
@@ -1415,7 +1611,7 @@ pub unsafe extern "C" fn crosvm_pause_vcpus(
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_start(self_: *mut crosvm) -> c_int {
-    let _u = STATS.record(Stat::Start);
+    let _u = record(Stat::Start);
     let self_ = &mut (*self_);
     let ret = self_.start();
     to_crosvm_rc(ret)
@@ -1427,7 +1623,7 @@ pub unsafe extern "C" fn crosvm_get_vcpu(
     cpu_id: u32,
     out: *mut *mut crosvm_vcpu,
 ) -> c_int {
-    let _u = STATS.record(Stat::GetVcpu);
+    let _u = record(Stat::GetVcpu);
     let self_ = &mut (*self_);
     let ret = self_.get_vcpu(cpu_id);
 
@@ -1442,7 +1638,7 @@ pub unsafe extern "C" fn crosvm_vcpu_wait(
     this: *mut crosvm_vcpu,
     event: *mut crosvm_vcpu_event,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuWait);
+    let _u = record(Stat::VcpuWait);
     let this = &mut *this;
     let event = &mut *event;
     let ret = this.wait(event);
@@ -1451,7 +1647,7 @@ pub unsafe extern "C" fn crosvm_vcpu_wait(
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_vcpu_resume(this: *mut crosvm_vcpu) -> c_int {
-    let _u = STATS.record(Stat::VcpuResume);
+    let _u = record(Stat::VcpuResume);
     let this = &mut *this;
     let ret = this.resume();
     to_crosvm_rc(ret)
@@ -1462,11 +1658,21 @@ pub unsafe extern "C" fn crosvm_vcpu_get_regs(
     this: *mut crosvm_vcpu,
     regs: *mut kvm_regs,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuGetRegs);
+    let _u = record(Stat::VcpuGetRegs);
     let this = &mut *this;
+    if this.regs.set {
+        if let Err(e) = this.set_state_from_cache(VcpuRequest_StateSet::REGS) {
+            return -e;
+        }
+    }
     let regs = from_raw_parts_mut(regs as *mut u8, size_of::<kvm_regs>());
-    let ret = this.get_state(VcpuRequest_StateSet::REGS, regs);
-    to_crosvm_rc(ret)
+    if this.regs.get {
+        regs.copy_from_slice(&this.regs.cache);
+        0
+    } else {
+        let ret = this.get_state(VcpuRequest_StateSet::REGS, regs);
+        to_crosvm_rc(ret)
+    }
 }
 
 #[no_mangle]
@@ -1474,11 +1680,13 @@ pub unsafe extern "C" fn crosvm_vcpu_set_regs(
     this: *mut crosvm_vcpu,
     regs: *const kvm_regs,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuSetRegs);
+    let _u = record(Stat::VcpuSetRegs);
     let this = &mut *this;
+    this.regs.get = false;
     let regs = from_raw_parts(regs as *mut u8, size_of::<kvm_regs>());
-    let ret = this.set_state(VcpuRequest_StateSet::REGS, regs);
-    to_crosvm_rc(ret)
+    this.regs.set = true;
+    this.regs.cache = regs.to_vec();
+    0
 }
 
 #[no_mangle]
@@ -1486,11 +1694,21 @@ pub unsafe extern "C" fn crosvm_vcpu_get_sregs(
     this: *mut crosvm_vcpu,
     sregs: *mut kvm_sregs,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuGetSregs);
+    let _u = record(Stat::VcpuGetSregs);
     let this = &mut *this;
+    if this.sregs.set {
+        if let Err(e) = this.set_state_from_cache(VcpuRequest_StateSet::SREGS) {
+            return -e;
+        }
+    }
     let sregs = from_raw_parts_mut(sregs as *mut u8, size_of::<kvm_sregs>());
-    let ret = this.get_state(VcpuRequest_StateSet::SREGS, sregs);
-    to_crosvm_rc(ret)
+    if this.sregs.get {
+        sregs.copy_from_slice(&this.sregs.cache);
+        0
+    } else {
+        let ret = this.get_state(VcpuRequest_StateSet::SREGS, sregs);
+        to_crosvm_rc(ret)
+    }
 }
 
 #[no_mangle]
@@ -1498,16 +1716,18 @@ pub unsafe extern "C" fn crosvm_vcpu_set_sregs(
     this: *mut crosvm_vcpu,
     sregs: *const kvm_sregs,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuSetSregs);
+    let _u = record(Stat::VcpuSetSregs);
     let this = &mut *this;
+    this.sregs.get = false;
     let sregs = from_raw_parts(sregs as *mut u8, size_of::<kvm_sregs>());
-    let ret = this.set_state(VcpuRequest_StateSet::SREGS, sregs);
-    to_crosvm_rc(ret)
+    this.sregs.set = true;
+    this.sregs.cache = sregs.to_vec();
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_vcpu_get_fpu(this: *mut crosvm_vcpu, fpu: *mut kvm_fpu) -> c_int {
-    let _u = STATS.record(Stat::GetFpu);
+    let _u = record(Stat::GetFpu);
     let this = &mut *this;
     let fpu = from_raw_parts_mut(fpu as *mut u8, size_of::<kvm_fpu>());
     let ret = this.get_state(VcpuRequest_StateSet::FPU, fpu);
@@ -1516,7 +1736,7 @@ pub unsafe extern "C" fn crosvm_vcpu_get_fpu(this: *mut crosvm_vcpu, fpu: *mut k
 
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_vcpu_set_fpu(this: *mut crosvm_vcpu, fpu: *const kvm_fpu) -> c_int {
-    let _u = STATS.record(Stat::SetFpu);
+    let _u = record(Stat::SetFpu);
     let this = &mut *this;
     let fpu = from_raw_parts(fpu as *mut u8, size_of::<kvm_fpu>());
     let ret = this.set_state(VcpuRequest_StateSet::FPU, fpu);
@@ -1528,11 +1748,21 @@ pub unsafe extern "C" fn crosvm_vcpu_get_debugregs(
     this: *mut crosvm_vcpu,
     dregs: *mut kvm_debugregs,
 ) -> c_int {
-    let _u = STATS.record(Stat::GetDebugRegs);
+    let _u = record(Stat::GetDebugRegs);
     let this = &mut *this;
+    if this.debugregs.set {
+        if let Err(e) = this.set_state_from_cache(VcpuRequest_StateSet::DEBUGREGS) {
+            return -e;
+        }
+    }
     let dregs = from_raw_parts_mut(dregs as *mut u8, size_of::<kvm_debugregs>());
-    let ret = this.get_state(VcpuRequest_StateSet::DEBUGREGS, dregs);
-    to_crosvm_rc(ret)
+    if this.debugregs.get {
+        dregs.copy_from_slice(&this.debugregs.cache);
+        0
+    } else {
+        let ret = this.get_state(VcpuRequest_StateSet::DEBUGREGS, dregs);
+        to_crosvm_rc(ret)
+    }
 }
 
 #[no_mangle]
@@ -1540,11 +1770,13 @@ pub unsafe extern "C" fn crosvm_vcpu_set_debugregs(
     this: *mut crosvm_vcpu,
     dregs: *const kvm_debugregs,
 ) -> c_int {
-    let _u = STATS.record(Stat::SetDebugRegs);
+    let _u = record(Stat::SetDebugRegs);
     let this = &mut *this;
+    this.debugregs.get = false;
     let dregs = from_raw_parts(dregs as *mut u8, size_of::<kvm_debugregs>());
-    let ret = this.set_state(VcpuRequest_StateSet::DEBUGREGS, dregs);
-    to_crosvm_rc(ret)
+    this.debugregs.set = true;
+    this.debugregs.cache = dregs.to_vec();
+    0
 }
 
 #[no_mangle]
@@ -1552,7 +1784,7 @@ pub unsafe extern "C" fn crosvm_vcpu_get_xcrs(
     this: *mut crosvm_vcpu,
     xcrs: *mut kvm_xcrs,
 ) -> c_int {
-    let _u = STATS.record(Stat::GetXCRegs);
+    let _u = record(Stat::GetXCRegs);
     let this = &mut *this;
     let xcrs = from_raw_parts_mut(xcrs as *mut u8, size_of::<kvm_xcrs>());
     let ret = this.get_state(VcpuRequest_StateSet::XCREGS, xcrs);
@@ -1564,7 +1796,7 @@ pub unsafe extern "C" fn crosvm_vcpu_set_xcrs(
     this: *mut crosvm_vcpu,
     xcrs: *const kvm_xcrs,
 ) -> c_int {
-    let _u = STATS.record(Stat::SetXCRegs);
+    let _u = record(Stat::SetXCRegs);
     let this = &mut *this;
     let xcrs = from_raw_parts(xcrs as *mut u8, size_of::<kvm_xcrs>());
     let ret = this.set_state(VcpuRequest_StateSet::XCREGS, xcrs);
@@ -1578,7 +1810,7 @@ pub unsafe extern "C" fn crosvm_vcpu_get_msrs(
     msr_entries: *mut kvm_msr_entry,
     out_count: *mut u32,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuGetMsrs);
+    let _u = record(Stat::VcpuGetMsrs);
     let this = &mut *this;
     let msr_entries = from_raw_parts_mut(msr_entries, msr_count as usize);
     let mut count: usize = 0;
@@ -1593,7 +1825,7 @@ pub unsafe extern "C" fn crosvm_vcpu_set_msrs(
     msr_count: u32,
     msr_entries: *const kvm_msr_entry,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuSetMsrs);
+    let _u = record(Stat::VcpuSetMsrs);
     let this = &mut *this;
     let msr_entries = from_raw_parts(msr_entries, msr_count as usize);
     let ret = this.set_msrs(msr_entries);
@@ -1606,7 +1838,7 @@ pub unsafe extern "C" fn crosvm_vcpu_set_cpuid(
     cpuid_count: u32,
     cpuid_entries: *const kvm_cpuid_entry2,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuSetCpuid);
+    let _u = record(Stat::VcpuSetCpuid);
     let this = &mut *this;
     let cpuid_entries = from_raw_parts(cpuid_entries, cpuid_count as usize);
     let ret = this.set_cpuid(cpuid_entries);
@@ -1618,7 +1850,7 @@ pub unsafe extern "C" fn crosvm_vcpu_get_lapic_state(
     this: *mut crosvm_vcpu,
     state: *mut kvm_lapic_state,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuGetLapicState);
+    let _u = record(Stat::VcpuGetLapicState);
     let this = &mut *this;
     let state = from_raw_parts_mut(state as *mut u8, size_of::<kvm_lapic_state>());
     let ret = this.get_state(VcpuRequest_StateSet::LAPIC, state);
@@ -1630,7 +1862,7 @@ pub unsafe extern "C" fn crosvm_vcpu_set_lapic_state(
     this: *mut crosvm_vcpu,
     state: *const kvm_lapic_state,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuSetLapicState);
+    let _u = record(Stat::VcpuSetLapicState);
     let this = &mut *this;
     let state = from_raw_parts(state as *mut u8, size_of::<kvm_lapic_state>());
     let ret = this.set_state(VcpuRequest_StateSet::LAPIC, state);
@@ -1642,7 +1874,7 @@ pub unsafe extern "C" fn crosvm_vcpu_get_mp_state(
     this: *mut crosvm_vcpu,
     state: *mut kvm_mp_state,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuGetMpState);
+    let _u = record(Stat::VcpuGetMpState);
     let this = &mut *this;
     let state = from_raw_parts_mut(state as *mut u8, size_of::<kvm_mp_state>());
     let ret = this.get_state(VcpuRequest_StateSet::MP, state);
@@ -1654,7 +1886,7 @@ pub unsafe extern "C" fn crosvm_vcpu_set_mp_state(
     this: *mut crosvm_vcpu,
     state: *const kvm_mp_state,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuSetMpState);
+    let _u = record(Stat::VcpuSetMpState);
     let this = &mut *this;
     let state = from_raw_parts(state as *mut u8, size_of::<kvm_mp_state>());
     let ret = this.set_state(VcpuRequest_StateSet::MP, state);
@@ -1666,7 +1898,7 @@ pub unsafe extern "C" fn crosvm_vcpu_get_vcpu_events(
     this: *mut crosvm_vcpu,
     events: *mut kvm_vcpu_events,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuGetVcpuEvents);
+    let _u = record(Stat::VcpuGetVcpuEvents);
     let this = &mut *this;
     let events = from_raw_parts_mut(events as *mut u8, size_of::<kvm_vcpu_events>());
     let ret = this.get_state(VcpuRequest_StateSet::EVENTS, events);
@@ -1678,7 +1910,7 @@ pub unsafe extern "C" fn crosvm_vcpu_set_vcpu_events(
     this: *mut crosvm_vcpu,
     events: *const kvm_vcpu_events,
 ) -> c_int {
-    let _u = STATS.record(Stat::VcpuSetVcpuEvents);
+    let _u = record(Stat::VcpuSetVcpuEvents);
     let this = &mut *this;
     let events = from_raw_parts(events as *mut u8, size_of::<kvm_vcpu_events>());
     let ret = this.set_state(VcpuRequest_StateSet::EVENTS, events);

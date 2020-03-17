@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use libc::{gid_t, pid_t, uid_t};
+use libc::{gid_t, pid_t, rlim64_t, uid_t};
 use std::os::raw::{c_char, c_int, c_ulong};
 
 /// Struct minijail is an opaque type inside libminijail.
@@ -19,10 +19,12 @@ extern "C" {
     pub fn minijail_keep_supplementary_gids(j: *mut minijail);
     pub fn minijail_change_user(j: *mut minijail, user: *const c_char) -> c_int;
     pub fn minijail_change_group(j: *mut minijail, group: *const c_char) -> c_int;
+    pub fn minijail_rlimit(j: *mut minijail, kind: c_int, cur: rlim64_t, max: rlim64_t) -> c_int;
     pub fn minijail_use_seccomp(j: *mut minijail);
     pub fn minijail_no_new_privs(j: *mut minijail);
     pub fn minijail_use_seccomp_filter(j: *mut minijail);
     pub fn minijail_set_seccomp_filter_tsync(j: *mut minijail);
+    pub fn minijail_set_seccomp_filters(j: *mut minijail, filter: *const net_sys::sock_fprog);
     pub fn minijail_parse_seccomp_filters(j: *mut minijail, path: *const c_char);
     pub fn minijail_parse_seccomp_filters_from_fd(j: *mut minijail, fd: c_int);
     pub fn minijail_log_seccomp_filter_failures(j: *mut minijail);
@@ -30,16 +32,22 @@ extern "C" {
     pub fn minijail_capbset_drop(j: *mut minijail, capmask: u64);
     pub fn minijail_set_ambient_caps(j: *mut minijail);
     pub fn minijail_reset_signal_mask(j: *mut minijail);
+    pub fn minijail_reset_signal_handlers(j: *mut minijail);
     pub fn minijail_namespace_vfs(j: *mut minijail);
     pub fn minijail_namespace_enter_vfs(j: *mut minijail, ns_path: *const c_char);
     pub fn minijail_new_session_keyring(j: *mut minijail);
+    pub fn minijail_skip_setting_securebits(j: *mut minijail, securebits_skip_mask: u64);
     pub fn minijail_skip_remount_private(j: *mut minijail);
+    pub fn minijail_remount_mode(j: *mut minijail, mode: c_ulong);
     pub fn minijail_namespace_ipc(j: *mut minijail);
+    pub fn minijail_namespace_uts(j: *mut minijail);
+    pub fn minijail_namespace_set_hostname(j: *mut minijail, name: *const c_char) -> c_int;
     pub fn minijail_namespace_net(j: *mut minijail);
     pub fn minijail_namespace_enter_net(j: *mut minijail, ns_path: *const c_char);
     pub fn minijail_namespace_cgroups(j: *mut minijail);
     pub fn minijail_close_open_fds(j: *mut minijail);
     pub fn minijail_namespace_pids(j: *mut minijail);
+    pub fn minijail_namespace_pids_rw_proc(j: *mut minijail);
     pub fn minijail_namespace_user(j: *mut minijail);
     pub fn minijail_namespace_user_disable_setgroups(j: *mut minijail);
     pub fn minijail_uidmap(j: *mut minijail, uidmap: *const c_char) -> c_int;
