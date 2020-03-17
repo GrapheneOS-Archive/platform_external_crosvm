@@ -14,5 +14,6 @@ rust_library_host_rlib {
         "libresources",
         "libsync_rust",
         "libsys_util",
+        "libvm_control",
     ],
 }

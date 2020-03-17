@@ -6,11 +6,11 @@ rust_library_host_rlib {
     crate_name: "devices",
     srcs: ["src/lib.rs"],
     features: [
+        "gfxstream",
         "gpu",
         "gpu_buffer",
         "gpu_display",
         "gpu_renderer",
-        "x",
     ],
     rlibs: [
         "libaudio_streams",
