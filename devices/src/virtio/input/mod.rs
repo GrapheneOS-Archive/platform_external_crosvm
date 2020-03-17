@@ -15,16 +15,17 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use data_model::{DataInit, Le16, Le32};
 use sys_util::{error, warn, EventFd, GuestMemory, PollContext, PollToken};
 
-use self::event_source::{input_event, EvdevEventSource, EventSource, SocketEventSource};
-use super::{Queue, VirtioDevice, INTERRUPT_STATUS_USED_RING, TYPE_INPUT};
-use std::cmp::min;
+use self::event_source::{EvdevEventSource, EventSource, SocketEventSource};
+use super::{
+    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer,
+    TYPE_INPUT,
+};
+use linux_input_sys::input_event;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display};
 use std::io::Read;
 use std::io::Write;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread;
 
 const EVENT_QUEUE_SIZE: u16 = 64;
@@ -34,7 +35,7 @@ const QUEUE_SIZES: &[u16] = &[EVENT_QUEUE_SIZE, STATUS_QUEUE_SIZE];
 #[derive(Debug)]
 pub enum InputError {
     /// Failed to write events to the source
-    EventsWriteError(sys_util::GuestMemoryError),
+    EventsWriteError(std::io::Error),
     /// Failed to read events from the source
     EventsReadError(std::io::Error),
     // Failed to get name of event device
@@ -51,7 +52,16 @@ pub enum InputError {
     EvdevAbsInfoError(sys_util::Error),
     // Failed to grab event device
     EvdevGrabError(sys_util::Error),
+    // Detected error on guest side
+    GuestError(String),
+    // Virtio descriptor error
+    Descriptor(DescriptorError),
+    // Error while reading from virtqueue
+    ReadQueue(std::io::Error),
+    // Error while writing to virtqueue
+    WriteQueue(std::io::Error),
 }
+
 pub type Result<T> = std::result::Result<T, InputError>;
 
 impl Display for InputError {
@@ -72,6 +82,10 @@ impl Display for InputError {
                 write!(f, "failed to get axis information of event device: {}", e)
             }
             EvdevGrabError(e) => write!(f, "failed to grab event device: {}", e),
+            GuestError(s) => write!(f, "detected error on guest side: {}", s),
+            Descriptor(e) => write!(f, "virtio descriptor error: {}", e),
+            ReadQueue(e) => write!(f, "failed to read from virtqueue: {}", e),
+            WriteQueue(e) => write!(f, "failed to write to virtqueue: {}", e),
         }
     }
 }
@@ -231,8 +245,6 @@ pub struct VirtioInputConfig {
 }
 
 impl VirtioInputConfig {
-    const CONFIG_MEM_SIZE: usize = size_of::<virtio_input_config>();
-
     fn new(
         device_ids: virtio_input_device_ids,
         name: Vec<u8>,
@@ -262,19 +274,6 @@ impl VirtioInputConfig {
             evdev::supported_events(source)?,
             evdev::abs_info(source),
         ))
-    }
-
-    fn validate_read_offsets(&self, offset: usize, len: usize) -> bool {
-        if offset + len > VirtioInputConfig::CONFIG_MEM_SIZE {
-            error!(
-                "Attempt to read from invalid config range: [{}..{}], valid ranges in [0..{}]",
-                offset,
-                offset + len,
-                VirtioInputConfig::CONFIG_MEM_SIZE
-            );
-            return false;
-        }
-        true
     }
 
     fn build_config_memory(&self) -> virtio_input_config {
@@ -312,6 +311,12 @@ impl VirtioInputConfig {
             VIRTIO_INPUT_CFG_ID_DEVIDS => {
                 cfg.set_device_ids(&self.device_ids);
             }
+            VIRTIO_INPUT_CFG_UNSET => {
+                // Per the virtio spec at https://docs.oasis-open.org/virtio/virtio/v1.1/cs01/virtio-v1.1-cs01.html#x1-3390008,
+                // there is no action required of us when this is set. It's unclear whether we
+                // should be zeroing the virtio_input_config, but empirically we know that the
+                // existing behavior of doing nothing works with the Linux virtio-input frontend.
+            }
             _ => {
                 warn!("Unsuported virtio input config selection: {}", self.select);
             }
@@ -320,41 +325,25 @@ impl VirtioInputConfig {
     }
 
     fn read(&self, offset: usize, data: &mut [u8]) {
-        let data_len = data.len();
-        if self.validate_read_offsets(offset, data_len) {
-            let config = self.build_config_memory();
-            data.clone_from_slice(&config.as_slice()[offset..offset + data_len]);
-        }
-    }
-
-    fn validate_write_offsets(&self, offset: usize, len: usize) -> bool {
-        const MAX_WRITABLE_BYTES: usize = 2;
-        if offset + len > MAX_WRITABLE_BYTES {
-            error!(
-                "Attempt to write to invalid config range: [{}..{}], valid ranges in [0..{}]",
-                offset,
-                offset + len,
-                MAX_WRITABLE_BYTES
-            );
-            return false;
-        }
-        true
+        copy_config(
+            data,
+            0,
+            self.build_config_memory().as_slice(),
+            offset as u64,
+        );
     }
 
     fn write(&mut self, offset: usize, data: &[u8]) {
-        let len = data.len();
-        if self.validate_write_offsets(offset, len) {
-            let mut selectors: [u8; 2] = [self.select, self.subsel];
-            selectors[offset..offset + len].clone_from_slice(&data);
-            self.select = selectors[0];
-            self.subsel = selectors[1];
-        }
+        let mut config = self.build_config_memory();
+        copy_config(config.as_mut_slice(), offset as u64, data, 0);
+        self.select = config.select;
+        self.subsel = config.subsel;
     }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
-struct virtio_input_event {
+pub struct virtio_input_event {
     type_: Le16,
     code: Le16,
     value: Le32,
@@ -365,13 +354,6 @@ unsafe impl DataInit for virtio_input_event {}
 
 impl virtio_input_event {
     const EVENT_SIZE: usize = size_of::<virtio_input_event>();
-    fn new(type_: u16, code: u16, value: u32) -> virtio_input_event {
-        virtio_input_event {
-            type_: Le16::from(type_),
-            code: Le16::from(code),
-            value: Le32::from(value),
-        }
-    }
 
     fn from_input_event(other: &input_event) -> virtio_input_event {
         virtio_input_event {
@@ -383,51 +365,63 @@ impl virtio_input_event {
 }
 
 struct Worker<T: EventSource> {
+    interrupt: Interrupt,
     event_source: T,
     event_queue: Queue,
     status_queue: Queue,
     guest_memory: GuestMemory,
-    interrupt_status: Arc<AtomicUsize>,
-    interrupt_evt: EventFd,
-    interrupt_resample_evt: EventFd,
 }
 
 impl<T: EventSource> Worker<T> {
-    fn signal_used_queue(&self) {
-        self.interrupt_status
-            .fetch_or(INTERRUPT_STATUS_USED_RING as usize, Ordering::SeqCst);
-        self.interrupt_evt.write(1).unwrap();
+    // Fills a virtqueue with events from the source.  Returns the number of bytes written.
+    fn fill_event_virtqueue(
+        event_source: &mut T,
+        avail_desc: DescriptorChain,
+        mem: &GuestMemory,
+    ) -> Result<usize> {
+        let mut writer = Writer::new(mem, avail_desc).map_err(InputError::Descriptor)?;
+
+        while writer.available_bytes() >= virtio_input_event::EVENT_SIZE {
+            if let Some(evt) = event_source.pop_available_event() {
+                writer.write_obj(evt).map_err(InputError::WriteQueue)?;
+            } else {
+                break;
+            }
+        }
+
+        Ok(writer.bytes_written())
     }
 
     // Send events from the source to the guest
     fn send_events(&mut self) -> bool {
-        let queue = &mut self.event_queue;
         let mut needs_interrupt = false;
 
         // Only consume from the queue iterator if we know we have events to send
         while self.event_source.available_events_count() > 0 {
-            match queue.pop(&self.guest_memory) {
+            match self.event_queue.pop(&self.guest_memory) {
                 None => {
                     break;
                 }
                 Some(avail_desc) => {
-                    if !avail_desc.is_write_only() {
-                        panic!("Received a read only descriptor on event queue");
-                    }
-                    let avail_events_size =
-                        self.event_source.available_events_count() * virtio_input_event::EVENT_SIZE;
-                    let len = min(avail_desc.len as usize, avail_events_size);
-                    if let Err(e) =
-                        self.guest_memory
-                            .read_to_memory(avail_desc.addr, &self.event_source, len)
-                    {
-                        // Read is guaranteed to succeed here, so the only possible failure would be
-                        // writing outside the guest memory region, which would mean the address and
-                        // length given in the queue descriptor are wrong.
-                        panic!("failed reading events into guest memory: {}", e);
-                    }
+                    let avail_desc_index = avail_desc.index;
 
-                    queue.add_used(&self.guest_memory, avail_desc.index, len as u32);
+                    let bytes_written = match Worker::fill_event_virtqueue(
+                        &mut self.event_source,
+                        avail_desc,
+                        &self.guest_memory,
+                    ) {
+                        Ok(count) => count,
+                        Err(e) => {
+                            error!("Input: failed to send events to guest: {}", e);
+                            break;
+                        }
+                    };
+
+                    self.event_queue.add_used(
+                        &self.guest_memory,
+                        avail_desc_index,
+                        bytes_written as u32,
+                    );
                     needs_interrupt = true;
                 }
             }
@@ -436,27 +430,40 @@ impl<T: EventSource> Worker<T> {
         needs_interrupt
     }
 
+    // Sends events from the guest to the source.  Returns the number of bytes read.
+    fn read_event_virtqueue(
+        avail_desc: DescriptorChain,
+        event_source: &mut T,
+        mem: &GuestMemory,
+    ) -> Result<usize> {
+        let mut reader = Reader::new(mem, avail_desc).map_err(InputError::Descriptor)?;
+        while reader.available_bytes() >= virtio_input_event::EVENT_SIZE {
+            let evt: virtio_input_event = reader.read_obj().map_err(InputError::ReadQueue)?;
+            event_source.send_event(&evt)?;
+        }
+
+        Ok(reader.bytes_read())
+    }
+
     fn process_status_queue(&mut self) -> Result<bool> {
-        let queue = &mut self.status_queue;
-
         let mut needs_interrupt = false;
-        while let Some(avail_desc) = queue.pop(&self.guest_memory) {
-            if !avail_desc.is_read_only() {
-                panic!("Received a writable descriptor on status queue");
-            }
-            let len = avail_desc.len as usize;
-            if len % virtio_input_event::EVENT_SIZE != 0 {
-                warn!(
-                    "Ignoring buffer of unexpected size on status queue: {:0}",
-                    len
-                );
-            } else {
-                self.guest_memory
-                    .write_from_memory(avail_desc.addr, &self.event_source, len)
-                    .map_err(InputError::EventsWriteError)?;
-            }
+        while let Some(avail_desc) = self.status_queue.pop(&self.guest_memory) {
+            let avail_desc_index = avail_desc.index;
 
-            queue.add_used(&self.guest_memory, avail_desc.index, len as u32);
+            let bytes_read = match Worker::read_event_virtqueue(
+                avail_desc,
+                &mut self.event_source,
+                &self.guest_memory,
+            ) {
+                Ok(count) => count,
+                Err(e) => {
+                    error!("Input: failed to read events from virtqueue: {}", e);
+                    break;
+                }
+            };
+
+            self.status_queue
+                .add_used(&self.guest_memory, avail_desc_index, bytes_read as u32);
             needs_interrupt = true;
         }
 
@@ -482,25 +489,13 @@ impl<T: EventSource> Worker<T> {
             InterruptResample,
             Kill,
         }
-        let poll_ctx: PollContext<Token> = match PollContext::new()
-            .and_then(|pc| {
-                pc.add(&event_queue_evt_fd, Token::EventQAvailable)
-                    .and(Ok(pc))
-            })
-            .and_then(|pc| {
-                pc.add(&status_queue_evt_fd, Token::StatusQAvailable)
-                    .and(Ok(pc))
-            })
-            .and_then(|pc| {
-                pc.add(&self.event_source, Token::InputEventsAvailable)
-                    .and(Ok(pc))
-            })
-            .and_then(|pc| {
-                pc.add(&self.interrupt_resample_evt, Token::InterruptResample)
-                    .and(Ok(pc))
-            })
-            .and_then(|pc| pc.add(&kill_evt, Token::Kill).and(Ok(pc)))
-        {
+        let poll_ctx: PollContext<Token> = match PollContext::build_with(&[
+            (&event_queue_evt_fd, Token::EventQAvailable),
+            (&status_queue_evt_fd, Token::StatusQAvailable),
+            (&self.event_source, Token::InputEventsAvailable),
+            (self.interrupt.get_resample_evt(), Token::InterruptResample),
+            (&kill_evt, Token::Kill),
+        ]) {
             Ok(poll_ctx) => poll_ctx,
             Err(e) => {
                 error!("failed creating PollContext: {}", e);
@@ -542,10 +537,7 @@ impl<T: EventSource> Worker<T> {
                         Ok(_cnt) => needs_interrupt |= self.send_events(),
                     },
                     Token::InterruptResample => {
-                        let _ = self.interrupt_resample_evt.read();
-                        if self.interrupt_status.load(Ordering::SeqCst) != 0 {
-                            self.interrupt_evt.write(1).unwrap();
-                        }
+                        self.interrupt.interrupt_resample();
                     }
                     Token::Kill => {
                         let _ = kill_evt.read();
@@ -554,7 +546,7 @@ impl<T: EventSource> Worker<T> {
                 }
             }
             if needs_interrupt {
-                self.signal_used_queue();
+                self.interrupt.signal_used_queue(self.event_queue.vector);
             }
         }
 
@@ -569,6 +561,7 @@ impl<T: EventSource> Worker<T> {
 
 pub struct Input<T: EventSource> {
     kill_evt: Option<EventFd>,
+    worker_thread: Option<thread::JoinHandle<Worker<T>>>,
     config: VirtioInputConfig,
     source: Option<T>,
 }
@@ -578,6 +571,10 @@ impl<T: EventSource> Drop for Input<T> {
         if let Some(kill_evt) = self.kill_evt.take() {
             // Ignore the result because there is nothing we can do about it.
             let _ = kill_evt.write(1);
+        }
+
+        if let Some(worker_thread) = self.worker_thread.take() {
+            let _ = worker_thread.join();
         }
     }
 }
@@ -612,9 +609,7 @@ where
     fn activate(
         &mut self,
         mem: GuestMemory,
-        interrupt_evt: EventFd,
-        interrupt_resample_evt: EventFd,
-        status: Arc<AtomicUsize>,
+        interrupt: Interrupt,
         mut queues: Vec<Queue>,
         mut queue_evts: Vec<EventFd>,
     ) {
@@ -643,25 +638,50 @@ where
                 .name(String::from("virtio_input"))
                 .spawn(move || {
                     let mut worker = Worker {
+                        interrupt,
                         event_source: source,
                         event_queue,
                         status_queue,
                         guest_memory: mem,
-                        interrupt_status: status,
-                        interrupt_evt,
-                        interrupt_resample_evt,
                     };
                     worker.run(event_queue_evt_fd, status_queue_evt_fd, kill_evt);
+                    worker
                 });
 
-            if let Err(e) = worker_result {
-                error!("failed to spawn virtio_input worker: {}", e);
-                return;
+            match worker_result {
+                Err(e) => {
+                    error!("failed to spawn virtio_input worker: {}", e);
+                }
+                Ok(join_handle) => {
+                    self.worker_thread = Some(join_handle);
+                }
             }
         } else {
             error!("tried to activate device without a source for events");
-            return;
         }
+    }
+
+    fn reset(&mut self) -> bool {
+        if let Some(kill_evt) = self.kill_evt.take() {
+            if kill_evt.write(1).is_err() {
+                error!("{}: failed to notify the kill event", self.debug_label());
+                return false;
+            }
+        }
+
+        if let Some(worker_thread) = self.worker_thread.take() {
+            match worker_thread.join() {
+                Err(_) => {
+                    error!("{}: failed to get back resources", self.debug_label());
+                    return false;
+                }
+                Ok(worker) => {
+                    self.source = Some(worker.event_source);
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -672,6 +692,7 @@ where
 {
     Ok(Input {
         kill_evt: None,
+        worker_thread: None,
         config: VirtioInputConfig::from_evdev(&source)?,
         source: Some(EvdevEventSource::new(source)),
     })
@@ -688,6 +709,7 @@ where
 {
     Ok(Input {
         kill_evt: None,
+        worker_thread: None,
         config: defaults::new_single_touch_config(width, height),
         source: Some(SocketEventSource::new(source)),
     })
@@ -701,6 +723,7 @@ where
 {
     Ok(Input {
         kill_evt: None,
+        worker_thread: None,
         config: defaults::new_trackpad_config(width, height),
         source: Some(SocketEventSource::new(source)),
     })
@@ -713,6 +736,7 @@ where
 {
     Ok(Input {
         kill_evt: None,
+        worker_thread: None,
         config: defaults::new_mouse_config(),
         source: Some(SocketEventSource::new(source)),
     })
@@ -725,6 +749,7 @@ where
 {
     Ok(Input {
         kill_evt: None,
+        worker_thread: None,
         config: defaults::new_keyboard_config(),
         source: Some(SocketEventSource::new(source)),
     })

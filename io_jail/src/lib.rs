@@ -2,17 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#[allow(dead_code)]
-#[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
-#[allow(non_upper_case_globals)]
-mod libminijail;
-
 use libc::pid_t;
+use minijail_sys::*;
 use std::ffi::CString;
 use std::fmt::{self, Display};
 use std::fs;
 use std::io;
+use std::os::raw::{c_char, c_ulong, c_ushort};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -52,8 +48,12 @@ pub enum Error {
     DupDevNull(i32),
     /// Failed to set up /dev/null for FDs 0, 1, or 2.
     OpenDevNull(io::Error),
+    /// Failed to read policy bpf from file.
+    ReadProgram(io::Error),
     /// Setting the specified alt-syscall table failed with errno. Is the table in the kernel?
     SetAltSyscallTable { errno: i32, name: String },
+    /// Setting the specified rlimit failed with errno.
+    SetRlimit { errno: i32, kind: libc::c_int },
     /// chroot failed with the provided errno.
     SettingChrootDirectory(i32, PathBuf),
     /// pivot_root failed with the provided errno.
@@ -66,6 +66,10 @@ pub enum Error {
     ProcFd(String),
     /// Minijail refused to preserve an FD in the inherit list of `fork()`.
     PreservingFd(i32),
+    /// Program size is too large
+    ProgramTooLarge,
+    /// File size should be non-zero and a multiple of sock_filter
+    WrongProgramSize,
 }
 
 impl Display for Error {
@@ -119,12 +123,14 @@ impl Display for Error {
                 "fail to open /dev/null for setting FDs 0, 1, or 2: {}",
                 e,
             ),
+            ReadProgram(e) => write!(f, "failed to read from bpf file: {}", e),
             SetAltSyscallTable { name, errno } => write!(
                 f,
                 "failed to set alt-syscall table {}: {}",
                 name,
                 io::Error::from_raw_os_error(*errno),
             ),
+            SetRlimit { errno, kind } => write!(f, "failed to set rlimit {}: {}", kind, errno),
             SettingChrootDirectory(errno, p) => write!(
                 f,
                 "failed to set chroot {}: {}",
@@ -141,6 +147,8 @@ impl Display for Error {
             ReadFdDir(e) => write!(f, "failed to open /proc/self/fd: {}", e),
             ProcFd(s) => write!(f, "an entry in /proc/self/fd is not an integer: {}", s),
             PreservingFd(e) => write!(f, "fork failed in minijail_preserve_fd with error {}", e),
+            ProgramTooLarge => write!(f, "bpf program is too large (max 64K instructions)"),
+            WrongProgramSize => write!(f, "bpf file was empty or not a multiple of sock_filter"),
         }
     }
 }
@@ -192,7 +200,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// partial jail is not recoverable and will instead result in killing the
 /// process.
 pub struct Minijail {
-    jail: *mut libminijail::minijail,
+    jail: *mut minijail,
 }
 
 impl Minijail {
@@ -201,7 +209,7 @@ impl Minijail {
         let j = unsafe {
             // libminijail actually owns the minijail structure. It will live until we call
             // minijail_destroy.
-            libminijail::minijail_new()
+            minijail_new()
         };
         if j.is_null() {
             return Err(Error::CreatingMinijail);
@@ -215,43 +223,78 @@ impl Minijail {
 
     pub fn change_uid(&mut self, uid: libc::uid_t) {
         unsafe {
-            libminijail::minijail_change_uid(self.jail, uid);
+            minijail_change_uid(self.jail, uid);
         }
     }
     pub fn change_gid(&mut self, gid: libc::gid_t) {
         unsafe {
-            libminijail::minijail_change_gid(self.jail, gid);
+            minijail_change_gid(self.jail, gid);
         }
     }
     pub fn set_supplementary_gids(&mut self, ids: &[libc::gid_t]) {
         unsafe {
-            libminijail::minijail_set_supplementary_gids(self.jail, ids.len(), ids.as_ptr());
+            minijail_set_supplementary_gids(self.jail, ids.len(), ids.as_ptr());
         }
     }
     pub fn keep_supplementary_gids(&mut self) {
         unsafe {
-            libminijail::minijail_keep_supplementary_gids(self.jail);
+            minijail_keep_supplementary_gids(self.jail);
+        }
+    }
+    pub fn set_rlimit(
+        &mut self,
+        kind: libc::c_int,
+        cur: libc::rlim64_t,
+        max: libc::rlim64_t,
+    ) -> Result<()> {
+        let errno = unsafe { minijail_rlimit(self.jail, kind, cur, max) };
+        if errno == 0 {
+            Ok(())
+        } else {
+            Err(Error::SetRlimit { errno, kind })
         }
     }
     pub fn use_seccomp(&mut self) {
         unsafe {
-            libminijail::minijail_use_seccomp(self.jail);
+            minijail_use_seccomp(self.jail);
         }
     }
     pub fn no_new_privs(&mut self) {
         unsafe {
-            libminijail::minijail_no_new_privs(self.jail);
+            minijail_no_new_privs(self.jail);
         }
     }
     pub fn use_seccomp_filter(&mut self) {
         unsafe {
-            libminijail::minijail_use_seccomp_filter(self.jail);
+            minijail_use_seccomp_filter(self.jail);
         }
     }
     pub fn set_seccomp_filter_tsync(&mut self) {
         unsafe {
-            libminijail::minijail_set_seccomp_filter_tsync(self.jail);
+            minijail_set_seccomp_filter_tsync(self.jail);
         }
+    }
+    pub fn parse_seccomp_program(&mut self, path: &Path) -> Result<()> {
+        if !path.is_file() {
+            return Err(Error::SeccompPath(path.to_owned()));
+        }
+
+        let buffer = fs::read(path).map_err(Error::ReadProgram)?;
+        if buffer.len() % std::mem::size_of::<sock_filter>() != 0 {
+            return Err(Error::WrongProgramSize);
+        }
+        let count = buffer.len() / std::mem::size_of::<sock_filter>();
+        if count > (!0 as u16) as usize {
+            return Err(Error::ProgramTooLarge);
+        }
+        let header = sock_fprog {
+            len: count as c_ushort,
+            filter: buffer.as_ptr() as *mut sock_filter,
+        };
+        unsafe {
+            minijail_set_seccomp_filters(self.jail, &header);
+        }
+        Ok(())
     }
     pub fn parse_seccomp_filters(&mut self, path: &Path) -> Result<()> {
         if !path.is_file() {
@@ -265,95 +308,98 @@ impl Minijail {
         let filename =
             CString::new(pathstring).map_err(|_| Error::PathToCString(path.to_owned()))?;
         unsafe {
-            libminijail::minijail_parse_seccomp_filters(self.jail, filename.as_ptr());
+            minijail_parse_seccomp_filters(self.jail, filename.as_ptr());
         }
         Ok(())
     }
     pub fn log_seccomp_filter_failures(&mut self) {
         unsafe {
-            libminijail::minijail_log_seccomp_filter_failures(self.jail);
+            minijail_log_seccomp_filter_failures(self.jail);
         }
     }
     pub fn use_caps(&mut self, capmask: u64) {
         unsafe {
-            libminijail::minijail_use_caps(self.jail, capmask);
+            minijail_use_caps(self.jail, capmask);
         }
     }
     pub fn capbset_drop(&mut self, capmask: u64) {
         unsafe {
-            libminijail::minijail_capbset_drop(self.jail, capmask);
+            minijail_capbset_drop(self.jail, capmask);
         }
     }
     pub fn set_ambient_caps(&mut self) {
         unsafe {
-            libminijail::minijail_set_ambient_caps(self.jail);
+            minijail_set_ambient_caps(self.jail);
         }
     }
     pub fn reset_signal_mask(&mut self) {
         unsafe {
-            libminijail::minijail_reset_signal_mask(self.jail);
+            minijail_reset_signal_mask(self.jail);
         }
     }
     pub fn run_as_init(&mut self) {
         unsafe {
-            libminijail::minijail_run_as_init(self.jail);
+            minijail_run_as_init(self.jail);
         }
     }
     pub fn namespace_pids(&mut self) {
         unsafe {
-            libminijail::minijail_namespace_pids(self.jail);
+            minijail_namespace_pids(self.jail);
         }
     }
     pub fn namespace_user(&mut self) {
         unsafe {
-            libminijail::minijail_namespace_user(self.jail);
+            minijail_namespace_user(self.jail);
         }
     }
     pub fn namespace_user_disable_setgroups(&mut self) {
         unsafe {
-            libminijail::minijail_namespace_user_disable_setgroups(self.jail);
+            minijail_namespace_user_disable_setgroups(self.jail);
         }
     }
     pub fn namespace_vfs(&mut self) {
         unsafe {
-            libminijail::minijail_namespace_vfs(self.jail);
+            minijail_namespace_vfs(self.jail);
         }
     }
     pub fn new_session_keyring(&mut self) {
         unsafe {
-            libminijail::minijail_new_session_keyring(self.jail);
+            minijail_new_session_keyring(self.jail);
         }
     }
     pub fn skip_remount_private(&mut self) {
         unsafe {
-            libminijail::minijail_skip_remount_private(self.jail);
+            minijail_skip_remount_private(self.jail);
         }
     }
     pub fn namespace_ipc(&mut self) {
         unsafe {
-            libminijail::minijail_namespace_ipc(self.jail);
+            minijail_namespace_ipc(self.jail);
         }
     }
     pub fn namespace_net(&mut self) {
         unsafe {
-            libminijail::minijail_namespace_net(self.jail);
+            minijail_namespace_net(self.jail);
         }
     }
     pub fn namespace_cgroups(&mut self) {
         unsafe {
-            libminijail::minijail_namespace_cgroups(self.jail);
+            minijail_namespace_cgroups(self.jail);
         }
     }
     pub fn remount_proc_readonly(&mut self) {
         unsafe {
-            libminijail::minijail_remount_proc_readonly(self.jail);
+            minijail_remount_proc_readonly(self.jail);
         }
+    }
+    pub fn set_remount_mode(&mut self, mode: c_ulong) {
+        unsafe { minijail_remount_mode(self.jail, mode) }
     }
     pub fn uidmap(&mut self, uid_map: &str) -> Result<()> {
         let map_cstring =
             CString::new(uid_map).map_err(|_| Error::StrToCString(uid_map.to_owned()))?;
         unsafe {
-            libminijail::minijail_uidmap(self.jail, map_cstring.as_ptr());
+            minijail_uidmap(self.jail, map_cstring.as_ptr());
         }
         Ok(())
     }
@@ -361,20 +407,19 @@ impl Minijail {
         let map_cstring =
             CString::new(gid_map).map_err(|_| Error::StrToCString(gid_map.to_owned()))?;
         unsafe {
-            libminijail::minijail_gidmap(self.jail, map_cstring.as_ptr());
+            minijail_gidmap(self.jail, map_cstring.as_ptr());
         }
         Ok(())
     }
     pub fn inherit_usergroups(&mut self) {
         unsafe {
-            libminijail::minijail_inherit_usergroups(self.jail);
+            minijail_inherit_usergroups(self.jail);
         }
     }
     pub fn use_alt_syscall(&mut self, table_name: &str) -> Result<()> {
         let table_name_string =
             CString::new(table_name).map_err(|_| Error::StrToCString(table_name.to_owned()))?;
-        let ret =
-            unsafe { libminijail::minijail_use_alt_syscall(self.jail, table_name_string.as_ptr()) };
+        let ret = unsafe { minijail_use_alt_syscall(self.jail, table_name_string.as_ptr()) };
         if ret < 0 {
             return Err(Error::SetAltSyscallTable {
                 errno: ret,
@@ -389,7 +434,7 @@ impl Minijail {
             .to_str()
             .ok_or(Error::PathToCString(dir.to_owned()))?;
         let dirname = CString::new(pathstring).map_err(|_| Error::PathToCString(dir.to_owned()))?;
-        let ret = unsafe { libminijail::minijail_enter_chroot(self.jail, dirname.as_ptr()) };
+        let ret = unsafe { minijail_enter_chroot(self.jail, dirname.as_ptr()) };
         if ret < 0 {
             return Err(Error::SettingChrootDirectory(ret, dir.to_owned()));
         }
@@ -401,7 +446,7 @@ impl Minijail {
             .to_str()
             .ok_or(Error::PathToCString(dir.to_owned()))?;
         let dirname = CString::new(pathstring).map_err(|_| Error::PathToCString(dir.to_owned()))?;
-        let ret = unsafe { libminijail::minijail_enter_pivot_root(self.jail, dirname.as_ptr()) };
+        let ret = unsafe { minijail_enter_pivot_root(self.jail, dirname.as_ptr()) };
         if ret < 0 {
             return Err(Error::SettingPivotRootDirectory(ret, dir.to_owned()));
         }
@@ -433,7 +478,7 @@ impl Minijail {
             CString::new(fstype).map_err(|_| Error::StrToCString(fstype.to_owned()))?;
         let data_string = CString::new(data).map_err(|_| Error::StrToCString(data.to_owned()))?;
         let ret = unsafe {
-            libminijail::minijail_mount_with_data(
+            minijail_mount_with_data(
                 self.jail,
                 src_path.as_ptr(),
                 dest_path.as_ptr(),
@@ -456,17 +501,17 @@ impl Minijail {
     }
     pub fn mount_dev(&mut self) {
         unsafe {
-            libminijail::minijail_mount_dev(self.jail);
+            minijail_mount_dev(self.jail);
         }
     }
     pub fn mount_tmp(&mut self) {
         unsafe {
-            libminijail::minijail_mount_tmp(self.jail);
+            minijail_mount_tmp(self.jail);
         }
     }
     pub fn mount_tmp_size(&mut self, size: usize) {
         unsafe {
-            libminijail::minijail_mount_tmp_size(self.jail, size);
+            minijail_mount_tmp_size(self.jail, size);
         }
     }
     pub fn mount_bind(&mut self, src: &Path, dest: &Path, writable: bool) -> Result<()> {
@@ -482,7 +527,7 @@ impl Minijail {
         let dest_path =
             CString::new(dest_os).map_err(|_| Error::StrToCString(dest_os.to_owned()))?;
         let ret = unsafe {
-            libminijail::minijail_bind(
+            minijail_bind(
                 self.jail,
                 src_path.as_ptr(),
                 dest_path.as_ptr(),
@@ -519,7 +564,7 @@ impl Minijail {
         args_array.push(null());
 
         for fd in inheritable_fds {
-            let ret = unsafe { libminijail::minijail_preserve_fd(self.jail, *fd, *fd) };
+            let ret = unsafe { minijail_preserve_fd(self.jail, *fd, *fd) };
             if ret < 0 {
                 return Err(Error::PreservingFd(ret));
             }
@@ -534,9 +579,7 @@ impl Minijail {
         // These will only be closed when this process exits.
         for io_fd in &[libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
             if !inheritable_fds.contains(io_fd) {
-                let ret = unsafe {
-                    libminijail::minijail_preserve_fd(self.jail, dev_null.as_raw_fd(), *io_fd)
-                };
+                let ret = unsafe { minijail_preserve_fd(self.jail, dev_null.as_raw_fd(), *io_fd) };
                 if ret < 0 {
                     return Err(Error::PreservingFd(ret));
                 }
@@ -544,15 +587,15 @@ impl Minijail {
         }
 
         unsafe {
-            libminijail::minijail_close_open_fds(self.jail);
+            minijail_close_open_fds(self.jail);
         }
 
         let mut pid = 0;
         let ret = unsafe {
-            libminijail::minijail_run_pid_pipes(
+            minijail_run_pid_pipes(
                 self.jail,
                 cmd_cstr.as_ptr(),
-                args_array.as_ptr(),
+                args_array.as_ptr() as *const *mut c_char,
                 &mut pid,
                 null_mut(),
                 null_mut(),
@@ -583,7 +626,7 @@ impl Minijail {
 
         if let Some(keep_fds) = inheritable_fds {
             for fd in keep_fds {
-                let ret = libminijail::minijail_preserve_fd(self.jail, *fd, *fd);
+                let ret = minijail_preserve_fd(self.jail, *fd, *fd);
                 if ret < 0 {
                     return Err(Error::PreservingFd(ret));
                 }
@@ -599,17 +642,16 @@ impl Minijail {
         // These will only be closed when this process exits.
         for io_fd in &[libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
             if inheritable_fds.is_none() || !inheritable_fds.unwrap().contains(io_fd) {
-                let ret =
-                    libminijail::minijail_preserve_fd(self.jail, dev_null.as_raw_fd(), *io_fd);
+                let ret = minijail_preserve_fd(self.jail, dev_null.as_raw_fd(), *io_fd);
                 if ret < 0 {
                     return Err(Error::PreservingFd(ret));
                 }
             }
         }
 
-        libminijail::minijail_close_open_fds(self.jail);
+        minijail_close_open_fds(self.jail);
 
-        let ret = libminijail::minijail_fork(self.jail);
+        let ret = minijail_fork(self.jail);
         if ret < 0 {
             return Err(Error::ForkingMinijail(ret));
         }
@@ -623,7 +665,7 @@ impl Drop for Minijail {
         unsafe {
             // Destroys the minijail's memory.  It is safe to do here because all references to
             // this object have been dropped.
-            libminijail::minijail_destroy(self.jail);
+            minijail_destroy(self.jail);
         }
     }
 }
@@ -649,9 +691,9 @@ mod tests {
     #[test]
     fn create_and_free() {
         unsafe {
-            let j = libminijail::minijail_new();
+            let j = minijail_new();
             assert_ne!(std::ptr::null_mut(), j);
-            libminijail::minijail_destroy(j);
+            minijail_destroy(j);
         }
 
         let j = Minijail::new().unwrap();

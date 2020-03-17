@@ -17,8 +17,7 @@ use std::mem;
 use std::sync::{Arc, Weak};
 use sync::Mutex;
 use sys_util::{error, Error as SysError, EventFd, GuestMemory};
-use usb_util::types::UsbRequestSetup;
-use usb_util::usb_transfer::TransferStatus;
+use usb_util::{TransferStatus, UsbRequestSetup};
 
 #[derive(Debug)]
 pub enum Error {
@@ -67,7 +66,7 @@ pub enum XhciTransferState {
     /// When transfer is submitted, it will contain a transfer callback, which should be invoked
     /// when the transfer is cancelled.
     Submitted {
-        cancel_callback: Box<dyn FnMut() + Send>,
+        cancel_callback: Box<dyn FnOnce() + Send>,
     },
     Cancelling,
     Cancelled,
@@ -78,9 +77,7 @@ impl XhciTransferState {
     /// Try to cancel this transfer, if it's possible.
     pub fn try_cancel(&mut self) {
         match mem::replace(self, XhciTransferState::Created) {
-            XhciTransferState::Submitted {
-                mut cancel_callback,
-            } => {
+            XhciTransferState::Submitted { cancel_callback } => {
                 *self = XhciTransferState::Cancelling;
                 cancel_callback();
             }
@@ -290,8 +287,13 @@ impl XhciTransfer {
                 usb_debug!("device disconnected, detaching from port");
                 // If the device is gone, we don't need to send transfer completion event, cause we
                 // are going to destroy everything related to this device anyway.
-                self.port.detach().map_err(Error::DetachPort)?;
-                return Ok(());
+                return match self.port.detach() {
+                    Ok(()) => Ok(()),
+                    // It's acceptable for the port to be already disconnected
+                    // as asynchronous transfer completions are processed.
+                    Err(HubError::AlreadyDetached(_e)) => Ok(()),
+                    Err(e) => Err(Error::DetachPort(e)),
+                };
             }
             TransferStatus::Cancelled => {
                 // TODO(jkwang) According to the spec, we should send a stopped event here. But

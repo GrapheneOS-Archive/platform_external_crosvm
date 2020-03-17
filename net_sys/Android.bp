@@ -2,9 +2,9 @@
 
 rust_library_host_rlib {
     name: "libnet_sys",
+    defaults: ["crosvm_defaults"],
     crate_name: "net_sys",
     srcs: ["src/lib.rs"],
-    defaults: ["crosvm_defaults"],
     rlibs: [
         "libsys_util",
     ],

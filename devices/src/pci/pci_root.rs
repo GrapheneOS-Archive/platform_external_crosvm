@@ -2,10 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::convert::TryInto;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-use byteorder::{ByteOrder, LittleEndian};
 use sync::Mutex;
 
 use crate::pci::pci_configuration::{
@@ -26,12 +26,12 @@ impl PciDevice for PciRootConfiguration {
     fn keep_fds(&self) -> Vec<RawFd> {
         Vec::new()
     }
-    fn config_registers(&self) -> &PciConfiguration {
-        &self.config
+    fn read_config_register(&self, reg_idx: usize) -> u32 {
+        self.config.read_reg(reg_idx)
     }
 
-    fn config_registers_mut(&mut self) -> &mut PciConfiguration {
-        &mut self.config
+    fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+        (&mut self.config).write_reg(reg_idx, offset, data)
     }
 
     fn read_bar(&mut self, _addr: u64, _data: &mut [u8]) {}
@@ -47,18 +47,21 @@ pub struct PciRoot {
     devices: Vec<Arc<Mutex<dyn BusDevice>>>,
 }
 
+const PCI_VENDOR_ID_INTEL: u16 = 0x8086;
+const PCI_DEVICE_ID_INTEL_82441: u16 = 0x1237;
+
 impl PciRoot {
     /// Create an empty PCI root bus.
     pub fn new() -> Self {
         PciRoot {
             root_configuration: PciRootConfiguration {
                 config: PciConfiguration::new(
-                    0,
-                    0,
+                    PCI_VENDOR_ID_INTEL,
+                    PCI_DEVICE_ID_INTEL_82441,
                     PciClassCode::BridgeDevice,
                     &PciBridgeSubclass::HostBridge,
                     None,
-                    PciHeaderType::Bridge,
+                    PciHeaderType::Device,
                     0,
                     0,
                 ),
@@ -181,9 +184,9 @@ impl PciConfigIo {
             ),
             2 => (
                 0x0000_ffff << (offset * 16),
-                ((data[1] as u32) << 8 | data[0] as u32) << (offset * 16),
+                u32::from(u16::from_le_bytes(data.try_into().unwrap())) << (offset * 16),
             ),
-            4 => (0xffff_ffff, LittleEndian::read_u32(data)),
+            4 => (0xffff_ffff, u32::from_le_bytes(data.try_into().unwrap())),
             _ => return,
         };
         self.config_address = (self.config_address & !mask) | value;
@@ -198,8 +201,8 @@ impl BusDevice for PciConfigIo {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
         // `offset` is relative to 0xcf8
         let value = match offset {
-            0...3 => self.config_address,
-            4...7 => self.config_space_read(),
+            0..=3 => self.config_address,
+            4..=7 => self.config_space_read(),
             _ => 0xffff_ffff,
         };
 
@@ -220,8 +223,8 @@ impl BusDevice for PciConfigIo {
     fn write(&mut self, offset: u64, data: &[u8]) {
         // `offset` is relative to 0xcf8
         match offset {
-            o @ 0...3 => self.set_config_address(o, data),
-            o @ 4...7 => self.config_space_write(o - 4, data),
+            o @ 0..=3 => self.set_config_address(o, data),
+            o @ 4..=7 => self.config_space_write(o - 4, data),
             _ => (),
         };
     }

@@ -4,6 +4,7 @@
 
 use std::ffi::CStr;
 use std::fs::File;
+use std::io::Read;
 
 use arch::fdt::{
     begin_node, end_node, finish_fdt, generate_prop32, generate_prop64, property, property_cstring,
@@ -20,6 +21,7 @@ use crate::AARCH64_GIC_CPUI_BASE;
 use crate::AARCH64_GIC_CPUI_SIZE;
 use crate::AARCH64_GIC_DIST_BASE;
 use crate::AARCH64_GIC_DIST_SIZE;
+use crate::AARCH64_GIC_REDIST_SIZE;
 
 // These are RTC related constants
 use crate::AARCH64_RTC_ADDR;
@@ -86,16 +88,20 @@ fn create_cpu_nodes(fdt: &mut Vec<u8>, num_cpus: u32) -> Result<()> {
     Ok(())
 }
 
-fn create_gic_node(fdt: &mut Vec<u8>) -> Result<()> {
-    let gic_reg_prop = generate_prop64(&[
-        AARCH64_GIC_DIST_BASE,
-        AARCH64_GIC_DIST_SIZE,
-        AARCH64_GIC_CPUI_BASE,
-        AARCH64_GIC_CPUI_SIZE,
-    ]);
+fn create_gic_node(fdt: &mut Vec<u8>, is_gicv3: bool, num_cpus: u64) -> Result<()> {
+    let mut gic_reg_prop = [AARCH64_GIC_DIST_BASE, AARCH64_GIC_DIST_SIZE, 0, 0];
 
     begin_node(fdt, "intc")?;
-    property_string(fdt, "compatible", "arm,cortex-a15-gic")?;
+    if is_gicv3 {
+        property_string(fdt, "compatible", "arm,gic-v3")?;
+        gic_reg_prop[2] = AARCH64_GIC_DIST_BASE - (AARCH64_GIC_REDIST_SIZE * num_cpus);
+        gic_reg_prop[3] = AARCH64_GIC_REDIST_SIZE * num_cpus;
+    } else {
+        property_string(fdt, "compatible", "arm,cortex-a15-gic")?;
+        gic_reg_prop[2] = AARCH64_GIC_CPUI_BASE;
+        gic_reg_prop[3] = AARCH64_GIC_CPUI_SIZE;
+    }
+    let gic_reg_prop = generate_prop64(&gic_reg_prop);
     property_u32(fdt, "#interrupt-cells", GIC_FDT_IRQ_NUM_CELLS)?;
     property_null(fdt, "interrupt-controller")?;
     property(fdt, "reg", &gic_reg_prop)?;
@@ -182,7 +188,21 @@ fn create_chosen_node(
     begin_node(fdt, "chosen")?;
     property_u32(fdt, "linux,pci-probe-only", 1)?;
     property_cstring(fdt, "bootargs", cmdline)?;
-    property_u64(fdt, "kaslr", 0)?;
+
+    let mut random_file = File::open("/dev/urandom").map_err(Error::FdtIoError)?;
+    let mut kaslr_seed_bytes = [0u8; 8];
+    random_file
+        .read_exact(&mut kaslr_seed_bytes)
+        .map_err(Error::FdtIoError)?;
+    let kaslr_seed = u64::from_le_bytes(kaslr_seed_bytes);
+    property_u64(fdt, "kaslr-seed", kaslr_seed)?;
+
+    let mut rng_seed_bytes = [0u8; 256];
+    random_file
+        .read_exact(&mut rng_seed_bytes)
+        .map_err(Error::FdtIoError)?;
+    property(fdt, "rng-seed", &rng_seed_bytes)?;
+
     if let Some((initrd_addr, initrd_size)) = initrd {
         let initrd_start = initrd_addr.offset() as u32;
         let initrd_end = initrd_start + initrd_size as u32;
@@ -318,6 +338,7 @@ fn create_rtc_node(fdt: &mut Vec<u8>) -> Result<()> {
 /// * `cmdline` - The kernel commandline
 /// * `initrd` - An optional tuple of initrd guest physical address and size
 /// * `android_fstab` - An optional file holding Android fstab entries
+/// * `is_gicv3` - True if gicv3, false if v2
 pub fn create_fdt(
     fdt_max_size: usize,
     guest_mem: &GuestMemory,
@@ -329,6 +350,7 @@ pub fn create_fdt(
     cmdline: &CStr,
     initrd: Option<(GuestAddress, usize)>,
     android_fstab: Option<File>,
+    is_gicv3: bool,
 ) -> Result<()> {
     let mut fdt = vec![0; fdt_max_size];
     start_fdt(&mut fdt, fdt_max_size)?;
@@ -345,7 +367,7 @@ pub fn create_fdt(
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_memory_node(&mut fdt, guest_mem)?;
     create_cpu_nodes(&mut fdt, num_cpus)?;
-    create_gic_node(&mut fdt)?;
+    create_gic_node(&mut fdt, is_gicv3, num_cpus as u64)?;
     create_timer_node(&mut fdt, num_cpus)?;
     create_serial_nodes(&mut fdt)?;
     create_psci_node(&mut fdt)?;
