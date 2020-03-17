@@ -4,16 +4,11 @@
 
 //! Runs a virtual machine under KVM
 
-pub mod argument;
-pub mod linux;
 pub mod panic_hook;
-#[cfg(feature = "plugin")]
-pub mod plugin;
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::net;
+use std::io::{BufRead, BufReader};
 use std::num::ParseIntError;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -21,9 +16,16 @@ use std::string::String;
 use std::thread::sleep;
 use std::time::Duration;
 
+use arch::Pstore;
+use crosvm::{
+    argument::{self, print_help, set_arguments, Argument},
+    linux, BindMount, Config, DiskOption, Executable, GidMap, SharedDir, TouchDeviceOption,
+};
+#[cfg(feature = "gpu")]
+use devices::virtio::gpu::{GpuMode, GpuParameters};
 use devices::{SerialParameters, SerialType};
+use disk::QcowFile;
 use msg_socket::{MsgReceiver, MsgSender, MsgSocket};
-use qcow::QcowFile;
 use sys_util::{
     debug, error, getpid, info, kill_process_group, net::UnixSeqpacket, reap_child, syslog,
     validate_raw_fd, warn,
@@ -33,143 +35,10 @@ use vm_control::{
     VmControlRequestSocket, VmRequest, VmResponse, USB_CONTROL_MAX_PORTS,
 };
 
-use crate::argument::{print_help, set_arguments, Argument};
-
-static SECCOMP_POLICY_DIR: &'static str = "/usr/share/policy/crosvm";
-
-struct DiskOption {
-    path: PathBuf,
-    read_only: bool,
-}
-
-#[allow(dead_code)]
-struct BindMount {
-    src: PathBuf,
-    dst: PathBuf,
-    writable: bool,
-}
-
-#[allow(dead_code)]
-struct GidMap {
-    inner: libc::gid_t,
-    outer: libc::gid_t,
-    count: u32,
-}
-
-const DEFAULT_TOUCH_DEVICE_WIDTH: u32 = 800;
-const DEFAULT_TOUCH_DEVICE_HEIGHT: u32 = 1280;
-
-struct TouchDeviceOption {
-    path: PathBuf,
-    width: u32,
-    height: u32,
-}
-
-impl TouchDeviceOption {
-    fn new(path: PathBuf) -> TouchDeviceOption {
-        TouchDeviceOption {
-            path,
-            width: DEFAULT_TOUCH_DEVICE_WIDTH,
-            height: DEFAULT_TOUCH_DEVICE_HEIGHT,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Executable {
-    Bios(PathBuf),
-    Kernel(PathBuf),
-    Plugin(PathBuf),
-}
-
 fn executable_is_plugin(executable: &Option<Executable>) -> bool {
     match executable {
         Some(Executable::Plugin(_)) => true,
         _ => false,
-    }
-}
-
-pub struct Config {
-    vcpu_count: Option<u32>,
-    vcpu_affinity: Vec<usize>,
-    memory: Option<usize>,
-    executable_path: Option<Executable>,
-    android_fstab: Option<PathBuf>,
-    initrd_path: Option<PathBuf>,
-    params: Vec<String>,
-    socket_path: Option<PathBuf>,
-    plugin_root: Option<PathBuf>,
-    plugin_mounts: Vec<BindMount>,
-    plugin_gid_maps: Vec<GidMap>,
-    disks: Vec<DiskOption>,
-    pmem_devices: Vec<DiskOption>,
-    host_ip: Option<net::Ipv4Addr>,
-    netmask: Option<net::Ipv4Addr>,
-    mac_address: Option<net_util::MacAddress>,
-    vhost_net: bool,
-    tap_fd: Vec<RawFd>,
-    cid: Option<u64>,
-    wayland_socket_path: Option<PathBuf>,
-    wayland_dmabuf: bool,
-    shared_dirs: Vec<(PathBuf, String)>,
-    sandbox: bool,
-    seccomp_policy_dir: PathBuf,
-    gpu: bool,
-    software_tpm: bool,
-    cras_audio: bool,
-    cras_capture: bool,
-    null_audio: bool,
-    serial_parameters: BTreeMap<u8, SerialParameters>,
-    syslog_tag: Option<String>,
-    virtio_single_touch: Option<TouchDeviceOption>,
-    virtio_trackpad: Option<TouchDeviceOption>,
-    virtio_mouse: Option<PathBuf>,
-    virtio_keyboard: Option<PathBuf>,
-    virtio_input_evdevs: Vec<PathBuf>,
-    split_irqchip: bool,
-}
-
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            vcpu_count: None,
-            vcpu_affinity: Vec::new(),
-            memory: None,
-            executable_path: None,
-            android_fstab: None,
-            initrd_path: None,
-            params: Vec::new(),
-            socket_path: None,
-            plugin_root: None,
-            plugin_mounts: Vec::new(),
-            plugin_gid_maps: Vec::new(),
-            disks: Vec::new(),
-            pmem_devices: Vec::new(),
-            host_ip: None,
-            netmask: None,
-            mac_address: None,
-            vhost_net: false,
-            tap_fd: Vec::new(),
-            cid: None,
-            gpu: false,
-            software_tpm: false,
-            wayland_socket_path: None,
-            wayland_dmabuf: false,
-            shared_dirs: Vec::new(),
-            sandbox: !cfg!(feature = "default-no-sandbox"),
-            seccomp_policy_dir: PathBuf::from(SECCOMP_POLICY_DIR),
-            cras_audio: false,
-            cras_capture: false,
-            null_audio: false,
-            serial_parameters: BTreeMap::new(),
-            syslog_tag: None,
-            virtio_single_touch: None,
-            virtio_trackpad: None,
-            virtio_mouse: None,
-            virtio_keyboard: None,
-            virtio_input_evdevs: Vec::new(),
-            split_irqchip: false,
-        }
     }
 }
 
@@ -243,12 +112,142 @@ fn parse_cpu_set(s: &str) -> argument::Result<Vec<usize>> {
     Ok(cpuset)
 }
 
+#[cfg(feature = "gpu")]
+fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
+    let mut gpu_params: GpuParameters = Default::default();
+
+    if let Some(s) = s {
+        let opts = s
+            .split(",")
+            .map(|frag| frag.split("="))
+            .map(|mut kv| (kv.next().unwrap_or(""), kv.next().unwrap_or("")));
+
+        for (k, v) in opts {
+            match k {
+                // Deprecated: Specifying --gpu=<mode> Not great as the mode can be set multiple
+                // times if the user specifies several modes (--gpu=2d,3d,gfxstream)
+                "2d" | "2D" => {
+                    gpu_params.mode = GpuMode::Mode2D;
+                }
+                "3d" | "3D" => {
+                    gpu_params.mode = GpuMode::Mode3D;
+                }
+                #[cfg(feature = "gfxstream")]
+                "gfxstream" => {
+                    gpu_params.mode = GpuMode::ModeGfxStream;
+                }
+                // Preferred: Specifying --gpu,backend=<mode>
+                "backend" => match v {
+                    "2d" | "2D" => {
+                        gpu_params.mode = GpuMode::Mode2D;
+                    }
+                    "3d" | "3D" => {
+                        gpu_params.mode = GpuMode::Mode3D;
+                    }
+                    #[cfg(feature = "gfxstream")]
+                    "gfxstream" => {
+                        gpu_params.mode = GpuMode::ModeGfxStream;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: "gpu parameter 'backend' should be one of (2d|3d|gfxstream)",
+                        });
+                    }
+                },
+                "egl" => match v {
+                    "true" | "" => {
+                        gpu_params.renderer_use_egl = true;
+                    }
+                    "false" => {
+                        gpu_params.renderer_use_egl = false;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: "gpu parameter 'egl' should be a boolean",
+                        });
+                    }
+                },
+                "gles" => match v {
+                    "true" | "" => {
+                        gpu_params.renderer_use_gles = true;
+                    }
+                    "false" => {
+                        gpu_params.renderer_use_gles = false;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: "gpu parameter 'gles' should be a boolean",
+                        });
+                    }
+                },
+                "glx" => match v {
+                    "true" | "" => {
+                        gpu_params.renderer_use_glx = true;
+                    }
+                    "false" => {
+                        gpu_params.renderer_use_glx = false;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: "gpu parameter 'glx' should be a boolean",
+                        });
+                    }
+                },
+                "surfaceless" => match v {
+                    "true" | "" => {
+                        gpu_params.renderer_use_surfaceless = true;
+                    }
+                    "false" => {
+                        gpu_params.renderer_use_surfaceless = false;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: "gpu parameter 'surfaceless' should be a boolean",
+                        });
+                    }
+                },
+                "width" => {
+                    gpu_params.display_width =
+                        v.parse::<u32>()
+                            .map_err(|_| argument::Error::InvalidValue {
+                                value: v.to_string(),
+                                expected: "gpu parameter 'width' must be a valid integer",
+                            })?;
+                }
+                "height" => {
+                    gpu_params.display_height =
+                        v.parse::<u32>()
+                            .map_err(|_| argument::Error::InvalidValue {
+                                value: v.to_string(),
+                                expected: "gpu parameter 'height' must be a valid integer",
+                            })?;
+                }
+                "" => {}
+                _ => {
+                    return Err(argument::Error::UnknownArgument(format!(
+                        "gpu parameter {}",
+                        k
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(gpu_params)
+}
+
 fn parse_serial_options(s: &str) -> argument::Result<SerialParameters> {
     let mut serial_setting = SerialParameters {
         type_: SerialType::Sink,
         path: None,
         num: 1,
         console: false,
+        stdin: false,
     };
 
     let opts = s
@@ -283,6 +282,11 @@ fn parse_serial_options(s: &str) -> argument::Result<SerialParameters> {
                     ))
                 })?
             }
+            "stdin" => {
+                serial_setting.stdin = v.parse::<bool>().map_err(|e| {
+                    argument::Error::Syntax(format!("serial device stdin is not parseable: {}", e))
+                })?
+            }
             "path" => serial_setting.path = Some(PathBuf::from(v)),
             _ => {
                 return Err(argument::Error::UnknownArgument(format!(
@@ -294,6 +298,91 @@ fn parse_serial_options(s: &str) -> argument::Result<SerialParameters> {
     }
 
     Ok(serial_setting)
+}
+
+fn parse_plugin_mount_option(value: &str) -> argument::Result<BindMount> {
+    let components: Vec<&str> = value.split(":").collect();
+    if components.is_empty() || components.len() > 3 || components[0].is_empty() {
+        return Err(argument::Error::InvalidValue {
+            value: value.to_owned(),
+            expected: "`plugin-mount` should be in a form of: <src>[:[<dst>][:<writable>]]",
+        });
+    }
+
+    let src = PathBuf::from(components[0]);
+    if src.is_relative() {
+        return Err(argument::Error::InvalidValue {
+            value: components[0].to_owned(),
+            expected: "the source path for `plugin-mount` must be absolute",
+        });
+    }
+    if !src.exists() {
+        return Err(argument::Error::InvalidValue {
+            value: components[0].to_owned(),
+            expected: "the source path for `plugin-mount` does not exist",
+        });
+    }
+
+    let dst = PathBuf::from(match components.get(1) {
+        None | Some(&"") => components[0],
+        Some(path) => path,
+    });
+    if dst.is_relative() {
+        return Err(argument::Error::InvalidValue {
+            value: components[1].to_owned(),
+            expected: "the destination path for `plugin-mount` must be absolute",
+        });
+    }
+
+    let writable: bool = match components.get(2) {
+        None => false,
+        Some(s) => s.parse().map_err(|_| argument::Error::InvalidValue {
+            value: components[2].to_owned(),
+            expected: "the <writable> component for `plugin-mount` is not valid bool",
+        })?,
+    };
+
+    Ok(BindMount { src, dst, writable })
+}
+
+fn parse_plugin_gid_map_option(value: &str) -> argument::Result<GidMap> {
+    let components: Vec<&str> = value.split(":").collect();
+    if components.is_empty() || components.len() > 3 || components[0].is_empty() {
+        return Err(argument::Error::InvalidValue {
+            value: value.to_owned(),
+            expected:
+                "`plugin-gid-map` must have exactly 3 components: <inner>[:[<outer>][:<count>]]",
+        });
+    }
+
+    let inner: libc::gid_t = components[0]
+        .parse()
+        .map_err(|_| argument::Error::InvalidValue {
+            value: components[0].to_owned(),
+            expected: "the <inner> component for `plugin-gid-map` is not valid gid",
+        })?;
+
+    let outer: libc::gid_t = match components.get(1) {
+        None | Some(&"") => inner,
+        Some(s) => s.parse().map_err(|_| argument::Error::InvalidValue {
+            value: components[1].to_owned(),
+            expected: "the <outer> component for `plugin-gid-map` is not valid gid",
+        })?,
+    };
+
+    let count: u32 = match components.get(2) {
+        None => 1,
+        Some(s) => s.parse().map_err(|_| argument::Error::InvalidValue {
+            value: components[2].to_owned(),
+            expected: "the <count> component for `plugin-gid-map` is not valid number",
+        })?,
+    };
+
+    Ok(GidMap {
+        inner,
+        outer,
+        count,
+    })
 }
 
 fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::Result<()> {
@@ -407,6 +496,15 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 }
             }
 
+            if serial_params.stdin {
+                if let Some(previous_stdin) = cfg.serial_parameters.values().find(|sp| sp.stdin) {
+                    return Err(argument::Error::TooManyArguments(format!(
+                        "serial device {} already connected to standard input",
+                        previous_stdin.num
+                    )));
+                }
+            }
+
             cfg.serial_parameters.insert(num, serial_params);
         }
         "syslog-tag" => {
@@ -418,29 +516,82 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             syslog::set_proc_name(value.unwrap());
             cfg.syslog_tag = Some(value.unwrap().to_owned());
         }
-        "root" | "disk" | "rwdisk" | "qcow" | "rwqcow" => {
-            let disk_path = PathBuf::from(value.unwrap());
+        "root" | "rwroot" | "disk" | "rwdisk" | "qcow" | "rwqcow" => {
+            let param = value.unwrap();
+            let mut components = param.split(',');
+            let read_only = !name.starts_with("rw");
+            let disk_path =
+                PathBuf::from(
+                    components
+                        .next()
+                        .ok_or_else(|| argument::Error::InvalidValue {
+                            value: param.to_owned(),
+                            expected: "missing disk path",
+                        })?,
+                );
             if !disk_path.exists() {
                 return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
+                    value: param.to_owned(),
                     expected: "this disk path does not exist",
                 });
             }
-            if name == "root" {
+            if name.ends_with("root") {
                 if cfg.disks.len() >= 26 {
                     return Err(argument::Error::TooManyArguments(
                         "ran out of letters for to assign to root disk".to_owned(),
                     ));
                 }
                 cfg.params.push(format!(
-                    "root=/dev/vd{} ro",
-                    char::from(b'a' + cfg.disks.len() as u8)
+                    "root=/dev/vd{} {}",
+                    char::from(b'a' + cfg.disks.len() as u8),
+                    if read_only { "ro" } else { "rw" }
                 ));
             }
-            cfg.disks.push(DiskOption {
+
+            let mut disk = DiskOption {
                 path: disk_path,
-                read_only: !name.starts_with("rw"),
-            });
+                read_only,
+                sparse: true,
+                block_size: 512,
+            };
+
+            for opt in components {
+                let mut o = opt.splitn(2, '=');
+                let kind = o.next().ok_or_else(|| argument::Error::InvalidValue {
+                    value: opt.to_owned(),
+                    expected: "disk options must not be empty",
+                })?;
+                let value = o.next().ok_or_else(|| argument::Error::InvalidValue {
+                    value: opt.to_owned(),
+                    expected: "disk options must be of the form `kind=value`",
+                })?;
+
+                match kind {
+                    "sparse" => {
+                        let sparse = value.parse().map_err(|_| argument::Error::InvalidValue {
+                            value: value.to_owned(),
+                            expected: "`sparse` must be a boolean",
+                        })?;
+                        disk.sparse = sparse;
+                    }
+                    "block_size" => {
+                        let block_size =
+                            value.parse().map_err(|_| argument::Error::InvalidValue {
+                                value: value.to_owned(),
+                                expected: "`block_size` must be an integer",
+                            })?;
+                        disk.block_size = block_size;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: kind.to_owned(),
+                            expected: "unrecognized disk option",
+                        });
+                    }
+                }
+            }
+
+            cfg.disks.push(disk);
         }
         "pmem-device" | "rw-pmem-device" => {
             let disk_path = PathBuf::from(value.unwrap());
@@ -454,6 +605,49 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.pmem_devices.push(DiskOption {
                 path: disk_path,
                 read_only: !name.starts_with("rw"),
+                sparse: false,
+                block_size: sys_util::pagesize() as u32,
+            });
+        }
+        "pstore" => {
+            if cfg.pstore.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`pstore` already given".to_owned(),
+                ));
+            }
+
+            let value = value.unwrap();
+            let components: Vec<&str> = value.split(',').collect();
+            if components.len() != 2 {
+                return Err(argument::Error::InvalidValue {
+                    value: value.to_owned(),
+                    expected: "pstore must have exactly 2 components: path=<path>,size=<size>",
+                });
+            }
+            cfg.pstore = Some(Pstore {
+                path: {
+                    if components[0].len() <= 5 || !components[0].starts_with("path=") {
+                        return Err(argument::Error::InvalidValue {
+                            value: components[0].to_owned(),
+                            expected: "pstore path must follow with `path=`",
+                        });
+                    };
+                    PathBuf::from(&components[0][5..])
+                },
+                size: {
+                    if components[1].len() <= 5 || !components[1].starts_with("size=") {
+                        return Err(argument::Error::InvalidValue {
+                            value: components[1].to_owned(),
+                            expected: "pstore size must follow with `size=`",
+                        });
+                    };
+                    components[1][5..]
+                        .parse()
+                        .map_err(|_| argument::Error::InvalidValue {
+                            value: value.to_owned(),
+                            expected: "pstore size must be an integer",
+                        })?
+                },
             });
         }
         "host_ip" => {
@@ -508,22 +702,62 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 )
         }
         "wayland-sock" => {
-            if cfg.wayland_socket_path.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`wayland-sock` already given".to_owned(),
-                ));
+            let mut components = value.unwrap().split(',');
+            let path =
+                PathBuf::from(
+                    components
+                        .next()
+                        .ok_or_else(|| argument::Error::InvalidValue {
+                            value: value.unwrap().to_owned(),
+                            expected: "missing socket path",
+                        })?,
+                );
+            let mut name = "";
+            for c in components {
+                let mut kv = c.splitn(2, '=');
+                let (kind, value) = match (kv.next(), kv.next()) {
+                    (Some(kind), Some(value)) => (kind, value),
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: c.to_owned(),
+                            expected: "option must be of the form `kind=value`",
+                        })
+                    }
+                };
+                match kind {
+                    "name" => name = value,
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: kind.to_owned(),
+                            expected: "unrecognized option",
+                        })
+                    }
+                }
             }
-            let wayland_socket_path = PathBuf::from(value.unwrap());
-            if !wayland_socket_path.exists() {
-                return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_string(),
-                    expected: "Wayland socket does not exist",
-                });
+            if cfg.wayland_socket_paths.contains_key(name) {
+                return Err(argument::Error::TooManyArguments(format!(
+                    "wayland socket name already used: '{}'",
+                    name
+                )));
             }
-            cfg.wayland_socket_path = Some(wayland_socket_path);
+            cfg.wayland_socket_paths.insert(name.to_string(), path);
         }
         #[cfg(feature = "wl-dmabuf")]
         "wayland-dmabuf" => cfg.wayland_dmabuf = true,
+        "x-display" => {
+            if cfg.x_display.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`x-display` already given".to_owned(),
+                ));
+            }
+            cfg.x_display = Some(value.unwrap().to_owned());
+        }
+        "display-window-keyboard" => {
+            cfg.display_window_keyboard = true;
+        }
+        "display-window-mouse" => {
+            cfg.display_window_mouse = true;
+        }
         "socket" => {
             if cfg.socket_path.is_some() {
                 return Err(argument::Error::TooManyArguments(
@@ -562,9 +796,20 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             );
         }
         "shared-dir" => {
-            // Formatted as <src:tag>.
+            // This is formatted as multiple fields, each separated by ":". The first 2 fields are
+            // fixed (src:tag).  The rest may appear in any order:
+            //
+            // * type=TYPE - must be one of "p9" or "fs" (default: p9)
+            // * uidmap=UIDMAP - a uid map in the format "inner outer count[,inner outer count]"
+            //   (default: "0 <current euid> 1")
+            // * gidmap=GIDMAP - a gid map in the same format as uidmap
+            //   (default: "0 <current egid> 1")
+            // * timeout=TIMEOUT - a timeout value in seconds, which indicates how long attributes
+            //   and directory contents should be considered valid (default: 5)
+            // * cache=CACHE - one of "never", "always", or "auto" (default: auto)
+            // * writeback=BOOL - indicates whether writeback caching should be enabled (default: false)
             let param = value.unwrap();
-            let mut components = param.splitn(2, ':');
+            let mut components = param.split(':');
             let src =
                 PathBuf::from(
                     components
@@ -589,11 +834,90 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 });
             }
 
-            cfg.shared_dirs.push((src, tag));
+            let mut shared_dir = SharedDir {
+                src,
+                tag,
+                ..Default::default()
+            };
+            for opt in components {
+                let mut o = opt.splitn(2, '=');
+                let kind = o.next().ok_or_else(|| argument::Error::InvalidValue {
+                    value: opt.to_owned(),
+                    expected: "`shared-dir` options must not be empty",
+                })?;
+                let value = o.next().ok_or_else(|| argument::Error::InvalidValue {
+                    value: opt.to_owned(),
+                    expected: "`shared-dir` options must be of the form `kind=value`",
+                })?;
+
+                match kind {
+                    "type" => {
+                        shared_dir.kind =
+                            value.parse().map_err(|_| argument::Error::InvalidValue {
+                                value: value.to_owned(),
+                                expected: "`type` must be one of `fs` or `9p`",
+                            })?
+                    }
+                    "uidmap" => shared_dir.uid_map = value.into(),
+                    "gidmap" => shared_dir.gid_map = value.into(),
+                    "timeout" => {
+                        let seconds = value.parse().map_err(|_| argument::Error::InvalidValue {
+                            value: value.to_owned(),
+                            expected: "`timeout` must be an integer",
+                        })?;
+
+                        let dur = Duration::from_secs(seconds);
+                        shared_dir.cfg.entry_timeout = dur.clone();
+                        shared_dir.cfg.attr_timeout = dur;
+                    }
+                    "cache" => {
+                        let policy = value.parse().map_err(|_| argument::Error::InvalidValue {
+                            value: value.to_owned(),
+                            expected: "`cache` must be one of `never`, `always`, or `auto`",
+                        })?;
+                        shared_dir.cfg.cache_policy = policy;
+                    }
+                    "writeback" => {
+                        let writeback =
+                            value.parse().map_err(|_| argument::Error::InvalidValue {
+                                value: value.to_owned(),
+                                expected: "`writeback` must be a boolean",
+                            })?;
+                        shared_dir.cfg.writeback = writeback;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: kind.to_owned(),
+                            expected: "unrecognized option for `shared-dir`",
+                        })
+                    }
+                }
+            }
+            cfg.shared_dirs.push(shared_dir);
         }
         "seccomp-policy-dir" => {
             // `value` is Some because we are in this match so it's safe to unwrap.
             cfg.seccomp_policy_dir = PathBuf::from(value.unwrap());
+        }
+        "seccomp-log-failures" => {
+            // A side-effect of this flag is to force the use of .policy files
+            // instead of .bpf files (.bpf files are expected and assumed to be
+            // compiled to fail an unpermitted action with "trap").
+            // Normally crosvm will first attempt to use a .bpf file, and if
+            // not present it will then try to use a .policy file.  It's up
+            // to the build to decide which of these files is present for
+            // crosvm to use (for CrOS the build will use .bpf files for
+            // x64 builds and .policy files for arm/arm64 builds).
+            //
+            // This flag will likely work as expected for builds that use
+            // .policy files.  For builds that only use .bpf files the initial
+            // result when using this flag is likely to be a file-not-found
+            // error (since the .policy files are not present).
+            // For .bpf builds you can either 1) manually add the .policy files,
+            // or 2) do not use this command-line parameter and instead
+            // temporarily change the build by passing "log" rather than
+            // "trap" as the "--default-action" to compile_seccomp_policy.py.
+            cfg.seccomp_log_failures = true;
         }
         "plugin" => {
             if cfg.executable_path.is_some() {
@@ -615,85 +939,42 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.plugin_root = Some(PathBuf::from(value.unwrap().to_owned()));
         }
         "plugin-mount" => {
-            let components: Vec<&str> = value.unwrap().split(":").collect();
-            if components.len() != 3 {
-                return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
-                    expected:
-                        "`plugin-mount` must have exactly 3 components: <src>:<dst>:<writable>",
-                });
+            let mount = parse_plugin_mount_option(value.unwrap())?;
+            cfg.plugin_mounts.push(mount);
+        }
+        "plugin-mount-file" => {
+            let file = File::open(value.unwrap()).map_err(|_| argument::Error::InvalidValue {
+                value: value.unwrap().to_owned(),
+                expected: "unable to open `plugin-mount-file` file",
+            })?;
+            let reader = BufReader::new(file);
+            for l in reader.lines() {
+                let line = l.unwrap();
+                let trimmed_line = line.splitn(2, '#').nth(0).unwrap().trim();
+                if !trimmed_line.is_empty() {
+                    let mount = parse_plugin_mount_option(trimmed_line)?;
+                    cfg.plugin_mounts.push(mount);
+                }
             }
-
-            let src = PathBuf::from(components[0]);
-            if src.is_relative() {
-                return Err(argument::Error::InvalidValue {
-                    value: components[0].to_owned(),
-                    expected: "the source path for `plugin-mount` must be absolute",
-                });
-            }
-            if !src.exists() {
-                return Err(argument::Error::InvalidValue {
-                    value: components[0].to_owned(),
-                    expected: "the source path for `plugin-mount` does not exist",
-                });
-            }
-
-            let dst = PathBuf::from(components[1]);
-            if dst.is_relative() {
-                return Err(argument::Error::InvalidValue {
-                    value: components[1].to_owned(),
-                    expected: "the destination path for `plugin-mount` must be absolute",
-                });
-            }
-
-            let writable: bool =
-                components[2]
-                    .parse()
-                    .map_err(|_| argument::Error::InvalidValue {
-                        value: components[2].to_owned(),
-                        expected: "the <writable> component for `plugin-mount` is not valid bool",
-                    })?;
-
-            cfg.plugin_mounts.push(BindMount { src, dst, writable });
         }
         "plugin-gid-map" => {
-            let components: Vec<&str> = value.unwrap().split(":").collect();
-            if components.len() != 3 {
-                return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
-                    expected:
-                        "`plugin-gid-map` must have exactly 3 components: <inner>:<outer>:<count>",
-                });
+            let map = parse_plugin_gid_map_option(value.unwrap())?;
+            cfg.plugin_gid_maps.push(map);
+        }
+        "plugin-gid-map-file" => {
+            let file = File::open(value.unwrap()).map_err(|_| argument::Error::InvalidValue {
+                value: value.unwrap().to_owned(),
+                expected: "unable to open `plugin-gid-map-file` file",
+            })?;
+            let reader = BufReader::new(file);
+            for l in reader.lines() {
+                let line = l.unwrap();
+                let trimmed_line = line.splitn(2, '#').nth(0).unwrap().trim();
+                if !trimmed_line.is_empty() {
+                    let map = parse_plugin_gid_map_option(trimmed_line)?;
+                    cfg.plugin_gid_maps.push(map);
+                }
             }
-
-            let inner: libc::gid_t =
-                components[0]
-                    .parse()
-                    .map_err(|_| argument::Error::InvalidValue {
-                        value: components[0].to_owned(),
-                        expected: "the <inner> component for `plugin-gid-map` is not valid gid",
-                    })?;
-
-            let outer: libc::gid_t =
-                components[1]
-                    .parse()
-                    .map_err(|_| argument::Error::InvalidValue {
-                        value: components[1].to_owned(),
-                        expected: "the <outer> component for `plugin-gid-map` is not valid gid",
-                    })?;
-
-            let count: u32 = components[2]
-                .parse()
-                .map_err(|_| argument::Error::InvalidValue {
-                    value: components[2].to_owned(),
-                    expected: "the <count> component for `plugin-gid-map` is not valid number",
-                })?;
-
-            cfg.plugin_gid_maps.push(GidMap {
-                inner,
-                outer,
-                count,
-            });
         }
         "vhost-net" => cfg.vhost_net = true,
         "tap-fd" => {
@@ -707,8 +988,10 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                     })?,
             );
         }
+        #[cfg(feature = "gpu")]
         "gpu" => {
-            cfg.gpu = true;
+            let params = parse_gpu_options(value)?;
+            cfg.gpu_parameters = Some(params);
         }
         "software-tpm" => {
             cfg.software_tpm = true;
@@ -724,12 +1007,11 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             let mut single_touch_spec =
                 TouchDeviceOption::new(PathBuf::from(it.next().unwrap().to_owned()));
             if let Some(width) = it.next() {
-                single_touch_spec.width = width.trim().parse().unwrap();
+                single_touch_spec.set_width(width.trim().parse().unwrap());
             }
             if let Some(height) = it.next() {
-                single_touch_spec.height = height.trim().parse().unwrap();
+                single_touch_spec.set_height(height.trim().parse().unwrap());
             }
-
             cfg.virtio_single_touch = Some(single_touch_spec);
         }
         "trackpad" => {
@@ -743,12 +1025,11 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             let mut trackpad_spec =
                 TouchDeviceOption::new(PathBuf::from(it.next().unwrap().to_owned()));
             if let Some(width) = it.next() {
-                trackpad_spec.width = width.trim().parse().unwrap();
+                trackpad_spec.set_width(width.trim().parse().unwrap());
             }
             if let Some(height) = it.next() {
-                trackpad_spec.height = height.trim().parse().unwrap();
+                trackpad_spec.set_height(height.trim().parse().unwrap());
             }
-
             cfg.virtio_trackpad = Some(trackpad_spec);
         }
         "mouse" => {
@@ -792,8 +1073,64 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.executable_path = Some(Executable::Bios(PathBuf::from(value.unwrap().to_owned())));
         }
+        "vfio" => {
+            let vfio_path = PathBuf::from(value.unwrap());
+            if !vfio_path.exists() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: "the vfio path does not exist",
+                });
+            }
+            if !vfio_path.is_dir() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: "the vfio path should be directory",
+                });
+            }
+
+            cfg.vfio = Some(vfio_path);
+        }
+
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Error> {
+    if cfg.executable_path.is_none() {
+        return Err(argument::Error::ExpectedArgument("`KERNEL`".to_owned()));
+    }
+    if cfg.host_ip.is_some() || cfg.netmask.is_some() || cfg.mac_address.is_some() {
+        if cfg.host_ip.is_none() {
+            return Err(argument::Error::ExpectedArgument(
+                "`host_ip` missing from network config".to_owned(),
+            ));
+        }
+        if cfg.netmask.is_none() {
+            return Err(argument::Error::ExpectedArgument(
+                "`netmask` missing from network config".to_owned(),
+            ));
+        }
+        if cfg.mac_address.is_none() {
+            return Err(argument::Error::ExpectedArgument(
+                "`mac` missing from network config".to_owned(),
+            ));
+        }
+    }
+    if cfg.plugin_root.is_some() && !executable_is_plugin(&cfg.executable_path) {
+        return Err(argument::Error::ExpectedArgument(
+            "`plugin-root` requires `plugin`".to_owned(),
+        ));
+    }
+    #[cfg(feature = "gpu")]
+    {
+        if let Some(gpu_parameters) = cfg.gpu_parameters.as_ref() {
+            let (width, height) = (gpu_parameters.display_width, gpu_parameters.display_height);
+            if let Some(virtio_single_touch) = cfg.virtio_single_touch.as_mut() {
+                virtio_single_touch.set_default_size(width, height);
+            }
+        }
     }
     Ok(())
 }
@@ -815,14 +1152,23 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                                 "Amount of guest memory in MiB. (default: 256)"),
           Argument::short_value('r',
                                 "root",
-                                "PATH",
-                                "Path to a root disk image. Like `--disk` but adds appropriate kernel command line option."),
-          Argument::short_value('d', "disk", "PATH", "Path to a disk image."),
+                                "PATH[,key=value[,key=value[,...]]",
+                                "Path to a root disk image followed by optional comma-separated options.
+                              Like `--disk` but adds appropriate kernel command line option.
+                              See --disk for valid options."),
+          Argument::value("rwroot", "PATH[,key=value[,key=value[,...]]", "Path to a writable root disk image followed by optional comma-separated options.
+                              See --disk for valid options."),
+          Argument::short_value('d', "disk", "PATH[,key=value[,key=value[,...]]", "Path to a disk image followed by optional comma-separated options.
+                              Valid keys:
+                              sparse=BOOL - Indicates whether the disk should support the discard operation (default: true)
+                              block_size=BYTES - Set the reported block size of the disk (default: 512)"),
           Argument::value("qcow", "PATH", "Path to a qcow2 disk image. (Deprecated; use --disk instead.)"),
-          Argument::value("rwdisk", "PATH", "Path to a writable disk image."),
+          Argument::value("rwdisk", "PATH[,key=value[,key=value[,...]]", "Path to a writable disk image followed by optional comma-separated options.
+                              See --disk for valid options."),
           Argument::value("rwqcow", "PATH", "Path to a writable qcow2 disk image. (Deprecated; use --rwdisk instead.)"),
           Argument::value("rw-pmem-device", "PATH", "Path to a writable disk image."),
           Argument::value("pmem-device", "PATH", "Path to a disk image."),
+          Argument::value("pstore", "path=PATH,size=SIZE", "Path to pstore buffer backend file follewed by size."),
           Argument::value("host_ip",
                           "IP",
                           "IP address to assign to host tap interface."),
@@ -832,16 +1178,20 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::flag("cras-capture", "Enable capturing audio from CRAS server to the cras-audio device"),
           Argument::flag("null-audio", "Add an audio device to the VM that plays samples to /dev/null"),
           Argument::value("serial",
-                          "type=TYPE,[num=NUM,path=PATH,console]",
-                          "Comma seperated key=value pairs for setting up serial devices. Can be given more than once.
+                          "type=TYPE,[num=NUM,path=PATH,console,stdin]",
+                          "Comma separated key=value pairs for setting up serial devices. Can be given more than once.
                           Possible key values:
                           type=(stdout,syslog,sink,file) - Where to route the serial device
                           num=(1,2,3,4) - Serial Device Number. If not provided, num will default to 1.
                           path=PATH - The path to the file to write to when type=file
                           console - Use this serial device as the guest console. Can only be given once. Will default to first serial port if not provided.
+                          stdin - Direct standard input to this serial device. Can only be given once. Will default to first serial port if not provided.
                           "),
           Argument::value("syslog-tag", "TAG", "When logging to syslog, use the provided tag."),
-          Argument::value("wayland-sock", "PATH", "Path to the Wayland socket to use."),
+          Argument::value("x-display", "DISPLAY", "X11 display name to use."),
+          Argument::flag("display-window-keyboard", "Capture keyboard input from the display window."),
+          Argument::flag("display-window-mouse", "Capture keyboard input from the display window."),
+          Argument::value("wayland-sock", "PATH[,name=NAME]", "Path to the Wayland socket to use. The unnamed one is used for displaying virtual screens. Named ones are only for IPC."),
           #[cfg(feature = "wl-dmabuf")]
           Argument::flag("wayland-dmabuf", "Enable support for DMABufs in Wayland device."),
           Argument::short_value('s',
@@ -850,9 +1200,19 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                                 "Path to put the control socket. If PATH is a directory, a name will be generated."),
           Argument::flag("disable-sandbox", "Run all devices in one, non-sandboxed process."),
           Argument::value("cid", "CID", "Context ID for virtual sockets."),
-          Argument::value("shared-dir", "PATH:TAG",
-                          "Directory to be shared with a VM as a source:tag pair. Can be given more than once."),
+          Argument::value("shared-dir", "PATH:TAG[:type=TYPE:writeback=BOOL:timeout=SECONDS:uidmap=UIDMAP:gidmap=GIDMAP:cache=CACHE]",
+                          "Colon-separated options for configuring a directory to be shared with the VM.
+The first field is the directory to be shared and the second field is the tag that the VM can use to identify the device.
+The remaining fields are key=value pairs that may appear in any order.  Valid keys are:
+type=(p9, fs) - Indicates whether the directory should be shared via virtio-9p or virtio-fs (default: p9).
+uidmap=UIDMAP - The uid map to use for the device's jail in the format \"inner outer count[,inner outer count]\" (default: 0 <current euid> 1).
+gidmap=GIDMAP - The gid map to use for the device's jail in the format \"inner outer count[,inner outer count]\" (default: 0 <current egid> 1).
+cache=(never, auto, always) - Indicates whether the VM can cache the contents of the shared directory (default: auto).  When set to \"auto\" and the type is \"fs\", the VM will use close-to-open consistency for file contents.
+timeout=SECONDS - How long the VM should consider file attributes and directory entries to be valid (default: 5).  If the VM has exclusive access to the directory, then this should be a large value.  If the directory can be modified by other processes, then this should be 0.
+writeback=BOOL - Indicates whether the VM can use writeback caching (default: false).  This is only safe to do when the VM has exclusive access to the files in a directory.  Additionally, the server should have read permission for all files as the VM may issue read requests even for files that are opened write-only.
+"),
           Argument::value("seccomp-policy-dir", "PATH", "Path to seccomp .policy files."),
+          Argument::flag("seccomp-log-failures", "Instead of seccomp filter failures being fatal, they will be logged instead."),
           #[cfg(feature = "plugin")]
           Argument::value("plugin", "PATH", "Absolute path to plugin process to run under crosvm."),
           #[cfg(feature = "plugin")]
@@ -860,13 +1220,27 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           #[cfg(feature = "plugin")]
           Argument::value("plugin-mount", "PATH:PATH:BOOL", "Path to be mounted into the plugin's root filesystem.  Can be given more than once."),
           #[cfg(feature = "plugin")]
+          Argument::value("plugin-mount-file", "PATH", "Path to the file listing paths be mounted into the plugin's root filesystem.  Can be given more than once."),
+          #[cfg(feature = "plugin")]
           Argument::value("plugin-gid-map", "GID:GID:INT", "Supplemental GIDs that should be mapped in plugin jail.  Can be given more than once."),
+          #[cfg(feature = "plugin")]
+          Argument::value("plugin-gid-map-file", "PATH", "Path to the file listing supplemental GIDs that should be mapped in plugin jail.  Can be given more than once."),
           Argument::flag("vhost-net", "Use vhost for networking."),
           Argument::value("tap-fd",
                           "fd",
                           "File descriptor for configured tap device. A different virtual network card will be added each time this argument is given."),
           #[cfg(feature = "gpu")]
-          Argument::flag("gpu", "(EXPERIMENTAL) enable virtio-gpu device"),
+          Argument::flag_or_value("gpu",
+                                  "[width=INT,height=INT]",
+                                  "(EXPERIMENTAL) Comma separated key=value pairs for setting up a virtio-gpu device
+                                  Possible key values:
+                                  backend=(2d|3d|gfxstream) - Which backend to use for virtio-gpu (determining rendering protocol)
+                                  width=INT - The width of the virtual display connected to the virtio-gpu.
+                                  height=INT - The height of the virtual display connected to the virtio-gpu.
+                                  egl[=true|=false] - If the virtio-gpu backend should use a EGL context for rendering.
+                                  glx[=true|=false] - If the virtio-gpu backend should use a GLX context for rendering.
+                                  surfaceless[=true|=false] - If the virtio-gpu backend should use a surfaceless context for rendering.
+                                  "),
           #[cfg(feature = "tpm")]
           Argument::flag("software-tpm", "enable a software emulated trusted platform module device"),
           Argument::value("evdev", "PATH", "Path to an event device node. The device will be grabbed (unusable from the host) and made available to the guest with the same configuration it shows on the host"),
@@ -877,53 +1251,29 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("split-irqchip", "(EXPERIMENTAL) enable split-irqchip support"),
           Argument::value("bios", "PATH", "Path to BIOS/firmware ROM"),
+          Argument::value("vfio", "PATH", "Path to sysfs of pass through or mdev device"),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
     let match_res = set_arguments(args, &arguments[..], |name, value| {
         set_argument(&mut cfg, name, value)
     })
-    .and_then(|_| {
-        if cfg.executable_path.is_none() {
-            return Err(argument::Error::ExpectedArgument("`KERNEL`".to_owned()));
-        }
-        if cfg.host_ip.is_some() || cfg.netmask.is_some() || cfg.mac_address.is_some() {
-            if cfg.host_ip.is_none() {
-                return Err(argument::Error::ExpectedArgument(
-                    "`host_ip` missing from network config".to_owned(),
-                ));
-            }
-            if cfg.netmask.is_none() {
-                return Err(argument::Error::ExpectedArgument(
-                    "`netmask` missing from network config".to_owned(),
-                ));
-            }
-            if cfg.mac_address.is_none() {
-                return Err(argument::Error::ExpectedArgument(
-                    "`mac` missing from network config".to_owned(),
-                ));
-            }
-        }
-        if cfg.plugin_root.is_some() && !executable_is_plugin(&cfg.executable_path) {
-            return Err(argument::Error::ExpectedArgument(
-                "`plugin-root` requires `plugin`".to_owned(),
-            ));
-        }
-        Ok(())
-    });
+    .and_then(|_| validate_arguments(&mut cfg));
 
     match match_res {
         #[cfg(feature = "plugin")]
-        Ok(()) if executable_is_plugin(&cfg.executable_path) => match plugin::run_config(cfg) {
-            Ok(_) => {
-                info!("crosvm and plugin have exited normally");
-                Ok(())
+        Ok(()) if executable_is_plugin(&cfg.executable_path) => {
+            match crosvm::plugin::run_config(cfg) {
+                Ok(_) => {
+                    info!("crosvm and plugin have exited normally");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("{}", e);
+                    Err(())
+                }
             }
-            Err(e) => {
-                error!("{}", e);
-                Err(())
-            }
-        },
+        }
         Ok(()) => match linux::run_config(cfg) {
             Ok(_) => {
                 info!("crosvm has exited normally");
@@ -939,7 +1289,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
             Ok(())
         }
         Err(e) => {
-            println!("{}", e);
+            error!("{}", e);
             Err(())
         }
     }
@@ -1035,34 +1385,82 @@ fn balloon_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     vms_request(&VmRequest::BalloonCommand(command), args)
 }
 
-fn create_qcow2(mut args: std::env::Args) -> std::result::Result<(), ()> {
-    if args.len() != 2 {
-        print_help("crosvm create_qcow2", "PATH SIZE", &[]);
-        println!("Create a new QCOW2 image at `PATH` of the specified `SIZE` in bytes.");
+fn create_qcow2(args: std::env::Args) -> std::result::Result<(), ()> {
+    let arguments = [
+        Argument::positional("PATH", "where to create the qcow2 image"),
+        Argument::positional("[SIZE]", "the expanded size of the image"),
+        Argument::value(
+            "backing_file",
+            "path/to/file",
+            " the file to back the image",
+        ),
+    ];
+    let mut positional_index = 0;
+    let mut file_path = String::from("");
+    let mut size: Option<u64> = None;
+    let mut backing_file: Option<String> = None;
+    set_arguments(args, &arguments[..], |name, value| {
+        match (name, positional_index) {
+            ("", 0) => {
+                // NAME
+                positional_index += 1;
+                file_path = value.unwrap().to_owned();
+            }
+            ("", 1) => {
+                // [SIZE]
+                positional_index += 1;
+                size = Some(value.unwrap().parse::<u64>().map_err(|_| {
+                    argument::Error::InvalidValue {
+                        value: value.unwrap().to_owned(),
+                        expected: "SIZE should be a nonnegative integer",
+                    }
+                })?);
+            }
+            ("", _) => {
+                return Err(argument::Error::TooManyArguments(
+                    "Expected at most 2 positional arguments".to_owned(),
+                ));
+            }
+            ("backing_file", _) => {
+                backing_file = value.map(|x| x.to_owned());
+            }
+            _ => unreachable!(),
+        };
+        Ok(())
+    })
+    .map_err(|e| {
+        error!("Unable to parse command line arguments: {}", e);
+    })?;
+    if file_path.len() == 0 || !(size.is_some() ^ backing_file.is_some()) {
+        print_help("crosvm create_qcow2", "PATH [SIZE]", &arguments);
+        println!(
+            "Create a new QCOW2 image at `PATH` of either the specified `SIZE` in bytes or
+with a '--backing_file'."
+        );
         return Err(());
     }
-    let file_path = args.nth(0).unwrap();
-    let size: u64 = match args.nth(0).unwrap().parse::<u64>() {
-        Ok(n) => n,
-        Err(_) => {
-            error!("Failed to parse size of the disk.");
-            return Err(());
-        }
-    };
 
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
+        .truncate(true)
         .open(&file_path)
         .map_err(|e| {
             error!("Failed opening qcow file at '{}': {}", file_path, e);
         })?;
 
-    QcowFile::new(file, size).map_err(|e| {
-        error!("Failed to create qcow file at '{}': {}", file_path, e);
-    })?;
-
+    match (size, backing_file) {
+        (Some(size), None) => QcowFile::new(file, size).map_err(|e| {
+            error!("Failed to create qcow file at '{}': {}", file_path, e);
+        })?,
+        (None, Some(backing_file)) => {
+            QcowFile::new_from_backing(file, &backing_file).map_err(|e| {
+                error!("Failed to create qcow file at '{}': {}", file_path, e);
+            })?
+        }
+        _ => unreachable!(),
+    };
     Ok(())
 }
 
@@ -1293,6 +1691,19 @@ fn print_usage() {
     println!("    create_qcow2  - Create a new qcow2 disk image file.");
     println!("    disk - Manage attached virtual disk devices.");
     println!("    usb - Manage attached virtual USB devices.");
+    println!("    version - Show package version.");
+}
+
+fn pkg_version() -> std::result::Result<(), ()> {
+    const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
+    const PKG_VERSION: Option<&'static str> = option_env!("PKG_VERSION");
+
+    print!("crosvm {}", VERSION.unwrap_or("UNKNOWN"));
+    match PKG_VERSION {
+        Some(v) => println!("-{}", v),
+        None => println!(""),
+    }
+    Ok(())
 }
 
 fn crosvm_main() -> std::result::Result<(), ()> {
@@ -1323,6 +1734,7 @@ fn crosvm_main() -> std::result::Result<(), ()> {
         Some("create_qcow2") => create_qcow2(args),
         Some("disk") => disk_cmd(args),
         Some("usb") => modify_usb(args),
+        Some("version") => pkg_version(),
         Some(c) => {
             println!("invalid subcommand: {:?}", c);
             print_usage();
@@ -1354,6 +1766,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crosvm::{DEFAULT_TOUCH_DEVICE_HEIGHT, DEFAULT_TOUCH_DEVICE_WIDTH};
 
     #[test]
     fn parse_cpu_set_single() {
@@ -1414,7 +1827,8 @@ mod tests {
 
     #[test]
     fn parse_serial_vaild() {
-        parse_serial_options("type=syslog,num=1,console=true").expect("parse should have succeded");
+        parse_serial_options("type=syslog,num=1,console=true,stdin=true")
+            .expect("parse should have succeded");
     }
 
     #[test]
@@ -1445,5 +1859,208 @@ mod tests {
     #[test]
     fn parse_serial_invalid_option() {
         parse_serial_options("type=syslog,speed=lightspeed").expect_err("parse should have failed");
+    }
+
+    #[test]
+    fn parse_serial_invalid_two_stdin() {
+        let mut config = Config::default();
+        set_argument(&mut config, "serial", Some("num=1,type=stdout,stdin=true"))
+            .expect("should parse the first serial argument");
+        set_argument(&mut config, "serial", Some("num=2,type=stdout,stdin=true"))
+            .expect_err("should fail to parse a second serial port connected to stdin");
+    }
+
+    #[test]
+    fn parse_plugin_mount_valid() {
+        let mut config = Config::default();
+        set_argument(
+            &mut config,
+            "plugin-mount",
+            Some("/dev/null:/dev/zero:true"),
+        )
+        .expect("parse should succeed");
+        assert_eq!(config.plugin_mounts[0].src, PathBuf::from("/dev/null"));
+        assert_eq!(config.plugin_mounts[0].dst, PathBuf::from("/dev/zero"));
+        assert_eq!(config.plugin_mounts[0].writable, true);
+    }
+
+    #[test]
+    fn parse_plugin_mount_valid_shorthand() {
+        let mut config = Config::default();
+        set_argument(&mut config, "plugin-mount", Some("/dev/null")).expect("parse should succeed");
+        assert_eq!(config.plugin_mounts[0].dst, PathBuf::from("/dev/null"));
+        assert_eq!(config.plugin_mounts[0].writable, false);
+        set_argument(&mut config, "plugin-mount", Some("/dev/null:/dev/zero"))
+            .expect("parse should succeed");
+        assert_eq!(config.plugin_mounts[1].dst, PathBuf::from("/dev/zero"));
+        assert_eq!(config.plugin_mounts[1].writable, false);
+        set_argument(&mut config, "plugin-mount", Some("/dev/null::true"))
+            .expect("parse should succeed");
+        assert_eq!(config.plugin_mounts[2].dst, PathBuf::from("/dev/null"));
+        assert_eq!(config.plugin_mounts[2].writable, true);
+    }
+
+    #[test]
+    fn parse_plugin_mount_invalid() {
+        let mut config = Config::default();
+        set_argument(&mut config, "plugin-mount", Some("")).expect_err("parse should fail");
+        set_argument(
+            &mut config,
+            "plugin-mount",
+            Some("/dev/null:/dev/null:true:false"),
+        )
+        .expect_err("parse should fail because too many arguments");
+        set_argument(&mut config, "plugin-mount", Some("null:/dev/null:true"))
+            .expect_err("parse should fail because source is not absolute");
+        set_argument(&mut config, "plugin-mount", Some("/dev/null:null:true"))
+            .expect_err("parse should fail because source is not absolute");
+        set_argument(&mut config, "plugin-mount", Some("/dev/null:null:blah"))
+            .expect_err("parse should fail because flag is not boolean");
+    }
+
+    #[test]
+    fn parse_plugin_gid_map_valid() {
+        let mut config = Config::default();
+        set_argument(&mut config, "plugin-gid-map", Some("1:2:3")).expect("parse should succeed");
+        assert_eq!(config.plugin_gid_maps[0].inner, 1);
+        assert_eq!(config.plugin_gid_maps[0].outer, 2);
+        assert_eq!(config.plugin_gid_maps[0].count, 3);
+    }
+
+    #[test]
+    fn parse_plugin_gid_map_valid_shorthand() {
+        let mut config = Config::default();
+        set_argument(&mut config, "plugin-gid-map", Some("1")).expect("parse should succeed");
+        assert_eq!(config.plugin_gid_maps[0].inner, 1);
+        assert_eq!(config.plugin_gid_maps[0].outer, 1);
+        assert_eq!(config.plugin_gid_maps[0].count, 1);
+        set_argument(&mut config, "plugin-gid-map", Some("1:2")).expect("parse should succeed");
+        assert_eq!(config.plugin_gid_maps[1].inner, 1);
+        assert_eq!(config.plugin_gid_maps[1].outer, 2);
+        assert_eq!(config.plugin_gid_maps[1].count, 1);
+        set_argument(&mut config, "plugin-gid-map", Some("1::3")).expect("parse should succeed");
+        assert_eq!(config.plugin_gid_maps[2].inner, 1);
+        assert_eq!(config.plugin_gid_maps[2].outer, 1);
+        assert_eq!(config.plugin_gid_maps[2].count, 3);
+    }
+
+    #[test]
+    fn parse_plugin_gid_map_invalid() {
+        let mut config = Config::default();
+        set_argument(&mut config, "plugin-gid-map", Some("")).expect_err("parse should fail");
+        set_argument(&mut config, "plugin-gid-map", Some("1:2:3:4"))
+            .expect_err("parse should fail because too many arguments");
+        set_argument(&mut config, "plugin-gid-map", Some("blah:2:3"))
+            .expect_err("parse should fail because inner is not a number");
+        set_argument(&mut config, "plugin-gid-map", Some("1:blah:3"))
+            .expect_err("parse should fail because outer is not a number");
+        set_argument(&mut config, "plugin-gid-map", Some("1:2:blah"))
+            .expect_err("parse should fail because count is not a number");
+    }
+
+    #[test]
+    fn single_touch_spec_and_track_pad_spec_default_size() {
+        let mut config = Config::default();
+        config
+            .executable_path
+            .replace(Executable::Kernel(PathBuf::from("kernel")));
+        set_argument(&mut config, "single-touch", Some("/dev/single-touch-test")).unwrap();
+        set_argument(&mut config, "trackpad", Some("/dev/single-touch-test")).unwrap();
+        validate_arguments(&mut config).unwrap();
+        assert_eq!(
+            config.virtio_single_touch.unwrap().get_size(),
+            (DEFAULT_TOUCH_DEVICE_WIDTH, DEFAULT_TOUCH_DEVICE_HEIGHT)
+        );
+        assert_eq!(
+            config.virtio_trackpad.unwrap().get_size(),
+            (DEFAULT_TOUCH_DEVICE_WIDTH, DEFAULT_TOUCH_DEVICE_HEIGHT)
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn single_touch_spec_default_size_from_gpu() {
+        let width = 12345u32;
+        let height = 54321u32;
+        let mut config = Config::default();
+        config
+            .executable_path
+            .replace(Executable::Kernel(PathBuf::from("kernel")));
+        set_argument(&mut config, "single-touch", Some("/dev/single-touch-test")).unwrap();
+        set_argument(
+            &mut config,
+            "gpu",
+            Some(&format!("width={},height={}", width, height)),
+        )
+        .unwrap();
+        validate_arguments(&mut config).unwrap();
+        assert_eq!(
+            config.virtio_single_touch.unwrap().get_size(),
+            (width, height)
+        );
+    }
+
+    #[test]
+    fn single_touch_spec_and_track_pad_spec_with_size() {
+        let width = 12345u32;
+        let height = 54321u32;
+        let mut config = Config::default();
+        config
+            .executable_path
+            .replace(Executable::Kernel(PathBuf::from("kernel")));
+        set_argument(
+            &mut config,
+            "single-touch",
+            Some(&format!("/dev/single-touch-test:{}:{}", width, height)),
+        )
+        .unwrap();
+        set_argument(
+            &mut config,
+            "trackpad",
+            Some(&format!("/dev/single-touch-test:{}:{}", width, height)),
+        )
+        .unwrap();
+        validate_arguments(&mut config).unwrap();
+        assert_eq!(
+            config.virtio_single_touch.unwrap().get_size(),
+            (width, height)
+        );
+        assert_eq!(config.virtio_trackpad.unwrap().get_size(), (width, height));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn single_touch_spec_with_size_independent_from_gpu() {
+        let touch_width = 12345u32;
+        let touch_height = 54321u32;
+        let display_width = 1234u32;
+        let display_height = 5432u32;
+        let mut config = Config::default();
+        config
+            .executable_path
+            .replace(Executable::Kernel(PathBuf::from("kernel")));
+        set_argument(
+            &mut config,
+            "single-touch",
+            Some(&format!(
+                "/dev/single-touch-test:{}:{}",
+                touch_width, touch_height
+            )),
+        )
+        .unwrap();
+        set_argument(
+            &mut config,
+            "gpu",
+            Some(&format!(
+                "width={},height={}",
+                display_width, display_height
+            )),
+        )
+        .unwrap();
+        validate_arguments(&mut config).unwrap();
+        assert_eq!(
+            config.virtio_single_touch.unwrap().get_size(),
+            (touch_width, touch_height)
+        );
     }
 }

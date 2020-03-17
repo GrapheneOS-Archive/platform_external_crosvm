@@ -3,7 +3,6 @@
 rust_library_host_rlib {
     name: "libsys_util",
     defaults: ["crosvm_defaults"],
-    deny_warnings: false,
     crate_name: "sys_util",
     srcs: ["src/lib.rs"],
     rlibs: [
@@ -11,6 +10,7 @@ rust_library_host_rlib {
         "liblibc",
         "libsync_rust",
         "libsyscall_defines",
+        "libtempfile",
     ],
     proc_macros: [
         "libpoll_token_derive",

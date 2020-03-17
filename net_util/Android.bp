@@ -6,6 +6,7 @@ rust_library_host_rlib {
     crate_name: "net_util",
     srcs: ["src/lib.rs"],
     rlibs: [
+        "libdata_model",
         "liblibc",
         "libnet_sys",
         "libsys_util",
