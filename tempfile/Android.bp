@@ -6,6 +6,6 @@ rust_library_host_rlib {
     crate_name: "tempfile",
     srcs: ["src/lib.rs"],
     rlibs: [
-        "librand_ish",
+        "liblibc",
     ],
 }

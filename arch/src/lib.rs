@@ -4,6 +4,7 @@
 
 pub mod android;
 pub mod fdt;
+pub mod pstore;
 
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
@@ -11,12 +12,13 @@ use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use devices::virtio::VirtioDevice;
 use devices::{
     Bus, BusDevice, BusError, PciDevice, PciDeviceError, PciInterruptPin, PciRoot, ProxyDevice,
-    Serial, SerialParameters, DEFAULT_SERIAL_PARAMS, SERIAL_ADDR,
+    SerialParameters, DEFAULT_SERIAL_PARAMS, SERIAL_ADDR,
 };
 use io_jail::Minijail;
 use kvm::{IoeventAddress, Kvm, Vcpu, Vm};
@@ -29,6 +31,12 @@ pub enum VmImage {
     Bios(File),
 }
 
+#[derive(Clone)]
+pub struct Pstore {
+    pub path: PathBuf,
+    pub size: u32,
+}
+
 /// Holds the pieces needed to build a VM. Passed to `build_vm` in the `LinuxArch` trait below to
 /// create a `RunnableLinuxVm`.
 pub struct VmComponents {
@@ -37,6 +45,7 @@ pub struct VmComponents {
     pub vcpu_affinity: Vec<usize>,
     pub vm_image: VmImage,
     pub android_fstab: Option<File>,
+    pub pstore: Option<Pstore>,
     pub initrd_image: Option<File>,
     pub extra_kernel_params: Vec<String>,
     pub wayland_dmabuf: bool,
@@ -47,7 +56,6 @@ pub struct RunnableLinuxVm {
     pub vm: Vm,
     pub kvm: Kvm,
     pub resources: SystemAllocator,
-    pub stdio_serial: Option<Arc<Mutex<Serial>>>,
     pub exit_evt: EventFd,
     pub vcpus: Vec<Vcpu>,
     pub vcpu_affinity: Vec<usize>,
@@ -55,6 +63,7 @@ pub struct RunnableLinuxVm {
     pub io_bus: Bus,
     pub mmio_bus: Bus,
     pub pid_debug_label_map: BTreeMap<u32, String>,
+    pub suspend_evt: EventFd,
 }
 
 /// The device and optional jail.
@@ -80,6 +89,7 @@ pub trait LinuxArch {
         components: VmComponents,
         split_irqchip: bool,
         serial_parameters: &BTreeMap<u8, SerialParameters>,
+        serial_jail: Option<Minijail>,
         create_devices: F,
     ) -> Result<RunnableLinuxVm, Self::Error>
     where
@@ -101,9 +111,9 @@ pub enum DeviceRegistrationError {
     AllocateDeviceAddrs(PciDeviceError),
     /// Could not allocate an IRQ number.
     AllocateIrq,
-    /// Could not create the mmio device to wrap a VirtioDevice.
-    CreateMmioDevice(sys_util::Error),
-    //  Unable to create serial device from serial parameters
+    // Unable to create a pipe.
+    CreatePipe(sys_util::Error),
+    // Unable to create serial device from serial parameters
     CreateSerialDevice(devices::SerialError),
     /// Could not create an event fd.
     EventFdCreate(sys_util::Error),
@@ -133,7 +143,7 @@ impl Display for DeviceRegistrationError {
             AllocateIoAddrs(e) => write!(f, "Allocating IO addresses: {}", e),
             AllocateDeviceAddrs(e) => write!(f, "Allocating device addresses: {}", e),
             AllocateIrq => write!(f, "Allocating IRQ number"),
-            CreateMmioDevice(e) => write!(f, "failed to create mmio device: {}", e),
+            CreatePipe(e) => write!(f, "failed to create pipe: {}", e),
             CreateSerialDevice(e) => write!(f, "failed to create serial device: {}", e),
             Cmdline(e) => write!(f, "unable to add device to kernel command line: {}", e),
             EventFdCreate(e) => write!(f, "failed to create eventfd: {}", e),
@@ -243,9 +253,9 @@ pub fn add_serial_devices(
     com_evt_1_3: &EventFd,
     com_evt_2_4: &EventFd,
     serial_parameters: &BTreeMap<u8, SerialParameters>,
-) -> Result<(Option<u8>, Option<Arc<Mutex<Serial>>>), DeviceRegistrationError> {
+    serial_jail: Option<Minijail>,
+) -> Result<Option<u8>, DeviceRegistrationError> {
     let mut stdio_serial_num = None;
-    let mut stdio_serial = None;
 
     for x in 0..=3 {
         let com_evt = match x {
@@ -260,22 +270,35 @@ pub fn add_serial_devices(
             .get(&(x + 1))
             .unwrap_or(&DEFAULT_SERIAL_PARAMS[x as usize]);
 
-        let com = Arc::new(Mutex::new(
-            param
-                .create_serial_device(&com_evt)
-                .map_err(DeviceRegistrationError::CreateSerialDevice)?,
-        ));
-        io_bus
-            .insert(com.clone(), SERIAL_ADDR[x as usize], 0x8, false)
-            .unwrap();
-
         if param.console {
             stdio_serial_num = Some(x + 1);
-            stdio_serial = Some(com.clone());
+        }
+
+        let mut preserved_fds = Vec::new();
+        let com = param
+            .create_serial_device(&com_evt, &mut preserved_fds)
+            .map_err(DeviceRegistrationError::CreateSerialDevice)?;
+
+        match serial_jail.as_ref() {
+            Some(jail) => {
+                let com = Arc::new(Mutex::new(
+                    ProxyDevice::new(com, &jail, preserved_fds)
+                        .map_err(DeviceRegistrationError::ProxyDeviceCreation)?,
+                ));
+                io_bus
+                    .insert(com.clone(), SERIAL_ADDR[x as usize], 0x8, false)
+                    .unwrap();
+            }
+            None => {
+                let com = Arc::new(Mutex::new(com));
+                io_bus
+                    .insert(com.clone(), SERIAL_ADDR[x as usize], 0x8, false)
+                    .unwrap();
+            }
         }
     }
 
-    Ok((stdio_serial_num, stdio_serial))
+    Ok(stdio_serial_num)
 }
 
 /// Errors for image loading.
