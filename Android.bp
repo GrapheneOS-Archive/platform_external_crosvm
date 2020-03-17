@@ -24,6 +24,9 @@ rust_binary_host {
             relative_install_path: "x86_64-linux-gnu",
             rlibs: ["libx86_64_rust"],
         },
+        darwin: {
+            enabled: false,
+        },
     },
 
     // Install the crosvm prebuilts as requirements until we're building these as well.
@@ -36,7 +39,9 @@ rust_binary_host {
     features: [
         "default-no-sandbox",
         "gpu",
+        "x",
     ],
+
     flags: [
         "-C overflow-checks=y",
         "-C panic=abort",
@@ -52,9 +57,10 @@ rust_binary_host {
         "libassertions",
         "libaudio_streams",
         "libbit_field",
-        "libbyteorder",
+        "libcrosvm",
         "libdata_model",
         "libdevices",
+        "libdisk",
         "libio_jail",
         "libkernel_cmdline",
         "libkernel_loader",
@@ -62,10 +68,10 @@ rust_binary_host {
         "libkvm_sys",
         "liblibc",
         "liblibcras",
+        "libminijail_sys",
         "libmsg_socket",
         "libnet_util",
         "libp9",
-        "libqcow",
         "librand_ish",
         "libresources",
         "libsync_rust",
@@ -76,7 +82,7 @@ rust_binary_host {
     ],
     proc_macros: [
         "libenumn",
-        "libremain-0.1.3",
+        "libremain",
     ],
     shared_libs: [
         "libminijail",
@@ -88,5 +94,48 @@ rust_binary_host {
         "libwayland_client",
         "libffi",
         "libfdt",
+    ],
+}
+
+rust_library_host_rlib {
+    name: "libcrosvm",
+    defaults: ["crosvm_defaults"],
+    crate_name: "crosvm",
+    srcs: ["src/crosvm.rs"],
+    features: [
+        "default-no-sandbox",
+        "gpu",
+        "x",
+    ],
+    rlibs: [
+        "libarch",
+        "libassertions",
+        "libaudio_streams",
+        "libbit_field",
+        "libdata_model",
+        "libdevices",
+        "libdisk",
+        "libio_jail",
+        "libkernel_cmdline",
+        "libkernel_loader",
+        "libkvm",
+        "libkvm_sys",
+        "liblibc",
+        "liblibcras",
+        "libminijail_sys",
+        "libmsg_socket",
+        "libnet_util",
+        "libp9",
+        "librand_ish",
+        "libresources",
+        "libsync_rust",
+        "libsys_util",
+        "libvhost",
+        "libvm_control",
+        "libx86_64_rust",
+    ],
+    proc_macros: [
+        "libenumn",
+        "libremain",
     ],
 }

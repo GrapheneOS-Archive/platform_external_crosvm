@@ -12,7 +12,7 @@ use crate::usb::xhci::xhci::Xhci;
 use crate::usb::xhci::xhci_backend_device_provider::XhciBackendDeviceProvider;
 use crate::usb::xhci::xhci_regs::{init_xhci_mmio_space_and_regs, XhciRegs};
 use crate::utils::FailHandle;
-use resources::{Alloc, SystemAllocator};
+use resources::{Alloc, MmioType, SystemAllocator};
 use std::mem;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,7 +96,6 @@ pub struct XhciController {
     config_regs: PciConfiguration,
     pci_bus_dev: Option<(u8, u8)>,
     mem: GuestMemory,
-    bar0: u64, // bar0 in config_regs will be changed by guest. Not sure why.
     state: XhciControllerState,
 }
 
@@ -117,7 +116,6 @@ impl XhciController {
             config_regs,
             pci_bus_dev: None,
             mem,
-            bar0: 0,
             state: XhciControllerState::Created {
                 device_provider: usb_provider,
             },
@@ -158,7 +156,6 @@ impl XhciController {
             }
             _ => {
                 error!("xhci controller is in a wrong state");
-                return;
             }
         }
     }
@@ -201,7 +198,6 @@ impl PciDevice for XhciController {
             }
             _ => {
                 error!("xhci controller is in a wrong state");
-                return;
             }
         }
     }
@@ -215,11 +211,12 @@ impl PciDevice for XhciController {
             .expect("assign_bus_dev must be called prior to allocate_io_bars");
         // xHCI spec 5.2.1.
         let bar0_addr = resources
-            .mmio_allocator()
-            .allocate(
+            .mmio_allocator(MmioType::Low)
+            .allocate_with_align(
                 XHCI_BAR0_SIZE,
                 Alloc::PciBar { bus, dev, bar: 0 },
                 "xhci_bar0".to_string(),
+                XHCI_BAR0_SIZE,
             )
             .map_err(|e| PciDeviceError::IoAllocationFailed(XHCI_BAR0_SIZE, e))?;
         let bar0_config = PciBarConfiguration::default()
@@ -229,20 +226,19 @@ impl PciDevice for XhciController {
         self.config_regs
             .add_pci_bar(&bar0_config)
             .map_err(|e| PciDeviceError::IoRegistrationFailed(bar0_addr, e))?;
-        self.bar0 = bar0_addr;
         Ok(vec![(bar0_addr, XHCI_BAR0_SIZE)])
     }
 
-    fn config_registers(&self) -> &PciConfiguration {
-        &self.config_regs
+    fn read_config_register(&self, reg_idx: usize) -> u32 {
+        self.config_regs.read_reg(reg_idx)
     }
 
-    fn config_registers_mut(&mut self) -> &mut PciConfiguration {
-        &mut self.config_regs
+    fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+        (&mut self.config_regs).write_reg(reg_idx, offset, data)
     }
 
     fn read_bar(&mut self, addr: u64, data: &mut [u8]) {
-        let bar0 = self.bar0;
+        let bar0 = self.config_regs.get_bar_addr(0);
         if addr < bar0 || addr > bar0 + XHCI_BAR0_SIZE {
             return;
         }
@@ -253,13 +249,12 @@ impl PciDevice for XhciController {
             }
             _ => {
                 error!("xhci controller is in a wrong state");
-                return;
             }
         }
     }
 
     fn write_bar(&mut self, addr: u64, data: &[u8]) {
-        let bar0 = self.bar0;
+        let bar0 = self.config_regs.get_bar_addr(0);
         if addr < bar0 || addr > bar0 + XHCI_BAR0_SIZE {
             return;
         }
@@ -273,10 +268,10 @@ impl PciDevice for XhciController {
             }
             _ => {
                 error!("xhci controller is in a wrong state");
-                return;
             }
         }
     }
+
     fn on_device_sandboxed(&mut self) {
         self.init_when_forked();
     }

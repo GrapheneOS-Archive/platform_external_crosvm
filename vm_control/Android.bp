@@ -6,7 +6,6 @@ rust_library_host_rlib {
     crate_name: "vm_control",
     srcs: ["src/lib.rs"],
     rlibs: [
-        "libbyteorder",
         "libdata_model",
         "libkvm",
         "liblibc",
