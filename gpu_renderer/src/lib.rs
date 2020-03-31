@@ -461,6 +461,21 @@ impl Renderer {
         Err(Error::Unsupported)
     }
 
+    #[allow(unused_variables)]
+    pub fn resource_map_info(&self, resource_id: u32) -> Result<u32> {
+        #[cfg(feature = "virtio-gpu-next")]
+        {
+            let mut map_info = 0;
+            let ret =
+                unsafe { virgl_renderer_resource_get_map_info(resource_id as u32, &mut map_info) };
+            ret_to_res(ret)?;
+
+            Ok(map_info)
+        }
+        #[cfg(not(feature = "virtio-gpu-next"))]
+        Err(Error::Unsupported)
+    }
+
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     extern "C" fn debug_callback(
         fmt: *const ::std::os::raw::c_char,
