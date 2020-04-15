@@ -122,20 +122,12 @@ impl VirtioPciNotifyCap {
 #[derive(Clone, Copy)]
 pub struct VirtioPciShmCap {
     cap: VirtioPciCap,
-    offset_hi: Le32,       // Most sig 32 bits of offset
-    length_hi: Le32,       // Most sig 32 bits of length
-    id: VirtioPciShmCapID, // To distinguish shm chunks
+    offset_hi: Le32, // Most sig 32 bits of offset
+    length_hi: Le32, // Most sig 32 bits of length
+    shmid: u8,       // To distinguish shm chunks
 }
 // It is safe to implement DataInit; all members are simple numbers and any value is valid.
 unsafe impl DataInit for VirtioPciShmCap {}
-
-#[repr(u8)]
-#[derive(Clone, Copy)]
-pub enum VirtioPciShmCapID {
-    Cache = 0,
-    Vertab = 1,
-    Journal = 2,
-}
 
 impl PciCapability for VirtioPciShmCap {
     fn bytes(&self) -> &[u8] {
@@ -148,13 +140,7 @@ impl PciCapability for VirtioPciShmCap {
 }
 
 impl VirtioPciShmCap {
-    pub fn new(
-        cfg_type: PciCapabilityType,
-        bar: u8,
-        offset: u64,
-        length: u64,
-        id: VirtioPciShmCapID,
-    ) -> Self {
+    pub fn new(cfg_type: PciCapabilityType, bar: u8, offset: u64, length: u64, shmid: u8) -> Self {
         VirtioPciShmCap {
             cap: VirtioPciCap {
                 _cap_vndr: 0,
@@ -168,7 +154,7 @@ impl VirtioPciShmCap {
             },
             offset_hi: Le32::from((offset >> 32) as u32),
             length_hi: Le32::from((length >> 32) as u32),
-            id,
+            shmid,
         }
     }
 }
