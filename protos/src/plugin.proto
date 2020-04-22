@@ -334,6 +334,9 @@ message VcpuRequest {
         bytes state = 2;
     }
 
+    message CpuidRequest {
+    }
+
     message GetMsrs {
         // The entry data will be returned in the same order as this in the
         // VcpuResponse::GetMsrs::entry_data array.
@@ -356,6 +359,10 @@ message VcpuRequest {
     message Shutdown {
     }
 
+    message EnableCapability {
+        uint32 capability = 1;
+    }
+
     // The type of the message is determined by which of these oneof fields is present in the
     // protobuf.
     oneof message {
@@ -367,6 +374,8 @@ message VcpuRequest {
         SetMsrs set_msrs = 6;
         SetCpuid set_cpuid = 7;
         Shutdown shutdown = 8;
+        CpuidRequest get_hyperv_cpuid = 9;
+        EnableCapability enable_capability = 10;
     }
 }
 
@@ -394,15 +403,30 @@ message VcpuResponse  {
             bytes debugregs = 8;
         }
 
-        // This type of wait reason is only generated after a PuaseVcpus request on this VCPU.
+        // This type of wait reason is only generated after a PauseVcpus request on this VCPU.
         message User {
             uint64 user = 1;
+        }
+
+        message HypervCall {
+            uint64 input = 1;
+            uint64 params0 = 2;
+            uint64 params1 = 3;
+        }
+
+        message HypervSynic {
+            uint32 msr = 1;
+            uint64 control = 2;
+            uint64 evt_page = 3;
+            uint64 msg_page = 4;
         }
 
         oneof exit {
             Init init = 1;
             Io io = 2;
             User user = 3;
+            HypervCall hyperv_call = 4;
+            HypervSynic hyperv_synic = 5;
         }
     }
 
@@ -417,6 +441,10 @@ message VcpuResponse  {
     message SetState {
     }
 
+    message CpuidResponse {
+        repeated CpuidEntry entries = 1;
+    }
+
     message GetMsrs {
         // The order of the entry_data values is the same order as the array of indices given in the
         // corresponding request.
@@ -426,6 +454,8 @@ message VcpuResponse  {
     message SetMsrs {}
 
     message SetCpuid {}
+
+    message EnableCapability {}
 
     // This is zero on success, and a negative integer on failure.
     sint32 errno = 1;
@@ -439,5 +469,7 @@ message VcpuResponse  {
         GetMsrs get_msrs = 6;
         SetMsrs set_msrs = 7;
         SetCpuid set_cpuid = 8;
+        CpuidResponse get_hyperv_cpuid = 9;
+        EnableCapability enable_capability = 10;
     }
 }
