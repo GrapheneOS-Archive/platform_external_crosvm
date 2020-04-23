@@ -37,9 +37,8 @@ rust_binary_host {
     ],
 
     features: [
-        "default-no-sandbox",
+        "gfxstream",
         "gpu",
-        "x",
     ],
 
     flags: [
@@ -53,6 +52,7 @@ rust_binary_host {
     ],
 
     rlibs: [
+        "libacpi_tables",
         "libarch",
         "libassertions",
         "libaudio_streams",
@@ -103,11 +103,11 @@ rust_library_host_rlib {
     crate_name: "crosvm",
     srcs: ["src/crosvm.rs"],
     features: [
-        "default-no-sandbox",
+        "gfxstream",
         "gpu",
-        "x",
     ],
     rlibs: [
+        "libacpi_tables",
         "libarch",
         "libassertions",
         "libaudio_streams",

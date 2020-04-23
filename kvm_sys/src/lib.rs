@@ -8,9 +8,6 @@
 
 use sys_util::{ioctl_io_nr, ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr};
 
-// Somehow this one gets missed by bindgen
-pub const KVM_EXIT_IO_OUT: ::std::os::raw::c_uint = 1;
-
 // Each of the below modules defines ioctls specific to their platform.
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -47,6 +44,7 @@ pub mod x86 {
     ioctl_iow_nr!(KVM_SET_XSAVE, KVMIO, 0xa5, kvm_xsave);
     ioctl_ior_nr!(KVM_GET_XCRS, KVMIO, 0xa6, kvm_xcrs);
     ioctl_iow_nr!(KVM_SET_XCRS, KVMIO, 0xa7, kvm_xcrs);
+    ioctl_iowr_nr!(KVM_GET_SUPPORTED_HV_CPUID, KVMIO, 0xc1, kvm_cpuid2);
 }
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
