@@ -5,6 +5,7 @@ rust_library_host_rlib {
     defaults: ["crosvm_defaults"],
     stem: "libx86_64",
     crate_name: "x86_64",
+    flags: ["-A unused-parens",], // added
     srcs: ["src/lib.rs"],
     rlibs: [
         "libacpi_tables",
