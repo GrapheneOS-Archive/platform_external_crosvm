@@ -5,6 +5,7 @@ rust_library_host_rlib {
     defaults: ["crosvm_defaults"],
     crate_name: "sys_util",
     srcs: ["src/lib.rs"],
+    flags: ["-A array-into-iter"], // added
     rlibs: [
         "libdata_model",
         "liblibc",
