@@ -20,8 +20,8 @@ use assertions::const_assert;
 use data_model::DataInit;
 use kvm::{CpuId, Vcpu};
 use kvm_sys::{
-    kvm_debugregs, kvm_fpu, kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_msrs, kvm_regs,
-    kvm_sregs, kvm_vcpu_events, kvm_xcrs, KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+    kvm_debugregs, kvm_enable_cap, kvm_fpu, kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_msrs,
+    kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
 };
 use protobuf::stream::CodedOutputStream;
 use protos::plugin::*;
@@ -513,6 +513,54 @@ impl PluginVcpu {
         self.process(IoSpace::Mmio, addr, VcpuRunData::Write(data), vcpu)
     }
 
+    /// Has the plugin process handle a hyper-v call.
+    pub fn hyperv_call(&self, input: u64, params: [u64; 2], data: &mut [u8], vcpu: &Vcpu) -> bool {
+        let mut wait_reason = VcpuResponse_Wait::new();
+        let hv = wait_reason.mut_hyperv_call();
+        hv.input = input;
+        hv.params0 = params[0];
+        hv.params1 = params[1];
+
+        self.wait_reason.set(Some(wait_reason));
+        match self.handle_until_resume(vcpu) {
+            Ok(resume_data) => {
+                data.copy_from_slice(&resume_data);
+                true
+            }
+            Err(e) if e.errno() == EPIPE => false,
+            Err(e) => {
+                error!("failed to process hyperv call request: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Has the plugin process handle a synic config change.
+    pub fn hyperv_synic(
+        &self,
+        msr: u32,
+        control: u64,
+        evt_page: u64,
+        msg_page: u64,
+        vcpu: &Vcpu,
+    ) -> bool {
+        let mut wait_reason = VcpuResponse_Wait::new();
+        let hv = wait_reason.mut_hyperv_synic();
+        hv.msr = msr;
+        hv.control = control;
+        hv.evt_page = evt_page;
+        hv.msg_page = msg_page;
+        self.wait_reason.set(Some(wait_reason));
+        match self.handle_until_resume(vcpu) {
+            Ok(_resume_data) => true,
+            Err(e) if e.errno() == EPIPE => false,
+            Err(e) => {
+                error!("failed to process hyperv synic request: {}", e);
+                false
+            }
+        }
+    }
+
     fn handle_request(&self, vcpu: &Vcpu) -> SysResult<Option<Vec<u8>>> {
         let mut wait_reason = self.wait_reason.take();
         let mut do_recv = true;
@@ -595,6 +643,17 @@ impl PluginVcpu {
                 response.mut_set_state();
                 let set_state = request.get_set_state();
                 set_vcpu_state(vcpu, set_state.set, set_state.get_state())
+            } else if request.has_get_hyperv_cpuid() {
+                let cpuid_response = &mut response.mut_get_hyperv_cpuid().entries;
+                match vcpu.get_hyperv_cpuid() {
+                    Ok(mut cpuid) => {
+                        for entry in cpuid.mut_entries_slice() {
+                            cpuid_response.push(cpuid_kvm_to_proto(entry));
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
             } else if request.has_get_msrs() {
                 let entry_data = &mut response.mut_get_msrs().entry_data;
                 let entry_indices = &request.get_get_msrs().entry_indices;
@@ -664,6 +723,18 @@ impl PluginVcpu {
                     cpuid_entry.edx = request_entry.edx;
                 }
                 vcpu.set_cpuid2(&cpuid)
+            } else if request.has_enable_capability() {
+                response.mut_enable_capability();
+                let capability = request.get_enable_capability().capability;
+                if capability != kvm_sys::KVM_CAP_HYPERV_SYNIC
+                    && capability != kvm_sys::KVM_CAP_HYPERV_SYNIC2
+                {
+                    Err(SysError::new(EINVAL))
+                } else {
+                    let mut cap: kvm_enable_cap = Default::default();
+                    cap.cap = capability;
+                    vcpu.kvm_enable_cap(&cap)
+                }
             } else if request.has_shutdown() {
                 return Err(SysError::new(EPIPE));
             } else {

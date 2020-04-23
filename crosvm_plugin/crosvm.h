@@ -47,7 +47,7 @@ extern "C" {
  * do not indicate anything about what version of crosvm is running.
  */
 #define CROSVM_API_MAJOR 0
-#define CROSVM_API_MINOR 19
+#define CROSVM_API_MINOR 22
 #define CROSVM_API_PATCH 0
 
 enum crosvm_address_space {
@@ -115,6 +115,14 @@ int crosvm_check_extension(struct crosvm*, uint32_t __extension,
                            bool *has_extension);
 
 /*
+ * Enable an extended capability for the VM.  Currently |__flags| and
+ * |__args| must be zero.  No values for |__capability| are supported,
+ * so all calls will fail.
+ */
+int crosvm_enable_capability(struct crosvm*, uint32_t __capability,
+                             uint32_t __flags, uint64_t __args[4]);
+
+/*
  * Queries x86 cpuid features which are supported by the hardware and
  * kvm.
  */
@@ -128,6 +136,13 @@ int crosvm_get_supported_cpuid(struct crosvm*, uint32_t __entry_count,
 int crosvm_get_emulated_cpuid(struct crosvm*, uint32_t __entry_count,
                               struct kvm_cpuid_entry2 *__cpuid_entries,
                               uint32_t *__out_count);
+
+/*
+ * Queries x86 hyper-v cpuid features which are emulated by kvm.
+ */
+int crosvm_get_hyperv_cpuid(struct crosvm_vcpu*, uint32_t __entry_count,
+                            struct kvm_cpuid_entry2 *__cpuid_entries,
+                            uint32_t *__out_count);
 
 /*
  * Queries kvm for list of supported MSRs.
@@ -480,6 +495,16 @@ enum crosvm_vcpu_event_kind {
    * a `crosvm_pause_vcpus` call.
    */
   CROSVM_VCPU_EVENT_KIND_PAUSED,
+
+  /*
+   * Hyper-V hypercall.
+   */
+  CROSVM_VCPU_EVENT_KIND_HYPERV_HCALL,
+
+  /*
+   * Hyper-V synic change.
+   */
+  CROSVM_VCPU_EVENT_KIND_HYPERV_SYNIC,
 };
 
 struct crosvm_vcpu_event {
@@ -537,6 +562,31 @@ struct crosvm_vcpu_event {
 
     /* CROSVM_VCPU_EVENT_KIND_PAUSED */
     void *user;
+
+    /* CROSVM_VCPU_EVENT_KIND_HYPERV_HCALL */
+    struct {
+      /*
+       * The |input| and |params| members are populated for the plugin to use.
+       * The |result| member is populated by the API to point to a uint64_t
+       * that the plugin should update before resuming.
+       */
+      uint64_t input;
+      uint64_t *result;
+      uint64_t params[2];
+    } hyperv_call;
+
+    /* CROSVM_VCPU_EVENT_KIND_HYPERV_SYNIC */
+    struct {
+      /*
+       * The |msr|, |control|, |evt_page|, and |msg_page| fields are populated
+       * for the plugin to use.
+       */
+      uint32_t msr;
+      uint32_t _reserved;
+      uint64_t control;
+      uint64_t evt_page;
+      uint64_t msg_page;
+    } hyperv_synic;
 
     uint8_t _reserved[64];
   };
@@ -625,6 +675,15 @@ int crosvm_vcpu_set_msrs(struct crosvm_vcpu*, uint32_t __msr_count,
 /* Sets the responses to the cpuid instructions executed on this vcpu, */
 int crosvm_vcpu_set_cpuid(struct crosvm_vcpu*, uint32_t __cpuid_count,
                           const struct kvm_cpuid_entry2 *__cpuid_entries);
+
+/*
+ * Enable an extended capability for a vcpu.  Currently |__flags| and
+ * |__args| must be zero.  The only permitted values for |__capability|
+ * are KVM_CAP_HYPERV_SYNIC or KVM_CAP_HYPERV_SYNIC2, though the latter
+ * also depends on kernel support.
+ */
+int crosvm_vcpu_enable_capability(struct crosvm_vcpu*, uint32_t __capability,
+                                  uint32_t __flags, uint64_t __args[4]);
 
 /* Gets state of LAPIC of the VCPU. */
 int crosvm_vcpu_get_lapic_state(struct crosvm_vcpu *,
