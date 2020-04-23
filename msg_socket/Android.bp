@@ -6,7 +6,10 @@ rust_library_host_rlib {
     crate_name: "msg_socket",
     srcs: ["src/lib.rs"],
     rlibs: [
+        "libcros_async",
         "libdata_model",
+        "libfutures",
+        "liblibc",
         "libsys_util",
     ],
     proc_macros: [
@@ -28,7 +31,10 @@ rust_test_host {
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rlibs: [
+        "libcros_async",
         "libdata_model",
+        "libfutures",
+        "liblibc",
         "libmsg_socket",
         "libsys_util",
     ],
@@ -46,7 +52,10 @@ rust_test_host {
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rlibs: [
+        "libcros_async",
         "libdata_model",
+        "libfutures",
+        "liblibc",
         "libsys_util",
     ],
     proc_macros: [

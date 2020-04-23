@@ -15,6 +15,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use devices::split_irqchip_common::GsiRelay;
 use devices::virtio::VirtioDevice;
 use devices::{
     Bus, BusDevice, BusError, PciDevice, PciDeviceError, PciInterruptPin, PciRoot, ProxyDevice,
@@ -25,6 +26,7 @@ use kvm::{IoeventAddress, Kvm, Vcpu, Vm};
 use resources::SystemAllocator;
 use sync::Mutex;
 use sys_util::{syslog, EventFd, GuestAddress, GuestMemory, GuestMemoryError};
+use vm_control::VmIrqRequestSocket;
 
 pub enum VmImage {
     Kernel(File),
@@ -60,6 +62,8 @@ pub struct RunnableLinuxVm {
     pub vcpus: Vec<Vcpu>,
     pub vcpu_affinity: Vec<usize>,
     pub irq_chip: Option<File>,
+    pub split_irqchip: Option<(Arc<Mutex<devices::Pic>>, Arc<Mutex<devices::Ioapic>>)>,
+    pub gsi_relay: Option<Arc<GsiRelay>>,
     pub io_bus: Bus,
     pub mmio_bus: Bus,
     pub pid_debug_label_map: BTreeMap<u32, String>,
@@ -88,6 +92,7 @@ pub trait LinuxArch {
     fn build_vm<F, E>(
         components: VmComponents,
         split_irqchip: bool,
+        ioapic_device_socket: VmIrqRequestSocket,
         serial_parameters: &BTreeMap<u8, SerialParameters>,
         serial_jail: Option<Minijail>,
         create_devices: F,
@@ -115,6 +120,8 @@ pub enum DeviceRegistrationError {
     CreatePipe(sys_util::Error),
     // Unable to create serial device from serial parameters
     CreateSerialDevice(devices::SerialError),
+    /// Could not clone an event fd.
+    EventFdClone(sys_util::Error),
     /// Could not create an event fd.
     EventFdCreate(sys_util::Error),
     /// Could not add a device to the mmio bus.
@@ -146,6 +153,7 @@ impl Display for DeviceRegistrationError {
             CreatePipe(e) => write!(f, "failed to create pipe: {}", e),
             CreateSerialDevice(e) => write!(f, "failed to create serial device: {}", e),
             Cmdline(e) => write!(f, "unable to add device to kernel command line: {}", e),
+            EventFdClone(e) => write!(f, "failed to clone eventfd: {}", e),
             EventFdCreate(e) => write!(f, "failed to create eventfd: {}", e),
             MmioInsert(e) => write!(f, "failed to add to mmio bus: {}", e),
             RegisterIoevent(e) => write!(f, "failed to register ioevent to VM: {}", e),
@@ -163,6 +171,7 @@ impl Display for DeviceRegistrationError {
 /// Creates a root PCI device for use by this Vm.
 pub fn generate_pci_root(
     devices: Vec<(Box<dyn PciDevice>, Option<Minijail>)>,
+    gsi_relay: &mut Option<GsiRelay>,
     mmio_bus: &mut Bus,
     resources: &mut SystemAllocator,
     vm: &mut Vm,
@@ -188,10 +197,22 @@ pub fn generate_pci_root(
             1 => PciInterruptPin::IntB,
             2 => PciInterruptPin::IntC,
             3 => PciInterruptPin::IntD,
-            _ => panic!(""), // Obviously not possible, but the compiler is not smart enough.
+            _ => unreachable!(), // Obviously not possible, but the compiler is not smart enough.
         };
-        vm.register_irqfd_resample(&irqfd, &irq_resample_fd, irq_num)
-            .map_err(DeviceRegistrationError::RegisterIrqfd)?;
+        if let Some(relay) = gsi_relay {
+            relay.register_irqfd_resample(
+                irqfd
+                    .try_clone()
+                    .map_err(DeviceRegistrationError::EventFdClone)?,
+                irq_resample_fd
+                    .try_clone()
+                    .map_err(DeviceRegistrationError::EventFdClone)?,
+                irq_num as usize,
+            );
+        } else {
+            vm.register_irqfd_resample(&irqfd, &irq_resample_fd, irq_num)
+                .map_err(DeviceRegistrationError::RegisterIrqfd)?;
+        }
         keep_fds.push(irqfd.as_raw_fd());
         keep_fds.push(irq_resample_fd.as_raw_fd());
         device.assign_irq(irqfd, irq_resample_fd, irq_num, pci_irq_pin);

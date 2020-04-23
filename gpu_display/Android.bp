@@ -10,16 +10,15 @@ rust_library_host_rlib {
     defaults: ["crosvm_defaults"],
     crate_name: "gpu_display",
     srcs: ["src/lib.rs"],
-    features: [
-        "x",
-    ],
     rlibs: [
         "libdata_model",
         "liblibc",
         "liblinux_input_sys",
         "libsys_util",
     ],
-    static_libs: ["libdisplay_wl"],
+    static_libs: [
+        "libdisplay_wl",
+    ],
 }
 
 cc_library_host_static {
