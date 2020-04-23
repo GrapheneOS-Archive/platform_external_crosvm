@@ -20,6 +20,7 @@ use sync::Mutex;
 use sys_util::Error as SysError;
 use sys_util::Result as SysResult;
 use sys_util::{error, info, iov_max, warn, EventFd, GuestMemory, PollContext, PollToken, TimerFd};
+use virtio_sys::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_control::{DiskControlCommand, DiskControlResponseSocket, DiskControlResult};
 
 use super::{
@@ -343,13 +344,13 @@ impl Worker {
             return DiskControlResult::Err(SysError::new(libc::EIO));
         }
 
-        if !self.sparse {
-            // Allocate new space if the disk image is not sparse.
-            if let Err(e) = self.disk_image.allocate(0, new_size) {
-                error!("Allocating disk space after resize failed! {}", e);
-                return DiskControlResult::Err(SysError::new(libc::EIO));
-            }
+        // Allocate new space if the disk image is not sparse.
+        if let Err(e) = self.disk_image.allocate(0, new_size) {
+            error!("Allocating disk space after resize failed! {}", e);
+            return DiskControlResult::Err(SysError::new(libc::EIO));
         }
+
+        self.sparse = false;
 
         if let Ok(new_disk_size) = self.disk_image.get_len() {
             let mut disk_size = self.disk_size.lock();
@@ -510,6 +511,7 @@ impl Block {
         }
 
         let mut avail_features: u64 = 1 << VIRTIO_BLK_F_FLUSH;
+        avail_features |= 1 << VIRTIO_RING_F_EVENT_IDX;
         if read_only {
             avail_features |= 1 << VIRTIO_BLK_F_RO;
         } else {
@@ -624,7 +626,8 @@ impl Block {
             }
             VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES => {
                 if req_type == VIRTIO_BLK_T_DISCARD && !sparse {
-                    return Err(ExecuteError::Unsupported(req_type));
+                    // Discard is a hint; if this is a non-sparse disk, just ignore it.
+                    return Ok(());
                 }
 
                 while reader.available_bytes() >= size_of::<virtio_blk_discard_write_zeroes>() {
@@ -870,8 +873,8 @@ mod tests {
             let b = Block::new(Box::new(f), false, true, 512, None).unwrap();
             // writable device should set VIRTIO_BLK_F_FLUSH + VIRTIO_BLK_F_DISCARD
             // + VIRTIO_BLK_F_WRITE_ZEROES + VIRTIO_F_VERSION_1 + VIRTIO_BLK_F_BLK_SIZE
-            // + VIRTIO_BLK_F_SEG_MAX
-            assert_eq!(0x100006244, b.features());
+            // + VIRTIO_BLK_F_SEG_MAX + VIRTIO_RING_F_EVENT_IDX
+            assert_eq!(0x120006244, b.features());
         }
 
         // read-write block device, non-sparse
@@ -880,8 +883,8 @@ mod tests {
             let b = Block::new(Box::new(f), false, false, 512, None).unwrap();
             // writable device should set VIRTIO_BLK_F_FLUSH
             // + VIRTIO_BLK_F_WRITE_ZEROES + VIRTIO_F_VERSION_1 + VIRTIO_BLK_F_BLK_SIZE
-            // + VIRTIO_BLK_F_SEG_MAX
-            assert_eq!(0x100004244, b.features());
+            // + VIRTIO_BLK_F_SEG_MAX + VIRTIO_RING_F_EVENT_IDX
+            assert_eq!(0x120004244, b.features());
         }
 
         // read-only block device
@@ -890,7 +893,8 @@ mod tests {
             let b = Block::new(Box::new(f), true, true, 512, None).unwrap();
             // read-only device should set VIRTIO_BLK_F_FLUSH and VIRTIO_BLK_F_RO
             // + VIRTIO_F_VERSION_1 + VIRTIO_BLK_F_BLK_SIZE + VIRTIO_BLK_F_SEG_MAX
-            assert_eq!(0x100000264, b.features());
+            // + VIRTIO_RING_F_EVENT_IDX
+            assert_eq!(0x120000264, b.features());
         }
     }
 

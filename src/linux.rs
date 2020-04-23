@@ -27,13 +27,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libc::{self, c_int, gid_t, uid_t};
 
-use audio_streams::DummyStreamSource;
+use audio_streams::shm_streams::NullShmStreamSource;
 #[cfg(feature = "gpu")]
 use devices::virtio::EventDevice;
 use devices::virtio::{self, VirtioDevice};
 use devices::{
-    self, HostBackendDeviceProvider, PciDevice, VfioDevice, VfioPciDevice, VirtioPciDevice,
-    XhciController,
+    self, HostBackendDeviceProvider, PciDevice, VfioContainer, VfioDevice, VfioPciDevice,
+    VirtioPciDevice, XhciController,
 };
 use io_jail::{self, Minijail};
 use kvm::*;
@@ -62,11 +62,7 @@ use vm_control::{
     VmRunMode,
 };
 
-use crate::{
-    Config, DiskOption, Executable, SharedDir, SharedDirKind, TouchDeviceOption,
-    DEFAULT_TOUCH_DEVICE_HEIGHT, DEFAULT_TOUCH_DEVICE_WIDTH,
-};
-
+use crate::{Config, DiskOption, Executable, SharedDir, SharedDirKind, TouchDeviceOption};
 use arch::{self, LinuxArch, RunnableLinuxVm, VirtioDeviceStub, VmComponents, VmImage};
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -100,7 +96,7 @@ pub enum Error {
     CreateVfioDevice(devices::vfio::VfioError),
     DeviceJail(io_jail::Error),
     DevicePivotRoot(io_jail::Error),
-    Disk(io::Error),
+    Disk(PathBuf, io::Error),
     DiskImageLock(sys_util::Error),
     DropCapabilities(sys_util::Error),
     FsDeviceNew(virtio::fs::Error),
@@ -187,7 +183,7 @@ impl Display for Error {
             CreateVfioDevice(e) => write!(f, "Failed to create vfio device {}", e),
             DeviceJail(e) => write!(f, "failed to jail device: {}", e),
             DevicePivotRoot(e) => write!(f, "failed to pivot root device: {}", e),
-            Disk(e) => write!(f, "failed to load disk image: {}", e),
+            Disk(p, e) => write!(f, "failed to load disk image {}: {}", p.display(), e),
             DiskImageLock(e) => write!(f, "failed to lock disk image: {}", e),
             DropCapabilities(e) => write!(f, "failed to drop process capabilities: {}", e),
             FsDeviceNew(e) => write!(f, "failed to create fs device: {}", e),
@@ -335,9 +331,13 @@ fn create_base_minijail(
         if let Some(gid_map) = config.gid_map {
             j.gidmap(gid_map).map_err(Error::SettingGidMap)?;
         }
+        // Run in a new mount namespace.
+        j.namespace_vfs();
+
         // Run in an empty network namespace.
         j.namespace_net();
-        // Apply the block device seccomp policy.
+
+        // Don't allow the device to gain new privileges.
         j.no_new_privs();
 
         // By default we'll prioritize using the pre-compiled .bpf over the .policy
@@ -367,9 +367,12 @@ fn create_base_minijail(
         j.run_as_init();
     }
 
-    // Create a new mount namespace with an empty root FS.
-    j.namespace_vfs();
-    j.enter_pivot_root(root).map_err(Error::DevicePivotRoot)?;
+    // Only pivot_root if we are not re-using the current root directory.
+    if root != Path::new("/") {
+        // It's safe to call `namespace_vfs` multiple times.
+        j.namespace_vfs();
+        j.enter_pivot_root(root).map_err(Error::DevicePivotRoot)?;
+    }
 
     // Most devices don't need to open many fds.
     let limit = if let Some(r) = r_limit { r } else { 1024u64 };
@@ -417,7 +420,7 @@ fn create_block_device(
             .read(true)
             .write(!disk.read_only)
             .open(&disk.path)
-            .map_err(Error::Disk)?
+            .map_err(|e| Error::Disk(disk.path.to_path_buf(), e))?
     };
     // Lock the disk image to prevent other crosvm instances from using it.
     let lock_op = if disk.read_only {
@@ -825,25 +828,36 @@ fn create_fs_device(
     })
 }
 
-fn create_9p_device(cfg: &Config, src: &Path, tag: &str) -> DeviceResult {
-    let (jail, root) = match simple_jail(&cfg, "9p_device")? {
-        Some(mut jail) => {
-            //  The shared directory becomes the root of the device's file system.
-            let root = Path::new("/");
-            jail.mount_bind(src, root, true)?;
+fn create_9p_device(
+    cfg: &Config,
+    uid_map: &str,
+    gid_map: &str,
+    src: &Path,
+    tag: &str,
+) -> DeviceResult {
+    let max_open_files = get_max_open_files()?;
+    let (jail, root) = if cfg.sandbox {
+        let seccomp_policy = cfg.seccomp_policy_dir.join("9p_device");
+        let config = SandboxConfig {
+            limit_caps: false,
+            uid_map: Some(uid_map),
+            gid_map: Some(gid_map),
+            log_failures: cfg.seccomp_log_failures,
+            seccomp_policy: &seccomp_policy,
+        };
 
-            // We want bind mounts from the parent namespaces to propagate into the 9p server's
-            // namespace.
-            jail.set_remount_mode(libc::MS_SLAVE);
+        let mut jail = create_base_minijail(src, Some(max_open_files), Some(&config))?;
+        // We want bind mounts from the parent namespaces to propagate into the 9p server's
+        // namespace.
+        jail.set_remount_mode(libc::MS_SLAVE);
 
-            add_crosvm_user_to_jail(&mut jail, "p9")?;
-            (Some(jail), root)
-        }
-        None => {
-            // There's no bind mount so we tell the server to treat the source directory as the
-            // root.
-            (None, src)
-        }
+        //  The shared directory becomes the root of the device's file system.
+        let root = Path::new("/");
+        (Some(jail), root)
+    } else {
+        // There's no mount namespace so we tell the server to treat the source directory as the
+        // root.
+        (None, src)
     };
 
     let dev = virtio::P9::new(root, tag).map_err(Error::P9DeviceNew)?;
@@ -865,10 +879,11 @@ fn create_pmem_device(
         .read(true)
         .write(!disk.read_only)
         .open(&disk.path)
-        .map_err(Error::Disk)?;
+        .map_err(|e| Error::Disk(disk.path.to_path_buf(), e))?;
 
     let (disk_size, arena_size) = {
-        let metadata = std::fs::metadata(&disk.path).map_err(Error::Disk)?;
+        let metadata =
+            std::fs::metadata(&disk.path).map_err(|e| Error::Disk(disk.path.to_path_buf(), e))?;
         let disk_len = metadata.len();
         // Linux requires pmem region sizes to be 2 MiB aligned. Linux will fill any partial page
         // at the end of an mmap'd file and won't write back beyond the actual file length, but if
@@ -1029,19 +1044,16 @@ fn create_virtio_devices(
 
     #[cfg(feature = "gpu")]
     {
-        if cfg.gpu_parameters.is_some() {
+        if let Some(gpu_parameters) = &cfg.gpu_parameters {
             let mut event_devices = Vec::new();
             if cfg.display_window_mouse {
                 let (event_device_socket, virtio_dev_socket) =
                     UnixStream::pair().map_err(Error::CreateSocket)?;
-                // TODO(nkgold): the width/height here should match the display's height/width. When
-                // those settings are available as CLI options, we should use the CLI options here
-                // as well.
                 let (single_touch_width, single_touch_height) = cfg
                     .virtio_single_touch
                     .as_ref()
                     .map(|single_touch_spec| single_touch_spec.get_size())
-                    .unwrap_or((DEFAULT_TOUCH_DEVICE_WIDTH, DEFAULT_TOUCH_DEVICE_HEIGHT));
+                    .unwrap_or((gpu_parameters.display_width, gpu_parameters.display_height));
                 let dev = virtio::new_single_touch(
                     virtio_dev_socket,
                     single_touch_width,
@@ -1093,7 +1105,7 @@ fn create_virtio_devices(
 
         let dev = match kind {
             SharedDirKind::FS => create_fs_device(cfg, uid_map, gid_map, src, tag, fs_cfg.clone())?,
-            SharedDirKind::P9 => create_9p_device(cfg, src, tag)?,
+            SharedDirKind::P9 => create_9p_device(cfg, uid_map, gid_map, src, tag)?,
         };
         devs.push(dev);
     }
@@ -1152,7 +1164,7 @@ fn create_devices(
     }
 
     if cfg.null_audio {
-        let server = Box::new(DummyStreamSource::new());
+        let server = Box::new(NullShmStreamSource::new());
         let null_audio = devices::Ac97Dev::new(mem.clone(), server);
 
         pci_devices.push((
@@ -1164,24 +1176,31 @@ fn create_devices(
     let usb_controller = Box::new(XhciController::new(mem.clone(), usb_provider));
     pci_devices.push((usb_controller, simple_jail(&cfg, "xhci")?));
 
-    if cfg.vfio.is_some() {
-        let (vfio_host_socket_irq, vfio_device_socket_irq) =
-            msg_socket::pair::<VmIrqResponse, VmIrqRequest>().map_err(Error::CreateSocket)?;
-        control_sockets.push(TaggedControlSocket::VmIrq(vfio_host_socket_irq));
-
-        let (vfio_host_socket_mem, vfio_device_socket_mem) =
-            msg_socket::pair::<VmMemoryResponse, VmMemoryRequest>().map_err(Error::CreateSocket)?;
-        control_sockets.push(TaggedControlSocket::VmMemory(vfio_host_socket_mem));
-
-        let vfio_path = cfg.vfio.as_ref().unwrap().as_path();
-        let vfiodevice =
-            VfioDevice::new(vfio_path, vm, mem.clone()).map_err(Error::CreateVfioDevice)?;
-        let vfiopcidevice = Box::new(VfioPciDevice::new(
-            vfiodevice,
-            vfio_device_socket_irq,
-            vfio_device_socket_mem,
+    if !cfg.vfio.is_empty() {
+        let vfio_container = Arc::new(Mutex::new(
+            VfioContainer::new().map_err(Error::CreateVfioDevice)?,
         ));
-        pci_devices.push((vfiopcidevice, simple_jail(&cfg, "vfio_device")?));
+
+        for vfio_path in &cfg.vfio {
+            // create one Irq and Mem request socket for each vfio device
+            let (vfio_host_socket_irq, vfio_device_socket_irq) =
+                msg_socket::pair::<VmIrqResponse, VmIrqRequest>().map_err(Error::CreateSocket)?;
+            control_sockets.push(TaggedControlSocket::VmIrq(vfio_host_socket_irq));
+
+            let (vfio_host_socket_mem, vfio_device_socket_mem) =
+                msg_socket::pair::<VmMemoryResponse, VmMemoryRequest>()
+                    .map_err(Error::CreateSocket)?;
+            control_sockets.push(TaggedControlSocket::VmMemory(vfio_host_socket_mem));
+
+            let vfiodevice = VfioDevice::new(vfio_path.as_path(), vm, mem, vfio_container.clone())
+                .map_err(Error::CreateVfioDevice)?;
+            let vfiopcidevice = Box::new(VfioPciDevice::new(
+                vfiodevice,
+                vfio_device_socket_irq,
+                vfio_device_socket_mem,
+            ));
+            pci_devices.push((vfiopcidevice, simple_jail(&cfg, "vfio_device")?));
+        }
     }
 
     Ok(pci_devices)
@@ -1330,6 +1349,26 @@ fn runnable_vcpu(vcpu: Vcpu, use_kvm_signals: bool, cpu_id: u32) -> Option<Runna
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn inject_interrupt(pic: &Arc<Mutex<devices::Pic>>, vcpu: &RunnableVcpu) {
+    let mut pic = pic.lock();
+    if pic.interrupt_requested() && vcpu.ready_for_interrupt() {
+        if let Some(vector) = pic.get_external_interrupt() {
+            if let Err(e) = vcpu.interrupt(vector as u32) {
+                error!("PIC: failed to inject interrupt to vCPU0: {}", e);
+            }
+        }
+        // The second interrupt request should be handled immediately, so ask
+        // vCPU to exit as soon as possible.
+        if pic.interrupt_requested() {
+            vcpu.request_interrupt_window();
+        }
+    }
+}
+
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+fn inject_interrupt(pic: &Arc<Mutex<devices::Pic>>, vcpu: &RunnableVcpu) {}
+
 fn run_vcpu(
     vcpu: Vcpu,
     cpu_id: u32,
@@ -1337,6 +1376,7 @@ fn run_vcpu(
     start_barrier: Arc<Barrier>,
     io_bus: devices::Bus,
     mmio_bus: devices::Bus,
+    split_irqchip: Option<(Arc<Mutex<devices::Pic>>, Arc<Mutex<devices::Ioapic>>)>,
     exit_evt: EventFd,
     requires_kvmclock_ctrl: bool,
     run_mode_arc: Arc<VcpuRunMode>,
@@ -1398,6 +1438,13 @@ fn run_vcpu(
                         }) => {
                             mmio_bus.write(address, &data[..size]);
                         }
+                        Ok(VcpuExit::IoapicEoi{vector}) => {
+                            if let Some((_, ioapic)) = &split_irqchip {
+                                ioapic.lock().end_of_interrupt(vector);
+                            } else {
+                                panic!("userspace ioapic not found in split irqchip mode, should be impossible.");
+                            }
+                        },
                         Ok(VcpuExit::Hlt) => break,
                         Ok(VcpuExit::Shutdown) => break,
                         Ok(VcpuExit::FailEntry {
@@ -1452,6 +1499,11 @@ fn run_vcpu(
                             // unblock and return a new exclusive lock.
                             run_mode_lock = run_mode_arc.cvar.wait(run_mode_lock);
                         }
+                    }
+
+                    if cpu_id != 0 { continue; }
+                    if let Some((pic, _)) = &split_irqchip {
+                        inject_interrupt(pic, &vcpu);
                     }
                 }
             }
@@ -1570,10 +1622,15 @@ pub fn run_config(cfg: Config) -> Result<()> {
         msg_socket::pair::<VmMemoryResponse, VmMemoryRequest>().map_err(Error::CreateSocket)?;
     control_sockets.push(TaggedControlSocket::VmMemory(gpu_host_socket));
 
+    let (ioapic_host_socket, ioapic_device_socket) =
+        msg_socket::pair::<VmIrqResponse, VmIrqRequest>().map_err(Error::CreateSocket)?;
+    control_sockets.push(TaggedControlSocket::VmIrq(ioapic_host_socket));
+
     let sandbox = cfg.sandbox;
     let linux = Arch::build_vm(
         components,
         cfg.split_irqchip,
+        ioapic_device_socket,
         &cfg.serial_parameters,
         simple_jail(&cfg, "serial")?,
         |mem, vm, sys_allocator, exit_evt| {
@@ -1642,6 +1699,7 @@ fn run_control(
         Suspend,
         ChildSignal,
         CheckAvailableMemory,
+        IrqFd { gsi: usize },
         LowMemory,
         LowmemTimer,
         VmControlServer,
@@ -1692,6 +1750,16 @@ fn run_control(
         .add(&freemem_timer, Token::CheckAvailableMemory)
         .map_err(Error::PollContextAdd)?;
 
+    if let Some(gsi_relay) = &linux.gsi_relay {
+        for (gsi, evt) in gsi_relay.irqfd.iter().enumerate() {
+            if let Some(evt) = evt {
+                poll_ctx
+                    .add(evt, Token::IrqFd { gsi })
+                    .map_err(Error::PollContextAdd)?;
+            }
+        }
+    }
+
     // Used to add jitter to timer values so that we don't have a thundering herd problem when
     // multiple VMs are running.
     let mut simple_rng = SimpleRng::new(
@@ -1720,6 +1788,7 @@ fn run_control(
             vcpu_thread_barrier.clone(),
             linux.io_bus.clone(),
             linux.mmio_bus.clone(),
+            linux.split_irqchip.clone(),
             linux.exit_evt.try_clone().map_err(Error::CloneEventFd)?,
             linux.vm.check_extension(Cap::KvmclockCtrl),
             run_mode_arc.clone(),
@@ -1729,6 +1798,7 @@ fn run_control(
     }
     vcpu_thread_barrier.wait();
 
+    let mut ioapic_delayed = Vec::<usize>::default();
     'poll: loop {
         let events = {
             match poll_ctx.wait() {
@@ -1739,6 +1809,26 @@ fn run_control(
                 }
             }
         };
+
+        ioapic_delayed.retain(|&gsi| {
+            if let Some((_, ioapic)) = &linux.split_irqchip {
+                if let Ok(mut ioapic) = ioapic.try_lock() {
+                    // The unwrap will never fail because gsi_relay is Some iff split_irqchip is
+                    // Some.
+                    if linux.gsi_relay.as_ref().unwrap().irqfd_resample[gsi].is_some() {
+                        ioapic.service_irq(gsi, true);
+                    } else {
+                        ioapic.service_irq(gsi, true);
+                        ioapic.service_irq(gsi, false);
+                    }
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        });
 
         let mut vm_control_indices_to_remove = Vec::new();
         for event in events.iter_readable() {
@@ -1801,6 +1891,47 @@ fn run_control(
                         if let Err(e) = balloon_host_socket.send(&command) {
                             warn!("failed to send memory value to balloon device: {}", e);
                         }
+                    }
+                }
+                Token::IrqFd { gsi } => {
+                    if let Some((pic, ioapic)) = &linux.split_irqchip {
+                        // This will never fail because gsi_relay is Some iff split_irqchip is
+                        // Some.
+                        let gsi_relay = linux.gsi_relay.as_ref().unwrap();
+                        if let Some(eventfd) = &gsi_relay.irqfd[gsi] {
+                            eventfd.read().unwrap();
+                        } else {
+                            warn!(
+                                "irqfd {} not found in GSI relay, should be impossible.",
+                                gsi
+                            );
+                        }
+
+                        let mut pic = pic.lock();
+                        if gsi_relay.irqfd_resample[gsi].is_some() {
+                            pic.service_irq(gsi as u8, true);
+                        } else {
+                            pic.service_irq(gsi as u8, true);
+                            pic.service_irq(gsi as u8, false);
+                        }
+                        if let Err(e) = vcpu_handles[0].kill(SIGRTMIN() + 0) {
+                            warn!("PIC: failed to kick vCPU0: {}", e);
+                        }
+
+                        // When IOAPIC is configuring its redirection table, we should first
+                        // process its AddMsiRoute request, otherwise we would deadlock.
+                        if let Ok(mut ioapic) = ioapic.try_lock() {
+                            if gsi_relay.irqfd_resample[gsi].is_some() {
+                                ioapic.service_irq(gsi, true);
+                            } else {
+                                ioapic.service_irq(gsi, true);
+                                ioapic.service_irq(gsi, false);
+                            }
+                        } else {
+                            ioapic_delayed.push(gsi);
+                        }
+                    } else {
+                        panic!("split irqchip not found, should be impossible.");
                     }
                 }
                 Token::LowMemory => {
@@ -1962,6 +2093,7 @@ fn run_control(
                 Token::Suspend => {}
                 Token::ChildSignal => {}
                 Token::CheckAvailableMemory => {}
+                Token::IrqFd { gsi: _ } => {}
                 Token::LowMemory => {}
                 Token::LowmemTimer => {}
                 Token::VmControlServer => {}

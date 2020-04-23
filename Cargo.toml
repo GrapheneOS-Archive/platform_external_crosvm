@@ -72,6 +72,7 @@ sync = { path = "sync" }
 sys_util = "*"
 vhost = { path = "vhost" }
 vm_control = { path = "vm_control" }
+acpi_tables = { path = "acpi_tables" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { path = "x86_64" }
@@ -84,10 +85,10 @@ sys_util = "*"
 
 [patch.crates-io]
 assertions = { path = "assertions" }
-audio_streams = { path = "../../third_party/adhd/audio_streams" } # ignored by ebuild
+audio_streams = { path = "../../external/adhd/audio_streams" } # ignored by ebuild
 data_model = { path = "data_model" }
-libcras = { path = "../../third_party/adhd/cras/client/libcras" } # ignored by ebuild
-minijail-sys = { path = "../../aosp/external/minijail" } # ignored by ebuild
+libcras = { path = "../../external/adhd/cras/client/libcras" } # ignored by ebuild
+minijail-sys = { path = "../../external/minijail" } # ignored by ebuild
 poll_token_derive = { path = "sys_util/poll_token_derive" }
 sync = { path = "sync" }
 sys_util = { path = "sys_util" }

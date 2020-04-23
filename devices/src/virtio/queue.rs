@@ -7,6 +7,7 @@ use std::num::Wrapping;
 use std::sync::atomic::{fence, Ordering};
 
 use sys_util::{error, GuestAddress, GuestMemory};
+use virtio_sys::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
 use super::{Interrupt, VIRTIO_MSI_NO_VECTOR};
 
@@ -224,6 +225,10 @@ pub struct Queue {
 
     next_avail: Wrapping<u16>,
     next_used: Wrapping<u16>,
+
+    // Device feature bits accepted by the driver
+    features: u64,
+    last_used: Wrapping<u16>,
 }
 
 impl Queue {
@@ -239,6 +244,8 @@ impl Queue {
             used_ring: GuestAddress(0),
             next_avail: Wrapping(0),
             next_used: Wrapping(0),
+            features: 0,
+            last_used: Wrapping(0),
         }
     }
 
@@ -258,6 +265,8 @@ impl Queue {
         self.used_ring = GuestAddress(0);
         self.next_avail = Wrapping(0);
         self.next_used = Wrapping(0);
+        self.features = 0;
+        self.last_used = Wrapping(0);
     }
 
     pub fn is_valid(&self, mem: &GuestMemory) -> bool {
@@ -339,15 +348,22 @@ impl Queue {
 
     /// Remove the first available descriptor chain from the queue.
     /// This function should only be called immediately following `peek`.
-    pub fn pop_peeked(&mut self) {
+    pub fn pop_peeked(&mut self, mem: &GuestMemory) {
         self.next_avail += Wrapping(1);
+        if self.features & ((1u64) << VIRTIO_RING_F_EVENT_IDX) != 0 {
+            let avail_event_off = self
+                .used_ring
+                .unchecked_add((4 + 8 * self.actual_size()).into());
+            mem.write_obj_at_addr(self.next_avail.0 as u16, avail_event_off)
+                .unwrap();
+        }
     }
 
     /// If a new DescriptorHead is available, returns one and removes it from the queue.
     pub fn pop<'a>(&mut self, mem: &'a GuestMemory) -> Option<DescriptorChain<'a>> {
         let descriptor_chain = self.peek(mem);
         if descriptor_chain.is_some() {
-            self.pop_peeked();
+            self.pop_peeked(mem);
         }
         descriptor_chain
     }
@@ -388,29 +404,350 @@ impl Queue {
     /// Enable / Disable guest notify device that requests are available on
     /// the descriptor chain.
     pub fn set_notify(&mut self, mem: &GuestMemory, enable: bool) {
-        let mut used_flags: u16 = mem.read_obj_from_addr(self.used_ring).unwrap();
-        if enable {
-            used_flags &= !VIRTQ_USED_F_NO_NOTIFY;
+        if self.features & ((1u64) << VIRTIO_RING_F_EVENT_IDX) != 0 {
+            let avail_index_addr = mem.checked_offset(self.avail_ring, 2).unwrap();
+            let avail_index: u16 = mem.read_obj_from_addr(avail_index_addr).unwrap();
+            let avail_event_off = self
+                .used_ring
+                .unchecked_add((4 + 8 * self.actual_size()).into());
+            mem.write_obj_at_addr(avail_index, avail_event_off).unwrap();
         } else {
-            used_flags |= VIRTQ_USED_F_NO_NOTIFY;
+            let mut used_flags: u16 = mem.read_obj_from_addr(self.used_ring).unwrap();
+            if enable {
+                used_flags &= !VIRTQ_USED_F_NO_NOTIFY;
+            } else {
+                used_flags |= VIRTQ_USED_F_NO_NOTIFY;
+            }
+            mem.write_obj_at_addr(used_flags, self.used_ring).unwrap();
         }
-        mem.write_obj_at_addr(used_flags, self.used_ring).unwrap();
     }
 
     // Check Whether guest enable interrupt injection or not.
     fn available_interrupt_enabled(&self, mem: &GuestMemory) -> bool {
-        let avail_flags: u16 = mem.read_obj_from_addr(self.avail_ring).unwrap();
-        if avail_flags & VIRTQ_AVAIL_F_NO_INTERRUPT == VIRTQ_AVAIL_F_NO_INTERRUPT {
-            false
+        if self.features & ((1u64) << VIRTIO_RING_F_EVENT_IDX) != 0 {
+            let used_event_off = self
+                .avail_ring
+                .unchecked_add((4 + 2 * self.actual_size()).into());
+            let used_event: u16 = mem.read_obj_from_addr(used_event_off).unwrap();
+            // if used_event >= self.last_used, driver handle interrupt quickly enough, new
+            // interrupt could be injected.
+            // if used_event < self.last_used, driver hasn't finished the last interrupt,
+            // so no need to inject new interrupt.
+            if self.next_used - Wrapping(used_event) - Wrapping(1) < self.next_used - self.last_used
+            {
+                true
+            } else {
+                false
+            }
         } else {
-            true
+            let avail_flags: u16 = mem.read_obj_from_addr(self.avail_ring).unwrap();
+            if avail_flags & VIRTQ_AVAIL_F_NO_INTERRUPT == VIRTQ_AVAIL_F_NO_INTERRUPT {
+                false
+            } else {
+                true
+            }
         }
     }
 
     /// inject interrupt into guest on this queue
-    pub fn trigger_interrupt(&self, mem: &GuestMemory, interrupt: &Interrupt) {
+    /// return true: interrupt is injected into guest for this queue
+    ///        false: interrupt isn't injected
+    pub fn trigger_interrupt(&mut self, mem: &GuestMemory, interrupt: &Interrupt) -> bool {
         if self.available_interrupt_enabled(mem) {
+            self.last_used = self.next_used;
             interrupt.signal_used_queue(self.vector);
+            true
+        } else {
+            false
         }
+    }
+
+    /// Acknowledges that this set of features should be enabled on this queue.
+    pub fn ack_features(&mut self, features: u64) {
+        self.features |= features;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use data_model::{DataInit, Le16, Le32, Le64};
+    use std::convert::TryInto;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use sys_util::EventFd;
+
+    const GUEST_MEMORY_SIZE: u64 = 0x10000;
+    const DESC_OFFSET: u64 = 0;
+    const AVAIL_OFFSET: u64 = 0x200;
+    const USED_OFFSET: u64 = 0x400;
+    const QUEUE_SIZE: usize = 0x10;
+    const BUFFER_OFFSET: u64 = 0x8000;
+    const BUFFER_LEN: u32 = 0x400;
+
+    #[derive(Copy, Clone, Debug)]
+    #[repr(C)]
+    struct Desc {
+        addr: Le64,
+        len: Le32,
+        flags: Le16,
+        next: Le16,
+    }
+    // Safe as this only runs in test
+    unsafe impl DataInit for Desc {}
+
+    #[derive(Copy, Clone, Debug)]
+    #[repr(C)]
+    struct Avail {
+        flags: Le16,
+        idx: Le16,
+        ring: [Le16; QUEUE_SIZE],
+        used_event: Le16,
+    }
+    // Safe as this only runs in test
+    unsafe impl DataInit for Avail {}
+    impl Default for Avail {
+        fn default() -> Self {
+            Avail {
+                flags: Le16::from(0u16),
+                idx: Le16::from(0u16),
+                ring: [Le16::from(0u16); QUEUE_SIZE],
+                used_event: Le16::from(0u16),
+            }
+        }
+    }
+
+    #[derive(Copy, Clone, Debug)]
+    #[repr(C)]
+    struct UsedElem {
+        id: Le32,
+        len: Le32,
+    }
+    // Safe as this only runs in test
+    unsafe impl DataInit for UsedElem {}
+    impl Default for UsedElem {
+        fn default() -> Self {
+            UsedElem {
+                id: Le32::from(0u32),
+                len: Le32::from(0u32),
+            }
+        }
+    }
+
+    #[derive(Copy, Clone, Debug)]
+    #[repr(C)]
+    struct Used {
+        flags: Le16,
+        idx: Le16,
+        used_elem_ring: [UsedElem; QUEUE_SIZE],
+        avail_event: Le16,
+    }
+    // Safe as this only runs in test
+    unsafe impl DataInit for Used {}
+    impl Default for Used {
+        fn default() -> Self {
+            Used {
+                flags: Le16::from(0u16),
+                idx: Le16::from(0u16),
+                used_elem_ring: [UsedElem::default(); QUEUE_SIZE],
+                avail_event: Le16::from(0u16),
+            }
+        }
+    }
+
+    fn setup_vq(queue: &mut Queue, mem: &GuestMemory) {
+        let desc = Desc {
+            addr: Le64::from(BUFFER_OFFSET),
+            len: Le32::from(BUFFER_LEN),
+            flags: Le16::from(0u16),
+            next: Le16::from(1u16),
+        };
+        let _ = mem.write_obj_at_addr(desc, GuestAddress(DESC_OFFSET));
+
+        let avail = Avail::default();
+        let _ = mem.write_obj_at_addr(avail, GuestAddress(AVAIL_OFFSET));
+
+        let used = Used::default();
+        let _ = mem.write_obj_at_addr(used, GuestAddress(USED_OFFSET));
+
+        queue.desc_table = GuestAddress(DESC_OFFSET);
+        queue.avail_ring = GuestAddress(AVAIL_OFFSET);
+        queue.used_ring = GuestAddress(USED_OFFSET);
+        queue.ack_features((1u64) << VIRTIO_RING_F_EVENT_IDX);
+    }
+
+    #[test]
+    fn queue_event_id_guest_fast() {
+        let mut queue = Queue::new(QUEUE_SIZE.try_into().unwrap());
+        let memory_start_addr = GuestAddress(0x0);
+        let mem = GuestMemory::new(&vec![(memory_start_addr, GUEST_MEMORY_SIZE)]).unwrap();
+        setup_vq(&mut queue, &mem);
+
+        let interrupt = Interrupt::new(
+            Arc::new(AtomicUsize::new(0)),
+            EventFd::new().unwrap(),
+            EventFd::new().unwrap(),
+            None,
+            10,
+        );
+
+        // Calculating the offset of used_event within Avail structure
+        let used_event_offset: u64 =
+            unsafe { &(*(::std::ptr::null::<Avail>())).used_event as *const _ as u64 };
+        let used_event_address = GuestAddress(AVAIL_OFFSET + used_event_offset);
+
+        // Assume driver submit 0x100 req to device,
+        // device has handled them, so increase self.next_used to 0x100
+        let mut device_generate: Wrapping<u16> = Wrapping(0x100);
+        for _ in 0..device_generate.0 {
+            queue.add_used(&mem, 0x0, BUFFER_LEN);
+        }
+
+        // At this moment driver hasn't handled any interrupts yet, so it
+        // should inject interrupt.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), true);
+
+        // Driver handle all the interrupts and update avail.used_event to 0x100
+        let mut driver_handled = device_generate;
+        let _ = mem.write_obj_at_addr(Le16::from(driver_handled.0), used_event_address);
+
+        // At this moment driver have handled all the interrupts, and
+        // device doesn't generate more data, so interrupt isn't needed.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), false);
+
+        // Assume driver submit another u16::MAX - 0x100 req to device,
+        // Device has handled all of them, so increase self.next_used to u16::MAX
+        for _ in device_generate.0..u16::max_value() {
+            queue.add_used(&mem, 0x0, BUFFER_LEN);
+        }
+        device_generate = Wrapping(u16::max_value());
+
+        // At this moment driver just handled 0x100 interrupts, so it
+        // should inject interrupt.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), true);
+
+        // driver handle all the interrupts and update avail.used_event to u16::MAX
+        driver_handled = device_generate;
+        let _ = mem.write_obj_at_addr(Le16::from(driver_handled.0), used_event_address);
+
+        // At this moment driver have handled all the interrupts, and
+        // device doesn't generate more data, so interrupt isn't needed.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), false);
+
+        // Assume driver submit another 1 request,
+        // device has handled it, so wrap self.next_used to 0
+        queue.add_used(&mem, 0x0, BUFFER_LEN);
+        device_generate += Wrapping(1);
+
+        // At this moment driver has handled all the previous interrupts, so it
+        // should inject interrupt again.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), true);
+
+        // driver handle that interrupts and update avail.used_event to 0
+        driver_handled = device_generate;
+        let _ = mem.write_obj_at_addr(Le16::from(driver_handled.0), used_event_address);
+
+        // At this moment driver have handled all the interrupts, and
+        // device doesn't generate more data, so interrupt isn't needed.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), false);
+    }
+
+    #[test]
+    fn queue_event_id_guest_slow() {
+        let mut queue = Queue::new(QUEUE_SIZE.try_into().unwrap());
+        let memory_start_addr = GuestAddress(0x0);
+        let mem = GuestMemory::new(&vec![(memory_start_addr, GUEST_MEMORY_SIZE)]).unwrap();
+        setup_vq(&mut queue, &mem);
+
+        let interrupt = Interrupt::new(
+            Arc::new(AtomicUsize::new(0)),
+            EventFd::new().unwrap(),
+            EventFd::new().unwrap(),
+            None,
+            10,
+        );
+
+        // Calculating the offset of used_event within Avail structure
+        let used_event_offset: u64 =
+            unsafe { &(*(::std::ptr::null::<Avail>())).used_event as *const _ as u64 };
+        let used_event_address = GuestAddress(AVAIL_OFFSET + used_event_offset);
+
+        // Assume driver submit 0x100 req to device,
+        // device have handled 0x100 req, so increase self.next_used to 0x100
+        let mut device_generate: Wrapping<u16> = Wrapping(0x100);
+        for _ in 0..device_generate.0 {
+            queue.add_used(&mem, 0x0, BUFFER_LEN);
+        }
+
+        // At this moment driver hasn't handled any interrupts yet, so it
+        // should inject interrupt.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), true);
+
+        // Driver handle part of the interrupts and update avail.used_event to 0x80
+        let mut driver_handled = Wrapping(0x80);
+        let _ = mem.write_obj_at_addr(Le16::from(driver_handled.0), used_event_address);
+
+        // At this moment driver hasn't finished last interrupt yet,
+        // so interrupt isn't needed.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), false);
+
+        // Assume driver submit another 1 request,
+        // device has handled it, so increment self.next_used.
+        queue.add_used(&mem, 0x0, BUFFER_LEN);
+        device_generate += Wrapping(1);
+
+        // At this moment driver hasn't finished last interrupt yet,
+        // so interrupt isn't needed.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), false);
+
+        // Assume driver submit another u16::MAX - 0x101 req to device,
+        // Device has handled all of them, so increase self.next_used to u16::MAX
+        for _ in device_generate.0..u16::max_value() {
+            queue.add_used(&mem, 0x0, BUFFER_LEN);
+        }
+        device_generate = Wrapping(u16::max_value());
+
+        // At this moment driver hasn't finished last interrupt yet,
+        // so interrupt isn't needed.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), false);
+
+        // driver handle most of the interrupts and update avail.used_event to u16::MAX - 1,
+        driver_handled = device_generate - Wrapping(1);
+        let _ = mem.write_obj_at_addr(Le16::from(driver_handled.0), used_event_address);
+
+        // Assume driver submit another 1 request,
+        // device has handled it, so wrap self.next_used to 0
+        queue.add_used(&mem, 0x0, BUFFER_LEN);
+        device_generate += Wrapping(1);
+
+        // At this moment driver has already finished the last interrupt(0x100),
+        // and device service other request, so new interrupt is needed.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), true);
+
+        // Assume driver submit another 1 request,
+        // device has handled it, so increment self.next_used to 1
+        queue.add_used(&mem, 0x0, BUFFER_LEN);
+        device_generate += Wrapping(1);
+
+        // At this moment driver hasn't finished last interrupt((Wrapping(0)) yet,
+        // so interrupt isn't needed.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), false);
+
+        // driver handle all the remain interrupts and wrap avail.used_event to 0x1.
+        driver_handled = device_generate;
+        let _ = mem.write_obj_at_addr(Le16::from(driver_handled.0), used_event_address);
+
+        // At this moment driver has handled all the interrupts, and
+        // device doesn't generate more data, so interrupt isn't needed.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), false);
+
+        // Assume driver submit another 1 request,
+        // device has handled it, so increase self.next_used.
+        queue.add_used(&mem, 0x0, BUFFER_LEN);
+        device_generate += Wrapping(1);
+
+        // At this moment driver has finished all the previous interrupts, so it
+        // should inject interrupt again.
+        assert_eq!(queue.trigger_interrupt(&mem, &interrupt), true);
     }
 }
