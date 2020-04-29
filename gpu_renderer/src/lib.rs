@@ -9,6 +9,7 @@ mod generated;
 mod vsnprintf;
 
 use std::cell::RefCell;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::ffi::CString;
 use std::fmt::{self, Display};
 use std::fs::File;
@@ -33,9 +34,10 @@ use crate::generated::p_format::PIPE_FORMAT_B8G8R8X8_UNORM;
 use crate::generated::virglrenderer::*;
 
 pub use crate::command_buffer::CommandBufferBuilder;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use crate::vsnprintf::vsnprintf;
 
-/// Arguments used in `Renderer::create_resource`..
+/// Arguments used in `Renderer::create_resource`.
 pub type ResourceCreateArgs = virgl_renderer_resource_create_args;
 /// Some of the information returned from `Resource::export_query`.
 pub type Query = virgl_renderer_export_query;
@@ -248,7 +250,10 @@ impl Renderer {
             fence_state: Rc::clone(&fence_state),
         }));
 
-        unsafe { virgl_set_debug_callback(Some(Renderer::debug_callback)) };
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        unsafe {
+            virgl_set_debug_callback(Some(Renderer::debug_callback))
+        };
 
         // Safe because a valid cookie and set of callbacks is used and the result is checked for
         // error.
@@ -401,71 +406,52 @@ impl Renderer {
     }
 
     #[allow(unused_variables)]
-    pub fn allocation_metadata(&self, request: &[u8], response: &mut Vec<u8>) -> Result<()> {
-        #[cfg(feature = "virtio-gpu-next")]
-        {
-            let ret = unsafe {
-                virgl_renderer_allocation_metadata(
-                    request.as_ptr() as *const c_void,
-                    response.as_mut_ptr() as *mut c_void,
-                    request.len() as u32,
-                    response.len() as u32,
-                )
-            };
-            ret_to_res(ret)
-        }
-        #[cfg(not(feature = "virtio-gpu-next"))]
-        Err(Error::Unsupported)
-    }
-
-    #[allow(unused_variables)]
     pub fn resource_create_v2(
         &self,
         resource_id: u32,
-        guest_memory_type: u32,
-        guest_caching_type: u32,
+        ctx_id: u32,
+        flags: u32,
         size: u64,
+        memory_id: u64,
+        vecs: &[(GuestAddress, usize)],
         mem: &GuestMemory,
-        iovecs: &[(GuestAddress, usize)],
-        args: &[u8],
     ) -> Result<Resource> {
         #[cfg(feature = "virtio-gpu-next")]
         {
-            if iovecs
+            if vecs
                 .iter()
                 .any(|&(addr, len)| mem.get_slice(addr.offset(), len as u64).is_err())
             {
                 return Err(Error::InvalidIovec);
             }
 
-            let mut vecs = Vec::new();
-            for &(addr, len) in iovecs {
+            let mut iovecs = Vec::new();
+            for &(addr, len) in vecs {
                 // Unwrap will not panic because we already checked the slices.
                 let slice = mem.get_slice(addr.offset(), len as u64).unwrap();
-                vecs.push(VirglVec {
+                iovecs.push(VirglVec {
                     base: slice.as_ptr() as *mut c_void,
                     len,
                 });
             }
 
-            let ret = unsafe {
-                virgl_renderer_resource_create_v2(
-                    resource_id,
-                    guest_memory_type,
-                    guest_caching_type,
-                    size,
-                    vecs.as_ptr() as *const iovec,
-                    vecs.len() as u32,
-                    args.as_ptr() as *const c_void,
-                    args.len() as u32,
-                )
+            let mut resource_create_args = virgl_renderer_resource_create_v2_args {
+                version: 1,
+                res_handle: resource_id,
+                ctx_id,
+                flags,
+                size,
+                memory_id,
+                iovecs: iovecs.as_mut_ptr() as *mut iovec,
+                num_iovs: iovecs.len() as u32,
             };
 
+            let ret = unsafe { virgl_renderer_resource_create_v2(&mut resource_create_args) };
             ret_to_res(ret)?;
 
             Ok(Resource {
                 id: resource_id,
-                backing_iovecs: vecs,
+                backing_iovecs: iovecs,
                 backing_mem: None,
                 no_sync_send: PhantomData,
             })
@@ -474,6 +460,7 @@ impl Renderer {
         Err(Error::Unsupported)
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     extern "C" fn debug_callback(
         fmt: *const ::std::os::raw::c_char,
         ap: *mut generated::virglrenderer::__va_list_tag,

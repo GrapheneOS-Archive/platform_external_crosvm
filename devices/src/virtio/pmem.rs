@@ -8,10 +8,14 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::thread;
 
-use sys_util::Result as SysResult;
 use sys_util::{error, EventFd, GuestAddress, GuestMemory, PollContext, PollToken};
+use sys_util::{Error as SysError, Result as SysResult};
 
 use data_model::{DataInit, Le32, Le64};
+
+use msg_socket::{MsgReceiver, MsgSender};
+
+use vm_control::{VmMsyncRequest, VmMsyncRequestSocket, VmMsyncResponse};
 
 use super::{
     copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer,
@@ -83,19 +87,40 @@ struct Worker {
     interrupt: Interrupt,
     queue: Queue,
     memory: GuestMemory,
-    disk_image: File,
+    pmem_device_socket: VmMsyncRequestSocket,
+    mapping_arena_slot: u32,
+    mapping_size: usize,
 }
 
 impl Worker {
     fn execute_request(&self, request: virtio_pmem_req) -> u32 {
         match request.type_.to_native() {
-            VIRTIO_PMEM_REQ_TYPE_FLUSH => match self.disk_image.sync_all() {
-                Ok(()) => VIRTIO_PMEM_RESP_TYPE_OK,
-                Err(e) => {
-                    error!("failed flushing disk image: {}", e);
-                    VIRTIO_PMEM_RESP_TYPE_EIO
+            VIRTIO_PMEM_REQ_TYPE_FLUSH => {
+                let request = VmMsyncRequest::MsyncArena {
+                    slot: self.mapping_arena_slot,
+                    offset: 0, // The pmem backing file is always at offset 0 in the arena.
+                    size: self.mapping_size,
+                };
+
+                if let Err(e) = self.pmem_device_socket.send(&request) {
+                    error!("failed to send request: {}", e);
+                    return VIRTIO_PMEM_RESP_TYPE_EIO;
                 }
-            },
+
+                match self.pmem_device_socket.recv() {
+                    Ok(response) => match response {
+                        VmMsyncResponse::Ok => VIRTIO_PMEM_RESP_TYPE_OK,
+                        VmMsyncResponse::Err(e) => {
+                            error!("failed flushing disk image: {}", e);
+                            VIRTIO_PMEM_RESP_TYPE_EIO
+                        }
+                    },
+                    Err(e) => {
+                        error!("failed to receive data: {}", e);
+                        VIRTIO_PMEM_RESP_TYPE_EIO
+                    }
+                }
+            }
             _ => {
                 error!("unknown request type: {}", request.type_.to_native());
                 VIRTIO_PMEM_RESP_TYPE_EIO
@@ -199,21 +224,31 @@ pub struct Pmem {
     worker_thread: Option<thread::JoinHandle<()>>,
     disk_image: Option<File>,
     mapping_address: GuestAddress,
+    mapping_arena_slot: u32,
     mapping_size: u64,
+    pmem_device_socket: Option<VmMsyncRequestSocket>,
 }
 
 impl Pmem {
     pub fn new(
         disk_image: File,
         mapping_address: GuestAddress,
+        mapping_arena_slot: u32,
         mapping_size: u64,
+        pmem_device_socket: Option<VmMsyncRequestSocket>,
     ) -> SysResult<Pmem> {
+        if mapping_size > usize::max_value() as u64 {
+            return Err(SysError::new(libc::EOVERFLOW));
+        }
+
         Ok(Pmem {
             kill_event: None,
             worker_thread: None,
             disk_image: Some(disk_image),
             mapping_address,
+            mapping_arena_slot,
             mapping_size,
+            pmem_device_socket,
         })
     }
 }
@@ -233,11 +268,15 @@ impl Drop for Pmem {
 
 impl VirtioDevice for Pmem {
     fn keep_fds(&self) -> Vec<RawFd> {
+        let mut keep_fds = Vec::new();
         if let Some(disk_image) = &self.disk_image {
-            vec![disk_image.as_raw_fd()]
-        } else {
-            vec![]
+            keep_fds.push(disk_image.as_raw_fd());
         }
+
+        if let Some(ref pmem_device_socket) = self.pmem_device_socket {
+            keep_fds.push(pmem_device_socket.as_raw_fd());
+        }
+        keep_fds
     }
 
     fn device_type(&self) -> u32 {
@@ -274,7 +313,11 @@ impl VirtioDevice for Pmem {
         let queue = queues.remove(0);
         let queue_event = queue_events.remove(0);
 
-        if let Some(disk_image) = self.disk_image.take() {
+        let mapping_arena_slot = self.mapping_arena_slot;
+        // We checked that this fits in a usize in `Pmem::new`.
+        let mapping_size = self.mapping_size as usize;
+
+        if let Some(pmem_device_socket) = self.pmem_device_socket.take() {
             let (self_kill_event, kill_event) =
                 match EventFd::new().and_then(|e| Ok((e.try_clone()?, e))) {
                     Ok(v) => v,
@@ -291,8 +334,10 @@ impl VirtioDevice for Pmem {
                     let mut worker = Worker {
                         interrupt,
                         memory,
-                        disk_image,
                         queue,
+                        pmem_device_socket,
+                        mapping_arena_slot,
+                        mapping_size,
                     };
                     worker.run(queue_event, kill_event);
                 });

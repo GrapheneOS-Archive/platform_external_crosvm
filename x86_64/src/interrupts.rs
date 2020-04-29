@@ -7,9 +7,7 @@ use std::fmt::{self, Display};
 use std::mem;
 use std::result;
 
-use kvm;
 use kvm_sys::kvm_lapic_state;
-use sys_util;
 
 #[derive(Debug)]
 pub enum Error {
@@ -57,7 +55,7 @@ fn set_klapic_reg(klapic: &mut kvm_lapic_state, reg_offset: usize, value: u32) {
 }
 
 fn set_apic_delivery_mode(reg: u32, mode: u32) -> u32 {
-    (((reg) & !0x700) | ((mode) << 8))
+    ((reg) & !0x700) | ((mode) << 8)
 }
 
 /// Configures LAPICs.  LAPIC0 is set for external interrupts, LAPIC1 is set for NMI.

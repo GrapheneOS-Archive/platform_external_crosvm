@@ -11,11 +11,10 @@ use std::mem::{self, size_of, MaybeUninit};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use data_model::DataInit;
-use libc;
 use sync::Mutex;
 use sys_util::{error, ioctl_ior_nr, ioctl_iow_nr, ioctl_with_mut_ptr, ioctl_with_ptr};
 
@@ -26,8 +25,6 @@ use crate::virtio::fs::filesystem::{
 use crate::virtio::fs::fuse;
 use crate::virtio::fs::multikey::MultikeyBTreeMap;
 
-const CURRENT_DIR_CSTR: &[u8] = b".\0";
-const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const ROOT_CSTR: &[u8] = b"/\0";
 const PROC_CSTR: &[u8] = b"/proc\0";
@@ -199,6 +196,20 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
     }
 }
 
+// Like `CStr::from_bytes_with_nul` but strips any bytes after the first '\0'-byte. Panics if `b`
+// doesn't contain any '\0' bytes.
+fn strip_padding(b: &[u8]) -> &CStr {
+    // It would be nice if we could use memchr here but that's locked behind an unstable gate.
+    let pos = b
+        .iter()
+        .position(|&c| c == 0)
+        .expect("`b` doesn't contain any nul bytes");
+
+    // Safe because we are creating this string with the first nul-byte we found so we can
+    // guarantee that it is nul-terminated and doesn't contain any interior nuls.
+    unsafe { CStr::from_bytes_with_nul_unchecked(&b[..pos + 1]) }
+}
+
 /// The caching policy that the file system should report to the FUSE client. By default the FUSE
 /// protocol uses close-to-open consistency. This means that any cached contents of the file are
 /// invalidated the next time that file is opened.
@@ -297,12 +308,12 @@ pub struct PassthroughFs {
     // the `O_PATH` option so they cannot be used for reading or writing any data. See the
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
     // do with an fd opened with this flag.
-    inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
+    inodes: Mutex<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
     next_inode: AtomicU64,
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
     // used for reading and writing data.
-    handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+    handles: Mutex<BTreeMap<Handle, Arc<HandleData>>>,
     next_handle: AtomicU64,
 
     // File descriptor pointing to the `/proc` directory. This is used to convert an fd from
@@ -339,10 +350,10 @@ impl PassthroughFs {
         let proc = unsafe { File::from_raw_fd(fd) };
 
         Ok(PassthroughFs {
-            inodes: RwLock::new(MultikeyBTreeMap::new()),
+            inodes: Mutex::new(MultikeyBTreeMap::new()),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
 
-            handles: RwLock::new(BTreeMap::new()),
+            handles: Mutex::new(BTreeMap::new()),
             next_handle: AtomicU64::new(0),
 
             proc,
@@ -356,11 +367,41 @@ impl PassthroughFs {
         vec![self.proc.as_raw_fd()]
     }
 
+    fn get_path(&self, inode: Inode) -> io::Result<CString> {
+        let data = self
+            .inodes
+            .lock()
+            .get(&inode)
+            .map(Arc::clone)
+            .ok_or_else(ebadf)?;
+
+        let mut buf = Vec::with_capacity(libc::PATH_MAX as usize);
+        buf.resize(libc::PATH_MAX as usize, 0);
+
+        let path = CString::new(format!("self/fd/{}", data.file.as_raw_fd()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Safe because this will only modify the contents of `buf` and we check the return value.
+        let res = unsafe {
+            libc::readlinkat(
+                self.proc.as_raw_fd(),
+                path.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        buf.resize(res as usize, 0);
+        CString::new(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&inode)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -395,7 +436,7 @@ impl PassthroughFs {
             libc::openat(
                 self.proc.as_raw_fd(),
                 pathname.as_ptr(),
-                (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
+                (flags | libc::O_CLOEXEC) & !(libc::O_NOFOLLOW | libc::O_DIRECT),
             )
         };
         if fd < 0 {
@@ -409,8 +450,7 @@ impl PassthroughFs {
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let p = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&parent)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -436,7 +476,7 @@ impl PassthroughFs {
             ino: st.st_ino,
             dev: st.st_dev,
         };
-        let data = self.inodes.read().unwrap().get_alt(&altkey).map(Arc::clone);
+        let data = self.inodes.lock().get_alt(&altkey).map(Arc::clone);
 
         let inode = if let Some(data) = data {
             // Matches with the release store in `forget`.
@@ -447,7 +487,7 @@ impl PassthroughFs {
             // into the inode list.  However, since each of those will get a unique Inode
             // value and unique file descriptors this shouldn't be that much of a problem.
             let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
-            self.inodes.write().unwrap().insert(
+            self.inodes.lock().insert(
                 inode,
                 InodeAltKey {
                     ino: st.st_ino,
@@ -489,8 +529,7 @@ impl PassthroughFs {
 
         let data = self
             .handles
-            .read()
-            .unwrap()
+            .lock()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
             .map(Arc::clone)
@@ -548,19 +587,15 @@ impl PassthroughFs {
             let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
             debug_assert!(namelen <= back.len(), "back is smaller than `namelen`");
 
-            let name = &back[..namelen];
-            let res = if name.starts_with(CURRENT_DIR_CSTR) || name.starts_with(PARENT_DIR_CSTR) {
-                // We don't want to report the "." and ".." entries. However, returning `Ok(0)` will
-                // break the loop so return `Ok` with a non-zero value instead.
-                Ok(1)
-            } else {
-                add_entry(DirEntry {
-                    ino: dirent64.d_ino,
-                    offset: dirent64.d_off as u64,
-                    type_: dirent64.d_ty as u32,
-                    name,
-                })
-            };
+            // The kernel will pad the name with additional nul bytes until it is 8-byte aligned so
+            // we need to strip those off here.
+            let name = strip_padding(&back[..namelen]);
+            let res = add_entry(DirEntry {
+                ino: dirent64.d_ino,
+                offset: dirent64.d_off as u64,
+                type_: dirent64.d_ty as u32,
+                name,
+            });
 
             debug_assert!(
                 rem.len() >= dirent64.d_reclen as usize,
@@ -583,7 +618,7 @@ impl PassthroughFs {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData { inode, file };
 
-        self.handles.write().unwrap().insert(handle, Arc::new(data));
+        self.handles.lock().insert(handle, Arc::new(data));
 
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
@@ -592,7 +627,13 @@ impl PassthroughFs {
                 OpenOptions::DIRECT_IO,
                 flags & (libc::O_DIRECTORY as u32) == 0,
             ),
-            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            CachePolicy::Always => {
+                opts |= if flags & (libc::O_DIRECTORY as u32) == 0 {
+                    OpenOptions::KEEP_CACHE
+                } else {
+                    OpenOptions::CACHE_DIR
+                }
+            }
             _ => {}
         };
 
@@ -600,7 +641,7 @@ impl PassthroughFs {
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
-        let mut handles = self.handles.write().unwrap();
+        let mut handles = self.handles.lock();
 
         if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
             if e.get().inode == inode {
@@ -617,8 +658,7 @@ impl PassthroughFs {
     fn do_getattr(&self, inode: Inode) -> io::Result<(libc::stat64, Duration)> {
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&inode)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -631,8 +671,7 @@ impl PassthroughFs {
     fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&parent)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -649,8 +688,7 @@ impl PassthroughFs {
     fn get_encryption_policy(&self, handle: Handle) -> io::Result<IoctlReply> {
         let data = self
             .handles
-            .read()
-            .unwrap()
+            .lock()
             .get(&handle)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -673,8 +711,7 @@ impl PassthroughFs {
     fn set_encryption_policy<R: io::Read>(&self, handle: Handle, r: R) -> io::Result<IoctlReply> {
         let data = self
             .handles
-            .read()
-            .unwrap()
+            .lock()
             .get(&handle)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -760,7 +797,7 @@ impl FileSystem for PassthroughFs {
         // we want the client to be able to set all the bits in the mode.
         unsafe { libc::umask(0o000) };
 
-        let mut inodes = self.inodes.write().unwrap();
+        let mut inodes = self.inodes.lock();
 
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         inodes.insert(
@@ -776,7 +813,8 @@ impl FileSystem for PassthroughFs {
             }),
         );
 
-        let mut opts = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
+        let mut opts =
+            FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO | FsOptions::EXPORT_SUPPORT;
         if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
             opts |= FsOptions::WRITEBACK_CACHE;
             self.writeback.store(true, Ordering::Relaxed);
@@ -785,15 +823,14 @@ impl FileSystem for PassthroughFs {
     }
 
     fn destroy(&self) {
-        self.handles.write().unwrap().clear();
-        self.inodes.write().unwrap().clear();
+        self.handles.lock().clear();
+        self.inodes.lock().clear();
     }
 
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<libc::statvfs64> {
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&inode)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -815,13 +852,13 @@ impl FileSystem for PassthroughFs {
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
-        let mut inodes = self.inodes.write().unwrap();
+        let mut inodes = self.inodes.lock();
 
         forget_one(&mut inodes, inode, count)
     }
 
     fn batch_forget(&self, _ctx: Context, requests: Vec<(Inode, u64)>) {
-        let mut inodes = self.inodes.write().unwrap();
+        let mut inodes = self.inodes.lock();
 
         for (inode, count) in requests {
             forget_one(&mut inodes, inode, count)
@@ -858,8 +895,7 @@ impl FileSystem for PassthroughFs {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&parent)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -905,16 +941,38 @@ impl FileSystem for PassthroughFs {
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
-            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
-            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
-            // way for us to know exactly how many padding bytes there are. This would cause
-            // `CStr::from_bytes_with_nul` to return an error because it would think there are
-            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
-            // so we'll just skip the checks here.
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.do_lookup(inode, name)?;
+            let name = dir_entry.name.to_bytes();
+            let entry = if name == b"." || name == b".." {
+                // Don't do lookups on the current directory or the parent directory. Safe because
+                // this only contains integer fields and any value is valid.
+                let mut attr = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
+                attr.st_ino = dir_entry.ino;
+                attr.st_mode = dir_entry.type_;
 
-            add_entry(dir_entry, entry)
+                // We use 0 for the inode value to indicate a negative entry.
+                Entry {
+                    inode: 0,
+                    generation: 0,
+                    attr,
+                    attr_timeout: Duration::from_secs(0),
+                    entry_timeout: Duration::from_secs(0),
+                }
+            } else {
+                self.do_lookup(inode, dir_entry.name)?
+            };
+
+            let entry_inode = entry.inode;
+            add_entry(dir_entry, entry).map_err(|e| {
+                if entry_inode != 0 {
+                    // Undo the `do_lookup` for this inode since we aren't going to report it to
+                    // the kernel. If `entry_inode` was 0 then that means this was the "." or
+                    // ".." entry and there wasn't a lookup in the first place.
+                    let mut inodes = self.inodes.lock();
+                    forget_one(&mut inodes, entry_inode, 1);
+                }
+
+                e
+            })
         })
     }
 
@@ -952,8 +1010,7 @@ impl FileSystem for PassthroughFs {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&parent)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -965,7 +1022,8 @@ impl FileSystem for PassthroughFs {
             libc::openat(
                 data.file.as_raw_fd(),
                 name.as_ptr(),
-                flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                (flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                    & !libc::O_DIRECT,
                 mode & !(umask & 0o777),
             )
         };
@@ -984,7 +1042,7 @@ impl FileSystem for PassthroughFs {
             file,
         };
 
-        self.handles.write().unwrap().insert(handle, Arc::new(data));
+        self.handles.lock().insert(handle, Arc::new(data));
 
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
@@ -1013,8 +1071,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         let data = self
             .handles
-            .read()
-            .unwrap()
+            .lock()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
             .map(Arc::clone)
@@ -1041,8 +1098,7 @@ impl FileSystem for PassthroughFs {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self
             .handles
-            .read()
-            .unwrap()
+            .lock()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
             .map(Arc::clone)
@@ -1071,8 +1127,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<(libc::stat64, Duration)> {
         let inode_data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&inode)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -1086,8 +1141,7 @@ impl FileSystem for PassthroughFs {
         let data = if let Some(handle) = handle {
             let hd = self
                 .handles
-                .read()
-                .unwrap()
+                .lock()
                 .get(&handle)
                 .filter(|hd| hd.inode == inode)
                 .map(Arc::clone)
@@ -1215,15 +1269,13 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         let old_inode = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&olddir)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
         let new_inode = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&newdir)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -1260,8 +1312,7 @@ impl FileSystem for PassthroughFs {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&parent)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -1292,15 +1343,13 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<Entry> {
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&inode)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
         let new_inode = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&newparent)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -1335,8 +1384,7 @@ impl FileSystem for PassthroughFs {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&parent)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -1354,8 +1402,7 @@ impl FileSystem for PassthroughFs {
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&inode)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -1392,8 +1439,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         let data = self
             .handles
-            .read()
-            .unwrap()
+            .lock()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
             .map(Arc::clone)
@@ -1419,8 +1465,7 @@ impl FileSystem for PassthroughFs {
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
         let data = self
             .handles
-            .read()
-            .unwrap()
+            .lock()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
             .map(Arc::clone)
@@ -1457,8 +1502,7 @@ impl FileSystem for PassthroughFs {
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
         let data = self
             .inodes
-            .read()
-            .unwrap()
+            .lock()
             .get(&inode)
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
@@ -1514,14 +1558,12 @@ impl FileSystem for PassthroughFs {
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to get a new fd.
-        let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        let path = self.get_path(inode)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
-            libc::fsetxattr(
-                file.as_raw_fd(),
+            libc::lsetxattr(
+                path.as_ptr(),
                 name.as_ptr(),
                 value.as_ptr() as *const libc::c_void,
                 value.len(),
@@ -1542,17 +1584,15 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         size: u32,
     ) -> io::Result<GetxattrReply> {
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to get a new fd.
-        let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        let path = self.get_path(inode)?;
 
         let mut buf = Vec::with_capacity(size as usize);
         buf.resize(size as usize, 0);
 
         // Safe because this will only modify the contents of `buf`.
         let res = unsafe {
-            libc::fgetxattr(
-                file.as_raw_fd(),
+            libc::lgetxattr(
+                path.as_ptr(),
                 name.as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_void,
                 size as libc::size_t,
@@ -1571,17 +1611,15 @@ impl FileSystem for PassthroughFs {
     }
 
     fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to get a new fd.
-        let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        let path = self.get_path(inode)?;
 
         let mut buf = Vec::with_capacity(size as usize);
         buf.resize(size as usize, 0);
 
         // Safe because this will only modify the contents of `buf`.
         let res = unsafe {
-            libc::flistxattr(
-                file.as_raw_fd(),
+            libc::llistxattr(
+                path.as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_char,
                 size as libc::size_t,
             )
@@ -1599,12 +1637,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to get a new fd.
-        let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        let path = self.get_path(inode)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) };
+        let res = unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) };
 
         if res == 0 {
             Ok(())
@@ -1624,8 +1660,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         let data = self
             .handles
-            .read()
-            .unwrap()
+            .lock()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
             .map(Arc::clone)
@@ -1688,5 +1723,83 @@ impl FileSystem for PassthroughFs {
             // Did you know that a file/directory is not a TTY?
             Err(io::Error::from_raw_os_error(libc::ENOTTY))
         }
+    }
+
+    fn copy_file_range(
+        &self,
+        ctx: Context,
+        inode_src: Inode,
+        handle_src: Handle,
+        offset_src: u64,
+        inode_dst: Inode,
+        handle_dst: Handle,
+        offset_dst: u64,
+        length: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        // We need to change credentials during a write so that the kernel will remove setuid or
+        // setgid bits from the file if it was written to by someone other than the owner.
+        let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+        let src_data = self
+            .handles
+            .lock()
+            .get(&handle_src)
+            .filter(|hd| hd.inode == inode_src)
+            .map(Arc::clone)
+            .ok_or_else(ebadf)?;
+        let dst_data = self
+            .handles
+            .lock()
+            .get(&handle_dst)
+            .filter(|hd| hd.inode == inode_dst)
+            .map(Arc::clone)
+            .ok_or_else(ebadf)?;
+
+        let src = src_data.file.lock().as_raw_fd();
+        let dst = dst_data.file.lock().as_raw_fd();
+
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                src,
+                &offset_src,
+                dst,
+                &offset_dst,
+                length,
+                flags,
+            )
+        };
+
+        if res >= 0 {
+            Ok(res as usize)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padded_cstrings() {
+        assert_eq!(strip_padding(b".\0\0\0\0\0\0\0").to_bytes(), b".");
+        assert_eq!(strip_padding(b"..\0\0\0\0\0\0").to_bytes(), b"..");
+        assert_eq!(
+            strip_padding(b"normal cstring\0").to_bytes(),
+            b"normal cstring"
+        );
+        assert_eq!(strip_padding(b"\0\0\0\0").to_bytes(), b"");
+        assert_eq!(
+            strip_padding(b"interior\0nul bytes\0\0\0").to_bytes(),
+            b"interior"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "`b` doesn't contain any nul bytes")]
+    fn no_nul_byte() {
+        strip_padding(b"no nul bytes in string");
     }
 }
