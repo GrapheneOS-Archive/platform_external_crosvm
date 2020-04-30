@@ -140,30 +140,21 @@ impl HostDevice {
             return Ok(());
         }
 
-        // Default buffer size for control data transfer.
-        const CONTROL_DATA_BUFFER_SIZE: usize = 1024;
+        // Allocate a buffer for the control transfer.
+        // This buffer will hold a UsbRequestSetup struct followed by the data.
+        let control_buffer_len =
+            mem::size_of::<UsbRequestSetup>() + self.control_request_setup.length as usize;
+        let mut control_buffer = vec![0u8; control_buffer_len];
 
-        // Buffer type for control transfer. The first 8 bytes is a UsbRequestSetup struct.
-        #[derive(Copy, Clone)]
-        #[repr(C, packed)]
-        struct ControlTransferBuffer {
-            pub setup: UsbRequestSetup,
-            pub data: [u8; CONTROL_DATA_BUFFER_SIZE],
-        }
-
-        // Safe because it only has data and has no implicit padding.
-        unsafe impl DataInit for ControlTransferBuffer {}
-
-        let mut control_request = ControlTransferBuffer {
-            setup: self.control_request_setup,
-            data: [0; CONTROL_DATA_BUFFER_SIZE],
-        };
+        // Copy the control request header.
+        control_buffer[..mem::size_of::<UsbRequestSetup>()]
+            .copy_from_slice(self.control_request_setup.as_slice());
 
         let direction = self.control_request_setup.get_direction();
         let buffer = if direction == ControlRequestDataPhaseTransferDirection::HostToDevice {
             if let Some(buffer) = buffer {
                 buffer
-                    .read(&mut control_request.data)
+                    .read(&mut control_buffer[mem::size_of::<UsbRequestSetup>()..])
                     .map_err(Error::ReadBuffer)?;
             }
             // buffer is consumed here for HostToDevice transfers.
@@ -172,8 +163,6 @@ impl HostDevice {
             // buffer will be used later in the callback for DeviceToHost transfers.
             buffer
         };
-
-        let control_buffer = control_request.as_slice().to_vec();
 
         let mut control_transfer =
             Transfer::new_control(control_buffer).map_err(Error::CreateTransfer)?;
@@ -305,22 +294,31 @@ impl HostDevice {
             config
         );
         self.release_interfaces();
-        let cur_config = self
-            .device
-            .lock()
-            .get_active_configuration()
-            .map_err(Error::GetActiveConfig)?;
-        usb_debug!("current config is: {}", cur_config);
-        if config != cur_config {
-            self.device
-                .lock()
-                .set_active_configuration(config)
-                .map_err(Error::SetActiveConfig)?;
+        if self.device.lock().get_num_configurations() > 1 {
+            let cur_config = match self.device.lock().get_active_configuration() {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    // The device may be in the default state, in which case
+                    // GET_CONFIGURATION may fail.  Assume the device needs to be
+                    // reconfigured.
+                    usb_debug!("Failed to get active configuration: {}", e);
+                    error!("Failed to get active configuration: {}", e);
+                    None
+                }
+            };
+            if Some(config) != cur_config {
+                self.device
+                    .lock()
+                    .set_active_configuration(config)
+                    .map_err(Error::SetActiveConfig)?;
+            }
+        } else {
+            usb_debug!("Only one configuration - not calling set_active_configuration");
         }
         let config_descriptor = self
             .device
             .lock()
-            .get_active_config_descriptor()
+            .get_config_descriptor(config)
             .map_err(Error::GetActiveConfig)?;
         self.claim_interfaces(&config_descriptor);
         self.create_endpoints(&config_descriptor)?;
@@ -337,10 +335,15 @@ impl HostDevice {
             .set_interface_alt_setting(interface, alt_setting)
             .map_err(Error::SetInterfaceAltSetting)?;
         self.alt_settings.insert(interface, alt_setting);
+        let config = self
+            .device
+            .lock()
+            .get_active_configuration()
+            .map_err(Error::GetActiveConfig)?;
         let config_descriptor = self
             .device
             .lock()
-            .get_active_config_descriptor()
+            .get_config_descriptor(config)
             .map_err(Error::GetActiveConfig)?;
         self.create_endpoints(&config_descriptor)?;
         Ok(TransferStatus::Completed)

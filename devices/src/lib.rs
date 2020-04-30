@@ -17,6 +17,7 @@ mod proxy;
 mod register_space;
 pub mod acpi;
 mod serial;
+mod serial_device;
 pub mod split_irqchip_common;
 pub mod usb;
 mod utils;
@@ -30,18 +31,16 @@ pub use self::cmos::Cmos;
 pub use self::i8042::I8042Device;
 pub use self::ioapic::{Ioapic, IOAPIC_BASE_ADDRESS, IOAPIC_MEM_LENGTH_BYTES};
 pub use self::pci::{
-    Ac97Dev, PciConfigIo, PciConfigMmio, PciDevice, PciDeviceError, PciInterruptPin, PciRoot,
-    VfioPciDevice,
+    Ac97Backend, Ac97Dev, Ac97Parameters, PciAddress, PciConfigIo, PciConfigMmio, PciDevice,
+    PciDeviceError, PciInterruptPin, PciRoot, VfioPciDevice,
 };
 pub use self::pic::Pic;
 pub use self::pit::{Pit, PitError};
 pub use self::pl030::Pl030;
 pub use self::proxy::Error as ProxyError;
 pub use self::proxy::ProxyDevice;
-pub use self::serial::Error as SerialError;
-pub use self::serial::{
-    get_serial_tty_string, Serial, SerialParameters, SerialType, DEFAULT_SERIAL_PARAMS, SERIAL_ADDR,
-};
+pub use self::serial::Serial;
+pub use self::serial_device::SerialDevice;
 pub use self::usb::host_backend::host_backend_device_provider::HostBackendDeviceProvider;
 pub use self::usb::xhci::xhci_controller::XhciController;
 pub use self::vfio::{VfioContainer, VfioDevice};

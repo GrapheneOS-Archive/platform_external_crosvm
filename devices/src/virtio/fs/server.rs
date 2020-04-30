@@ -8,7 +8,6 @@ use std::io::{self, Read, Write};
 use std::mem::size_of;
 
 use data_model::DataInit;
-use libc;
 use sys_util::error;
 
 use crate::virtio::fs::filesystem::{
@@ -19,7 +18,7 @@ use crate::virtio::fs::fuse::*;
 use crate::virtio::fs::{Error, Result};
 use crate::virtio::{Reader, Writer};
 
-const MAX_BUFFER_SIZE: u32 = (1 << 20);
+const MAX_BUFFER_SIZE: u32 = 1 << 20;
 const DIRENT_PADDING: [u8; 8] = [0; 8];
 
 struct ZCReader<'a>(Reader<'a>);
@@ -118,7 +117,8 @@ impl<F: FileSystem + Sync> Server<F> {
             Some(Opcode::Readdirplus) => self.readdirplus(in_header, r, w),
             Some(Opcode::Rename2) => self.rename2(in_header, r, w),
             Some(Opcode::Lseek) => self.lseek(in_header, r, w),
-            None => reply_error(
+            Some(Opcode::CopyFileRange) => self.copy_file_range(in_header, r, w),
+            Some(Opcode::SetUpMapping) | Some(Opcode::RemoveMapping) | None => reply_error(
                 io::Error::from_raw_os_error(libc::ENOSYS),
                 in_header.unique,
                 w,
@@ -809,7 +809,7 @@ impl<F: FileSystem + Sync> Server<F> {
             return reply_ok(Some(out), None, in_header.unique, w);
         }
 
-        if minor < KERNEL_MINOR_VERSION {
+        if minor < OLDEST_SUPPORTED_KERNEL_MINOR_VERSION {
             error!(
                 "Unsupported fuse protocol minor version: {}.{}",
                 major, minor
@@ -1208,6 +1208,40 @@ impl<F: FileSystem + Sync> Server<F> {
             Ok(0)
         }
     }
+
+    fn copy_file_range(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+        let CopyFileRangeIn {
+            fh_src,
+            off_src,
+            nodeid_dst,
+            fh_dst,
+            off_dst,
+            len,
+            flags,
+        } = r.read_obj().map_err(Error::DecodeMessage)?;
+
+        match self.fs.copy_file_range(
+            Context::from(in_header),
+            in_header.nodeid.into(),
+            fh_src.into(),
+            off_src,
+            nodeid_dst.into(),
+            fh_dst.into(),
+            off_dst,
+            len,
+            flags,
+        ) {
+            Ok(count) => {
+                let out = WriteOut {
+                    size: count as u32,
+                    ..Default::default()
+                };
+
+                reply_ok(Some(out), None, in_header.unique, w)
+            }
+            Err(e) => reply_error(e, in_header.unique, w),
+        }
+    }
 }
 
 fn retry_ioctl(
@@ -1334,12 +1368,14 @@ fn add_dirent(
     d: DirEntry,
     entry: Option<Entry>,
 ) -> io::Result<usize> {
-    if d.name.len() > ::std::u32::MAX as usize {
+    // Strip the trailing '\0'.
+    let name = d.name.to_bytes();
+    if name.len() > ::std::u32::MAX as usize {
         return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
     }
 
     let dirent_len = size_of::<Dirent>()
-        .checked_add(d.name.len())
+        .checked_add(name.len())
         .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
 
     // Directory entries must be padded to 8-byte alignment.  If adding 7 causes
@@ -1367,12 +1403,12 @@ fn add_dirent(
         let dirent = Dirent {
             ino: d.ino,
             off: d.offset,
-            namelen: d.name.len() as u32,
+            namelen: name.len() as u32,
             type_: d.type_,
         };
 
         cursor.write_all(dirent.as_slice())?;
-        cursor.write_all(d.name)?;
+        cursor.write_all(name)?;
 
         // We know that `dirent_len` <= `padded_dirent_len` due to the check above
         // so there's no need for checked arithmetic.
