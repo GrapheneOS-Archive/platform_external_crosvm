@@ -13,8 +13,9 @@ use std::sync::Once;
 
 use libc::{cpu_set_t, sched_getaffinity};
 
+use arch::{set_default_serial_parameters, SerialHardware, SerialParameters, SerialType};
 use crosvm::{linux, Config, Executable};
-use devices::{SerialParameters, SerialType};
+use sys_util::syslog;
 
 const CHROOT_KERNEL_PATH: &str = "/mnt/host/source/src/third_party/kernel/v4.19/";
 const CONTAINER_VM_DEFCONFIG: &str = "arch/x86/configs/chromiumos-container-vm-x86_64_defconfig";
@@ -220,20 +221,26 @@ fn prepare_kernel() -> PathBuf {
 
 #[test]
 fn boot() {
+    syslog::init().unwrap();
+
     let kernel_path = prepare_kernel();
 
     let mut c = Config::default();
     c.sandbox = false;
     c.serial_parameters.insert(
-        1,
+        (SerialHardware::Serial, 1),
         SerialParameters {
             type_: SerialType::Sink,
+            hardware: SerialHardware::Serial,
             path: None,
+            input: None,
             num: 1,
             console: false,
+            earlycon: false,
             stdin: false,
         },
     );
+    set_default_serial_parameters(&mut c.serial_parameters);
     c.executable_path = Some(Executable::Kernel(kernel_path));
 
     let r = linux::run_config(c);

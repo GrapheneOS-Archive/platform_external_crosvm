@@ -182,6 +182,15 @@ impl Device {
 
     /// Perform a USB port reset to reinitialize a device.
     pub fn reset(&self) -> Result<()> {
+        // TODO(dverkamp): re-enable reset once crbug.com/1058059 is resolved.
+        // Skip reset for all non-Edge TPU devices.
+        let vid = self.device_descriptor_tree.idVendor;
+        let pid = self.device_descriptor_tree.idProduct;
+        match (vid, pid) {
+            (0x1a6e, 0x089a) => (),
+            _ => return Ok(()),
+        }
+
         // Safe because self.fd is a valid usbdevfs file descriptor.
         let result = unsafe { self.ioctl(usb_sys::USBDEVFS_RESET()) };
 
@@ -261,12 +270,8 @@ impl Device {
     }
 
     /// Get active config descriptor of this device.
-    pub fn get_active_config_descriptor(&self) -> Result<ConfigDescriptorTree> {
-        let active_config = self.get_active_configuration()?;
-        match self
-            .device_descriptor_tree
-            .get_config_descriptor(active_config)
-        {
+    pub fn get_config_descriptor(&self, config: u8) -> Result<ConfigDescriptorTree> {
+        match self.device_descriptor_tree.get_config_descriptor(config) {
             Some(config_descriptor) => Ok(config_descriptor.clone()),
             None => Err(Error::NoSuchDescriptor),
         }
@@ -295,6 +300,11 @@ impl Device {
             self.ioctl_with_ref(usb_sys::USBDEVFS_CONTROL(), &ctrl_transfer)?;
         }
         Ok(active_config)
+    }
+
+    /// Get the total number of configurations for this device.
+    pub fn get_num_configurations(&self) -> u8 {
+        self.device_descriptor_tree.bNumConfigurations
     }
 
     /// Clear the halt/stall condition for an endpoint.

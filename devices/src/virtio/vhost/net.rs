@@ -7,16 +7,18 @@ use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::thread;
 
-use net_sys;
 use net_util::{MacAddress, TapT};
 
 use sys_util::{error, warn, EventFd, GuestMemory};
 use vhost::NetT as VhostNetT;
 use virtio_sys::virtio_net;
 
+use super::control_socket::*;
 use super::worker::Worker;
 use super::{Error, Result};
+use crate::pci::MsixStatus;
 use crate::virtio::{Interrupt, Queue, VirtioDevice, TYPE_NET};
+use msg_socket::{MsgReceiver, MsgSender};
 
 const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: usize = 2;
@@ -31,6 +33,8 @@ pub struct Net<T: TapT, U: VhostNetT<T>> {
     vhost_interrupt: Option<Vec<EventFd>>,
     avail_features: u64,
     acked_features: u64,
+    request_socket: Option<VhostDevRequestSocket>,
+    response_socket: Option<VhostDevResponseSocket>,
 }
 
 impl<T, U> Net<T, U>
@@ -48,7 +52,7 @@ where
     ) -> Result<Net<T, U>> {
         let kill_evt = EventFd::new().map_err(Error::CreateKillEventFd)?;
 
-        let tap: T = T::new(true).map_err(Error::TapOpen)?;
+        let tap: T = T::new(true, false).map_err(Error::TapOpen)?;
         tap.set_ip_addr(ip_addr).map_err(Error::TapSetIp)?;
         tap.set_netmask(netmask).map_err(Error::TapSetNetmask)?;
         tap.set_mac_address(mac_addr)
@@ -85,6 +89,8 @@ where
             vhost_interrupt.push(EventFd::new().map_err(Error::VhostIrqCreate)?);
         }
 
+        let (request_socket, response_socket) = create_control_sockets();
+
         Ok(Net {
             workers_kill_evt: Some(kill_evt.try_clone().map_err(Error::CloneKillEventFd)?),
             kill_evt,
@@ -94,6 +100,8 @@ where
             vhost_interrupt: Some(vhost_interrupt),
             avail_features,
             acked_features: 0u64,
+            request_socket,
+            response_socket,
         })
     }
 }
@@ -143,6 +151,14 @@ where
         }
         keep_fds.push(self.kill_evt.as_raw_fd());
 
+        if let Some(request_socket) = &self.request_socket {
+            keep_fds.push(request_socket.as_raw_fd());
+        }
+
+        if let Some(response_socket) = &self.response_socket {
+            keep_fds.push(response_socket.as_raw_fd());
+        }
+
         keep_fds
     }
 
@@ -189,6 +205,11 @@ where
                 if let Some(vhost_interrupt) = self.vhost_interrupt.take() {
                     if let Some(kill_evt) = self.workers_kill_evt.take() {
                         let acked_features = self.acked_features;
+                        let socket = if self.response_socket.is_some() {
+                            self.response_socket.take()
+                        } else {
+                            None
+                        };
                         let worker_result = thread::Builder::new()
                             .name("vhost_net".to_string())
                             .spawn(move || {
@@ -199,6 +220,7 @@ where
                                     interrupt,
                                     acked_features,
                                     kill_evt,
+                                    socket,
                                 );
                                 let activate_vqs = |handle: &U| -> Result<()> {
                                     for idx in 0..NUM_QUEUES {
@@ -251,6 +273,48 @@ where
         }
     }
 
+    fn control_notify(&self, behavior: MsixStatus) {
+        if self.worker_thread.is_none() || self.request_socket.is_none() {
+            return;
+        }
+        if let Some(socket) = &self.request_socket {
+            match behavior {
+                MsixStatus::EntryChanged(index) => {
+                    if let Err(e) = socket.send(&VhostDevRequest::MsixEntryChanged(index)) {
+                        error!(
+                            "{} failed to send VhostMsixEntryChanged request for entry {}: {:?}",
+                            self.debug_label(),
+                            index,
+                            e
+                        );
+                        return;
+                    }
+                    if let Err(e) = socket.recv() {
+                        error!("{} failed to receive VhostMsixEntryChanged response for entry {}: {:?}", self.debug_label(), index, e);
+                    }
+                }
+                MsixStatus::Changed => {
+                    if let Err(e) = socket.send(&VhostDevRequest::MsixChanged) {
+                        error!(
+                            "{} failed to send VhostMsixChanged request: {:?}",
+                            self.debug_label(),
+                            e
+                        );
+                        return;
+                    }
+                    if let Err(e) = socket.recv() {
+                        error!(
+                            "{} failed to receive VhostMsixChanged response {:?}",
+                            self.debug_label(),
+                            e
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn reset(&mut self) -> bool {
         // Only kill the child if it claimed its eventfd.
         if self.workers_kill_evt.is_none() && self.kill_evt.write(1).is_err() {
@@ -269,6 +333,7 @@ where
                     self.tap = Some(tap);
                     self.vhost_interrupt = Some(worker.vhost_interrupt);
                     self.workers_kill_evt = Some(worker.kill_evt);
+                    self.response_socket = worker.response_socket;
                     return true;
                 }
             }

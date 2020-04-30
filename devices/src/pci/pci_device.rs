@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std;
 use std::fmt::{self, Display};
 use std::os::unix::io::RawFd;
 
@@ -22,6 +21,8 @@ pub enum Error {
     IoAllocationFailed(u64, SystemAllocatorFaliure),
     /// Registering an IO BAR failed.
     IoRegistrationFailed(u64, pci_configuration::Error),
+    /// Create cras client failed.
+    CreateCrasClientFailed(libcras::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -31,6 +32,7 @@ impl Display for Error {
 
         match self {
             CapabilitiesSetup(e) => write!(f, "failed to add capability {}", e),
+            CreateCrasClientFailed(e) => write!(f, "failed to create CRAS Client: {}", e),
             IoAllocationFailed(size, e) => write!(
                 f,
                 "failed to allocate space for an IO BAR, size={}: {}",

@@ -182,6 +182,10 @@ trait Backend {
     /// Detaches any backing memory from the given resource, if there is any.
     fn detach_backing(&mut self, id: u32) -> GpuResponse;
 
+    fn resource_assign_uuid(&mut self, _id: u32) -> GpuResponse {
+        GpuResponse::ErrUnspec
+    }
+
     /// Updates the cursor's memory to the given id, and sets its position to the given coordinates.
     fn update_cursor(&mut self, id: u32, x: u32, y: u32) -> GpuResponse;
 
@@ -277,30 +281,24 @@ trait Backend {
         GpuResponse::ErrUnspec
     }
 
-    fn allocation_metadata(
-        &mut self,
-        _request_id: u32,
-        _request: Vec<u8>,
-        mut _response: Vec<u8>,
-    ) -> GpuResponse {
-        GpuResponse::ErrUnspec
-    }
-
     fn resource_create_v2(
         &mut self,
         _resource_id: u32,
-        _guest_memory_type: u32,
-        _guest_caching_type: u32,
+        _ctx_id: u32,
+        _flags: u32,
         _size: u64,
-        _pci_addr: u64,
-        _mem: &GuestMemory,
+        _memory_id: u64,
         _vecs: Vec<(GuestAddress, usize)>,
-        _args: Vec<u8>,
+        _mem: &GuestMemory,
     ) -> GpuResponse {
         GpuResponse::ErrUnspec
     }
 
-    fn resource_v2_unref(&mut self, _resource_id: u32) -> GpuResponse {
+    fn resource_map(&mut self, _resource_id: u32, _pci_addr: u64) -> GpuResponse {
+        GpuResponse::ErrUnspec
+    }
+
+    fn resource_unmap(&mut self, _resource_id: u32) -> GpuResponse {
         GpuResponse::ErrUnspec
     }
 }
@@ -474,19 +472,19 @@ impl Frontend {
                 let available_bytes = reader.available_bytes();
                 if available_bytes != 0 {
                     let entry_count = info.nr_entries.to_native() as usize;
-                    let mut iovecs = Vec::with_capacity(entry_count);
+                    let mut vecs = Vec::with_capacity(entry_count);
                     for _ in 0..entry_count {
                         match reader.read_obj::<virtio_gpu_mem_entry>() {
                             Ok(entry) => {
                                 let addr = GuestAddress(entry.addr.to_native());
                                 let len = entry.length.to_native() as usize;
-                                iovecs.push((addr, len))
+                                vecs.push((addr, len))
                             }
                             Err(_) => return GpuResponse::ErrUnspec,
                         }
                     }
                     self.backend
-                        .attach_backing(info.resource_id.to_native(), mem, iovecs)
+                        .attach_backing(info.resource_id.to_native(), mem, vecs)
                 } else {
                     error!("missing data for command {:?}", cmd);
                     GpuResponse::ErrUnspec
@@ -503,6 +501,10 @@ impl Frontend {
             GpuCommand::MoveCursor(info) => self
                 .backend
                 .move_cursor(info.pos.x.into(), info.pos.y.into()),
+            GpuCommand::ResourceAssignUuid(info) => {
+                let resource_id = info.resource_id.to_native();
+                self.backend.resource_assign_uuid(resource_id)
+            }
             GpuCommand::GetCapsetInfo(info) => {
                 self.backend.get_capset_info(info.capset_index.to_native())
             }
@@ -610,78 +612,49 @@ impl Frontend {
                     GpuResponse::OkNoData
                 }
             }
-            GpuCommand::AllocationMetadata(info) => {
-                if reader.available_bytes() != 0 {
-                    let id = info.request_id.to_native();
-                    let request_size = info.request_size.to_native();
-                    let response_size = info.response_size.to_native();
-                    if request_size > VIRTIO_GPU_MAX_BLOB_ARGUMENT_SIZE
-                        || response_size > VIRTIO_GPU_MAX_BLOB_ARGUMENT_SIZE
-                    {
-                        return GpuResponse::ErrUnspec;
-                    }
-
-                    let mut request_buf = vec![0; request_size as usize];
-                    let response_buf = vec![0; response_size as usize];
-                    if reader.read_exact(&mut request_buf[..]).is_ok() {
-                        self.backend
-                            .allocation_metadata(id, request_buf, response_buf)
-                    } else {
-                        GpuResponse::ErrInvalidParameter
-                    }
-                } else {
-                    GpuResponse::ErrUnspec
-                }
-            }
             GpuCommand::ResourceCreateV2(info) => {
-                if reader.available_bytes() != 0 {
-                    let resource_id = info.resource_id.to_native();
-                    let guest_memory_type = info.guest_memory_type.to_native();
-                    let size = info.size.to_native();
-                    let guest_caching_type = info.guest_caching_type.to_native();
-                    let pci_addr = info.pci_addr.to_native();
-                    let entry_count = info.nr_entries.to_native();
-                    let args_size = info.args_size.to_native();
-                    if args_size > VIRTIO_GPU_MAX_BLOB_ARGUMENT_SIZE
-                        || entry_count > VIRTIO_GPU_MAX_IOVEC_ENTRIES
-                    {
-                        return GpuResponse::ErrUnspec;
-                    }
-
-                    let mut iovecs = Vec::with_capacity(entry_count as usize);
-                    let mut args = vec![0; args_size as usize];
-
-                    for _ in 0..entry_count {
-                        match reader.read_obj::<virtio_gpu_mem_entry>() {
-                            Ok(entry) => {
-                                let addr = GuestAddress(entry.addr.to_native());
-                                let len = entry.length.to_native() as usize;
-                                iovecs.push((addr, len))
-                            }
-                            Err(_) => return GpuResponse::ErrUnspec,
-                        }
-                    }
-
-                    match reader.read_exact(&mut args[..]) {
-                        Ok(_) => self.backend.resource_create_v2(
-                            resource_id,
-                            guest_memory_type,
-                            guest_caching_type,
-                            size,
-                            pci_addr,
-                            mem,
-                            iovecs,
-                            args,
-                        ),
-                        Err(_) => GpuResponse::ErrUnspec,
-                    }
-                } else {
-                    GpuResponse::ErrUnspec
-                }
-            }
-            GpuCommand::ResourceV2Unref(info) => {
                 let resource_id = info.resource_id.to_native();
-                self.backend.resource_v2_unref(resource_id)
+                let ctx_id = info.hdr.ctx_id.to_native();
+                let flags = info.flags.to_native();
+                let size = info.size.to_native();
+                let memory_id = info.memory_id.to_native();
+                let entry_count = info.nr_entries.to_native();
+                if entry_count > VIRTIO_GPU_MAX_IOVEC_ENTRIES
+                    || (reader.available_bytes() == 0 && entry_count > 0)
+                {
+                    return GpuResponse::ErrUnspec;
+                }
+
+                let mut vecs = Vec::with_capacity(entry_count as usize);
+                for _ in 0..entry_count {
+                    match reader.read_obj::<virtio_gpu_mem_entry>() {
+                        Ok(entry) => {
+                            let addr = GuestAddress(entry.addr.to_native());
+                            let len = entry.length.to_native() as usize;
+                            vecs.push((addr, len))
+                        }
+                        Err(_) => return GpuResponse::ErrUnspec,
+                    }
+                }
+
+                self.backend.resource_create_v2(
+                    resource_id,
+                    ctx_id,
+                    flags,
+                    size,
+                    memory_id,
+                    vecs,
+                    mem,
+                )
+            }
+            GpuCommand::ResourceMap(info) => {
+                let resource_id = info.resource_id.to_native();
+                let offset = info.offset.to_native();
+                self.backend.resource_map(resource_id, offset)
+            }
+            GpuCommand::ResourceUnmap(info) => {
+                let resource_id = info.resource_id.to_native();
+                self.backend.resource_unmap(resource_id)
             }
         }
     }

@@ -43,10 +43,13 @@ impl AsRawFd for MaybeOwnedFd {
 
 // When sent, it could be owned or borrowed. On the receiver end, it always owned.
 impl MsgOnSocket for MaybeOwnedFd {
-    fn msg_size() -> usize {
-        0usize
+    fn uses_fd() -> bool {
+        true
     }
-    fn max_fd_count() -> usize {
+    fn fixed_size() -> Option<usize> {
+        Some(0)
+    }
+    fn fd_count(&self) -> usize {
         1usize
     }
     unsafe fn read_from_buffer(buffer: &[u8], fds: &[RawFd]) -> MsgResult<(Self, usize)> {
@@ -99,7 +102,70 @@ pub const USB_CONTROL_MAX_PORTS: usize = 16;
 #[derive(MsgOnSocket, Debug)]
 pub enum BalloonControlCommand {
     /// Set the size of the VM's balloon.
-    Adjust { num_bytes: u64 },
+    Adjust {
+        num_bytes: u64,
+    },
+    Stats,
+}
+
+// BalloonStats holds stats returned from the stats_queue.
+#[derive(Default, MsgOnSocket, Debug)]
+pub struct BalloonStats {
+    pub swap_in: Option<u64>,
+    pub swap_out: Option<u64>,
+    pub major_faults: Option<u64>,
+    pub minor_faults: Option<u64>,
+    pub free_memory: Option<u64>,
+    pub total_memory: Option<u64>,
+    pub available_memory: Option<u64>,
+    pub disk_caches: Option<u64>,
+    pub hugetlb_allocations: Option<u64>,
+    pub hugetlb_failures: Option<u64>,
+}
+
+impl Display for BalloonStats {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{{")?;
+        if let Some(swap_in) = self.swap_in {
+            write!(f, "\n    swap_in: {}", swap_in)?;
+        }
+        if let Some(swap_out) = self.swap_out {
+            write!(f, "\n    swap_out: {}", swap_out)?;
+        }
+        if let Some(major_faults) = self.major_faults {
+            write!(f, "\n    major_faults: {}", major_faults)?;
+        }
+        if let Some(minor_faults) = self.minor_faults {
+            write!(f, "\n    minor_faults: {}", minor_faults)?;
+        }
+        if let Some(free_memory) = self.free_memory {
+            write!(f, "\n    free_memory: {}", free_memory)?;
+        }
+        if let Some(total_memory) = self.total_memory {
+            write!(f, "\n    total_memory: {}", total_memory)?;
+        }
+        if let Some(available_memory) = self.available_memory {
+            write!(f, "\n    available_memory: {}", available_memory)?;
+        }
+        if let Some(disk_caches) = self.disk_caches {
+            write!(f, "\n    disk_caches: {}", disk_caches)?;
+        }
+        if let Some(hugetlb_allocations) = self.hugetlb_allocations {
+            write!(f, "\n    hugetlb_allocations: {}", hugetlb_allocations)?;
+        }
+        if let Some(hugetlb_failures) = self.hugetlb_failures {
+            write!(f, "\n    hugetlb_failures: {}", hugetlb_failures)?;
+        }
+        write!(f, "\n}}")
+    }
+}
+
+#[derive(MsgOnSocket, Debug)]
+pub enum BalloonControlResult {
+    Stats {
+        stats: BalloonStats,
+        balloon_actual: u64,
+    },
 }
 
 #[derive(MsgOnSocket, Debug)]
@@ -192,7 +258,7 @@ pub enum VmMemoryRequest {
     RegisterMemory(MaybeOwnedFd, usize),
     /// Similiar to `VmMemoryRequest::RegisterMemory`, but doesn't allocate new address space.
     /// Useful for cases where the address space is already allocated (PCI regions).
-    RegisterMemoryAtAddress(Alloc, MaybeOwnedFd, usize, u64),
+    RegisterFdAtPciBarOffset(Alloc, MaybeOwnedFd, usize, u64),
     /// Unregister the given memory slot that was previously registereed with `RegisterMemory`.
     UnregisterMemory(u32),
     /// Allocate GPU buffer of a given size/format and register the memory into guest address space.
@@ -206,7 +272,7 @@ pub enum VmMemoryRequest {
     RegisterMmapMemory {
         fd: MaybeOwnedFd,
         size: usize,
-        offset: usize,
+        offset: u64,
         gpa: u64,
     },
 }
@@ -230,8 +296,8 @@ impl VmMemoryRequest {
                     Err(e) => VmMemoryResponse::Err(e),
                 }
             }
-            RegisterMemoryAtAddress(alloc, ref fd, size, guest_addr) => {
-                match register_memory(vm, sys_allocator, fd, size, Some((alloc, guest_addr))) {
+            RegisterFdAtPciBarOffset(alloc, ref fd, size, offset) => {
+                match register_memory(vm, sys_allocator, fd, size, Some((alloc, offset))) {
                     Ok((pfn, slot)) => VmMemoryResponse::RegisterMemory { pfn, slot },
                     Err(e) => VmMemoryResponse::Err(e),
                 }
@@ -274,7 +340,7 @@ impl VmMemoryRequest {
                 offset,
                 gpa,
             } => {
-                let mmap = match MemoryMapping::from_fd_offset(fd, size, offset) {
+                let mmap = match MemoryMapping::from_fd_offset(fd, size, offset as u64) {
                     Ok(v) => v,
                     Err(_e) => return VmMemoryResponse::Err(SysError::new(EINVAL)),
                 };
@@ -379,8 +445,56 @@ pub enum VmIrqResponse {
     Err(SysError),
 }
 
-pub type BalloonControlRequestSocket = MsgSocket<BalloonControlCommand, ()>;
-pub type BalloonControlResponseSocket = MsgSocket<(), BalloonControlCommand>;
+#[derive(MsgOnSocket, Debug)]
+pub enum VmMsyncRequest {
+    /// Flush the content of a memory mapping to its backing file.
+    /// `slot` selects the arena (as returned by `Vm::add_mmap_arena`).
+    /// `offset` is the offset of the mapping to sync within the arena.
+    /// `size` is the size of the mapping to sync within the arena.
+    MsyncArena {
+        slot: u32,
+        offset: usize,
+        size: usize,
+    },
+}
+
+#[derive(MsgOnSocket, Debug)]
+pub enum VmMsyncResponse {
+    Ok,
+    Err(SysError),
+}
+
+impl VmMsyncRequest {
+    /// Executes this request on the given Vm.
+    ///
+    /// # Arguments
+    /// * `vm` - The `Vm` to perform the request on.
+    ///
+    /// This does not return a result, instead encapsulating the success or failure in a
+    /// `VmMsyncResponse` with the intended purpose of sending the response back over the socket
+    /// that received this `VmMsyncResponse`.
+    pub fn execute(&self, vm: &mut Vm) -> VmMsyncResponse {
+        use self::VmMsyncRequest::*;
+        match *self {
+            MsyncArena { slot, offset, size } => {
+                if let Some(arena) = vm.get_mmap_arena(slot) {
+                    match arena.msync(offset, size) {
+                        Ok(()) => VmMsyncResponse::Ok,
+                        Err(e) => match e {
+                            MmapError::SystemCallFailed(errno) => VmMsyncResponse::Err(errno),
+                            _ => VmMsyncResponse::Err(SysError::new(EINVAL)),
+                        },
+                    }
+                } else {
+                    VmMsyncResponse::Err(SysError::new(EINVAL))
+                }
+            }
+        }
+    }
+}
+
+pub type BalloonControlRequestSocket = MsgSocket<BalloonControlCommand, BalloonControlResult>;
+pub type BalloonControlResponseSocket = MsgSocket<BalloonControlResult, BalloonControlCommand>;
 
 pub type DiskControlRequestSocket = MsgSocket<DiskControlCommand, DiskControlResult>;
 pub type DiskControlResponseSocket = MsgSocket<DiskControlResult, DiskControlCommand>;
@@ -392,6 +506,9 @@ pub type VmMemoryControlResponseSocket = MsgSocket<VmMemoryResponse, VmMemoryReq
 
 pub type VmIrqRequestSocket = MsgSocket<VmIrqRequest, VmIrqResponse>;
 pub type VmIrqResponseSocket = MsgSocket<VmIrqResponse, VmIrqRequest>;
+
+pub type VmMsyncRequestSocket = MsgSocket<VmMsyncRequest, VmMsyncResponse>;
+pub type VmMsyncResponseSocket = MsgSocket<VmMsyncResponse, VmMsyncRequest>;
 
 pub type VmControlRequestSocket = MsgSocket<VmRequest, VmResponse>;
 pub type VmControlResponseSocket = MsgSocket<VmResponse, VmRequest>;
@@ -433,12 +550,13 @@ fn register_memory(
     };
 
     let addr = match allocation {
-        Some((Alloc::PciBar { bus, dev, bar }, address)) => {
+        Some((Alloc::PciBar { bus, dev, bar }, offset)) => {
             match allocator
                 .mmio_allocator(MmioType::High)
                 .get(&Alloc::PciBar { bus, dev, bar })
             {
                 Some((start_addr, length, _)) => {
+                    let address = *start_addr + offset;
                     let range = *start_addr..*start_addr + *length;
                     let end = address + (size as u64);
                     match (range.contains(&address), range.contains(&end)) {
@@ -497,10 +615,30 @@ impl VmRequest {
                 *run_mode = Some(VmRunMode::Running);
                 VmResponse::Ok
             }
-            VmRequest::BalloonCommand(ref command) => match balloon_host_socket.send(command) {
-                Ok(_) => VmResponse::Ok,
-                Err(_) => VmResponse::Err(SysError::last()),
-            },
+            VmRequest::BalloonCommand(BalloonControlCommand::Adjust { num_bytes }) => {
+                match balloon_host_socket.send(&BalloonControlCommand::Adjust { num_bytes }) {
+                    Ok(_) => VmResponse::Ok,
+                    Err(_) => VmResponse::Err(SysError::last()),
+                }
+            }
+            VmRequest::BalloonCommand(BalloonControlCommand::Stats) => {
+                match balloon_host_socket.send(&BalloonControlCommand::Stats {}) {
+                    Ok(_) => match balloon_host_socket.recv() {
+                        Ok(BalloonControlResult::Stats {
+                            stats,
+                            balloon_actual,
+                        }) => VmResponse::BalloonStats {
+                            stats,
+                            balloon_actual,
+                        },
+                        Err(e) => {
+                            error!("balloon socket recv failed: {}", e);
+                            VmResponse::Err(SysError::last())
+                        }
+                    },
+                    Err(_) => VmResponse::Err(SysError::last()),
+                }
+            }
             VmRequest::DiskCommand {
                 disk_index,
                 ref command,
@@ -562,6 +700,11 @@ pub enum VmResponse {
         slot: u32,
         desc: GpuMemoryDesc,
     },
+    /// Results of balloon control commands.
+    BalloonStats {
+        stats: BalloonStats,
+        balloon_actual: u64,
+    },
     /// Results of usb control commands.
     UsbResponse(UsbControlResult),
 }
@@ -582,6 +725,14 @@ impl Display for VmResponse {
                 f,
                 "gpu memory allocated and registered to page frame number {:#x} and memory slot {}",
                 pfn, slot
+            ),
+            BalloonStats {
+                stats,
+                balloon_actual,
+            } => write!(
+                f,
+                "balloon size: {}\nballoon stats: {}",
+                balloon_actual, stats
             ),
             UsbResponse(result) => write!(f, "usb control request get result {:?}", result),
         }
