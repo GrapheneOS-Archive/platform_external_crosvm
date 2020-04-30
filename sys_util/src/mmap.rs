@@ -6,10 +6,9 @@
 //! mmap object leaves scope.
 
 use std::cmp::min;
-use std::collections::BTreeMap;
 use std::fmt::{self, Display};
 use std::io;
-use std::mem::{size_of, ManuallyDrop};
+use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::ptr::{copy_nonoverlapping, null_mut, read_unaligned, write_unaligned};
 
@@ -28,8 +27,6 @@ pub enum Error {
     InvalidOffset,
     /// Requested mapping is not page aligned
     NotPageAligned,
-    /// Overlapping regions
-    Overlapping(usize, usize),
     /// Requested memory range spans past the end of the region.
     InvalidRange(usize, usize, usize),
     /// `mmap` returned the given error.
@@ -49,11 +46,6 @@ impl Display for Error {
             InvalidAddress => write!(f, "requested memory out of range"),
             InvalidOffset => write!(f, "requested offset is out of range of off_t"),
             NotPageAligned => write!(f, "requested memory is not page aligned"),
-            Overlapping(offset, count) => write!(
-                f,
-                "requested memory range overlaps with existing region: offset={} size={}",
-                offset, count
-            ),
             InvalidRange(offset, count, region_size) => write!(
                 f,
                 "requested memory range spans past the end of the region: offset={} count={} region_size={}",
@@ -164,8 +156,50 @@ impl MemoryMapping {
         MemoryMapping::from_fd_offset(fd, size, 0)
     }
 
-    pub fn from_fd_offset(fd: &dyn AsRawFd, size: usize, offset: usize) -> Result<MemoryMapping> {
+    pub fn from_fd_offset(fd: &dyn AsRawFd, size: usize, offset: u64) -> Result<MemoryMapping> {
         MemoryMapping::from_fd_offset_protection(fd, size, offset, Protection::read_write())
+    }
+
+    /// Maps `size` bytes starting at `offset` from the given `fd` as read/write, and requests
+    /// that the pages are pre-populated.
+    /// # Arguments
+    /// * `fd` - File descriptor to mmap from.
+    /// * `size` - Size of memory region in bytes.
+    /// * `offset` - Offset in bytes from the beginning of `fd` to start the mmap.
+    pub fn from_fd_offset_populate(
+        fd: &dyn AsRawFd,
+        size: usize,
+        offset: u64,
+    ) -> Result<MemoryMapping> {
+        MemoryMapping::from_fd_offset_flags(
+            fd,
+            size,
+            offset,
+            libc::MAP_SHARED | libc::MAP_POPULATE,
+            Protection::read_write(),
+        )
+    }
+
+    /// Maps the `size` bytes starting at `offset` bytes of the given `fd` as read/write.
+    ///
+    /// # Arguments
+    /// * `fd` - File descriptor to mmap from.
+    /// * `size` - Size of memory region in bytes.
+    /// * `offset` - Offset in bytes from the beginning of `fd` to start the mmap.
+    /// * `flags` - flags passed directly to mmap.
+    /// * `prot` - Protection (e.g. readable/writable) of the memory region.
+    fn from_fd_offset_flags(
+        fd: &dyn AsRawFd,
+        size: usize,
+        offset: u64,
+        flags: c_int,
+        prot: Protection,
+    ) -> Result<MemoryMapping> {
+        unsafe {
+            // This is safe because we are creating an anonymous mapping in a place not already used
+            // by any other area in this process.
+            MemoryMapping::try_mmap(None, size, prot.into(), flags, Some((fd, offset)))
+        }
     }
 
     /// Maps the `size` bytes starting at `offset` bytes of the given `fd` as read/write.
@@ -178,20 +212,10 @@ impl MemoryMapping {
     pub fn from_fd_offset_protection(
         fd: &dyn AsRawFd,
         size: usize,
-        offset: usize,
+        offset: u64,
         prot: Protection,
     ) -> Result<MemoryMapping> {
-        // This is safe because we are creating an anonymous mapping in a place not already used by
-        // any other area in this process.
-        unsafe {
-            MemoryMapping::try_mmap(
-                None,
-                size,
-                prot.into(),
-                libc::MAP_SHARED,
-                Some((fd, offset)),
-            )
-        }
+        MemoryMapping::from_fd_offset_flags(fd, size, offset, libc::MAP_SHARED, prot)
     }
 
     /// Creates an anonymous shared mapping of `size` bytes with `prot` protection.
@@ -229,7 +253,7 @@ impl MemoryMapping {
         addr: *mut u8,
         fd: &dyn AsRawFd,
         size: usize,
-        offset: usize,
+        offset: u64,
         prot: Protection,
     ) -> Result<MemoryMapping> {
         MemoryMapping::try_mmap(
@@ -248,7 +272,7 @@ impl MemoryMapping {
         size: usize,
         prot: c_int,
         flags: c_int,
-        fd: Option<(&dyn AsRawFd, usize)>,
+        fd: Option<(&dyn AsRawFd, u64)>,
     ) -> Result<MemoryMapping> {
         let mut flags = flags;
         // If addr is provided, set the FIXED flag, and validate addr alignment
@@ -265,7 +289,7 @@ impl MemoryMapping {
         // If fd is provided, validate fd offset is within bounds
         let (fd, offset) = match fd {
             Some((fd, offset)) => {
-                if offset > libc::off_t::max_value() as usize {
+                if offset > libc::off_t::max_value() as u64 {
                     return Err(Error::InvalidOffset);
                 }
                 (fd.as_raw_fd(), offset as libc::off_t)
@@ -611,13 +635,6 @@ impl Drop for MemoryMapping {
 pub struct MemoryMappingArena {
     addr: *mut u8,
     size: usize,
-    // When doing in-place swaps of MemoryMappings, the BTreeMap returns a owned
-    // instance of the old MemoryMapping. When the old MemoryMapping falls out
-    // of scope, it calls munmap on the same region as the new MemoryMapping
-    // that was just mapped in. To avoid accidentally munmapping the new,
-    // MemoryMapping, all mappings are wrapped in a ManuallyDrop, and then
-    // "forgotten" when removed from the BTreeMap
-    maps: BTreeMap<usize, ManuallyDrop<MemoryMapping>>,
 }
 
 // Send and Sync aren't automatically inherited for the raw address pointer.
@@ -634,17 +651,7 @@ impl MemoryMappingArena {
     /// * `size` - Size of memory region in bytes.
     pub fn new(size: usize) -> Result<MemoryMappingArena> {
         // Reserve the arena's memory using an anonymous read-only mmap.
-        // The actual MemoryMapping object is forgotten, with
-        // MemoryMappingArena manually calling munmap on drop.
-        let mmap = MemoryMapping::new_protection(size, Protection::none().set_read())?;
-        let addr = mmap.as_ptr();
-        let size = mmap.size();
-        std::mem::forget(mmap);
-        Ok(MemoryMappingArena {
-            addr,
-            size,
-            maps: BTreeMap::new(),
-        })
+        MemoryMapping::new_protection(size, Protection::none().set_read()).map(From::from)
     }
 
     /// Anonymously maps `size` bytes at `offset` bytes from the start of the arena.
@@ -682,7 +689,7 @@ impl MemoryMappingArena {
         offset: usize,
         size: usize,
         fd: &dyn AsRawFd,
-        fd_offset: usize,
+        fd_offset: u64,
     ) -> Result<()> {
         self.add_fd_offset_protection(offset, size, fd, fd_offset, Protection::read_write())
     }
@@ -702,7 +709,7 @@ impl MemoryMappingArena {
         offset: usize,
         size: usize,
         fd: &dyn AsRawFd,
-        fd_offset: usize,
+        fd_offset: u64,
         prot: Protection,
     ) -> Result<()> {
         self.try_add(offset, size, prot, Some((fd, fd_offset)))
@@ -715,7 +722,7 @@ impl MemoryMappingArena {
         offset: usize,
         size: usize,
         prot: Protection,
-        fd: Option<(&dyn AsRawFd, usize)>,
+        fd: Option<(&dyn AsRawFd, u64)>,
     ) -> Result<()> {
         self.validate_range(offset, size)?;
 
@@ -723,58 +730,43 @@ impl MemoryMappingArena {
         let mmap = unsafe {
             match fd {
                 Some((fd, fd_offset)) => MemoryMapping::from_fd_offset_protection_fixed(
-                    (self.addr as usize + offset) as *mut u8,
+                    self.addr.add(offset),
                     fd,
                     size,
                     fd_offset,
                     prot,
                 )?,
-                None => MemoryMapping::new_protection_fixed(
-                    (self.addr as usize + offset) as *mut u8,
-                    size,
-                    prot,
-                )?,
+                None => MemoryMapping::new_protection_fixed(self.addr.add(offset), size, prot)?,
             }
         };
 
-        self.maps.insert(offset, ManuallyDrop::new(mmap));
+        // This mapping will get automatically removed when we drop the whole arena.
+        std::mem::forget(mmap);
         Ok(())
     }
 
-    /// Removes a mapping at `offset` from the start of the arena.
-    /// Returns a boolean indicating if there was a mapping present at `offset`.
-    /// If none was present, this method is a noop.
-    pub fn remove(&mut self, offset: usize) -> Result<bool> {
-        if let Some(mmap) = self.maps.remove(&offset) {
-            // Instead of munmapping the memory map, leaving an unprotected hole
-            // in the arena, swap this mmap with an anonymous protection.
-            // This is safe since the memory mapping perfectly overlaps with an
-            // existing, known good memory mapping.
-            let mmap = unsafe {
-                MemoryMapping::new_protection_fixed(
-                    mmap.as_ptr(),
-                    mmap.size(),
-                    Protection::none().set_read(),
-                )?
-            };
-            self.maps.insert(offset, ManuallyDrop::new(mmap));
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+    /// Removes `size` bytes at `offset` bytes from the start of the arena. `offset` must be page
+    /// aligned.
+    ///
+    /// # Arguments
+    /// * `offset` - Page aligned offset into the arena in bytes.
+    /// * `size` - Size of memory region in bytes.
+    pub fn remove(&mut self, offset: usize, size: usize) -> Result<()> {
+        self.try_add(offset, size, Protection::read(), None)
     }
 
-    /// Calls msync with MS_SYNC on the mapping at `offset` from the start of
-    /// the arena.
-    /// Returns a boolean indicating if there was a mapping present at `offset`.
-    /// If none was present, this method is a noop.
-    pub fn msync(&self, offset: usize) -> Result<bool> {
-        if let Some(mmap) = self.maps.get(&offset) {
-            mmap.msync()?;
-            Ok(true)
-        } else {
-            Ok(false)
+    /// Calls msync with MS_SYNC on a mapping of `size` bytes starting at `offset` from the start of
+    /// the arena. `offset` must be page aligned.
+    pub fn msync(&self, offset: usize, size: usize) -> Result<()> {
+        self.validate_range(offset, size)?;
+
+        // Safe because we've validated that this memory range is owned by this `MemoryMappingArena`.
+        let ret =
+            unsafe { libc::msync(self.addr as *mut libc::c_void, self.size(), libc::MS_SYNC) };
+        if ret == -1 {
+            return Err(Error::SystemCallFailed(errno::Error::last()));
         }
+        Ok(())
     }
 
     /// Returns a pointer to the beginning of the memory region.  Should only be
@@ -804,32 +796,26 @@ impl MemoryMappingArena {
         if end_offset > self.size {
             return Err(Error::InvalidAddress);
         }
-        // Ensure offset..offset+size doesn't overlap with existing regions
-        // Find the offset + size of the first mapping before the desired offset
-        let (prev_offset, prev_size) = match self.maps.range(..offset).rev().next() {
-            Some((offset, mmap)) => (*offset, mmap.size()),
-            None => {
-                // Empty map
-                return Ok(());
-            }
-        };
-        if offset == prev_offset {
-            // Perfectly overlapping regions are allowed
-            if size != prev_size {
-                return Err(Error::Overlapping(offset, size));
-            }
-        } else if offset < (prev_offset + prev_size) {
-            return Err(Error::Overlapping(offset, size));
-        }
-
         Ok(())
+    }
+}
+
+impl From<MemoryMapping> for MemoryMappingArena {
+    fn from(mmap: MemoryMapping) -> Self {
+        let addr = mmap.as_ptr();
+        let size = mmap.size();
+
+        // Forget the original mapping because the `MemoryMappingArena` will take care of calling
+        // `munmap` when it is dropped.
+        std::mem::forget(mmap);
+        MemoryMappingArena { addr, size }
     }
 }
 
 impl Drop for MemoryMappingArena {
     fn drop(&mut self) {
-        // This is safe because we mmap the area at addr ourselves, and nobody
-        // else is holding a reference to it.
+        // This is safe because we own this memory range, and nobody else is holding a reference to
+        // it.
         unsafe {
             libc::munmap(self.addr as *mut libc::c_void, self.size);
         }
@@ -921,7 +907,7 @@ mod tests {
     #[test]
     fn from_fd_offset_invalid() {
         let fd = unsafe { std::fs::File::from_raw_fd(-1) };
-        let res = MemoryMapping::from_fd_offset(&fd, 4096, (libc::off_t::max_value() as usize) + 1)
+        let res = MemoryMapping::from_fd_offset(&fd, 4096, (libc::off_t::max_value() as u64) + 1)
             .unwrap_err();
         match res {
             Error::InvalidOffset => {}
@@ -945,22 +931,8 @@ mod tests {
     fn arena_remove() {
         let mut m = MemoryMappingArena::new(0x40000).unwrap();
         assert!(m.add_anon(0, pagesize() * 4).is_ok());
-        assert!(m.remove(0).unwrap(), true);
-        assert!(m.remove(0).unwrap(), false);
-    }
-
-    #[test]
-    fn arena_add_overlap_error() {
-        let page = pagesize();
-        let mut m = MemoryMappingArena::new(page * 4).unwrap();
-        assert!(m.add_anon(0, page * 4).is_ok());
-        let res = m.add_anon(page, page).unwrap_err();
-        match res {
-            Error::Overlapping(a, o) => {
-                assert_eq!((a, o), (page, page));
-            }
-            e => panic!("unexpected error: {}", e),
-        }
+        assert!(m.remove(0, pagesize()).is_ok());
+        assert!(m.remove(0, pagesize() * 2).is_ok());
     }
 
     #[test]
@@ -982,5 +954,63 @@ mod tests {
             Error::InvalidAddress => {}
             e => panic!("unexpected error: {}", e),
         }
+    }
+
+    #[test]
+    fn arena_add_overlapping() {
+        let ps = pagesize();
+        let mut m =
+            MemoryMappingArena::new(12 * ps).expect("failed to create `MemoryMappingArena`");
+        m.add_anon(ps * 4, ps * 4)
+            .expect("failed to add sub-mapping");
+
+        // Overlap in the front.
+        m.add_anon(ps * 2, ps * 3)
+            .expect("failed to add front overlapping sub-mapping");
+
+        // Overlap in the back.
+        m.add_anon(ps * 7, ps * 3)
+            .expect("failed to add back overlapping sub-mapping");
+
+        // Overlap the back of the first mapping, all of the middle mapping, and the front of the
+        // last mapping.
+        m.add_anon(ps * 3, ps * 6)
+            .expect("failed to add mapping that overlaps several mappings");
+    }
+
+    #[test]
+    fn arena_remove_overlapping() {
+        let ps = pagesize();
+        let mut m =
+            MemoryMappingArena::new(12 * ps).expect("failed to create `MemoryMappingArena`");
+        m.add_anon(ps * 4, ps * 4)
+            .expect("failed to add sub-mapping");
+        m.add_anon(ps * 2, ps * 2)
+            .expect("failed to add front overlapping sub-mapping");
+        m.add_anon(ps * 8, ps * 2)
+            .expect("failed to add back overlapping sub-mapping");
+
+        // Remove the back of the first mapping and the front of the second.
+        m.remove(ps * 3, ps * 2)
+            .expect("failed to remove front overlapping mapping");
+
+        // Remove the back of the second mapping and the front of the third.
+        m.remove(ps * 7, ps * 2)
+            .expect("failed to remove back overlapping mapping");
+
+        // Remove a mapping that completely overlaps the middle mapping.
+        m.remove(ps * 5, ps * 2)
+            .expect("failed to remove fully overlapping mapping");
+    }
+
+    #[test]
+    fn arena_remove_unaligned() {
+        let ps = pagesize();
+        let mut m =
+            MemoryMappingArena::new(12 * ps).expect("failed to create `MemoryMappingArena`");
+
+        m.add_anon(0, ps).expect("failed to add mapping");
+        m.remove(0, ps - 1)
+            .expect("failed to remove unaligned mapping");
     }
 }

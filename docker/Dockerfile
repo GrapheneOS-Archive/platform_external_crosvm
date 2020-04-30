@@ -36,16 +36,15 @@ RUN apt-get update && apt-get install -y \
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH \
-    RUST_VERSION=1.41.0 \
+    RUST_VERSION=1.42.0 \
     RUSTFLAGS='--cfg hermetic'
 
 # Debian usually has an old rust version in the repository. Instead of using that, we use rustup to
 # pull in a toolchain versions of our choosing.
-RUN curl -LO "https://static.rust-lang.org/rustup/archive/1.14.0/x86_64-unknown-linux-gnu/rustup-init" \
-    && echo "0077ff9c19f722e2be202698c037413099e1188c0c233c12a2297bf18e9ff6e7 *rustup-init" | sha256sum -c - \
+RUN curl -LO "https://static.rust-lang.org/rustup/archive/1.21.1/x86_64-unknown-linux-gnu/rustup-init" \
+    && echo "ad1f8b5199b3b9e231472ed7aa08d2e5d1d539198a15c5b1e53c746aad81d27b *rustup-init" | sha256sum -c - \
     && chmod +x rustup-init \
     && ./rustup-init -y --no-modify-path --default-toolchain $RUST_VERSION \
-    && rustup component add rustfmt-preview \
     && rm rustup-init \
     && chmod -R a+w $RUSTUP_HOME $CARGO_HOME \
     && rustup --version \
@@ -110,24 +109,34 @@ RUN git clone https://chromium.googlesource.com/chromiumos/third_party/tpm2 \
     && make -j$(nproc) \
     && cp build/libtpm2.a /lib
 
-# Install librendernodehost
+# PUll down platform2 repositroy and install librendernodehost.
+# Note that we clone the repository outside of /scratch not to be removed
+# because crosvm depends on libvda.
+ENV PLATFORM2_ROOT=/platform2
 ARG PLATFORM2_COMMIT=master
-RUN git clone https://chromium.googlesource.com/chromiumos/platform2 \
-    && cd platform2 \
+RUN git clone https://chromium.googlesource.com/chromiumos/platform2 $PLATFORM2_ROOT \
+    && cd $PLATFORM2_ROOT \
     && git checkout $PLATFORM2_COMMIT \
     && cd rendernodehost \
     && gcc -c src.c -o src.o \
     && ar rcs librendernodehost.a src.o \
-    && cp librendernodehost.a /lib
+    && cp librendernodehost.a /lib \
+    && git clean -f
 
 # Set up sysroot from which system_api proto files are built.
 ENV SYSROOT=/sysroot
 RUN mkdir -p $SYSROOT/usr/include/chromeos/dbus/trunks \
-    && cp platform2/trunks/interface.proto \
+    && cp $PLATFORM2_ROOT/trunks/interface.proto \
         $SYSROOT/usr/include/chromeos/dbus/trunks
+# Copy it under rustc's sysroot as well for cargo clippy.
+RUN export RUST_SYSROOT=$(rustc --print sysroot); echo $RUST_SYSROOT
+RUN mkdir -p $RUST_SYSROOT/usr/include/chromeos/dbus/trunks \
+  && cp $PLATFORM2_ROOT/trunks/interface.proto \
+        $RUST_SYSROOT/usr/include/chromeos/dbus/trunks
 
 # Inform pkg-config where libraries we install are placed.
-COPY pkgconfig/* /usr/lib/pkgconfig
+# Also, copy a dummy libvda.pc to compile crosvm with video features.
+COPY pkgconfig/* /usr/lib/pkgconfig/
 
 # Reduces image size and prevents accidentally using /scratch files
 RUN rm -r /scratch /usr/bin/meson
