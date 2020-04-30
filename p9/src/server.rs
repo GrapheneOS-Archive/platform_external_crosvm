@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use libc;
-
 use std::cmp::min;
 use std::collections::{btree_map, BTreeMap};
 use std::ffi::CString;
@@ -44,7 +42,7 @@ const MAPPED_FLAGS: [(u32, i32); 10] = [
     (P9_NONBLOCK, libc::O_NONBLOCK),
     (P9_DSYNC, libc::O_DSYNC),
     (P9_FASYNC, 0), // Unsupported
-    (P9_DIRECT, libc::O_DIRECT),
+    (P9_DIRECT, 0), // Unsupported
     (P9_LARGEFILE, libc::O_LARGEFILE),
     (P9_DIRECTORY, libc::O_DIRECTORY),
     (P9_NOFOLLOW, libc::O_NOFOLLOW),

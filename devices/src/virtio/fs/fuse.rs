@@ -7,13 +7,15 @@ use std::mem;
 use bitflags::bitflags;
 use data_model::DataInit;
 use enumn::N;
-use libc;
 
 /// Version number of this interface.
 pub const KERNEL_VERSION: u32 = 7;
 
+/// Oldest supported minor version of the fuse interface.
+pub const OLDEST_SUPPORTED_KERNEL_MINOR_VERSION: u32 = 27;
+
 /// Minor version number of this interface.
-pub const KERNEL_MINOR_VERSION: u32 = 27;
+pub const KERNEL_MINOR_VERSION: u32 = 31;
 
 /// The ID of the inode corresponding to the root directory of the file system.
 pub const ROOT_ID: u64 = 1;
@@ -56,6 +58,12 @@ const FOPEN_KEEP_CACHE: u32 = 2;
 /// The file is not seekable.
 const FOPEN_NONSEEKABLE: u32 = 4;
 
+/// Allow caching the directory entries.
+const FOPEN_CACHE_DIR: u32 = 8;
+
+/// This file is stream-like (i.e., no file position).
+const FOPEN_STREAM: u32 = 16;
+
 bitflags! {
     /// Options controlling the behavior of files opened by the server in response
     /// to an open or create request.
@@ -63,6 +71,8 @@ bitflags! {
         const DIRECT_IO = FOPEN_DIRECT_IO;
         const KEEP_CACHE = FOPEN_KEEP_CACHE;
         const NONSEEKABLE = FOPEN_NONSEEKABLE;
+        const CACHE_DIR = FOPEN_CACHE_DIR;
+        const STREAM = FOPEN_STREAM;
     }
 }
 
@@ -130,6 +140,24 @@ const HANDLE_KILLPRIV: u32 = 524288;
 
 /// FileSystem supports posix acls.
 const POSIX_ACL: u32 = 1048576;
+
+/// Reading the device after an abort returns `ECONNABORTED`.
+const ABORT_ERROR: u32 = 2097152;
+
+/// The reply to the `init` message contains the max number of request pages.
+const MAX_PAGES: u32 = 4194304;
+
+/// Cache `readlink` responses.
+const CACHE_SYMLINKS: u32 = 8388608;
+
+/// Kernel supports zero-message opens for directories.
+const NO_OPENDIR_SUPPORT: u32 = 16777216;
+
+/// Kernel supports explicit cache invalidation.
+const EXPLICIT_INVAL_DATA: u32 = 33554432;
+
+/// The `map_alignment` field of the `InitOut` struct is valid.
+const MAP_ALIGNMENT: u32 = 67108864;
 
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
@@ -297,6 +325,37 @@ bitflags! {
         ///
         /// This feature is disabled by default.
         const POSIX_ACL = POSIX_ACL;
+
+        /// Indicates that the kernel may cache responses to `readlink` calls.
+        const CACHE_SYMLINKS = CACHE_SYMLINKS;
+
+        /// Indicates support for zero-message opens for directories. If this flag is set in the
+        /// `capable` parameter of the `init` trait method, then the file system may return `ENOSYS`
+        /// from the opendir() handler to indicate success. Further attempts to open directories
+        /// will be handled in the kernel. (If this flag is not set, returning ENOSYS will be
+        /// treated as an error and signaled to the caller).
+        ///
+        /// Setting (or not setting) the field in the `FsOptions` returned from the `init` method
+        /// has no effect.
+        const ZERO_MESSAGE_OPENDIR = NO_OPENDIR_SUPPORT;
+
+        /// Indicates support for invalidating cached pages only on explicit request.
+        ///
+        /// If this flag is set in the `capable` parameter of the `init` trait method, then the FUSE
+        /// kernel module supports invalidating cached pages only on explicit request by the
+        /// filesystem.
+        ///
+        /// By setting this flag in the return value of the `init` trait method, the filesystem is
+        /// responsible for invalidating cached pages through explicit requests to the kernel.
+        ///
+        /// Note that setting this flag does not prevent the cached pages from being flushed by OS
+        /// itself and/or through user actions.
+        ///
+        /// Note that if both EXPLICIT_INVAL_DATA and AUTO_INVAL_DATA are set in the `capable`
+        /// parameter of the `init` trait method then AUTO_INVAL_DATA takes precedence.
+        ///
+        /// This feature is disabled by default.
+        const EXPLICIT_INVAL_DATA = EXPLICIT_INVAL_DATA;
     }
 }
 
@@ -318,6 +377,9 @@ pub const WRITE_CACHE: u32 = 1;
 /// `lock_owner` field is valid.
 pub const WRITE_LOCKOWNER: u32 = 2;
 
+/// Kill the suid and sgid bits.
+pub const WRITE_KILL_PRIV: u32 = 3;
+
 // Read flags.
 pub const READ_LOCKOWNER: u32 = 2;
 
@@ -338,6 +400,9 @@ const IOCTL_32BIT: u32 = 8;
 /// Is a directory
 const IOCTL_DIR: u32 = 16;
 
+/// 32-bit compat ioctl on 64-bit machine with 64-bit time_t.
+const IOCTL_COMPAT_X32: u32 = 32;
+
 /// Maximum of in_iovecs + out_iovecs
 pub const IOCTL_MAX_IOV: usize = 256;
 
@@ -357,6 +422,9 @@ bitflags! {
 
         /// Is a directory
         const DIR = IOCTL_DIR;
+
+        /// 32-bit compat ioctl on 64-bit machine with 64-bit time_t.
+        const COMPAT_X32 = IOCTL_COMPAT_X32;
     }
 }
 
@@ -511,6 +579,9 @@ pub enum Opcode {
     Readdirplus = 44,
     Rename2 = 45,
     Lseek = 46,
+    CopyFileRange = 47,
+    SetUpMapping = 48,
+    RemoveMapping = 49,
 }
 
 #[repr(u32)]
@@ -830,7 +901,9 @@ pub struct InitOut {
     pub congestion_threshold: u16,
     pub max_write: u32,
     pub time_gran: u32,
-    pub unused: [u32; 9],
+    pub max_pages: u16,
+    pub map_alignment: u16,
+    pub unused: [u32; 8],
 }
 unsafe impl DataInit for InitOut {}
 
@@ -1049,3 +1122,16 @@ pub struct LseekOut {
     pub offset: u64,
 }
 unsafe impl DataInit for LseekOut {}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct CopyFileRangeIn {
+    pub fh_src: u64,
+    pub off_src: u64,
+    pub nodeid_dst: u64,
+    pub fh_dst: u64,
+    pub off_dst: u64,
+    pub len: u64,
+    pub flags: u64,
+}
+unsafe impl DataInit for CopyFileRangeIn {}
