@@ -26,6 +26,7 @@ rust_library_host_rlib {
         "libkvm",
         "libkvm_sys",
         "liblibc",
+        "liblibcras",
         "liblinux_input_sys",
         "libmsg_socket",
         "libnet_sys",

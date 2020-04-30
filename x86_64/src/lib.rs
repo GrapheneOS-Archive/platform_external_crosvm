@@ -54,11 +54,14 @@ use std::mem;
 use std::sync::Arc;
 
 use crate::bootparam::boot_params;
-use arch::{RunnableLinuxVm, VmComponents, VmImage};
+use arch::{
+    get_serial_cmdline, GetSerialCmdlineError, RunnableLinuxVm, SerialHardware, SerialParameters,
+    VmComponents, VmImage,
+};
 use devices::split_irqchip_common::GsiRelay;
 use devices::{
-    get_serial_tty_string, Ioapic, PciConfigIo, PciDevice, PciInterruptPin, Pic, SerialParameters,
-    IOAPIC_BASE_ADDRESS, IOAPIC_MEM_LENGTH_BYTES,
+    Ioapic, PciConfigIo, PciDevice, PciInterruptPin, Pic, IOAPIC_BASE_ADDRESS,
+    IOAPIC_MEM_LENGTH_BYTES,
 };
 use io_jail::Minijail;
 use kvm::*;
@@ -90,6 +93,7 @@ pub enum Error {
     CreateVm(sys_util::Error),
     E820Configuration,
     EnableSplitIrqchip(sys_util::Error),
+    GetSerialCmdline(GetSerialCmdlineError),
     KernelOffsetPastEnd,
     LoadBios(io::Error),
     LoadBzImage(bzimage::Error),
@@ -139,6 +143,7 @@ impl Display for Error {
             CreateVm(e) => write!(f, "failed to create VM: {}", e),
             E820Configuration => write!(f, "invalid e820 setup params"),
             EnableSplitIrqchip(e) => write!(f, "failed to enable split irqchip: {}", e),
+            GetSerialCmdline(e) => write!(f, "failed to get serial cmdline: {}", e),
             KernelOffsetPastEnd => write!(f, "the kernel extends past the end of RAM"),
             LoadBios(e) => write!(f, "error loading bios: {}", e),
             LoadBzImage(e) => write!(f, "error loading kernel bzImage: {}", e),
@@ -172,8 +177,8 @@ pub struct X8664arch;
 
 const BOOT_STACK_POINTER: u64 = 0x8000;
 // Make sure it align to 256MB for MTRR convenient
-const MEM_32BIT_GAP_SIZE: u64 = (768 << 20);
-const FIRST_ADDR_PAST_32BITS: u64 = (1 << 32);
+const MEM_32BIT_GAP_SIZE: u64 = 768 << 20;
+const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
 const END_ADDR_BEFORE_32BITS: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
 const MMIO_SIZE: u64 = MEM_32BIT_GAP_SIZE - 0x8000000;
 const KERNEL_64BIT_ENTRY_OFFSET: u64 = 0x200;
@@ -189,7 +194,15 @@ const CMDLINE_OFFSET: u64 = 0x20000;
 const CMDLINE_MAX_SIZE: u64 = KERNEL_START_OFFSET - CMDLINE_OFFSET;
 const X86_64_SERIAL_1_3_IRQ: u32 = 4;
 const X86_64_SERIAL_2_4_IRQ: u32 = 3;
-const X86_64_IRQ_BASE: u32 = 5;
+// X86_64_SCI_IRQ is used to fill the ACPI FACP table.
+// The sci_irq number is better to be a legacy
+// IRQ number which is less than 16(actually most of the
+// platforms have fixed IRQ number 9). So we can
+// reserve the IRQ number 5 for SCI and let the
+// the other devices starts from next.
+pub const X86_64_SCI_IRQ: u32 = 5;
+// So the IRQ_BASE start from SCI_IRQ + 1
+pub const X86_64_IRQ_BASE: u32 = X86_64_SCI_IRQ + 1;
 const ACPI_HI_RSDP_WINDOW_BASE: u64 = 0x000E0000;
 
 fn configure_system(
@@ -203,7 +216,6 @@ fn configure_system(
     setup_data: Option<GuestAddress>,
     initrd: Option<(GuestAddress, usize)>,
     mut params: boot_params,
-    sci_irq: u32,
 ) -> Result<()> {
     const EBDA_START: u64 = 0x0009fc00;
     const KERNEL_BOOT_FLAG_MAGIC: u16 = 0xaa55;
@@ -267,7 +279,7 @@ fn configure_system(
         .write_obj_at_addr(params, zero_page_addr)
         .map_err(|_| Error::ZeroPageSetup)?;
 
-    let rsdp_addr = acpi::create_acpi_tables(guest_mem, num_cpus, sci_irq);
+    let rsdp_addr = acpi::create_acpi_tables(guest_mem, num_cpus, X86_64_SCI_IRQ);
     params.acpi_rsdp_addr = rsdp_addr.0;
 
     Ok(())
@@ -324,7 +336,7 @@ impl arch::LinuxArch for X8664arch {
         mut components: VmComponents,
         split_irqchip: bool,
         ioapic_device_socket: VmIrqRequestSocket,
-        serial_parameters: &BTreeMap<u8, SerialParameters>,
+        serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
         create_devices: F,
     ) -> Result<RunnableLinuxVm>
@@ -404,8 +416,6 @@ impl arch::LinuxArch for X8664arch {
 
         // Event used to notify crosvm that guest OS is trying to suspend.
         let suspend_evt = EventFd::new().map_err(Error::CreateEventFd)?;
-        // allocate sci_irq to fill the ACPI FACP table
-        let sci_irq = resources.allocate_irq().ok_or(Error::AllocateIrq)?;
 
         let mut io_bus = Self::setup_io_bus(
             &mut vm,
@@ -416,7 +426,7 @@ impl arch::LinuxArch for X8664arch {
             suspend_evt.try_clone().map_err(Error::CloneEventFd)?,
         )?;
 
-        let stdio_serial_num = Self::setup_serial_devices(
+        Self::setup_serial_devices(
             &mut vm,
             &mut io_bus,
             &mut gsi_relay,
@@ -454,7 +464,11 @@ impl arch::LinuxArch for X8664arch {
         match components.vm_image {
             VmImage::Bios(ref mut bios) => Self::load_bios(&mem, bios)?,
             VmImage::Kernel(ref mut kernel_image) => {
-                let mut cmdline = Self::get_base_linux_cmdline(stdio_serial_num);
+                let mut cmdline = Self::get_base_linux_cmdline();
+
+                get_serial_cmdline(&mut cmdline, serial_parameters, "io")
+                    .map_err(Error::GetSerialCmdline)?;
+
                 for param in components.extra_kernel_params {
                     cmdline.insert_str(&param).map_err(Error::Cmdline)?;
                 }
@@ -492,7 +506,6 @@ impl arch::LinuxArch for X8664arch {
                     components.android_fstab,
                     kernel_end,
                     params,
-                    sci_irq,
                 )?;
             }
         }
@@ -579,7 +592,6 @@ impl X8664arch {
         android_fstab: Option<File>,
         kernel_end: u64,
         params: boot_params,
-        sci_irq: u32,
     ) -> Result<()> {
         kernel_loader::load_cmdline(mem, GuestAddress(CMDLINE_OFFSET), cmdline)
             .map_err(Error::LoadCmdline)?;
@@ -641,7 +653,6 @@ impl X8664arch {
             setup_data,
             initrd,
             params,
-            sci_irq,
         )?;
         Ok(())
     }
@@ -717,13 +728,9 @@ impl X8664arch {
     }
 
     /// This returns a minimal kernel command for this architecture
-    fn get_base_linux_cmdline(stdio_serial_num: Option<u8>) -> kernel_cmdline::Cmdline {
+    fn get_base_linux_cmdline() -> kernel_cmdline::Cmdline {
         let mut cmdline = kernel_cmdline::Cmdline::new(CMDLINE_MAX_SIZE as usize);
-        if let Some(stdio_serial_num) = stdio_serial_num {
-            let tty_string = get_serial_tty_string(stdio_serial_num);
-            cmdline.insert("console", &tty_string).unwrap();
-        }
-        cmdline.insert_str("acpi=off reboot=k panic=-1").unwrap();
+        cmdline.insert_str("pci=noacpi reboot=k panic=-1").unwrap();
 
         cmdline
     }
@@ -846,13 +853,13 @@ impl X8664arch {
         vm: &mut Vm,
         io_bus: &mut devices::Bus,
         gsi_relay: &mut Option<GsiRelay>,
-        serial_parameters: &BTreeMap<u8, SerialParameters>,
+        serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
-    ) -> Result<Option<u8>> {
+    ) -> Result<()> {
         let com_evt_1_3 = EventFd::new().map_err(Error::CreateEventFd)?;
         let com_evt_2_4 = EventFd::new().map_err(Error::CreateEventFd)?;
 
-        let stdio_serial_num = arch::add_serial_devices(
+        arch::add_serial_devices(
             io_bus,
             &com_evt_1_3,
             &com_evt_2_4,
@@ -871,7 +878,7 @@ impl X8664arch {
                 .map_err(Error::RegisterIrqfd)?;
         }
 
-        Ok(stdio_serial_num)
+        Ok(())
     }
 
     /// Configures the vcpu and should be called once per vcpu from the vcpu's thread.
