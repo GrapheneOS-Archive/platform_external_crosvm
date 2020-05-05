@@ -106,6 +106,7 @@ rust_library_host_rlib {
         "gfxstream",
         "gpu",
     ],
+    flags: ["-A unused-parens"],
     rlibs: [
         "libacpi_tables",
         "libarch",

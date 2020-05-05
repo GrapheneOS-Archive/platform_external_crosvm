@@ -4,6 +4,7 @@ rust_library_host_rlib {
     name: "libcros_async",
     defaults: ["crosvm_defaults"],
     crate_name: "cros_async",
+    flags: ["-A unused-doc-comments"], // added
     srcs: ["src/lib.rs"],
     rlibs: [
         "libfutures",
