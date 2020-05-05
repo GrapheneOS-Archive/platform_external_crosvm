@@ -10,6 +10,7 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap as Map;
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::usize;
 
 use libc::EINVAL;
@@ -17,6 +18,7 @@ use libc::EINVAL;
 use data_model::*;
 use msg_socket::{MsgReceiver, MsgSender};
 use resources::Alloc;
+use sync::Mutex;
 use sys_util::{error, warn, Error, GuestAddress, GuestMemory};
 
 use gpu_display::*;
@@ -36,7 +38,10 @@ use crate::virtio::gpu::{
 };
 use crate::virtio::resource_bridge::{PlaneInfo, ResourceInfo, ResourceResponse};
 
-use vm_control::{MaybeOwnedFd, VmMemoryControlRequestSocket, VmMemoryRequest, VmMemoryResponse};
+use vm_control::{
+    ExternallyMappedHostMemoryRequests, MaybeOwnedFd, VmMemoryControlRequestSocket,
+    VmMemoryRequest, VmMemoryResponse,
+};
 
 struct Virtio3DResource {
     width: u32,
@@ -248,6 +253,7 @@ impl Backend for Virtio3DBackend {
         event_devices: Vec<EventDevice>,
         gpu_device_socket: VmMemoryControlRequestSocket,
         pci_bar: Alloc,
+        _ext_mapped_hostmem_requests: Arc<Mutex<ExternallyMappedHostMemoryRequests>>,
     ) -> Option<Box<dyn Backend>> {
         let mut renderer_flags = renderer_flags;
         let mut display_opt = None;
