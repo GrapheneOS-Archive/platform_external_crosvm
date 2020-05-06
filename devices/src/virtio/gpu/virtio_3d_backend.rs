@@ -10,6 +10,7 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap as Map;
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::usize;
 
 use libc::EINVAL;
@@ -17,6 +18,7 @@ use libc::EINVAL;
 use data_model::*;
 use msg_socket::{MsgReceiver, MsgSender};
 use resources::Alloc;
+use sync::Mutex;
 use sys_util::{error, warn, Error, GuestAddress, GuestMemory};
 
 use gpu_display::*;
@@ -26,17 +28,20 @@ use gpu_renderer::{
 };
 
 use super::protocol::{
-    GpuResponse, GpuResponsePlaneInfo, VIRTIO_GPU_CAPSET3, VIRTIO_GPU_CAPSET_VIRGL,
-    VIRTIO_GPU_CAPSET_VIRGL2, VIRTIO_GPU_RESOURCE_USE_MAPPABLE, VIRTIO_GPU_RESOURCE_USE_MASK,
+    GpuResponse, GpuResponsePlaneInfo, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_CAPSET3,
+    VIRTIO_GPU_CAPSET_VIRGL, VIRTIO_GPU_CAPSET_VIRGL2,
 };
 pub use crate::virtio::gpu::virtio_backend::{VirtioBackend, VirtioResource};
 use crate::virtio::gpu::{
-    Backend, DisplayBackend, VIRTIO_F_VERSION_1, VIRTIO_GPU_F_HOST_VISIBLE,
-    VIRTIO_GPU_F_RESOURCE_UUID, VIRTIO_GPU_F_RESOURCE_V2, VIRTIO_GPU_F_VIRGL, VIRTIO_GPU_F_VULKAN,
+    Backend, DisplayBackend, VIRTIO_F_VERSION_1, VIRTIO_GPU_F_RESOURCE_BLOB,
+    VIRTIO_GPU_F_RESOURCE_UUID, VIRTIO_GPU_F_VIRGL, VIRTIO_GPU_F_VULKAN,
 };
 use crate::virtio::resource_bridge::{PlaneInfo, ResourceInfo, ResourceResponse};
 
-use vm_control::{MaybeOwnedFd, VmMemoryControlRequestSocket, VmMemoryRequest, VmMemoryResponse};
+use vm_control::{
+    ExternallyMappedHostMemoryRequests, MaybeOwnedFd, VmMemoryControlRequestSocket,
+    VmMemoryRequest, VmMemoryResponse,
+};
 
 struct Virtio3DResource {
     width: u32,
@@ -45,7 +50,7 @@ struct Virtio3DResource {
     display_import: Option<(Rc<RefCell<GpuDisplay>>, u32)>,
     kvm_slot: Option<u32>,
     size: u64,
-    flags: u32,
+    blob_flags: u32,
 }
 
 impl Virtio3DResource {
@@ -56,18 +61,18 @@ impl Virtio3DResource {
             gpu_resource,
             display_import: None,
             kvm_slot: None,
-            flags: 0,
+            blob_flags: 0,
             // The size of the host resource isn't really zero, but it's undefined by
             // virtio_gpu_resource_create_3d
             size: 0,
         }
     }
 
-    pub fn v2_new(
+    pub fn blob_new(
         width: u32,
         height: u32,
         gpu_resource: GpuRendererResource,
-        flags: u32,
+        blob_flags: u32,
         size: u64,
     ) -> Virtio3DResource {
         Virtio3DResource {
@@ -76,17 +81,13 @@ impl Virtio3DResource {
             gpu_resource,
             display_import: None,
             kvm_slot: None,
-            flags,
+            blob_flags,
             size,
         }
     }
 
     fn as_mut(&mut self) -> &mut dyn VirtioResource {
         self
-    }
-
-    fn use_flags(&self) -> u32 {
-        self.flags & VIRTIO_GPU_RESOURCE_USE_MASK
     }
 }
 
@@ -239,8 +240,7 @@ impl Backend for Virtio3DBackend {
         1 << VIRTIO_GPU_F_VIRGL
             | 1 << VIRTIO_F_VERSION_1
             | 1 << VIRTIO_GPU_F_RESOURCE_UUID
-            | 1 << VIRTIO_GPU_F_RESOURCE_V2
-            | 1 << VIRTIO_GPU_F_HOST_VISIBLE
+            | 1 << VIRTIO_GPU_F_RESOURCE_BLOB
             | 1 << VIRTIO_GPU_F_VULKAN
     }
 
@@ -253,6 +253,7 @@ impl Backend for Virtio3DBackend {
         event_devices: Vec<EventDevice>,
         gpu_device_socket: VmMemoryControlRequestSocket,
         pci_bar: Alloc,
+        _ext_mapped_hostmem_requests: Arc<Mutex<ExternallyMappedHostMemoryRequests>>,
     ) -> Option<Box<dyn Backend>> {
         let mut renderer_flags = renderer_flags;
         let mut display_opt = None;
@@ -789,24 +790,26 @@ impl Backend for Virtio3DBackend {
         }
     }
 
-    fn resource_create_v2(
+    fn resource_create_blob(
         &mut self,
         resource_id: u32,
         ctx_id: u32,
-        flags: u32,
+        blob_mem: u32,
+        blob_flags: u32,
+        blob_id: u64,
         size: u64,
-        memory_id: u64,
         vecs: Vec<(GuestAddress, usize)>,
         mem: &GuestMemory,
     ) -> GpuResponse {
         match self.resources.entry(resource_id) {
             Entry::Vacant(entry) => {
-                let resource = match self.renderer.resource_create_v2(
+                let resource = match self.renderer.resource_create_blob(
                     resource_id,
                     ctx_id,
-                    flags,
+                    blob_mem,
+                    blob_flags,
+                    blob_id,
                     size,
-                    memory_id,
                     &vecs,
                     mem,
                 ) {
@@ -817,11 +820,11 @@ impl Backend for Virtio3DBackend {
                     }
                 };
 
-                entry.insert(Virtio3DResource::v2_new(
+                entry.insert(Virtio3DResource::blob_new(
                     self.base.display_width,
                     self.base.display_height,
                     resource,
-                    flags,
+                    blob_flags,
                     size,
                 ));
 
@@ -831,16 +834,24 @@ impl Backend for Virtio3DBackend {
         }
     }
 
-    fn resource_map(&mut self, resource_id: u32, offset: u64) -> GpuResponse {
+    fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> GpuResponse {
         let resource = match self.resources.get_mut(&resource_id) {
             Some(r) => r,
             None => return GpuResponse::ErrInvalidResourceId,
         };
 
-        if resource.use_flags() & VIRTIO_GPU_RESOURCE_USE_MAPPABLE == 0 {
+        if resource.blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE == 0 {
             error!("resource not mappable");
             return GpuResponse::ErrUnspec;
         }
+
+        let map_info = match self.renderer.resource_map_info(resource_id) {
+            Ok(map_info) => map_info,
+            Err(e) => {
+                error!("failed to get map info: {}", e);
+                return GpuResponse::ErrUnspec;
+            }
+        };
 
         let dma_buf_fd = match resource.gpu_resource.export() {
             Ok(export) => export.1,
@@ -876,7 +887,7 @@ impl Backend for Virtio3DBackend {
         match response {
             VmMemoryResponse::RegisterMemory { pfn: _, slot } => {
                 resource.kvm_slot = Some(slot);
-                GpuResponse::OkNoData
+                GpuResponse::OkMapInfo { map_info }
             }
             VmMemoryResponse::Err(e) => {
                 error!("received an error: {}", e);
@@ -889,7 +900,7 @@ impl Backend for Virtio3DBackend {
         }
     }
 
-    fn resource_unmap(&mut self, resource_id: u32) -> GpuResponse {
+    fn resource_unmap_blob(&mut self, resource_id: u32) -> GpuResponse {
         let resource = match self.resources.get_mut(&resource_id) {
             Some(r) => r,
             None => return GpuResponse::ErrInvalidResourceId,

@@ -30,8 +30,8 @@ pub enum Alloc {
     /// Should only be instantiated through `SystemAllocator::get_anon_alloc()`.
     /// Avoid using these. Instead, use / create a more descriptive Alloc variant.
     Anon(usize),
-    /// A PCI BAR region with associated bus, device, and bar numbers.
-    PciBar { bus: u8, dev: u8, bar: u8 },
+    /// A PCI BAR region with associated bus, device, function and bar numbers.
+    PciBar { bus: u8, dev: u8, func: u8, bar: u8 },
     /// GPU render node region.
     GpuRenderNode,
     /// Pmem device region with associated device index.
@@ -46,10 +46,12 @@ pub enum Error {
     BadAlignment,
     CreateGpuAllocator(GpuAllocatorError),
     ExistingAlloc(Alloc),
+    InvalidAlloc(Alloc),
     MissingHighMMIOAddresses,
     MissingLowMMIOAddresses,
     NoIoAllocator,
     OutOfSpace,
+    OutOfBounds,
     PoolOverflow { base: u64, size: u64 },
     PoolSizeZero,
 }
@@ -64,10 +66,12 @@ impl Display for Error {
             BadAlignment => write!(f, "Pool alignment must be a power of 2"),
             CreateGpuAllocator(e) => write!(f, "Failed to create GPU allocator: {:?}", e),
             ExistingAlloc(tag) => write!(f, "Alloc already exists: {:?}", tag),
+            InvalidAlloc(tag) => write!(f, "Invalid Alloc: {:?}", tag),
             MissingHighMMIOAddresses => write!(f, "High MMIO address range not specified"),
             MissingLowMMIOAddresses => write!(f, "Low MMIO address range not specified"),
             NoIoAllocator => write!(f, "No IO address range specified"),
             OutOfSpace => write!(f, "Out of space"),
+            OutOfBounds => write!(f, "Out of bounds"),
             PoolOverflow { base, size } => write!(f, "base={} + size={} overflows", base, size),
             PoolSizeZero => write!(f, "Pool cannot have size of 0"),
         }

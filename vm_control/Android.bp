@@ -11,6 +11,7 @@ rust_library_host_rlib {
         "liblibc",
         "libmsg_socket",
         "libresources",
+        "libsync_rust",
         "libsys_util",
     ],
 }
