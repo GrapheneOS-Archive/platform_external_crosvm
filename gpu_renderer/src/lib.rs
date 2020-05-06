@@ -406,13 +406,14 @@ impl Renderer {
     }
 
     #[allow(unused_variables)]
-    pub fn resource_create_v2(
+    pub fn resource_create_blob(
         &self,
         resource_id: u32,
         ctx_id: u32,
-        flags: u32,
+        blob_mem: u32,
+        blob_flags: u32,
+        blob_id: u64,
         size: u64,
-        memory_id: u64,
         vecs: &[(GuestAddress, usize)],
         mem: &GuestMemory,
     ) -> Result<Resource> {
@@ -435,18 +436,18 @@ impl Renderer {
                 });
             }
 
-            let mut resource_create_args = virgl_renderer_resource_create_v2_args {
-                version: 1,
+            let mut resource_create_args = virgl_renderer_resource_create_blob_args {
                 res_handle: resource_id,
                 ctx_id,
-                flags,
+                blob_mem,
+                blob_flags,
+                blob_id,
                 size,
-                memory_id,
                 iovecs: iovecs.as_mut_ptr() as *mut iovec,
                 num_iovs: iovecs.len() as u32,
             };
 
-            let ret = unsafe { virgl_renderer_resource_create_v2(&mut resource_create_args) };
+            let ret = unsafe { virgl_renderer_resource_create_blob(&mut resource_create_args) };
             ret_to_res(ret)?;
 
             Ok(Resource {
@@ -455,6 +456,21 @@ impl Renderer {
                 backing_mem: None,
                 no_sync_send: PhantomData,
             })
+        }
+        #[cfg(not(feature = "virtio-gpu-next"))]
+        Err(Error::Unsupported)
+    }
+
+    #[allow(unused_variables)]
+    pub fn resource_map_info(&self, resource_id: u32) -> Result<u32> {
+        #[cfg(feature = "virtio-gpu-next")]
+        {
+            let mut map_info = 0;
+            let ret =
+                unsafe { virgl_renderer_resource_get_map_info(resource_id as u32, &mut map_info) };
+            ret_to_res(ret)?;
+
+            Ok(map_info)
         }
         #[cfg(not(feature = "virtio-gpu-next"))]
         Err(Error::Unsupported)
