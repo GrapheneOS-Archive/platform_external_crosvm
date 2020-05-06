@@ -15,10 +15,10 @@ use sys_util::{warn, EventFd, GuestMemory, Result};
 
 use super::*;
 use crate::pci::{
-    MsixCap, MsixConfig, PciBarConfiguration, PciCapability, PciCapabilityID, PciClassCode,
-    PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciInterruptPin, PciSubclass,
+    MsixCap, MsixConfig, PciAddress, PciBarConfiguration, PciCapability, PciCapabilityID,
+    PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciInterruptPin,
+    PciSubclass,
 };
-
 use vm_control::VmIrqRequestSocket;
 
 use self::virtio_pci_common_config::VirtioPciCommonConfig;
@@ -122,20 +122,12 @@ impl VirtioPciNotifyCap {
 #[derive(Clone, Copy)]
 pub struct VirtioPciShmCap {
     cap: VirtioPciCap,
-    offset_hi: Le32,       // Most sig 32 bits of offset
-    length_hi: Le32,       // Most sig 32 bits of length
-    id: VirtioPciShmCapID, // To distinguish shm chunks
+    offset_hi: Le32, // Most sig 32 bits of offset
+    length_hi: Le32, // Most sig 32 bits of length
+    shmid: u8,       // To distinguish shm chunks
 }
 // It is safe to implement DataInit; all members are simple numbers and any value is valid.
 unsafe impl DataInit for VirtioPciShmCap {}
-
-#[repr(u8)]
-#[derive(Clone, Copy)]
-pub enum VirtioPciShmCapID {
-    Cache = 0,
-    Vertab = 1,
-    Journal = 2,
-}
 
 impl PciCapability for VirtioPciShmCap {
     fn bytes(&self) -> &[u8] {
@@ -148,13 +140,7 @@ impl PciCapability for VirtioPciShmCap {
 }
 
 impl VirtioPciShmCap {
-    pub fn new(
-        cfg_type: PciCapabilityType,
-        bar: u8,
-        offset: u64,
-        length: u64,
-        id: VirtioPciShmCapID,
-    ) -> Self {
+    pub fn new(cfg_type: PciCapabilityType, bar: u8, offset: u64, length: u64, shmid: u8) -> Self {
         VirtioPciShmCap {
             cap: VirtioPciCap {
                 _cap_vndr: 0,
@@ -168,7 +154,7 @@ impl VirtioPciShmCap {
             },
             offset_hi: Le32::from((offset >> 32) as u32),
             length_hi: Le32::from((length >> 32) as u32),
-            id,
+            shmid,
         }
     }
 }
@@ -211,7 +197,7 @@ const VIRTIO_PCI_DEVICE_ID_BASE: u16 = 0x1040; // Add to device type to get devi
 /// transport for virtio devices.
 pub struct VirtioPciDevice {
     config_regs: PciConfiguration,
-    pci_bus_dev: Option<(u8, u8)>,
+    pci_address: Option<PciAddress>,
 
     device: Box<dyn VirtioDevice>,
     device_activated: bool,
@@ -269,7 +255,7 @@ impl VirtioPciDevice {
 
         Ok(VirtioPciDevice {
             config_regs,
-            pci_bus_dev: None,
+            pci_address: None,
             device,
             device_activated: false,
             interrupt_status: Arc::new(AtomicUsize::new(0)),
@@ -392,8 +378,8 @@ impl PciDevice for VirtioPciDevice {
         format!("virtio-pci ({})", self.device.debug_label())
     }
 
-    fn assign_bus_dev(&mut self, bus: u8, device: u8) {
-        self.pci_bus_dev = Some((bus, device));
+    fn assign_address(&mut self, address: PciAddress) {
+        self.pci_address = Some(address);
     }
 
     fn keep_fds(&self) -> Vec<RawFd> {
@@ -425,16 +411,21 @@ impl PciDevice for VirtioPciDevice {
         &mut self,
         resources: &mut SystemAllocator,
     ) -> std::result::Result<Vec<(u64, u64)>, PciDeviceError> {
-        let (bus, dev) = self
-            .pci_bus_dev
-            .expect("assign_bus_dev must be called prior to allocate_io_bars");
+        let address = self
+            .pci_address
+            .expect("assign_address must be called prior to allocate_io_bars");
         // Allocate one bar for the structures pointed to by the capability structures.
         let mut ranges = Vec::new();
         let settings_config_addr = resources
             .mmio_allocator(MmioType::Low)
             .allocate_with_align(
                 CAPABILITY_BAR_SIZE,
-                Alloc::PciBar { bus, dev, bar: 0 },
+                Alloc::PciBar {
+                    bus: address.bus,
+                    dev: address.dev,
+                    func: address.func,
+                    bar: 0,
+                },
                 format!(
                     "virtio-{}-cap_bar",
                     type_to_str(self.device.device_type()).unwrap_or("?")
@@ -463,18 +454,19 @@ impl PciDevice for VirtioPciDevice {
         &mut self,
         resources: &mut SystemAllocator,
     ) -> std::result::Result<Vec<(u64, u64)>, PciDeviceError> {
-        let (bus, dev) = self
-            .pci_bus_dev
-            .expect("assign_bus_dev must be called prior to allocate_device_bars");
+        let address = self
+            .pci_address
+            .expect("assign_address must be called prior to allocate_device_bars");
         let mut ranges = Vec::new();
-        for config in self.device.get_device_bars(bus, dev) {
+        for config in self.device.get_device_bars(address) {
             let device_addr = resources
                 .mmio_allocator(MmioType::High)
                 .allocate_with_align(
                     config.get_size(),
                     Alloc::PciBar {
-                        bus,
-                        dev,
+                        bus: address.bus,
+                        dev: address.dev,
+                        func: address.func,
                         bar: config.get_register_index() as u8,
                     },
                     format!(

@@ -17,11 +17,13 @@ use std::num::NonZeroU8;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use data_model::*;
 
+use sync::Mutex;
 use sys_util::{debug, error, warn, EventFd, GuestAddress, GuestMemory, PollContext, PollToken};
 
 pub use gpu_display::EventDevice;
@@ -35,16 +37,18 @@ use super::{
     Writer, TYPE_GPU, VIRTIO_F_VERSION_1,
 };
 
-use super::{PciCapabilityType, VirtioPciShmCap, VirtioPciShmCapID};
+use super::{PciCapabilityType, VirtioPciShmCap};
 
 use self::protocol::*;
 use self::virtio_2d_backend::Virtio2DBackend;
 use self::virtio_3d_backend::Virtio3DBackend;
 #[cfg(feature = "gfxstream")]
 use self::virtio_gfxstream_backend::VirtioGfxStreamBackend;
-use crate::pci::{PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciCapability};
+use crate::pci::{
+    PciAddress, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciCapability,
+};
 
-use vm_control::VmMemoryControlRequestSocket;
+use vm_control::{ExternallyMappedHostMemoryRequests, VmMemoryControlRequestSocket};
 
 pub const DEFAULT_DISPLAY_WIDTH: u32 = 1280;
 pub const DEFAULT_DISPLAY_HEIGHT: u32 = 1024;
@@ -116,6 +120,7 @@ trait Backend {
         event_devices: Vec<EventDevice>,
         gpu_device_socket: VmMemoryControlRequestSocket,
         pci_bar: Alloc,
+        ext_mapped_hostmem_requests: Arc<Mutex<ExternallyMappedHostMemoryRequests>>,
     ) -> Option<Box<dyn Backend>>
     where
         Self: Sized;
@@ -281,24 +286,25 @@ trait Backend {
         GpuResponse::ErrUnspec
     }
 
-    fn resource_create_v2(
+    fn resource_create_blob(
         &mut self,
         _resource_id: u32,
         _ctx_id: u32,
-        _flags: u32,
+        _blob_mem: u32,
+        _blob_flags: u32,
+        _blob_id: u64,
         _size: u64,
-        _memory_id: u64,
         _vecs: Vec<(GuestAddress, usize)>,
         _mem: &GuestMemory,
     ) -> GpuResponse {
         GpuResponse::ErrUnspec
     }
 
-    fn resource_map(&mut self, _resource_id: u32, _pci_addr: u64) -> GpuResponse {
+    fn resource_map_blob(&mut self, _resource_id: u32, _offset: u64) -> GpuResponse {
         GpuResponse::ErrUnspec
     }
 
-    fn resource_unmap(&mut self, _resource_id: u32) -> GpuResponse {
+    fn resource_unmap_blob(&mut self, _resource_id: u32) -> GpuResponse {
         GpuResponse::ErrUnspec
     }
 }
@@ -342,6 +348,7 @@ impl BackendKind {
         event_devices: Vec<EventDevice>,
         gpu_device_socket: VmMemoryControlRequestSocket,
         pci_bar: Alloc,
+        ext_mapped_hostmem_requests: Arc<Mutex<ExternallyMappedHostMemoryRequests>>,
     ) -> Option<Box<dyn Backend>> {
         match self {
             BackendKind::Virtio2D => Virtio2DBackend::build(
@@ -352,6 +359,7 @@ impl BackendKind {
                 event_devices,
                 gpu_device_socket,
                 pci_bar,
+                ext_mapped_hostmem_requests,
             ),
             BackendKind::Virtio3D => Virtio3DBackend::build(
                 possible_displays,
@@ -361,6 +369,7 @@ impl BackendKind {
                 event_devices,
                 gpu_device_socket,
                 pci_bar,
+                ext_mapped_hostmem_requests,
             ),
             #[cfg(feature = "gfxstream")]
             BackendKind::VirtioGfxStream => VirtioGfxStreamBackend::build(
@@ -371,6 +380,7 @@ impl BackendKind {
                 event_devices,
                 gpu_device_socket,
                 pci_bar,
+                ext_mapped_hostmem_requests,
             ),
         }
     }
@@ -612,12 +622,13 @@ impl Frontend {
                     GpuResponse::OkNoData
                 }
             }
-            GpuCommand::ResourceCreateV2(info) => {
+            GpuCommand::ResourceCreateBlob(info) => {
                 let resource_id = info.resource_id.to_native();
                 let ctx_id = info.hdr.ctx_id.to_native();
-                let flags = info.flags.to_native();
+                let blob_mem = info.blob_mem.to_native();
+                let blob_flags = info.blob_flags.to_native();
+                let blob_id = info.blob_id.to_native();
                 let size = info.size.to_native();
-                let memory_id = info.memory_id.to_native();
                 let entry_count = info.nr_entries.to_native();
                 if entry_count > VIRTIO_GPU_MAX_IOVEC_ENTRIES
                     || (reader.available_bytes() == 0 && entry_count > 0)
@@ -637,24 +648,25 @@ impl Frontend {
                     }
                 }
 
-                self.backend.resource_create_v2(
+                self.backend.resource_create_blob(
                     resource_id,
                     ctx_id,
-                    flags,
+                    blob_mem,
+                    blob_flags,
+                    blob_id,
                     size,
-                    memory_id,
                     vecs,
                     mem,
                 )
             }
-            GpuCommand::ResourceMap(info) => {
+            GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id.to_native();
                 let offset = info.offset.to_native();
-                self.backend.resource_map(resource_id, offset)
+                self.backend.resource_map_blob(resource_id, offset)
             }
-            GpuCommand::ResourceUnmap(info) => {
+            GpuCommand::ResourceUnmapBlob(info) => {
                 let resource_id = info.resource_id.to_native();
-                self.backend.resource_unmap(resource_id)
+                self.backend.resource_unmap_blob(resource_id)
             }
         }
     }
@@ -998,6 +1010,7 @@ pub struct Gpu {
     display_height: u32,
     renderer_flags: RendererFlags,
     pci_bar: Option<Alloc>,
+    ext_mapped_hostmem_requests: Arc<Mutex<ExternallyMappedHostMemoryRequests>>,
     backend_kind: BackendKind,
 }
 
@@ -1010,6 +1023,7 @@ impl Gpu {
         display_backends: Vec<DisplayBackend>,
         gpu_parameters: &GpuParameters,
         event_devices: Vec<EventDevice>,
+        ext_mapped_hostmem_requests: Arc<Mutex<ExternallyMappedHostMemoryRequests>>,
     ) -> Gpu {
         let renderer_flags = RendererFlags::new()
             .use_egl(gpu_parameters.renderer_use_egl)
@@ -1038,6 +1052,7 @@ impl Gpu {
             display_height: gpu_parameters.display_height,
             renderer_flags,
             pci_bar: None,
+            ext_mapped_hostmem_requests,
             backend_kind,
         }
     }
@@ -1158,6 +1173,7 @@ impl VirtioDevice for Gpu {
         let display_height = self.display_height;
         let renderer_flags = self.renderer_flags;
         let event_devices = self.event_devices.split_off(0);
+        let ext_mapped_hostmem_requests = Arc::clone(&self.ext_mapped_hostmem_requests);
         if let (Some(gpu_device_socket), Some(pci_bar)) =
             (self.gpu_device_socket.take(), self.pci_bar.take())
         {
@@ -1173,6 +1189,7 @@ impl VirtioDevice for Gpu {
                             event_devices,
                             gpu_device_socket,
                             pci_bar,
+                            ext_mapped_hostmem_requests,
                         ) {
                             Some(backend) => backend,
                             None => return,
@@ -1206,10 +1223,11 @@ impl VirtioDevice for Gpu {
     }
 
     // Require 1 BAR for mapping 3D buffers
-    fn get_device_bars(&mut self, bus: u8, dev: u8) -> Vec<PciBarConfiguration> {
+    fn get_device_bars(&mut self, address: PciAddress) -> Vec<PciBarConfiguration> {
         self.pci_bar = Some(Alloc::PciBar {
-            bus,
-            dev,
+            bus: address.bus,
+            dev: address.dev,
+            func: address.func,
             bar: GPU_BAR_NUM,
         });
         vec![PciBarConfiguration::new(
@@ -1226,7 +1244,7 @@ impl VirtioDevice for Gpu {
             GPU_BAR_NUM,
             GPU_BAR_OFFSET,
             GPU_BAR_SIZE,
-            VirtioPciShmCapID::Cache,
+            VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
         ))]
     }
 }
