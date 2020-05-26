@@ -33,7 +33,7 @@ rust_binary_host {
     required: [
         "x86_64_linux_gnu_libepoxy.so.0_for_crosvm",
         "x86_64_linux_gnu_libgbm.so.1_for_crosvm",
-        "x86_64_linux_gnu_libvirglrenderer.so.0_for_crosvm",
+        "x86_64_linux_gnu_libvirglrenderer.so.1_for_crosvm",
     ],
 
     features: [
