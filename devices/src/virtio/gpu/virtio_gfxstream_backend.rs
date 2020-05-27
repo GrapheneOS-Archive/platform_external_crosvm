@@ -155,6 +155,11 @@ extern "C" {
         iovec: *mut iovec,
         iovec_cnt: c_uint,
     ) -> c_int;
+    fn pipe_virgl_renderer_submit_cmd(
+        commands: *mut c_void,
+        ctx_id: i32,
+        dword_count: i32,
+    ) -> c_int;
     fn pipe_virgl_renderer_resource_attach_iov(
         res_handle: c_int,
         iov: *mut iovec,
@@ -812,9 +817,27 @@ impl Backend for VirtioGfxStreamBackend {
         GpuResponse::OkNoData
     }
 
-    // Not considered for gfxstream
-    fn submit_command(&mut self, _ctx_id: u32, _commands: &mut [u8]) -> GpuResponse {
-        GpuResponse::ErrUnspec
+    fn submit_command(&mut self, ctx_id: u32, commands: &mut [u8]) -> GpuResponse {
+        if commands.len() % std::mem::size_of::<u32>() != 0 {
+            error!(
+                "context {} got command with size {} which is not u32 multiple",
+                ctx_id,
+                commands.len()
+            );
+            return GpuResponse::ErrUnspec;
+        }
+
+        let dword_count = commands.len() / std::mem::size_of::<u32>();
+
+        unsafe {
+            pipe_virgl_renderer_submit_cmd(
+                commands.as_mut_ptr() as *mut c_void,
+                ctx_id as i32,
+                dword_count as i32,
+            );
+        }
+
+        GpuResponse::OkNoData
     }
 
     // Not considered for gfxstream
