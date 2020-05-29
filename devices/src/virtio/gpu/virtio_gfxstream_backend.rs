@@ -299,6 +299,7 @@ impl VirtioGfxStreamBackend {
         display: GpuDisplay,
         display_width: u32,
         display_height: u32,
+        renderer_flags: RendererFlags,
         gpu_device_socket: VmMemoryControlRequestSocket,
         pci_bar: Alloc,
         ext_mapped_hostmem_requests: Arc<Mutex<ExternallyMappedHostMemoryRequests>>,
@@ -307,8 +308,6 @@ impl VirtioGfxStreamBackend {
         let cookie: *mut VirglCookie = Box::into_raw(Box::new(VirglCookie {
             fence_state: Rc::clone(&fence_state),
         }));
-
-        let renderer_flags: RendererFlags = RendererFlags::new().use_surfaceless(true);
 
         let display_rc_refcell = Rc::new(RefCell::new(display));
 
@@ -385,7 +384,7 @@ impl Backend for VirtioGfxStreamBackend {
         possible_displays: &[DisplayBackend],
         display_width: u32,
         display_height: u32,
-        _renderer_flags: RendererFlags,
+        renderer_flags: RendererFlags,
         _event_devices: Vec<EventDevice>,
         gpu_device_socket: VmMemoryControlRequestSocket,
         pci_bar: Alloc,
@@ -414,6 +413,7 @@ impl Backend for VirtioGfxStreamBackend {
             display,
             display_width,
             display_height,
+            renderer_flags,
             gpu_device_socket,
             pci_bar,
             ext_mapped_hostmem_requests,
