@@ -5,7 +5,6 @@ rust_test_host {
     defaults: ["crosvm_defaults"],
     crate_name: "kvm_sys",
     srcs: ["src/lib.rs"],
-    relative_install_path: "kvm_sys_tests",
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rlibs: [
@@ -19,7 +18,6 @@ rust_test_host {
     defaults: ["crosvm_defaults"],
     crate_name: "sanity",
     srcs: ["tests/sanity.rs"],
-    relative_install_path: "kvm_sys_tests",
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rlibs: [
