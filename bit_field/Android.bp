@@ -4,7 +4,6 @@ rust_defaults {
     name: "bit_field_tests_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "bit_field",
-    relative_install_path: "bit_field_tests",
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rlibs: [
@@ -36,7 +35,6 @@ rust_test_host {
     defaults: ["crosvm_defaults"],
     crate_name: "bit_field",
     srcs: ["src/lib.rs"],
-    relative_install_path: "bit_field_tests",
     test_suites: ["general-tests"],
     auto_gen_config: true,
     proc_macros: [
