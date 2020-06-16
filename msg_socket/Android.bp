@@ -21,7 +21,6 @@ rust_defaults {
     name: "msg_socket_tests",
     defaults: ["crosvm_defaults"],
     crate_name: "msg_socket",
-    relative_install_path: "msg_socket_tests",
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rlibs: [
@@ -74,7 +73,6 @@ rust_test_host {
     defaults: ["crosvm_defaults"],
     crate_name: "msg_socket",
     srcs: ["src/lib.rs"],
-    relative_install_path: "msg_socket_tests",
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rlibs: [
