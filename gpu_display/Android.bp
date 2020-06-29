@@ -35,7 +35,7 @@ cc_library_host_static {
 
 wayland_protocol_codegen {
     name: "gpu_display_protocol_sources",
-    cmd: "$(location wayland_scanner) code < $(in) > $(out)",
+    cmd: "$(location wayland_scanner) private-code < $(in) > $(out)",
     suffix: ".c",
     srcs: [
         "protocol/aura-shell.xml",
