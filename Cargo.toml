@@ -88,7 +88,7 @@ assertions = { path = "assertions" }
 audio_streams = { path = "../../external/adhd/audio_streams" } # ignored by ebuild
 data_model = { path = "data_model" }
 libcras = { path = "../../external/adhd/cras/client/libcras" } # ignored by ebuild
-minijail-sys = { path = "../../external/minijail" } # ignored by ebuild
+minijail-sys = { path = "../../external/minijail/rust/minijail-sys" } # ignored by ebuild
 poll_token_derive = { path = "sys_util/poll_token_derive" }
 sync = { path = "sync" }
 sys_util = { path = "sys_util" }
