@@ -5,6 +5,13 @@ use acpi_tables::{rsdp::RSDP, sdt::SDT};
 use data_model::DataInit;
 use sys_util::{GuestAddress, GuestMemory};
 
+pub struct ACPIDevResource {
+    pub amls: Vec<u8>,
+    pub pm_iobase: u64,
+    /// Additional system descriptor tables.
+    pub sdts: Vec<SDT>,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct LocalAPIC {
@@ -65,21 +72,7 @@ const MADT_ENABLED: u32 = 1;
 // XSDT
 const XSDT_REVISION: u8 = 1;
 
-fn create_dsdt_table() -> SDT {
-    // The hex tables in this file are generated from the ASL below with:
-    // "iasl -tc <dsdt.asl>"
-    // Below is the tables represents by the pm_dsdt_data
-    // Name (_S1, Package (0x04)  // _S1_: S1 System State
-    // {
-    //     One,
-    //     One,
-    //     Zero,
-    //     Zero
-    // })
-    let pm_dsdt_data = [
-        0x08u8, 0x5F, 0x53, 0x31, 0x5f, 0x12, 0x06, 0x04, 0x01, 0x01, 0x00, 0x00,
-    ];
-
+fn create_dsdt_table(amls: Vec<u8>) -> SDT {
     let mut dsdt = SDT::new(
         *b"DSDT",
         acpi_tables::HEADER_LEN,
@@ -88,7 +81,10 @@ fn create_dsdt_table() -> SDT {
         *b"CROSVMDT",
         OEM_REVISION,
     );
-    dsdt.append(pm_dsdt_data);
+
+    if amls.len() != 0 {
+        dsdt.append_slice(amls.as_slice());
+    }
 
     dsdt
 }
@@ -102,17 +98,41 @@ fn create_dsdt_table() -> SDT {
 /// * `sci_irq` - Used to fill the FACP SCI_INTERRUPT field, which
 ///               is going to be used by the ACPI drivers to register
 ///               sci handler.
-pub fn create_acpi_tables(guest_mem: &GuestMemory, num_cpus: u8, sci_irq: u32) -> GuestAddress {
+/// * `acpi_dev_resource` - resouces needed by the ACPI devices for creating tables
+pub fn create_acpi_tables(
+    guest_mem: &GuestMemory,
+    num_cpus: u8,
+    sci_irq: u32,
+    acpi_dev_resource: ACPIDevResource,
+) -> Option<GuestAddress> {
     // RSDP is at the HI RSDP WINDOW
     let rsdp_offset = GuestAddress(super::ACPI_HI_RSDP_WINDOW_BASE);
+    let mut offset = rsdp_offset.checked_add(RSDP::len() as u64)?;
     let mut tables: Vec<u64> = Vec::new();
+    let mut dsdt_offset: Option<GuestAddress> = None;
+
+    // User supplied System Description Tables, e.g. SSDT.
+    for sdt in acpi_dev_resource.sdts.iter() {
+        guest_mem.write_at_addr(sdt.as_slice(), offset).ok()?;
+        if sdt.is_signature(b"DSDT") {
+            dsdt_offset = Some(offset);
+        } else {
+            tables.push(offset.0);
+        }
+        offset = offset.checked_add(sdt.len() as u64)?;
+    }
 
     // DSDT
-    let dsdt = create_dsdt_table();
-    let dsdt_offset = rsdp_offset.checked_add(RSDP::len() as u64).unwrap();
-    guest_mem
-        .write_at_addr(dsdt.as_slice(), dsdt_offset)
-        .expect("Error writing DSDT table");
+    let dsdt_offset = match dsdt_offset {
+        Some(dsdt_offset) => dsdt_offset,
+        None => {
+            let dsdt_offset = offset;
+            let dsdt = create_dsdt_table(acpi_dev_resource.amls);
+            guest_mem.write_at_addr(dsdt.as_slice(), offset).ok()?;
+            offset = offset.checked_add(dsdt.len() as u64)?;
+            dsdt_offset
+        }
+    };
 
     // FACP aka FADT
     // Revision 6 of the ACPI FADT table is 276 bytes long
@@ -134,14 +154,13 @@ pub fn create_acpi_tables(guest_mem: &GuestMemory, num_cpus: u8, sci_irq: u32) -
     // PM1A Event Block Address
     facp.write(
         FADT_FIELD_PM1A_EVENT_BLK_ADDR,
-        devices::acpi::ACPIPM_RESOURCE_BASE as u32,
+        acpi_dev_resource.pm_iobase as u32,
     );
 
     // PM1A Control Block Address
     facp.write(
         FADT_FIELD_PM1A_CONTROL_BLK_ADDR,
-        devices::acpi::ACPIPM_RESOURCE_BASE as u32
-            + devices::acpi::ACPIPM_RESOURCE_EVENTBLK_LEN as u32,
+        acpi_dev_resource.pm_iobase as u32 + devices::acpi::ACPIPM_RESOURCE_EVENTBLK_LEN as u32,
     );
 
     // PM1 Event Block Length
@@ -161,11 +180,9 @@ pub fn create_acpi_tables(guest_mem: &GuestMemory, num_cpus: u8, sci_irq: u32) -
 
     facp.write(FADT_FIELD_HYPERVISOR_ID, *b"CROSVM"); // Hypervisor Vendor Identity
 
-    let facp_offset = dsdt_offset.checked_add(dsdt.len() as u64).unwrap();
-    guest_mem
-        .write_at_addr(facp.as_slice(), facp_offset)
-        .expect("Error writing FACP table");
-    tables.push(facp_offset.0);
+    guest_mem.write_at_addr(facp.as_slice(), offset).ok()?;
+    tables.push(offset.0);
+    offset = offset.checked_add(facp.len() as u64)?;
 
     // MADT
     let mut madt = SDT::new(
@@ -199,11 +216,9 @@ pub fn create_acpi_tables(guest_mem: &GuestMemory, num_cpus: u8, sci_irq: u32) -
         ..Default::default()
     });
 
-    let madt_offset = facp_offset.checked_add(facp.len() as u64).unwrap();
-    guest_mem
-        .write_at_addr(madt.as_slice(), madt_offset)
-        .expect("Error writing MADT table");
-    tables.push(madt_offset.0);
+    guest_mem.write_at_addr(madt.as_slice(), offset).ok()?;
+    tables.push(offset.0);
+    offset = offset.checked_add(madt.len() as u64)?;
 
     // XSDT
     let mut xsdt = SDT::new(
@@ -218,16 +233,11 @@ pub fn create_acpi_tables(guest_mem: &GuestMemory, num_cpus: u8, sci_irq: u32) -
         xsdt.append(table);
     }
 
-    let xsdt_offset = madt_offset.checked_add(madt.len() as u64).unwrap();
-    guest_mem
-        .write_at_addr(xsdt.as_slice(), xsdt_offset)
-        .expect("Error writing XSDT table");
+    guest_mem.write_at_addr(xsdt.as_slice(), offset).ok()?;
 
     // RSDP
-    let rsdp = RSDP::new(*b"CROSVM", xsdt_offset.0);
-    guest_mem
-        .write_at_addr(rsdp.as_slice(), rsdp_offset)
-        .expect("Error writing RSDP");
+    let rsdp = RSDP::new(*b"CROSVM", offset.0);
+    guest_mem.write_at_addr(rsdp.as_slice(), rsdp_offset).ok()?;
 
-    rsdp_offset
+    Some(rsdp_offset)
 }

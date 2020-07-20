@@ -11,7 +11,7 @@ use arch::fdt::{
     property_null, property_string, property_u32, property_u64, start_fdt, Error, Result,
 };
 use arch::SERIAL_ADDR;
-use devices::PciInterruptPin;
+use devices::{PciAddress, PciInterruptPin};
 use sys_util::{GuestAddress, GuestMemory};
 
 // This is the start of DRAM in the physical address space.
@@ -37,11 +37,12 @@ use crate::AARCH64_SERIAL_SIZE;
 use crate::AARCH64_SERIAL_SPEED;
 
 // These are related to guest virtio devices.
-use crate::AARCH64_IRQ_BASE;
 use crate::AARCH64_MMIO_BASE;
 use crate::AARCH64_MMIO_SIZE;
 use crate::AARCH64_PCI_CFG_BASE;
 use crate::AARCH64_PCI_CFG_SIZE;
+
+use crate::AARCH64_PMU_IRQ;
 
 // This is an arbitrary number to specify the node for the GIC.
 // If we had a more complex interrupt architecture, then we'd need an enum for
@@ -138,6 +139,23 @@ fn create_timer_node(fdt: &mut Vec<u8>, num_cpus: u32) -> Result<()> {
     Ok(())
 }
 
+fn create_pmu_node(fdt: &mut Vec<u8>, num_cpus: u32) -> Result<()> {
+    let compatible = "arm,armv8-pmuv3";
+    let cpu_mask: u32 =
+        (((1 << num_cpus) - 1) << GIC_FDT_IRQ_PPI_CPU_SHIFT) & GIC_FDT_IRQ_PPI_CPU_MASK;
+    let irq = generate_prop32(&[
+        GIC_FDT_IRQ_TYPE_PPI,
+        AARCH64_PMU_IRQ,
+        cpu_mask | IRQ_TYPE_LEVEL_HIGH,
+    ]);
+
+    begin_node(fdt, "pmu")?;
+    property_string(fdt, "compatible", compatible)?;
+    property(fdt, "interrupts", &irq)?;
+    end_node(fdt)?;
+    Ok(())
+}
+
 fn create_serial_node(fdt: &mut Vec<u8>, addr: u64, irq: u32) -> Result<()> {
     let serial_reg_prop = generate_prop64(&[addr, AARCH64_SERIAL_SIZE]);
     let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, irq, IRQ_TYPE_EDGE_RISING]);
@@ -217,7 +235,7 @@ fn create_chosen_node(
 
 fn create_pci_nodes(
     fdt: &mut Vec<u8>,
-    pci_irqs: Vec<(u32, PciInterruptPin)>,
+    pci_irqs: Vec<(PciAddress, u32, PciInterruptPin)>,
     pci_device_base: u64,
     pci_device_size: u64,
 ) -> Result<()> {
@@ -248,14 +266,14 @@ fn create_pci_nodes(
     let mut interrupts: Vec<u32> = Vec::new();
     let mut masks: Vec<u32> = Vec::new();
 
-    for (i, pci_irq) in pci_irqs.iter().enumerate() {
+    for (address, irq_num, irq_pin) in pci_irqs.iter() {
         // PCI_DEVICE(3)
-        interrupts.push((pci_irq.0 + 1) << 11);
+        interrupts.push(address.to_config_address(0));
         interrupts.push(0);
         interrupts.push(0);
 
         // INT#(1)
-        interrupts.push(pci_irq.1.to_mask() + 1);
+        interrupts.push(irq_pin.to_mask() + 1);
 
         // CONTROLLER(PHANDLE)
         interrupts.push(PHANDLE_GIC);
@@ -264,7 +282,7 @@ fn create_pci_nodes(
 
         // CONTROLLER_DATA(3)
         interrupts.push(GIC_FDT_IRQ_TYPE_SPI);
-        interrupts.push(AARCH64_IRQ_BASE + i as u32);
+        interrupts.push(*irq_num);
         interrupts.push(IRQ_TYPE_LEVEL_HIGH);
 
         // PCI_DEVICE(3)
@@ -331,7 +349,7 @@ fn create_rtc_node(fdt: &mut Vec<u8>) -> Result<()> {
 ///
 /// * `fdt_max_size` - The amount of space reserved for the device tree
 /// * `guest_mem` - The guest memory object
-/// * `pci_irqs` - List of PCI device number to PCI interrupt pin mappings
+/// * `pci_irqs` - List of PCI device address to PCI interrupt number and pin mappings
 /// * `num_cpus` - Number of virtual CPUs the guest will have
 /// * `fdt_load_offset` - The offset into physical memory for the device tree
 /// * `pci_device_base` - The offset into physical memory for PCI device memory
@@ -343,7 +361,7 @@ fn create_rtc_node(fdt: &mut Vec<u8>) -> Result<()> {
 pub fn create_fdt(
     fdt_max_size: usize,
     guest_mem: &GuestMemory,
-    pci_irqs: Vec<(u32, PciInterruptPin)>,
+    pci_irqs: Vec<(PciAddress, u32, PciInterruptPin)>,
     num_cpus: u32,
     fdt_load_offset: u64,
     pci_device_base: u64,
@@ -352,6 +370,7 @@ pub fn create_fdt(
     initrd: Option<(GuestAddress, usize)>,
     android_fstab: Option<File>,
     is_gicv3: bool,
+    use_pmu: bool,
 ) -> Result<()> {
     let mut fdt = vec![0; fdt_max_size];
     start_fdt(&mut fdt, fdt_max_size)?;
@@ -370,6 +389,9 @@ pub fn create_fdt(
     create_cpu_nodes(&mut fdt, num_cpus)?;
     create_gic_node(&mut fdt, is_gicv3, num_cpus as u64)?;
     create_timer_node(&mut fdt, num_cpus)?;
+    if use_pmu {
+        create_pmu_node(&mut fdt, num_cpus)?;
+    }
     create_serial_nodes(&mut fdt)?;
     create_psci_node(&mut fdt)?;
     create_pci_nodes(&mut fdt, pci_irqs, pci_device_base, pci_device_size)?;
