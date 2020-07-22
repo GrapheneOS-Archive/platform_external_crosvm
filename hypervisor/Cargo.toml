@@ -1,0 +1,16 @@
+[package]
+name = "hypervisor"
+version = "0.1.0"
+authors = ["The Chromium OS Authors"]
+edition = "2018"
+
+[dependencies]
+bit_field = { path = "../bit_field" }
+data_model = { path = "../data_model" }
+enumn = { path = "../enumn" }
+kvm = { path = "../kvm" }
+kvm_sys = { path = "../kvm_sys" }
+libc = "*"
+msg_socket = { path = "../msg_socket" }
+sync = { path = "../sync" }
+sys_util = { path = "../sys_util" }

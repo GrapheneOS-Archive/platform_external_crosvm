@@ -10,6 +10,7 @@ rust_library_host_rlib {
         "libdata_model",
         "libfutures",
         "liblibc",
+        "libsync_rust",
         "libsys_util",
     ],
     proc_macros: [
@@ -80,6 +81,7 @@ rust_test_host {
         "libdata_model",
         "libfutures",
         "liblibc",
+        "libsync_rust",
         "libsys_util",
     ],
     proc_macros: [

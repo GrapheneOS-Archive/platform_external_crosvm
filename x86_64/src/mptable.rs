@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::convert::TryFrom;
 use std::fmt::{self, Display};
 use std::mem;
 use std::result;
@@ -9,8 +10,7 @@ use std::slice;
 
 use libc::c_char;
 
-use data_model::VolatileMemory;
-use devices::PciInterruptPin;
+use devices::{PciAddress, PciInterruptPin};
 use sys_util::{GuestAddress, GuestMemory};
 
 use crate::mpspec::*;
@@ -117,14 +117,16 @@ fn compute_mp_size(num_cpus: u8) -> usize {
 pub fn setup_mptable(
     mem: &GuestMemory,
     num_cpus: u8,
-    pci_irqs: Vec<(u32, PciInterruptPin)>,
+    pci_irqs: Vec<(PciAddress, u32, PciInterruptPin)>,
 ) -> Result<()> {
-    const PCI_BUS_ID: u8 = 0;
-    const ISA_BUS_ID: u8 = 1;
-
     // Used to keep track of the next base pointer into the MP table.
     let mut base_mp = GuestAddress(MPTABLE_START);
 
+    // Calculate ISA bus number in the system, report at least one PCI bus.
+    let isa_bus_id = match pci_irqs.iter().max_by_key(|v| v.0.bus) {
+        Some(pci_irq) => pci_irq.0.bus + 1,
+        _ => 1,
+    };
     let mp_size = compute_mp_size(num_cpus);
 
     // The checked_add here ensures the all of the following base_mp.unchecked_add's will be without
@@ -137,7 +139,7 @@ pub fn setup_mptable(
         return Err(Error::AddressOverflow);
     }
 
-    mem.get_slice(base_mp.0, mp_size as u64)
+    mem.get_slice_at_addr(base_mp, mp_size)
         .map_err(|_| Error::Clear)?
         .write_bytes(0);
 
@@ -194,11 +196,11 @@ pub fn setup_mptable(
         base_mp = base_mp.unchecked_add(size as u64);
         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic));
     }
-    {
+    for pci_bus_id in 0..isa_bus_id {
         let size = mem::size_of::<mpc_bus>();
         let mut mpc_bus = mpc_bus::default();
         mpc_bus.type_ = MP_BUS as u8;
-        mpc_bus.busid = PCI_BUS_ID;
+        mpc_bus.busid = pci_bus_id;
         mpc_bus.bustype = BUS_TYPE_PCI;
         mem.write_obj_at_addr(mpc_bus, base_mp)
             .map_err(|_| Error::WriteMpcBus)?;
@@ -209,7 +211,7 @@ pub fn setup_mptable(
         let size = mem::size_of::<mpc_bus>();
         let mut mpc_bus = mpc_bus::default();
         mpc_bus.type_ = MP_BUS as u8;
-        mpc_bus.busid = ISA_BUS_ID;
+        mpc_bus.busid = isa_bus_id;
         mpc_bus.bustype = BUS_TYPE_ISA;
         mem.write_obj_at_addr(mpc_bus, base_mp)
             .map_err(|_| Error::WriteMpcBus)?;
@@ -222,7 +224,7 @@ pub fn setup_mptable(
         mpc_intsrc.type_ = MP_INTSRC as u8;
         mpc_intsrc.irqtype = mp_irq_source_types_mp_INT as u8;
         mpc_intsrc.irqflag = MP_IRQDIR_DEFAULT as u16;
-        mpc_intsrc.srcbus = ISA_BUS_ID;
+        mpc_intsrc.srcbus = isa_bus_id;
         mpc_intsrc.srcbusirq = 0;
         mpc_intsrc.dstapic = 0;
         mpc_intsrc.dstirq = 0;
@@ -239,7 +241,7 @@ pub fn setup_mptable(
         mpc_intsrc.type_ = MP_INTSRC as u8;
         mpc_intsrc.irqtype = mp_irq_source_types_mp_INT as u8;
         mpc_intsrc.irqflag = MP_IRQDIR_DEFAULT as u16;
-        mpc_intsrc.srcbus = ISA_BUS_ID;
+        mpc_intsrc.srcbus = isa_bus_id;
         mpc_intsrc.srcbusirq = i;
         mpc_intsrc.dstapic = ioapicid;
         mpc_intsrc.dstirq = i;
@@ -257,7 +259,7 @@ pub fn setup_mptable(
         mpc_intsrc.type_ = MP_INTSRC as u8;
         mpc_intsrc.irqtype = mp_irq_source_types_mp_INT as u8;
         mpc_intsrc.irqflag = (MP_IRQDIR_HIGH | MP_LEVEL_TRIGGER) as u16;
-        mpc_intsrc.srcbus = ISA_BUS_ID;
+        mpc_intsrc.srcbus = isa_bus_id;
         mpc_intsrc.srcbusirq = sci_irq;
         mpc_intsrc.dstapic = ioapicid;
         mpc_intsrc.dstirq = sci_irq;
@@ -268,16 +270,16 @@ pub fn setup_mptable(
     }
     let pci_irq_base = super::X86_64_IRQ_BASE as u8;
     // Insert PCI interrupts after platform IRQs.
-    for (i, pci_irq) in pci_irqs.iter().enumerate() {
+    for (address, irq_num, irq_pin) in pci_irqs.iter() {
         let size = mem::size_of::<mpc_intsrc>();
         let mut mpc_intsrc = mpc_intsrc::default();
         mpc_intsrc.type_ = MP_INTSRC as u8;
         mpc_intsrc.irqtype = mp_irq_source_types_mp_INT as u8;
         mpc_intsrc.irqflag = MP_IRQDIR_DEFAULT as u16;
-        mpc_intsrc.srcbus = PCI_BUS_ID;
-        mpc_intsrc.srcbusirq = (pci_irq.0 as u8 + 1) << 2 | pci_irq.1.to_mask() as u8;
+        mpc_intsrc.srcbus = address.bus;
+        mpc_intsrc.srcbusirq = address.dev << 2 | irq_pin.to_mask() as u8;
         mpc_intsrc.dstapic = ioapicid;
-        mpc_intsrc.dstirq = pci_irq_base + i as u8;
+        mpc_intsrc.dstirq = u8::try_from(*irq_num).map_err(|_| Error::WriteMpcIntsrc)?;
         mem.write_obj_at_addr(mpc_intsrc, base_mp)
             .map_err(|_| Error::WriteMpcIntsrc)?;
         base_mp = base_mp.unchecked_add(size as u64);
@@ -290,7 +292,7 @@ pub fn setup_mptable(
         mpc_intsrc.type_ = MP_INTSRC as u8;
         mpc_intsrc.irqtype = mp_irq_source_types_mp_INT as u8;
         mpc_intsrc.irqflag = MP_IRQDIR_DEFAULT as u16;
-        mpc_intsrc.srcbus = ISA_BUS_ID;
+        mpc_intsrc.srcbus = isa_bus_id;
         mpc_intsrc.srcbusirq = i as u8;
         mpc_intsrc.dstapic = ioapicid;
         mpc_intsrc.dstirq = i as u8;
@@ -305,7 +307,7 @@ pub fn setup_mptable(
         mpc_lintsrc.type_ = MP_LINTSRC as u8;
         mpc_lintsrc.irqtype = mp_irq_source_types_mp_ExtINT as u8;
         mpc_lintsrc.irqflag = MP_IRQDIR_DEFAULT as u16;
-        mpc_lintsrc.srcbusid = ISA_BUS_ID;
+        mpc_lintsrc.srcbusid = isa_bus_id;
         mpc_lintsrc.srcbusirq = 0;
         mpc_lintsrc.destapic = 0;
         mpc_lintsrc.destapiclint = 0;
@@ -320,7 +322,7 @@ pub fn setup_mptable(
         mpc_lintsrc.type_ = MP_LINTSRC as u8;
         mpc_lintsrc.irqtype = mp_irq_source_types_mp_NMI as u8;
         mpc_lintsrc.irqflag = MP_IRQDIR_DEFAULT as u16;
-        mpc_lintsrc.srcbusid = ISA_BUS_ID;
+        mpc_lintsrc.srcbusid = isa_bus_id;
         mpc_lintsrc.srcbusirq = 0;
         mpc_lintsrc.destapic = 0xFF; // Per SeaBIOS
         mpc_lintsrc.destapiclint = 1;
