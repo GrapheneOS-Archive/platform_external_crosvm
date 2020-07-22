@@ -8,6 +8,7 @@ rust_library_host_rlib {
     srcs: ["src/lib.rs"],
     rlibs: [
         "libfutures",
+        "libio_uring",
         "liblibc",
         "libpaste",
         "libpin_utils",

@@ -54,17 +54,19 @@ use std::mem;
 use std::sync::Arc;
 
 use crate::bootparam::boot_params;
+use acpi_tables::aml::Aml;
+use acpi_tables::sdt::SDT;
 use arch::{
     get_serial_cmdline, GetSerialCmdlineError, RunnableLinuxVm, SerialHardware, SerialParameters,
     VmComponents, VmImage,
 };
 use devices::split_irqchip_common::GsiRelay;
 use devices::{
-    Ioapic, PciConfigIo, PciDevice, PciInterruptPin, Pic, IOAPIC_BASE_ADDRESS,
+    Ioapic, PciAddress, PciConfigIo, PciDevice, PciInterruptPin, Pic, IOAPIC_BASE_ADDRESS,
     IOAPIC_MEM_LENGTH_BYTES,
 };
-use io_jail::Minijail;
 use kvm::*;
+use minijail::Minijail;
 use remain::sorted;
 use resources::SystemAllocator;
 use sync::Mutex;
@@ -74,6 +76,7 @@ use vm_control::VmIrqRequestSocket;
 #[sorted]
 #[derive(Debug)]
 pub enum Error {
+    AllocateIOResouce(resources::Error),
     AllocateIrq,
     CloneEventFd(sys_util::Error),
     Cmdline(kernel_cmdline::Error),
@@ -124,6 +127,7 @@ impl Display for Error {
 
         #[sorted]
         match self {
+            AllocateIOResouce(e) => write!(f, "error allocating IO resource: {}", e),
             AllocateIrq => write!(f, "error allocating a single irq"),
             CloneEventFd(e) => write!(f, "unable to clone an EventFd: {}", e),
             Cmdline(e) => write!(f, "the given kernel command line was invalid: {}", e),
@@ -212,10 +216,11 @@ fn configure_system(
     cmdline_addr: GuestAddress,
     cmdline_size: usize,
     num_cpus: u8,
-    pci_irqs: Vec<(u32, PciInterruptPin)>,
+    pci_irqs: Vec<(PciAddress, u32, PciInterruptPin)>,
     setup_data: Option<GuestAddress>,
     initrd: Option<(GuestAddress, usize)>,
     mut params: boot_params,
+    acpi_dev_resource: acpi::ACPIDevResource,
 ) -> Result<()> {
     const EBDA_START: u64 = 0x0009fc00;
     const KERNEL_BOOT_FLAG_MAGIC: u16 = 0xaa55;
@@ -279,8 +284,11 @@ fn configure_system(
         .write_obj_at_addr(params, zero_page_addr)
         .map_err(|_| Error::ZeroPageSetup)?;
 
-    let rsdp_addr = acpi::create_acpi_tables(guest_mem, num_cpus, X86_64_SCI_IRQ);
-    params.acpi_rsdp_addr = rsdp_addr.0;
+    if let Some(rsdp_addr) =
+        acpi::create_acpi_tables(guest_mem, num_cpus, X86_64_SCI_IRQ, acpi_dev_resource)
+    {
+        params.acpi_rsdp_addr = rsdp_addr.0;
+    }
 
     Ok(())
 }
@@ -363,16 +371,15 @@ impl arch::LinuxArch for X8664arch {
         let mut vcpus = Vec::with_capacity(vcpu_count as usize);
         for cpu_id in 0..vcpu_count {
             let vcpu = Vcpu::new(cpu_id as libc::c_ulong, &kvm, &vm).map_err(Error::CreateVcpu)?;
-            if let VmImage::Kernel(_) = components.vm_image {
-                Self::configure_vcpu(
-                    vm.get_memory(),
-                    &kvm,
-                    &vm,
-                    &vcpu,
-                    cpu_id as u64,
-                    vcpu_count as u64,
-                )?;
-            }
+            Self::configure_vcpu(
+                vm.get_memory(),
+                &kvm,
+                &vm,
+                &vcpu,
+                cpu_id as u64,
+                vcpu_count as u64,
+                &components.vm_image,
+            )?;
             vcpus.push(vcpu);
         }
 
@@ -423,7 +430,6 @@ impl arch::LinuxArch for X8664arch {
             exit_evt.try_clone().map_err(Error::CloneEventFd)?,
             Some(pci_bus.clone()),
             components.memory_size,
-            suspend_evt.try_clone().map_err(Error::CloneEventFd)?,
         )?;
 
         Self::setup_serial_devices(
@@ -432,6 +438,13 @@ impl arch::LinuxArch for X8664arch {
             &mut gsi_relay,
             serial_parameters,
             serial_jail,
+        )?;
+
+        let acpi_dev_resource = Self::setup_acpi_devices(
+            &mut io_bus,
+            &mut resources,
+            suspend_evt.try_clone().map_err(Error::CloneEventFd)?,
+            components.acpi_sdts,
         )?;
 
         let ramoops_region = match components.pstore {
@@ -506,6 +519,7 @@ impl arch::LinuxArch for X8664arch {
                     components.android_fstab,
                     kernel_end,
                     params,
+                    acpi_dev_resource,
                 )?;
             }
         }
@@ -588,10 +602,11 @@ impl X8664arch {
         vcpu_count: u32,
         cmdline: &CStr,
         initrd_file: Option<File>,
-        pci_irqs: Vec<(u32, PciInterruptPin)>,
+        pci_irqs: Vec<(PciAddress, u32, PciInterruptPin)>,
         android_fstab: Option<File>,
         kernel_end: u64,
         params: boot_params,
+        acpi_dev_resource: acpi::ACPIDevResource,
     ) -> Result<()> {
         kernel_loader::load_cmdline(mem, GuestAddress(CMDLINE_OFFSET), cmdline)
             .map_err(Error::LoadCmdline)?;
@@ -653,6 +668,7 @@ impl X8664arch {
             setup_data,
             initrd,
             params,
+            acpi_dev_resource,
         )?;
         Ok(())
     }
@@ -754,14 +770,12 @@ impl X8664arch {
     /// * - `gsi_relay`: only valid for split IRQ chip (i.e. userspace PIT/PIC/IOAPIC)
     /// * - `exit_evt` - the event fd object which should receive exit events
     /// * - `mem_size` - the size in bytes of physical ram for the guest
-    /// * - `suspend_evt` - the event fd object which used to suspend the vm
     fn setup_io_bus(
         _vm: &mut Vm,
         gsi_relay: &mut Option<GsiRelay>,
         exit_evt: EventFd,
         pci: Option<Arc<Mutex<devices::PciConfigIo>>>,
         mem_size: u64,
-        suspend_evt: EventFd,
     ) -> Result<devices::Bus> {
         struct NoDevice;
         impl devices::BusDevice for NoDevice {
@@ -826,18 +840,58 @@ impl X8664arch {
                 .unwrap();
         }
 
-        let pm = Arc::new(Mutex::new(devices::ACPIPMResource::new(suspend_evt)));
+        Ok(io_bus)
+    }
+
+    /// Sets up the acpi devices for this platform and
+    /// return the resources which is used to set the ACPI tables.
+    ///
+    /// # Arguments
+    ///
+    /// * - `io_bus` the I/O bus to add the devices to
+    /// * - `resources` the SystemAllocator to allocate IO and MMIO for acpi
+    ///                devices.
+    /// * - `suspend_evt` - the event fd object which used to suspend the vm
+    fn setup_acpi_devices(
+        io_bus: &mut devices::Bus,
+        resources: &mut SystemAllocator,
+        suspend_evt: EventFd,
+        sdts: Vec<SDT>,
+    ) -> Result<acpi::ACPIDevResource> {
+        // The AML data for the acpi devices
+        let mut amls = Vec::new();
+
+        let pm_alloc = resources.get_anon_alloc();
+        let pm_iobase = match resources.io_allocator() {
+            Some(io) => io
+                .allocate_with_align(
+                    devices::acpi::ACPIPM_RESOURCE_LEN as u64,
+                    pm_alloc,
+                    "ACPIPM".to_string(),
+                    devices::acpi::ACPIPM_RESOURCE_LEN as u64,
+                )
+                .map_err(Error::AllocateIOResouce)?,
+            None => 0x600,
+        };
+
+        let pmresource = devices::ACPIPMResource::new(suspend_evt);
+        Aml::to_aml_bytes(&pmresource, &mut amls);
+        let pm = Arc::new(Mutex::new(pmresource));
         io_bus
             .insert(
                 pm.clone(),
-                devices::acpi::ACPIPM_RESOURCE_BASE,
+                pm_iobase as u64,
                 devices::acpi::ACPIPM_RESOURCE_LEN as u64,
                 false,
             )
             .unwrap();
         io_bus.notify_on_resume(pm);
 
-        Ok(io_bus)
+        Ok(acpi::ACPIDevResource {
+            amls,
+            pm_iobase,
+            sdts,
+        })
     }
 
     /// Sets up the serial devices for this platform. Returns the serial port number and serial
@@ -886,13 +940,12 @@ impl X8664arch {
     /// # Arguments
     ///
     /// * `guest_mem` - The memory to be used by the guest.
-    /// * `kernel_load_offset` - Offset in bytes from `guest_mem` at which the
-    ///                          kernel starts.
     /// * `kvm` - The /dev/kvm object that created vcpu.
     /// * `vm` - The VM object associated with this VCPU.
     /// * `vcpu` - The VCPU object to configure.
     /// * `cpu_id` - The id of the given `vcpu`.
     /// * `num_cpus` - Number of virtual CPUs the guest will have.
+    /// * `image_type` - Type of image being run on vcpu
     fn configure_vcpu(
         guest_mem: &GuestMemory,
         kvm: &Kvm,
@@ -900,23 +953,26 @@ impl X8664arch {
         vcpu: &Vcpu,
         cpu_id: u64,
         num_cpus: u64,
+        image_type: &VmImage,
     ) -> Result<()> {
-        let kernel_load_addr = GuestAddress(KERNEL_START_OFFSET);
         cpuid::setup_cpuid(kvm, vcpu, cpu_id, num_cpus).map_err(Error::SetupCpuid)?;
-        regs::setup_msrs(vcpu, END_ADDR_BEFORE_32BITS).map_err(Error::SetupMsrs)?;
-        let kernel_end = guest_mem
-            .checked_offset(kernel_load_addr, KERNEL_64BIT_ENTRY_OFFSET)
-            .ok_or(Error::KernelOffsetPastEnd)?;
-        regs::setup_regs(
-            vcpu,
-            (kernel_end).offset() as u64,
-            BOOT_STACK_POINTER as u64,
-            ZERO_PAGE_OFFSET as u64,
-        )
-        .map_err(Error::SetupRegs)?;
-        regs::setup_fpu(vcpu).map_err(Error::SetupFpu)?;
-        regs::setup_sregs(guest_mem, vcpu).map_err(Error::SetupSregs)?;
-        interrupts::set_lint(vcpu).map_err(Error::SetLint)?;
+        if let VmImage::Kernel(_) = image_type {
+            let kernel_load_addr = GuestAddress(KERNEL_START_OFFSET);
+            regs::setup_msrs(vcpu, END_ADDR_BEFORE_32BITS).map_err(Error::SetupMsrs)?;
+            let kernel_end = guest_mem
+                .checked_offset(kernel_load_addr, KERNEL_64BIT_ENTRY_OFFSET)
+                .ok_or(Error::KernelOffsetPastEnd)?;
+            regs::setup_regs(
+                vcpu,
+                (kernel_end).offset() as u64,
+                BOOT_STACK_POINTER as u64,
+                ZERO_PAGE_OFFSET as u64,
+            )
+            .map_err(Error::SetupRegs)?;
+            regs::setup_fpu(vcpu).map_err(Error::SetupFpu)?;
+            regs::setup_sregs(guest_mem, vcpu).map_err(Error::SetupSregs)?;
+            interrupts::set_lint(vcpu).map_err(Error::SetLint)?;
+        }
         Ok(())
     }
 }

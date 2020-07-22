@@ -48,7 +48,7 @@ use std::thread;
 use std::time::Duration;
 
 #[cfg(feature = "wl-dmabuf")]
-use libc::{dup, EBADF, EINVAL};
+use libc::{EBADF, EINVAL};
 
 use data_model::VolatileMemoryError;
 use data_model::*;
@@ -587,15 +587,13 @@ impl WlVfd {
             })?;
         match allocate_and_register_gpu_memory_response {
             VmMemoryResponse::AllocateAndRegisterGpuMemory {
-                fd,
+                fd: MaybeOwnedFd::Owned(file),
                 pfn,
                 slot,
                 desc,
             } => {
                 let mut vfd = WlVfd::default();
-                // Duplicate FD for shared memory instance.
-                let raw_fd = unsafe { File::from_raw_fd(dup(fd.as_raw_fd())) };
-                let vfd_shm = SharedMemory::from_raw_fd(raw_fd).map_err(WlError::NewAlloc)?;
+                let vfd_shm = SharedMemory::from_file(file).map_err(WlError::NewAlloc)?;
                 vfd.guest_shared_memory = Some((vfd_shm.size(), vfd_shm.into()));
                 vfd.slot = Some((slot, pfn, vm));
                 vfd.is_dmabuf = true;
@@ -732,12 +730,10 @@ impl WlVfd {
     fn send(&mut self, fds: &[RawFd], data: &mut Reader) -> WlResult<WlResp> {
         if let Some(socket) = &self.socket {
             socket
-                .send_with_fds(
-                    data.get_iovec(usize::max_value())
-                        .map_err(WlError::ParseDesc)?,
-                    fds,
-                )
+                .send_with_fds(data.get_remaining(), fds)
                 .map_err(WlError::SendVfd)?;
+            // All remaining data in `data` is now considered consumed.
+            data.consume(::std::usize::MAX);
             Ok(WlResp::Ok)
         } else if let Some((_, local_pipe)) = &mut self.local_pipe {
             // Impossible to send fds over a simple pipe.
