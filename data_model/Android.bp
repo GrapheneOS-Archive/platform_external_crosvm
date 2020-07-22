@@ -7,5 +7,6 @@ rust_library_host_rlib {
     srcs: ["src/lib.rs"],
     rlibs: [
         "libassertions",
+        "liblibc",
     ],
 }

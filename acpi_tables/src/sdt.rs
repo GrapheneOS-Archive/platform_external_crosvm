@@ -2,6 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::fs::File;
+use std::io::{ErrorKind, Read, Result};
+use std::path::PathBuf;
+
 use data_model::DataInit;
 
 /// SDT represents for System Description Table. The structure SDT is a
@@ -54,6 +58,23 @@ impl SDT {
         sdt
     }
 
+    /// Set up the ACPI table from file content. Verify file checksum.
+    pub fn from_file(path: &PathBuf) -> Result<Self> {
+        let mut file = File::open(path)?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        let checksum = super::generate_checksum(data.as_slice());
+        if checksum == 0 {
+            Ok(SDT { data })
+        } else {
+            Err(ErrorKind::InvalidData.into())
+        }
+    }
+
+    pub fn is_signature(&self, signature: &[u8; 4]) -> bool {
+        self.data[0..4] == *signature
+    }
+
     fn update_checksum(&mut self) {
         self.data[CHECKSUM_OFFSET] = 0;
         let checksum = super::generate_checksum(self.data.as_slice());
@@ -66,6 +87,11 @@ impl SDT {
 
     pub fn append<T: DataInit>(&mut self, value: T) {
         self.data.extend_from_slice(value.as_slice());
+        self.write(LENGTH_OFFSET, self.data.len() as u32);
+    }
+
+    pub fn append_slice(&mut self, value: &[u8]) {
+        self.data.extend_from_slice(value);
         self.write(LENGTH_OFFSET, self.data.len() as u32);
     }
 

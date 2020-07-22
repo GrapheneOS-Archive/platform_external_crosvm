@@ -5,6 +5,7 @@ authors = ["The Chromium OS Authors"]
 edition = "2018"
 
 [dependencies]
+io_uring = { path = "../io_uring" }
 libc = "*"
 paste = "*"
 sys_util = { path = "../sys_util" }
@@ -13,3 +14,7 @@ syscall_defines = { path = "../syscall_defines" }
 [dependencies.futures]
 version = "*"
 default-features = false
+features = ["alloc"]
+
+[dev-dependencies]
+tempfile = { path = "../tempfile" }

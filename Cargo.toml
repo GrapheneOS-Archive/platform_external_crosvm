@@ -19,7 +19,6 @@ overflow-checks = true
 members = ["qcow_utils"]
 exclude = [
     "assertions",
-    "async_core",
     "cros_async",
     "data_model",
     "rand_ish",
@@ -27,13 +26,18 @@ exclude = [
     "sys_util",
     "syscall_defines",
     "tempfile",
+    "hypervisor"
 ]
 
 [features]
+default = ["audio"]
 default-no-sandbox = []
+audio = ["devices/audio"]
 gpu = ["devices/gpu"]
 plugin = ["protos/plugin", "crosvm_plugin", "protobuf"]
 tpm = ["devices/tpm"]
+video-decoder = ["devices/video-decoder"]
+video-encoder = ["devices/video-encoder"]
 wl-dmabuf = ["devices/wl-dmabuf", "gpu_buffer", "resources/wl-dmabuf"]
 x = ["devices/x"]
 virtio-gpu-next = ["gpu_renderer/virtio-gpu-next"]
@@ -52,14 +56,13 @@ disk = { path = "disk" }
 enumn = { path = "enumn" }
 gpu_buffer = { path = "gpu_buffer", optional = true }
 gpu_renderer = { path = "gpu_renderer", optional = true }
-io_jail = { path = "io_jail" }
 kernel_cmdline = { path = "kernel_cmdline" }
 kernel_loader = { path = "kernel_loader" }
 kvm = { path = "kvm" }
 kvm_sys = { path = "kvm_sys" }
-libc = "0.2.44"
+libc = "0.2.65"
 libcras = "*"
-minijail-sys = "*" # provided by ebuild
+minijail = "*" # provided by ebuild
 msg_socket = { path = "msg_socket" }
 net_util = { path = "net_util" }
 p9 = { path = "p9" }
@@ -88,7 +91,7 @@ assertions = { path = "assertions" }
 audio_streams = { path = "../../external/adhd/audio_streams" } # ignored by ebuild
 data_model = { path = "data_model" }
 libcras = { path = "../../external/adhd/cras/client/libcras" } # ignored by ebuild
-minijail-sys = { path = "../../external/minijail/rust/minijail-sys" } # ignored by ebuild
+minijail = { path = "../../external/minijail/rust/minijail" } # ignored by ebuild
 poll_token_derive = { path = "sys_util/poll_token_derive" }
 sync = { path = "sync" }
 sys_util = { path = "sys_util" }

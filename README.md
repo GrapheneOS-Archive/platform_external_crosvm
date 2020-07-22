@@ -61,6 +61,11 @@ Known issues:
     policies [into the crosvm binary](http://crbug.com/1052126).
 *   Devices can't be jailed if `/var/empty` doesn't exist. `sudo mkdir -p
     /var/empty` to work around this for now.
+*   You need read/write permissions for `/dev/kvm` to run tests or other crosvm
+    instances. Usually it's owned by the `kvm` group, so `sudo usermod -a -G kvm
+    $USER` and then log out and back in again to fix this.
+*   Some other features (networking) require `CAP_NET_ADMIN` so those usually
+    need to be run as root.
 
 And that's it! You should be able to `cargo build/run/test`.
 
@@ -203,6 +208,12 @@ checking in a change. This is different from `cargo fmt --all` which formats
 multiple crates but a single workspace only; crosvm consists of multiple
 workspaces.
 
+#### `clippy`
+
+The `clippy` linter is used to check for common Rust problems.  The crosvm
+project uses a specific set of `clippy` checks; please run `bin/clippy` before
+checking in a change.
+
 #### Dependencies
 
 With a few exceptions, external dependencies inside of the `Cargo.toml` files
@@ -224,7 +235,6 @@ crates are:
 
 * `crosvm` - The top-level binary front-end for using crosvm.
 * `devices` - Virtual devices exposed to the guest OS.
-* `io_jail` - Creates jailed process using `libminijail`.
 * `kernel_loader` - Loads elf64 kernel files to a slice of memory.
 * `kvm_sys` - Low-level (mostly) auto-generated structures and constants for using KVM.
 * `kvm` - Unsafe, low-level wrapper code for using `kvm_sys`.

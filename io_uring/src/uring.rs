@@ -2,14 +2,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+// This file makes several casts from u8 pointers into more-aligned pointer types.
+// We assume that the kernel will give us suitably aligned memory.
+#![allow(clippy::cast_ptr_alignment)]
+
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
-use std::io::IoSlice;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use sys_util::{MemoryMapping, WatchingEvents};
+use sys_util::{MappedRegion, MemoryMapping, WatchingEvents};
 
 use crate::bindings::*;
 use crate::syscalls::*;
@@ -78,11 +82,11 @@ pub struct URingStats {
 /// let f = File::open(Path::new("/dev/zero")).unwrap();
 /// let mut uring = URingContext::new(16).unwrap();
 /// uring
-///   .add_poll_fd(f.as_raw_fd(), WatchingEvents::empty().set_read(), 454)
+///   .add_poll_fd(f.as_raw_fd(), &WatchingEvents::empty().set_read(), 454)
 /// .unwrap();
 /// let (user_data, res) = uring.wait().unwrap().next().unwrap();
-/// assert_eq!(user_data, 454 as UserData);
-/// assert_eq!(res.unwrap(), 1 as i32);
+/// assert_eq!(user_data, 454 as io_uring::UserData);
+/// assert_eq!(res.unwrap(), 1 as u32);
 ///
 /// ```
 pub struct URingContext {
@@ -93,6 +97,7 @@ pub struct URingContext {
     io_vecs: Vec<libc::iovec>,
     in_flight: usize, // The number of pending operations.
     added: usize,     // The number of ops added since the last call to `io_uring_enter`.
+    num_sqes: usize,  // The total number of sqes allocated in shared memory.
     stats: URingStats,
 }
 
@@ -160,6 +165,7 @@ impl URingContext {
                     num_sqe
                 ],
                 added: 0,
+                num_sqes: ring_params.sq_entries as usize,
                 in_flight: 0,
                 stats: Default::default(),
             })
@@ -172,6 +178,10 @@ impl URingContext {
     where
         F: FnMut(&mut io_uring_sqe, &mut libc::iovec),
     {
+        if self.added == self.num_sqes {
+            return Err(Error::NoSpace);
+        }
+
         // Find the next free submission entry in the submit ring and fill it with an iovec.
         // The below raw pointer derefs are safe because the memory the pointers use lives as long
         // as the mmap in self.
@@ -260,6 +270,21 @@ impl URingContext {
         self.add_rw_op(ptr, len, fd, offset, user_data, IORING_OP_READV as u8)
     }
 
+    /// See 'writev' but accepts an iterator instead of a vector if there isn't already a vector in
+    /// existence.
+    pub unsafe fn add_writev_iter<I>(
+        &mut self,
+        iovecs: I,
+        fd: RawFd,
+        offset: u64,
+        user_data: UserData,
+    ) -> Result<()>
+    where
+        I: Iterator<Item = libc::iovec>,
+    {
+        self.add_writev(iovecs.collect(), fd, offset, user_data)
+    }
+
     /// Asynchronously writes to `fd` from the addresses given in `iovecs`.
     /// # Safety
     /// `add_writev` will write to the address given by `iovecs`. This is only safe if the caller
@@ -267,9 +292,10 @@ impl URingContext {
     /// transaction is complete and that completion has been returned from the `wait` function.  In
     /// addition there must not be any mutable references to the data pointed to by `iovecs` until
     /// the operation completes.  Ensure that the fd remains open until the op completes as well.
+    /// The iovecs reference must be kept alive until the op returns.
     pub unsafe fn add_writev(
         &mut self,
-        iovecs: &[IoSlice],
+        iovecs: Vec<libc::iovec>,
         fd: RawFd,
         offset: u64,
         user_data: UserData,
@@ -284,7 +310,24 @@ impl URingContext {
             sqe.user_data = user_data;
             sqe.flags = 0;
             sqe.fd = fd;
-        })
+        })?;
+        self.complete_ring.add_op_data(user_data, iovecs);
+        Ok(())
+    }
+
+    /// See 'readv' but accepts an iterator instead of a vector if there isn't already a vector in
+    /// existence.
+    pub unsafe fn add_readv_iter<I>(
+        &mut self,
+        iovecs: I,
+        fd: RawFd,
+        offset: u64,
+        user_data: UserData,
+    ) -> Result<()>
+    where
+        I: Iterator<Item = libc::iovec>,
+    {
+        self.add_readv(iovecs.collect(), fd, offset, user_data)
     }
 
     /// Asynchronously reads from `fd` to the addresses given in `iovecs`.
@@ -294,9 +337,10 @@ impl URingContext {
     /// transaction is complete and that completion has been returned from the `wait` function.  In
     /// addition there must not be any references to the data pointed to by `iovecs` until the
     /// operation completes.  Ensure that the fd remains open until the op completes as well.
+    /// The iovecs reference must be kept alive until the op returns.
     pub unsafe fn add_readv(
         &mut self,
-        iovecs: &[IoSlice],
+        iovecs: Vec<libc::iovec>,
         fd: RawFd,
         offset: u64,
         user_data: UserData,
@@ -311,7 +355,9 @@ impl URingContext {
             sqe.user_data = user_data;
             sqe.flags = 0;
             sqe.fd = fd;
-        })
+        })?;
+        self.complete_ring.add_op_data(user_data, iovecs);
+        Ok(())
     }
 
     /// Syncs all completed operations, the ordering with in-flight async ops is not
@@ -337,8 +383,8 @@ impl URingContext {
         &mut self,
         fd: RawFd,
         offset: u64,
-        len: usize,
-        mode: u64,
+        len: u64,
+        mode: u32,
         user_data: UserData,
     ) -> Result<()> {
         // Note that len for fallocate in passed in the addr field of the sqe and the mode uses the
@@ -347,8 +393,8 @@ impl URingContext {
             sqe.opcode = IORING_OP_FALLOCATE as u8;
 
             sqe.fd = fd;
-            sqe.addr = len as u64;
-            sqe.len = mode as u32;
+            sqe.addr = len;
+            sqe.len = mode;
             sqe.__bindgen_anon_1.off = offset;
             sqe.user_data = user_data;
 
@@ -367,7 +413,7 @@ impl URingContext {
     pub fn add_poll_fd(
         &mut self,
         fd: RawFd,
-        events: WatchingEvents,
+        events: &WatchingEvents,
         user_data: UserData,
     ) -> Result<()> {
         self.prep_next_sqe(|sqe, _iovec| {
@@ -389,7 +435,7 @@ impl URingContext {
     pub fn remove_poll_fd(
         &mut self,
         fd: RawFd,
-        events: WatchingEvents,
+        events: &WatchingEvents,
         user_data: UserData,
     ) -> Result<()> {
         self.prep_next_sqe(|sqe, _iovec| {
@@ -415,7 +461,7 @@ impl URingContext {
             self.stats.total_enter_calls = self.stats.total_enter_calls.wrapping_add(1);
             unsafe {
                 // Safe because the only memory modified is in the completion queue.
-                io_uring_enter(self.ring_file.as_raw_fd(), self.added as u64, 1, 0)
+                io_uring_enter(self.ring_file.as_raw_fd(), self.added as u64, 0, 0)
                     .map_err(Error::RingEnter)?;
             }
         }
@@ -434,22 +480,35 @@ impl URingContext {
         let completed = self.complete_ring.num_completed();
         self.stats.total_complete = self.stats.total_complete.wrapping_add(completed as u64);
         self.in_flight -= completed;
-        self.in_flight += self.added;
         self.stats.total_ops = self.stats.total_ops.wrapping_add(self.added as u64);
-        if self.in_flight > 0 {
+        if self.in_flight > 0 || self.added > 0 {
             unsafe {
                 self.stats.total_enter_calls = self.stats.total_enter_calls.wrapping_add(1);
                 // Safe because the only memory modified is in the completion queue.
-                io_uring_enter(
+                let ret = io_uring_enter(
                     self.ring_file.as_raw_fd(),
                     self.added as u64,
                     1,
                     IORING_ENTER_GETEVENTS,
-                )
-                .map_err(Error::RingEnter)?;
+                );
+                match ret {
+                    Ok(_) => {
+                        self.in_flight += self.added;
+                        self.added = 0;
+                    }
+                    Err(e) => {
+                        if e != libc::EBUSY {
+                            return Err(Error::RingEnter(e));
+                        }
+                        // An ebusy return means that some completed events must be processed before
+                        // submitting more, wait for some to finish without pushing the new sqes in
+                        // that case.
+                        io_uring_enter(self.ring_file.as_raw_fd(), 0, 1, IORING_ENTER_GETEVENTS)
+                            .map_err(Error::RingEnter)?;
+                    }
+                }
             }
         }
-        self.added = 0;
 
         // The CompletionQueue will iterate all completed ops.
         Ok(&mut self.complete_ring)
@@ -472,11 +531,14 @@ impl SubmitQueueEntries {
         if index >= self.len {
             return None;
         }
-        unsafe {
+        let mut_ref = unsafe {
             // Safe because the mut borrow of self resticts to one mutable reference at a time and
             // we trust that the kernel has returned enough memory in io_uring_setup and mmap.
-            Some(&mut *(self.mmap.as_ptr() as *mut io_uring_sqe).add(index))
-        }
+            &mut *(self.mmap.as_ptr() as *mut io_uring_sqe).add(index)
+        };
+        // Clear any state.
+        *mut_ref = io_uring_sqe::default();
+        Some(mut_ref)
     }
 }
 
@@ -524,6 +586,9 @@ struct CompleteQueueState {
     ring_mask: u32,
     cqes_offset: u32,
     completed: usize,
+    //For ops that pass in arrays of iovecs, they need to be valid for the duration of the
+    //operation because the kernel might read them at any time.
+    pending_op_addrs: BTreeMap<UserData, Vec<libc::iovec>>,
 }
 
 impl CompleteQueueState {
@@ -541,7 +606,12 @@ impl CompleteQueueState {
             ring_mask,
             cqes_offset: params.cq_off.cqes,
             completed: 0,
+            pending_op_addrs: BTreeMap::new(),
         }
+    }
+
+    fn add_op_data(&mut self, user_data: UserData, addrs: Vec<libc::iovec>) {
+        self.pending_op_addrs.insert(user_data, addrs);
     }
 
     fn get_cqe(&self, head: u32) -> &io_uring_cqe {
@@ -581,6 +651,9 @@ impl Iterator for CompleteQueueState {
         let cqe = self.get_cqe(head);
         let user_data = cqe.user_data;
         let res = cqe.res;
+
+        // free the addrs saved for this op.
+        let _ = self.pending_op_addrs.remove(&user_data);
 
         // Store the new head and ensure the reads above complete before the kernel sees the
         // update to head, `set_head` uses `Release` ordering
@@ -637,6 +710,7 @@ impl QueuePointers {
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
+    use std::io::{IoSlice, IoSliceMut};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -677,10 +751,18 @@ mod tests {
         offset: u64,
         user_data: UserData,
     ) {
-        let iovecs = [IoSlice::new(buf)];
+        let io_vecs = unsafe {
+            //safe to transmut from IoSlice to iovec.
+            vec![IoSliceMut::new(buf)]
+                .into_iter()
+                .map(|slice| std::mem::transmute::<IoSliceMut, libc::iovec>(slice))
+                .collect::<Vec<libc::iovec>>()
+        };
         let (user_data_ret, res) = unsafe {
             // Safe because the `wait` call waits until the kernel is done with `buf`.
-            uring.add_readv(&iovecs, fd, offset, user_data).unwrap();
+            uring
+                .add_readv_iter(io_vecs.into_iter(), fd, offset, user_data)
+                .unwrap();
             uring.wait().unwrap().next().unwrap()
         };
         assert_eq!(user_data_ret, user_data);
@@ -771,15 +853,27 @@ mod tests {
         const BUF_SIZE: usize = 0x2000;
 
         let mut uring = URingContext::new(queue_size).unwrap();
-        let buf = [0u8; BUF_SIZE];
-        let buf2 = [0u8; BUF_SIZE];
-        let buf3 = [0u8; BUF_SIZE];
-        let io_slices = vec![IoSlice::new(&buf), IoSlice::new(&buf2), IoSlice::new(&buf3)];
-        let total_len = io_slices.iter().fold(0, |a, iovec| a + iovec.len());
+        let mut buf = [0u8; BUF_SIZE];
+        let mut buf2 = [0u8; BUF_SIZE];
+        let mut buf3 = [0u8; BUF_SIZE];
+        let io_vecs = unsafe {
+            //safe to transmut from IoSlice to iovec.
+            vec![
+                IoSliceMut::new(&mut buf),
+                IoSliceMut::new(&mut buf2),
+                IoSliceMut::new(&mut buf3),
+            ]
+            .into_iter()
+            .map(|slice| std::mem::transmute::<IoSliceMut, libc::iovec>(slice))
+            .collect::<Vec<libc::iovec>>()
+        };
+        let total_len = io_vecs.iter().fold(0, |a, iovec| a + iovec.iov_len);
         let f = create_test_file(&temp_dir, total_len as u64 * 2);
         let (user_data_ret, res) = unsafe {
             // Safe because the `wait` call waits until the kernel is done with `buf`.
-            uring.add_readv(&io_slices, f.as_raw_fd(), 0, 55).unwrap();
+            uring
+                .add_readv_iter(io_vecs.into_iter(), f.as_raw_fd(), 0, 55)
+                .unwrap();
             uring.wait().unwrap().next().unwrap()
         };
         assert_eq!(user_data_ret, 55);
@@ -865,13 +959,19 @@ mod tests {
         let buf = [0xaau8; BUF_SIZE];
         let buf2 = [0xffu8; BUF_SIZE];
         let buf3 = [0x55u8; BUF_SIZE];
-        let io_slices = vec![IoSlice::new(&buf), IoSlice::new(&buf2), IoSlice::new(&buf3)];
-        let total_len = io_slices.iter().fold(0, |a, iovec| a + iovec.len());
+        let io_vecs = unsafe {
+            //safe to transmut from IoSlice to iovec.
+            vec![IoSlice::new(&buf), IoSlice::new(&buf2), IoSlice::new(&buf3)]
+                .into_iter()
+                .map(|slice| std::mem::transmute::<IoSlice, libc::iovec>(slice))
+                .collect::<Vec<libc::iovec>>()
+        };
+        let total_len = io_vecs.iter().fold(0, |a, iovec| a + iovec.iov_len);
         let mut f = create_test_file(&temp_dir, total_len as u64 * 2);
         let (user_data_ret, res) = unsafe {
             // Safe because the `wait` call waits until the kernel is done with `buf`.
             uring
-                .add_writev(&io_slices, f.as_raw_fd(), OFFSET, 55)
+                .add_writev_iter(io_vecs.into_iter(), f.as_raw_fd(), OFFSET, 55)
                 .unwrap();
             uring.wait().unwrap().next().unwrap()
         };
@@ -916,23 +1016,60 @@ mod tests {
 
         let mut uring = URingContext::new(16).unwrap();
         uring
-            .add_fallocate(f.as_raw_fd(), 0, set_size, 0, 66)
+            .add_fallocate(f.as_raw_fd(), 0, set_size as u64, 0, 66)
             .unwrap();
         let (user_data, res) = uring.wait().unwrap().next().unwrap();
         assert_eq!(user_data, 66 as UserData);
-        assert_eq!(res.unwrap(), 0 as u32);
+        match res {
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::InvalidInput {
+                    // skip on kernels that don't support fallocate.
+                    return;
+                }
+                panic!("Unexpected fallocate error: {}", e);
+            }
+            Ok(val) => assert_eq!(val, 0 as u32),
+        }
 
-        uring.add_fsync(f.as_raw_fd(), 67).unwrap();
-        let (user_data, res) = uring.wait().unwrap().next().unwrap();
-        assert_eq!(user_data, 67 as UserData);
-        assert_eq!(res.unwrap(), 0 as u32);
+        // Add a few writes and then fsync
+        let buf = [0u8; 4096];
+        let mut pending = std::collections::BTreeSet::new();
+        unsafe {
+            uring
+                .add_write(buf.as_ptr(), buf.len(), f.as_raw_fd(), 0, 67)
+                .unwrap();
+            pending.insert(67u64);
+            uring
+                .add_write(buf.as_ptr(), buf.len(), f.as_raw_fd(), 4096, 68)
+                .unwrap();
+            pending.insert(68);
+            uring
+                .add_write(buf.as_ptr(), buf.len(), f.as_raw_fd(), 8192, 69)
+                .unwrap();
+            pending.insert(69);
+        }
+        uring.add_fsync(f.as_raw_fd(), 70).unwrap();
+        pending.insert(70);
+
+        let mut wait_calls = 0;
+
+        while !pending.is_empty() && wait_calls < 5 {
+            let events = uring.wait().unwrap();
+            for (user_data, res) in events {
+                assert!(res.is_ok());
+                assert!(pending.contains(&user_data));
+                pending.remove(&user_data);
+            }
+            wait_calls += 1;
+        }
+        assert!(pending.is_empty());
 
         uring
             .add_fallocate(
                 f.as_raw_fd(),
                 init_size as u64,
-                set_size - init_size,
-                (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE) as u64,
+                (set_size - init_size) as u64,
+                (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE) as u32,
                 68,
             )
             .unwrap();
@@ -951,10 +1088,53 @@ mod tests {
         let f = File::open(Path::new("/dev/zero")).unwrap();
         let mut uring = URingContext::new(16).unwrap();
         uring
-            .add_poll_fd(f.as_raw_fd(), WatchingEvents::empty().set_read(), 454)
+            .add_poll_fd(f.as_raw_fd(), &WatchingEvents::empty().set_read(), 454)
             .unwrap();
         let (user_data, res) = uring.wait().unwrap().next().unwrap();
         assert_eq!(user_data, 454 as UserData);
         assert_eq!(res.unwrap(), 1 as u32);
+    }
+
+    #[test]
+    fn queue_many_ebusy_retry() {
+        let num_entries = 16;
+        let f = File::open(Path::new("/dev/zero")).unwrap();
+        let mut uring = URingContext::new(num_entries).unwrap();
+        // Fill the sumbit ring.
+        for sqe_batch in 0..3 {
+            for i in 0..num_entries {
+                uring
+                    .add_poll_fd(
+                        f.as_raw_fd(),
+                        &WatchingEvents::empty().set_read(),
+                        (sqe_batch * num_entries + i) as u64,
+                    )
+                    .unwrap();
+            }
+            uring.submit().unwrap();
+        }
+        // Adding more than the number of cqes will cause the uring to return ebusy, make sure that
+        // is handled cleanly and wait still returns the completed entries.
+        uring
+            .add_poll_fd(
+                f.as_raw_fd(),
+                &WatchingEvents::empty().set_read(),
+                (num_entries * 3) as u64,
+            )
+            .unwrap();
+        // The first wait call should return the cques that are already filled.
+        {
+            let mut results = uring.wait().unwrap();
+            for _i in 0..num_entries * 2 {
+                assert_eq!(results.next().unwrap().1.unwrap(), 1 as u32);
+            }
+            assert!(results.next().is_none());
+        }
+        // The second will finish submitting any more sqes and return the rest.
+        let mut results = uring.wait().unwrap();
+        for _i in 0..num_entries + 1 {
+            assert_eq!(results.next().unwrap().1.unwrap(), 1 as u32);
+        }
+        assert!(results.next().is_none());
     }
 }
