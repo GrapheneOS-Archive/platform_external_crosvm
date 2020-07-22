@@ -105,6 +105,58 @@ impl Into<c_int> for Protection {
     }
 }
 
+/// Validates that `offset`..`offset+range_size` lies within the bounds of a memory mapping of
+/// `mmap_size` bytes.  Also checks for any overflow.
+fn validate_includes_range(mmap_size: usize, offset: usize, range_size: usize) -> Result<()> {
+    // Ensure offset + size doesn't overflow
+    let end_offset = offset
+        .checked_add(range_size)
+        .ok_or(Error::InvalidAddress)?;
+    // Ensure offset + size are within the mapping bounds
+    if end_offset <= mmap_size {
+        Ok(())
+    } else {
+        Err(Error::InvalidAddress)
+    }
+}
+
+/// A range of memory that can be msynced, for abstracting over different types of memory mappings.
+///
+/// Safe when implementers guarantee `ptr`..`ptr+size` is an mmaped region owned by this object that
+/// can't be unmapped during the `MappedRegion`'s lifetime.
+pub unsafe trait MappedRegion: Send + Sync {
+    /// Returns a pointer to the beginning of the memory region. Should only be
+    /// used for passing this region to ioctls for setting guest memory.
+    fn as_ptr(&self) -> *mut u8;
+
+    /// Returns the size of the memory region in bytes.
+    fn size(&self) -> usize;
+}
+
+impl dyn MappedRegion {
+    /// Calls msync with MS_SYNC on a mapping of `size` bytes starting at `offset` from the start of
+    /// the region.  `offset`..`offset+size` must be contained within the `MappedRegion`.
+    pub fn msync(&self, offset: usize, size: usize) -> Result<()> {
+        validate_includes_range(self.size(), offset, size)?;
+
+        // Safe because the MemoryMapping/MemoryMappingArena interface ensures our pointer and size
+        // are correct, and we've validated that `offset`..`offset+size` is in the range owned by
+        // this `MappedRegion`.
+        let ret = unsafe {
+            libc::msync(
+                (self.as_ptr() as usize + offset) as *mut libc::c_void,
+                size,
+                libc::MS_SYNC,
+            )
+        };
+        if ret != -1 {
+            Ok(())
+        } else {
+            Err(Error::SystemCallFailed(errno::Error::last()))
+        }
+    }
+}
+
 /// Wraps an anonymous shared memory mapping in the current process.
 #[derive(Debug)]
 pub struct MemoryMapping {
@@ -312,17 +364,6 @@ impl MemoryMapping {
             addr: addr as *mut u8,
             size,
         })
-    }
-
-    /// Returns a pointer to the beginning of the memory region. Should only be
-    /// used for passing this region to ioctls for setting guest memory.
-    pub fn as_ptr(&self) -> *mut u8 {
-        self.addr
-    }
-
-    /// Returns the size of the memory region in bytes.
-    pub fn size(&self) -> usize {
-        self.size
     }
 
     /// Calls msync with MS_SYNC on the mapping.
@@ -607,16 +648,36 @@ impl MemoryMapping {
     }
 }
 
+// Safe because the pointer and size point to a memory range owned by this MemoryMapping that won't
+// be unmapped until it's Dropped.
+unsafe impl MappedRegion for MemoryMapping {
+    fn as_ptr(&self) -> *mut u8 {
+        self.addr
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+}
+
 impl VolatileMemory for MemoryMapping {
-    fn get_slice(&self, offset: u64, count: u64) -> VolatileMemoryResult<VolatileSlice> {
+    fn get_slice(&self, offset: usize, count: usize) -> VolatileMemoryResult<VolatileSlice> {
         let mem_end = calc_offset(offset, count)?;
-        if mem_end > self.size as u64 {
+        if mem_end > self.size {
             return Err(VolatileMemoryError::OutOfBounds { addr: mem_end });
         }
 
+        let new_addr =
+            (self.as_ptr() as usize)
+                .checked_add(offset)
+                .ok_or(VolatileMemoryError::Overflow {
+                    base: self.as_ptr() as usize,
+                    offset,
+                })?;
+
         // Safe because we checked that offset + count was within our range and we only ever hand
         // out volatile accessors.
-        Ok(unsafe { VolatileSlice::new((self.addr as usize + offset as usize) as *mut _, count) })
+        Ok(unsafe { VolatileSlice::from_raw_parts(new_addr as *mut u8, count) })
     }
 }
 
@@ -724,7 +785,11 @@ impl MemoryMappingArena {
         prot: Protection,
         fd: Option<(&dyn AsRawFd, u64)>,
     ) -> Result<()> {
-        self.validate_range(offset, size)?;
+        // Ensure offset is page-aligned
+        if offset % pagesize() != 0 {
+            return Err(Error::NotPageAligned);
+        }
+        validate_includes_range(self.size(), offset, size)?;
 
         // This is safe since the range has been validated.
         let mmap = unsafe {
@@ -754,49 +819,17 @@ impl MemoryMappingArena {
     pub fn remove(&mut self, offset: usize, size: usize) -> Result<()> {
         self.try_add(offset, size, Protection::read(), None)
     }
+}
 
-    /// Calls msync with MS_SYNC on a mapping of `size` bytes starting at `offset` from the start of
-    /// the arena. `offset` must be page aligned.
-    pub fn msync(&self, offset: usize, size: usize) -> Result<()> {
-        self.validate_range(offset, size)?;
-
-        // Safe because we've validated that this memory range is owned by this `MemoryMappingArena`.
-        let ret =
-            unsafe { libc::msync(self.addr as *mut libc::c_void, self.size(), libc::MS_SYNC) };
-        if ret == -1 {
-            return Err(Error::SystemCallFailed(errno::Error::last()));
-        }
-        Ok(())
-    }
-
-    /// Returns a pointer to the beginning of the memory region.  Should only be
-    /// used for passing this region to ioctls for setting guest memory.
-    pub fn as_ptr(&self) -> *mut u8 {
+// Safe because the pointer and size point to a memory range owned by this MemoryMappingArena that
+// won't be unmapped until it's Dropped.
+unsafe impl MappedRegion for MemoryMappingArena {
+    fn as_ptr(&self) -> *mut u8 {
         self.addr
     }
 
-    /// Returns the size of the memory region in bytes.
-    pub fn size(&self) -> usize {
+    fn size(&self) -> usize {
         self.size
-    }
-
-    /// Validates `offset` and `size`.
-    /// Checks that offset..offset+size doesn't overlap with existing mappings.
-    /// Also ensures correct alignment, and checks for any overflow.
-    /// Note: offset..offset+size is considered valid if it _perfectly_ overlaps
-    /// with single other region.
-    fn validate_range(&self, offset: usize, size: usize) -> Result<()> {
-        // Ensure offset is page-aligned
-        if offset % pagesize() != 0 {
-            return Err(Error::NotPageAligned);
-        }
-        // Ensure offset + size doesn't overflow
-        let end_offset = offset.checked_add(size).ok_or(Error::InvalidAddress)?;
-        // Ensure offset + size are within the arena bounds
-        if end_offset > self.size {
-            return Err(Error::InvalidAddress);
-        }
-        Ok(())
     }
 }
 
@@ -819,53 +852,6 @@ impl Drop for MemoryMappingArena {
         unsafe {
             libc::munmap(self.addr as *mut libc::c_void, self.size);
         }
-    }
-}
-
-/// ExternallyMappedHostMemory represents an existing buffer in the current address space for
-/// purposes of sharing device memory to the guest where the device memory is not compatible with
-/// the mmap interface, such as Vulkan VkDeviceMemory in the non-exportable case or when exported
-/// as an opaque fd.
-///
-/// It makes the critical assumption that the buffer outlives it. It is only used to pass to the
-/// hypervisor so that the memory can be shared to the guest.
-
-/// ExternallyMappedHostMemory uses a trait object `ExternallyMappedHostMemoryInfo` that performs
-/// device specific setup and cleanup operations (via the concrete object's new and drop methods)
-/// and also implements the method to get the host address.
-pub trait ExternallyMappedHostMemoryInfo {
-    fn as_ptr(&self) -> *mut u8;
-    fn size(&self) -> u64;
-}
-
-pub struct ExternallyMappedHostMemory {
-    info: Box<dyn ExternallyMappedHostMemoryInfo + Send>,
-}
-
-impl ExternallyMappedHostMemory {
-    /// Creates a externally mapped memory object. This is marked unsafe because it is not
-    /// guaranteed that the address and size don't alias some other memory in Rust.
-    pub unsafe fn new(
-        info: Box<dyn ExternallyMappedHostMemoryInfo + Send>,
-    ) -> Result<ExternallyMappedHostMemory> {
-        if info.as_ptr() == std::ptr::null_mut() {
-            return Err(Error::InvalidAddress);
-        }
-        if info.size() == 0 {
-            return Err(Error::InvalidAddress);
-        }
-        Ok(ExternallyMappedHostMemory { info })
-    }
-
-    /// Returns a pointer to the beginning of the memory region. Should only be
-    /// used for passing this region to ioctls for setting guest memory.
-    pub fn as_ptr(&self) -> *mut u8 {
-        self.info.as_ptr()
-    }
-
-    /// Returns the size of the memory region in bytes.
-    pub fn size(&self) -> u64 {
-        self.info.size()
     }
 }
 
@@ -935,11 +921,11 @@ mod tests {
     #[test]
     fn slice_overflow_error() {
         let m = MemoryMapping::new(5).unwrap();
-        let res = m.get_slice(std::u64::MAX, 3).unwrap_err();
+        let res = m.get_slice(std::usize::MAX, 3).unwrap_err();
         assert_eq!(
             res,
             VolatileMemoryError::Overflow {
-                base: std::u64::MAX,
+                base: std::usize::MAX,
                 offset: 3,
             }
         );
@@ -1061,91 +1047,18 @@ mod tests {
             .expect("failed to remove unaligned mapping");
     }
 
-    struct MemoryInfoForTest {
-        hva: u64,
-        size: u64,
-    }
-
-    impl ExternallyMappedHostMemoryInfo for MemoryInfoForTest {
-        fn as_ptr(&self) -> *mut u8 {
-            self.hva as *mut u8
-        }
-        fn size(&self) -> u64 {
-            self.size
-        }
-    }
-
     #[test]
-    fn ext_mapped_hostmem_invalid_address() {
-        let res = unsafe {
-            ExternallyMappedHostMemory::new(Box::new(MemoryInfoForTest { hva: 0, size: 1 }))
-        };
+    fn arena_msync() {
+        let size = 0x40000;
+        let m = MemoryMappingArena::new(size).unwrap();
+        let ps = pagesize();
+        MappedRegion::msync(&m, 0, ps).unwrap();
+        MappedRegion::msync(&m, 0, size).unwrap();
+        MappedRegion::msync(&m, ps, size - ps).unwrap();
+        let res = MappedRegion::msync(&m, ps, size).unwrap_err();
         match res {
-            Err(Error::InvalidAddress) => (),
-            Err(e) => panic!("Unexpected error: {}", e),
-            Ok(_) => panic!(
-                "Should not be able to create ExternallyMappedHostMemory with null host address"
-            ),
-        }
-    }
-
-    #[test]
-    fn ext_mapped_hostmem_invalid_size() {
-        let res = unsafe {
-            ExternallyMappedHostMemory::new(Box::new(MemoryInfoForTest { hva: 1, size: 0 }))
-        };
-        match res {
-            Err(Error::InvalidAddress) => (),
-            Err(e) => panic!("Unexpected error: {}", e),
-            Ok(_) => {
-                panic!("Should not be able to create ExternallyMappedHostMemory with zero size")
-            }
-        }
-    }
-
-    #[test]
-    fn ext_mapped_hostmem_valid_parameters() {
-        let res = unsafe {
-            ExternallyMappedHostMemory::new(Box::new(MemoryInfoForTest { hva: 1, size: 1 }))
-        };
-        match res {
-            Ok(_) => (),
-            Err(e) => panic!("Unexpected error: {}", e),
-        }
-    }
-
-    #[test]
-    fn ext_mapped_hostmem_get_address() {
-        let address = 1234 as *mut u8;
-        let res = unsafe {
-            ExternallyMappedHostMemory::new(Box::new(MemoryInfoForTest {
-                hva: address as u64,
-                size: 1,
-            }))
-        };
-        match res {
-            Ok(mem) => {
-                assert_eq!(mem.as_ptr(), address);
-            }
-            Err(e) => panic!("Unexpected error: {}", e),
-        }
-    }
-
-    #[test]
-    fn ext_mapped_hostmem_get_address_with_size() {
-        let address = 1234 as *mut u8;
-        let size = 5678 as u64;
-        let res = unsafe {
-            ExternallyMappedHostMemory::new(Box::new(MemoryInfoForTest {
-                hva: address as u64,
-                size,
-            }))
-        };
-        match res {
-            Ok(mem) => {
-                assert_eq!(mem.size(), size);
-            }
-            Err(e) => panic!("Unexpected error: {}", e),
+            Error::InvalidAddress => {}
+            e => panic!("unexpected error: {}", e),
         }
     }
 }

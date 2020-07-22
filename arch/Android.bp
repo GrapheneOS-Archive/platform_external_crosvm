@@ -6,11 +6,12 @@ rust_library_host_rlib {
     crate_name: "arch",
     srcs: ["src/lib.rs"],
     rlibs: [
+        "libacpi_tables",
         "libdevices",
-        "libio_jail",
         "libkernel_cmdline",
         "libkvm",
         "liblibc",
+        "libminijail_rust",
         "libresources",
         "libsync_rust",
         "libsys_util",

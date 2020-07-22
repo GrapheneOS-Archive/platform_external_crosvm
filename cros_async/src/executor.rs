@@ -2,15 +2,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
-use std::task::Waker;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::waker::create_waker;
+use futures::future::FutureExt;
+use futures::task::waker_ref;
+
+use crate::waker::NeedsPoll;
 
 /// Represents a future executor that can be run. Implementers of the trait will take a list of
 /// futures and poll them until completed.
@@ -26,22 +27,14 @@ pub trait Executor {
 
 // Tracks if a future needs to be polled and the waker to use.
 pub(crate) struct FutureState {
-    pub needs_poll: Rc<Cell<bool>>,
-    pub waker: Waker,
+    pub needs_poll: Arc<NeedsPoll>,
 }
 
 impl FutureState {
     pub fn new() -> FutureState {
-        let needs_poll = Rc::new(Cell::new(true));
-        // Safe because a valid pointer is passed to `create_waker` and the valid result is
-        // passed to `Waker::from_raw`. And because the reference count to needs_poll is
-        // incremented by cloning it so it can't be dropped before the waker.
-        let waker = unsafe {
-            let clone = needs_poll.clone();
-            let raw_waker = create_waker(Rc::into_raw(clone) as *const _);
-            Waker::from_raw(raw_waker)
-        };
-        FutureState { needs_poll, waker }
+        FutureState {
+            needs_poll: NeedsPoll::new(),
+        }
     }
 }
 
@@ -67,7 +60,8 @@ impl<T> ExecutableFuture<T> {
     // Polls the future if needed and returns the result.
     // Covers setting up the waker and context before calling the future.
     fn poll(&mut self) -> Poll<T> {
-        let mut ctx = Context::from_waker(&self.state.waker);
+        let waker = waker_ref(&self.state.needs_poll);
+        let mut ctx = Context::from_waker(&waker);
         let f = self.future.as_mut();
         f.poll(&mut ctx)
     }
@@ -114,7 +108,7 @@ impl UnitFutures {
         let mut i = 0;
         while i < self.futures.len() {
             let fut = &mut self.futures[i];
-            let remove = if fut.state.needs_poll.replace(false) {
+            let remove = if fut.state.needs_poll.swap(false) {
                 fut.poll().is_ready()
             } else {
                 false
@@ -149,9 +143,54 @@ impl FutureList for UnitFutures {
     }
 }
 
+// Execute one future until it completes.
+pub(crate) struct RunOne<F: Future + Unpin> {
+    fut: F,
+    fut_state: FutureState,
+    added_futures: UnitFutures,
+}
+
+impl<F: Future + Unpin> RunOne<F> {
+    pub fn new(f: F) -> RunOne<F> {
+        RunOne {
+            fut: f,
+            fut_state: FutureState::new(),
+            added_futures: UnitFutures::new(),
+        }
+    }
+}
+
+impl<F: Future + Unpin> FutureList for RunOne<F> {
+    type Output = F::Output;
+
+    fn futures_mut(&mut self) -> &mut UnitFutures {
+        &mut self.added_futures
+    }
+
+    fn poll_results(&mut self) -> Option<Self::Output> {
+        let _ = self.added_futures.poll_results();
+
+        if self.fut_state.needs_poll.swap(false) {
+            let waker = waker_ref(&self.fut_state.needs_poll);
+            let mut ctx = Context::from_waker(&waker);
+            // The future impls `Unpin`, use `poll_unpin` to avoid wrapping it in
+            // `Pin` to call `poll`.
+            if let Poll::Ready(o) = self.fut.poll_unpin(&mut ctx) {
+                return Some(o);
+            }
+        };
+        None
+    }
+
+    fn any_ready(&self) -> bool {
+        self.added_futures.any_ready() || self.fut_state.needs_poll.get()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]

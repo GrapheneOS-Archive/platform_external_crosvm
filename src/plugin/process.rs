@@ -5,9 +5,9 @@
 use std::collections::hash_map::{Entry, HashMap, VacantEntry};
 use std::env::set_var;
 use std::fs::File;
-use std::io::Write;
+use std::io::{IoSlice, Write};
 use std::mem::transmute;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::process::Command;
@@ -20,9 +20,9 @@ use libc::{pid_t, waitpid, EINVAL, ENODATA, ENOTTY, WEXITSTATUS, WIFEXITED, WNOH
 
 use protobuf::Message;
 
-use io_jail::Minijail;
 use kvm::{dirty_log_bitmap_size, Datamatch, IoeventAddress, IrqRoute, IrqSource, PicId, Vm};
 use kvm_sys::{kvm_clock_data, kvm_ioapic_state, kvm_pic_state, kvm_pit_state2};
+use minijail::Minijail;
 use protos::plugin::*;
 use sync::Mutex;
 use sys_util::{
@@ -346,7 +346,7 @@ impl Process {
         read_only: bool,
         dirty_log: bool,
     ) -> SysResult<()> {
-        let shm = SharedMemory::from_raw_fd(memfd)?;
+        let shm = SharedMemory::from_file(memfd)?;
         // Checking the seals ensures the plugin process won't shrink the mmapped file, causing us
         // to SIGBUS in the future.
         let seals = shm.get_seals()?;
@@ -361,7 +361,8 @@ impl Process {
         }
         let mem = MemoryMapping::from_fd_offset(&shm, length as usize, offset)
             .map_err(mmap_to_sys_err)?;
-        let slot = vm.add_mmio_memory(GuestAddress(start), mem, read_only, dirty_log)?;
+        let slot =
+            vm.add_memory_region(GuestAddress(start), Box::new(mem), read_only, dirty_log)?;
         entry.insert(PluginObject::Memory {
             slot,
             length: length as usize,
@@ -515,7 +516,14 @@ impl Process {
         let request = protobuf::parse_from_bytes::<MainRequest>(&self.request_buffer[..msg_size])
             .map_err(Error::DecodeRequest)?;
 
-        let mut response_files = Vec::new();
+        /// Use this to make it easier to stuff various kinds of File-like objects into the
+        /// `boxed_fds` list.
+        fn box_owned_fd<F: IntoRawFd + 'static>(f: F) -> Box<dyn IntoRawFd> {
+            Box::new(f)
+        }
+
+        // This vec is used to extend ownership of certain FDs until the end of this function.
+        let mut boxed_fds = Vec::new();
         let mut response_fds = Vec::new();
         let mut response = MainResponse::new();
         let res = if request.has_create() {
@@ -557,7 +565,7 @@ impl Process {
                                 Ok(()) => {
                                     response_fds.push(evt.as_raw_fd());
                                     response_fds.push(resample_evt.as_raw_fd());
-                                    response_files.push(downcast_file(resample_evt));
+                                    boxed_fds.push(box_owned_fd(resample_evt));
                                     entry.insert(PluginObject::IrqEvent {
                                         irq_id: irq_event.irq_id,
                                         evt,
@@ -586,7 +594,7 @@ impl Process {
                 Ok((request_socket, child_socket)) => {
                     self.request_sockets.push(request_socket);
                     response_fds.push(child_socket.as_raw_fd());
-                    response_files.push(downcast_file(child_socket));
+                    boxed_fds.push(box_owned_fd(child_socket));
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -723,7 +731,7 @@ impl Process {
             .map_err(Error::EncodeResponse)?;
         assert_ne!(self.response_buffer.len(), 0);
         self.request_sockets[index]
-            .send_with_fds(&self.response_buffer[..], &response_fds)
+            .send_with_fds(&[IoSlice::new(&self.response_buffer[..])], &response_fds)
             .map_err(Error::PluginSocketSend)?;
 
         Ok(())
