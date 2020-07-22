@@ -12,6 +12,7 @@ rust_defaults {
         "libkvm_sys",
         "liblibc",
         "libmsg_socket",
+        "libsync_rust",
         "libsys_util",
     ],
 }
@@ -50,6 +51,7 @@ rust_test_host {
         "libkvm_sys",
         "liblibc",
         "libmsg_socket",
+        "libsync_rust",
         "libsys_util",
     ],
 }
@@ -64,6 +66,7 @@ rust_library_host_rlib {
         "libkvm_sys",
         "liblibc",
         "libmsg_socket",
+        "libsync_rust",
         "libsys_util",
     ],
 }

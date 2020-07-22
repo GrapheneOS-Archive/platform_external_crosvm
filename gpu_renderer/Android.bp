@@ -4,6 +4,9 @@ rust_library_host_rlib {
     name: "libgpu_renderer",
     defaults: ["crosvm_defaults"],
     crate_name: "gpu_renderer",
+    features: [
+        "gfxstream",
+    ],
     srcs: ["src/lib.rs"],
     rlibs: [
         "libdata_model",
