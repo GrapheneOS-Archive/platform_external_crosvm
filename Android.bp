@@ -11,6 +11,9 @@ rust_defaults {
             enabled: true,
         },
     },
+    flags: [
+        "-L device/google/cuttlefish_vmm/x86_64-linux-gnu/bin/",
+    ],
 }
 
 rust_binary_host {
@@ -22,7 +25,7 @@ rust_binary_host {
     target: {
         linux_glibc_x86_64: {
             relative_install_path: "x86_64-linux-gnu",
-            rlibs: ["libx86_64_rust"],
+            rustlibs: ["libx86_64_rust"],
         },
         darwin: {
             enabled: false,
@@ -36,8 +39,10 @@ rust_binary_host {
         "x86_64_linux_gnu_libvirglrenderer.so.1_for_crosvm",
     ],
 
+    edition: "2018",
     features: [
         "audio",
+        "default",
         "gfxstream",
         "gpu",
     ],
@@ -45,14 +50,13 @@ rust_binary_host {
     flags: [
         "-C overflow-checks=y",
         "-C panic=abort",
-        "-L device/google/cuttlefish_vmm/x86_64-linux-gnu/bin/",
     ],
     ld_flags: [
         "-Wl,--rpath,\\$$ORIGIN",
         "-Wl,--rpath,\\$$ORIGIN/../../lib64",
     ],
 
-    rlibs: [
+    rustlibs: [
         "libacpi_tables",
         "libarch",
         "libassertions",
@@ -88,27 +92,112 @@ rust_binary_host {
         "libminijail",
         "libcap",
     ],
-    static_libs: [
-        "libusb",
-        "libdisplay_wl",
-        "libwayland_client",
-        "libffi",
-        "libfdt",
+}
+
+rust_test_host {
+    name: "crosvm_host_test_src_crosvm",
+    defaults: ["crosvm_defaults"],
+    crate_name: "crosvm",
+    srcs: ["src/crosvm.rs"],
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+    edition: "2018",
+    features: [
+        "audio",
+        "default",
+    ],
+    rustlibs: [
+        "libacpi_tables",
+        "libarch",
+        "libassertions",
+        "libaudio_streams",
+        "libbit_field",
+        "libdata_model",
+        "libdevices",
+        "libdisk",
+        "libkernel_cmdline",
+        "libkernel_loader",
+        "libkvm",
+        "libkvm_sys",
+        "liblibc",
+        "liblibcras",
+        "libminijail_rust",
+        "libmsg_socket",
+        "libnet_util",
+        "libp9",
+        "librand_ish",
+        "libresources",
+        "libsync_rust",
+        "libsys_util",
+        "libvhost",
+        "libvm_control",
+        "libx86_64_rust",
+    ],
+    proc_macros: [
+        "libenumn",
+        "libremain",
     ],
 }
 
-rust_library_host_rlib {
+rust_test_host {
+    name: "crosvm_host_test_src_main",
+    defaults: ["crosvm_defaults"],
+    crate_name: "crosvm",
+    srcs: ["src/main.rs"],
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+    edition: "2018",
+    features: [
+        "audio",
+        "default",
+    ],
+    rustlibs: [
+        "libacpi_tables",
+        "libarch",
+        "libassertions",
+        "libaudio_streams",
+        "libbit_field",
+        "libcrosvm",
+        "libdata_model",
+        "libdevices",
+        "libdisk",
+        "libkernel_cmdline",
+        "libkernel_loader",
+        "libkvm",
+        "libkvm_sys",
+        "liblibc",
+        "liblibcras",
+        "libminijail_rust",
+        "libmsg_socket",
+        "libnet_util",
+        "libp9",
+        "librand_ish",
+        "libresources",
+        "libsync_rust",
+        "libsys_util",
+        "libvhost",
+        "libvm_control",
+        "libx86_64_rust",
+    ],
+    proc_macros: [
+        "libenumn",
+        "libremain",
+    ],
+}
+
+rust_library_host {
     name: "libcrosvm",
     defaults: ["crosvm_defaults"],
     crate_name: "crosvm",
     srcs: ["src/crosvm.rs"],
+    edition: "2018",
     features: [
         "audio",
+        "default",
         "gfxstream",
         "gpu",
     ],
-    flags: ["-A unused-parens"],
-    rlibs: [
+    rustlibs: [
         "libacpi_tables",
         "libarch",
         "libassertions",
