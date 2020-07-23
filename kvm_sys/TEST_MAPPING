@@ -2,11 +2,11 @@
 // These tests passed locally but failed in TreeHugger presubmit runner.
 //  "presubmit": [
 //    {
-//      "name": "kvm_sys_tests_kvm_sys",
+//      "name": "kvm_sys_host_test_kvm_sys_src_lib",
 //      "host": true
 //    },
 //    {
-//      "name": "kvm_sys_tests_sanity",
+//      "name": "kvm_sys_host_test_kvm_sys_tests_sanity",
 //      "host": true
 //    }
 //  ]

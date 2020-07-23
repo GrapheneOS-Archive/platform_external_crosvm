@@ -5,12 +5,12 @@
 //   does not generate cc_library module yet
 //   does not generate wayland_protocol_codegen module yet
 
-rust_library_host_rlib {
+rust_library_host {
     name: "libgpu_display",
     defaults: ["crosvm_defaults"],
     crate_name: "gpu_display",
     srcs: ["src/lib.rs"],
-    rlibs: [
+    rustlibs: [
         "libdata_model",
         "liblibc",
         "liblinux_input_sys",
@@ -18,6 +18,8 @@ rust_library_host_rlib {
     ],
     static_libs: [
         "libdisplay_wl",
+        "libwayland_client",
+        "libffi",
     ],
 }
 
