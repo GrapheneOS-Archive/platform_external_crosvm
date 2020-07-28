@@ -10,8 +10,10 @@ rust_library_host {
         "libfutures",
         "libio_uring",
         "liblibc",
-        "libpaste",
         "libsys_util",
         "libsyscall_defines",
+    ],
+    proc_macros: [
+        "libpaste",
     ],
 }
