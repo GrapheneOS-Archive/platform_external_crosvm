@@ -10,7 +10,7 @@ devices = { path = "../devices" }
 kernel_cmdline = { path = "../kernel_cmdline" }
 kvm = { path = "../kvm" }
 libc = "*"
-minijail = "*"
+minijail = { path = "../../minijail/rust/minijail" } # ignored by ebuild
 resources = { path = "../resources" }
 sync = { path = "../sync" }
 sys_util = { path = "../sys_util" }
