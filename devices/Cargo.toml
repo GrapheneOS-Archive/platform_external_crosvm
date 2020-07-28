@@ -16,7 +16,7 @@ gfxstream = ["gpu", "gpu_renderer/gfxstream"]
 
 [dependencies]
 acpi_tables = {path = "../acpi_tables" }
-audio_streams = "*"
+audio_streams = { path = "../../adhd/audio_streams" } # ignored by ebuild
 bit_field = { path = "../bit_field" }
 bitflags = "1"
 cros_async = { path = "../cros_async" }
@@ -30,9 +30,9 @@ hypervisor = { path = "../hypervisor" }
 kvm = { path = "../kvm" }
 kvm_sys = { path = "../kvm_sys" }
 libc = "*"
-libcras = "*"
+libcras = { path = "../../adhd/cras/client/libcras" } # ignored by ebuild
 linux_input_sys = { path = "../linux_input_sys" }
-minijail = "*"
+minijail = { path = "../../minijail/rust/minijail" } # ignored by ebuild
 msg_on_socket_derive = { path = "../msg_socket/msg_on_socket_derive" }
 msg_socket = { path = "../msg_socket" }
 net_sys = { path = "../net_sys" }
