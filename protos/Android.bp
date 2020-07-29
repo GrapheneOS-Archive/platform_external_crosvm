@@ -1,0 +1,49 @@
+// Hand coded genrule to call rust protobuf generator.
+
+genrule_defaults {
+    name: "crosvm-protos-defaults",
+    tools: ["aprotoc", "protoc-gen-rust"],
+    depfile: true,
+    cmd: "$(location aprotoc) -I`dirname $(in)`"
+    + " --dependency_out=$(depfile)"
+    + " --plugin=$(location protoc-gen-rust)"
+    + " --rust_out=$(genDir) $(in) &&"
+    + " diff $(out) `dirname $(in)`/`basename $(out)`",
+    // Generate file to $(out) and compare it with the
+    // checked-in version in the directory of $(in).
+}
+
+// Although aprotoc can process multiple input files,
+// its dependency_out can only take one.
+// So we call it for each proto file.
+genrule {
+    name: "crosvm_cdisk_spec_proto",
+    defaults: ["crosvm-protos-defaults"],
+    srcs: ["src/cdisk_spec.proto"],
+    out: ["cdisk_spec.rs"],
+}
+
+// generated plugin.rs is not used yet.
+genrule {
+    name: "crosvm_plugin_proto",
+    defaults: ["crosvm-protos-defaults"],
+    srcs: ["src/plugin.proto"],
+    out: ["plugin.rs"],
+}
+
+// Only enable composite-disk and include cdisk_spec.rs for now.
+rust_library_host {
+    name: "libprotos",
+    defaults: ["crosvm_defaults"],
+    crate_name: "protos",
+    srcs: [
+        "src/lib.rs",
+        ":crosvm_cdisk_spec_proto",
+    ],
+    features: [
+        "composite-disk",
+    ],
+    rustlibs: [
+        "libprotobuf",
+    ],
+}
