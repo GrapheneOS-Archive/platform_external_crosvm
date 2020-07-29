@@ -4,7 +4,7 @@
 //   * all modules use crosvm_defaults or other defaults derived from it
 // * root host binary is crosvm.experimental
 // * crosvm.experimental and libcrosvm have extra features:
-//   * gfxstream, gpu
+//   * audio, gfxstream, gpu, virtio-gpu-next
 // * crosvm.experimental has extra flags and ld_flags
 // * crosvm_host_test_tests_boot and crosvm_host_test_tests_plugins
 //   are not ready yet
@@ -44,9 +44,11 @@ rust_binary_host {
 
     // Install the crosvm prebuilts as requirements until we're building these as well.
     required: [
-        "x86_64_linux_gnu_libepoxy.so.0_for_crosvm",
-        "x86_64_linux_gnu_libgbm.so.1_for_crosvm",
-        "x86_64_linux_gnu_libvirglrenderer.so.1_for_crosvm",
+        "x86_64_linux_gnu_libandroid_emu_shared.so_for_crosvm",
+        "x86_64_linux_gnu_libc++.so.1_for_crosvm",
+        "x86_64_linux_gnu_libemugl_common.so_for_crosvm",
+        "x86_64_linux_gnu_libgfxstream_backend.so_for_crosvm",
+        "x86_64_linux_gnu_libOpenglRender.so_for_crosvm",
     ],
 
     edition: "2018",
@@ -99,8 +101,11 @@ rust_binary_host {
         "libremain",
     ],
     shared_libs: [
-        "libminijail",
         "libcap",
+        "libepoxy",
+        "libgbm",
+        "libminijail",
+        "libvirglrenderer",
     ],
 }
 
