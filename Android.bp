@@ -103,7 +103,6 @@ rust_binary_host {
     shared_libs: [
         "libcap",
         "libepoxy",
-        "libgbm",
         "libminijail",
     ],
 }
