@@ -105,7 +105,6 @@ rust_binary_host {
         "libepoxy",
         "libgbm",
         "libminijail",
-        "libvirglrenderer",
     ],
 }
 
