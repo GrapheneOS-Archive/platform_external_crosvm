@@ -17,6 +17,9 @@ rust_test_host {
         "liblibc",
         "libsys_util",
     ],
+    shared_libs: [
+        "libvirglrenderer",  // added manually
+    ],
 }
 
 rust_library_host {
@@ -33,6 +36,9 @@ rust_library_host {
         "libdata_model",
         "liblibc",
         "libsys_util",
+    ],
+    shared_libs: [
+        "libvirglrenderer",  // added manually
     ],
 }
 
