@@ -100,11 +100,6 @@ rust_binary_host {
         "libenumn",
         "libremain",
     ],
-    shared_libs: [
-        "libcap",
-        "libepoxy",
-        "libminijail",
-    ],
 }
 
 rust_test_host {
