@@ -20,7 +20,7 @@ rust_test_host {
         "libsys_util",
         "libvm_control",
     ],
-    static_libs: [
+    shared_libs: [
         "libfdt",  // added manually
     ],
 }
@@ -43,7 +43,7 @@ rust_library_host {
         "libsys_util",
         "libvm_control",
     ],
-    static_libs: [
+    shared_libs: [
         "libfdt",  // added manually
     ],
 }
