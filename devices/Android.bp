@@ -56,6 +56,9 @@ rust_test_host {
         "libmsg_on_socket_derive",
         "libremain",
     ],
+    shared_libs: [
+        "libvirglrenderer",  // added manually
+    ],
 }
 
 rust_library_host {
