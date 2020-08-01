@@ -12,6 +12,9 @@ rust_test_host {
         "libdata_model",
         "libsys_util",
     ],
+    shared_libs: [
+        "libgbm",  // added manually
+    ],
 }
 
 rust_library_host {
@@ -23,6 +26,9 @@ rust_library_host {
     rustlibs: [
         "libdata_model",
         "libsys_util",
+    ],
+    shared_libs: [
+        "libgbm",  // added manually
     ],
 }
 
