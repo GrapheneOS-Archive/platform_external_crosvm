@@ -2,18 +2,19 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use base::IoctlNr;
 use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
-use sys_util::IoctlNr;
 
 use libc::E2BIG;
 
+use base::{
+    errno_result, error, ioctl, ioctl_with_mut_ptr, ioctl_with_mut_ref, ioctl_with_ptr,
+    ioctl_with_ref, ioctl_with_val, Error, MappedRegion, Result,
+};
 use data_model::vec_with_array_field;
 use kvm_sys::*;
-use sys_util::{
-    errno_result, error, ioctl, ioctl_with_mut_ptr, ioctl_with_mut_ref, ioctl_with_ptr,
-    ioctl_with_ref, ioctl_with_val, Error, GuestAddress, MappedRegion, Result,
-};
+use vm_memory::GuestAddress;
 
 use super::{Kvm, KvmVcpu, KvmVm};
 use crate::{
@@ -288,7 +289,12 @@ impl KvmVm {
 }
 
 impl VmX86_64 for KvmVm {
+    type Hypervisor = Kvm;
     type Vcpu = KvmVcpu;
+
+    fn get_hypervisor(&self) -> &Self::Hypervisor {
+        &self.kvm
+    }
 
     fn create_vcpu(&self, id: usize) -> Result<Self::Vcpu> {
         // create_vcpu is declared separately in VmAArch64 and VmX86, so it can return VcpuAArch64
@@ -1133,10 +1139,11 @@ mod tests {
     use crate::{
         DeliveryMode, DeliveryStatus, DestinationMode, Hypervisor, HypervisorCap, HypervisorX86_64,
         IoapicRedirectionTableEntry, IoapicState, IrqRoute, IrqSource, IrqSourceChip, LapicState,
-        PicInitState, PicState, PitChannelState, PitRWMode, PitRWState, PitState, TriggerMode, Vm,
+        PicInitState, PicState, PitChannelState, PitRWMode, PitRWState, PitState, TriggerMode,
+        Vcpu, Vm,
     };
     use libc::EINVAL;
-    use sys_util::{GuestAddress, GuestMemory};
+    use vm_memory::{GuestAddress, GuestMemory};
 
     #[test]
     fn get_supported_cpuid() {
@@ -1411,6 +1418,17 @@ mod tests {
     }
 
     #[test]
+    fn enable_feature() {
+        let kvm = Kvm::new().unwrap();
+        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vm = KvmVm::new(&kvm, gm).unwrap();
+        vm.create_irq_chip().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        vcpu.enable_raw_capability(kvm_sys::KVM_CAP_HYPERV_SYNIC, &[0; 4])
+            .unwrap();
+    }
+
+    #[test]
     fn from_fpu() {
         // Fpu has the largest arrays in our struct adapters.  Test that they're small enough for
         // Rust to copy.
@@ -1484,9 +1502,9 @@ mod tests {
         let vm = KvmVm::new(&kvm, gm).unwrap();
         let vcpu = vm.create_vcpu(0).unwrap();
 
-        const MSR_FS_BASE: u32 = 0xc0000100;
+        const MSR_TSC_AUX: u32 = 0xc0000103;
         let mut msrs = vec![Register {
-            id: MSR_FS_BASE,
+            id: MSR_TSC_AUX,
             value: 42,
         }];
         vcpu.set_msrs(&msrs).unwrap();
@@ -1494,7 +1512,7 @@ mod tests {
         msrs[0].value = 0;
         vcpu.get_msrs(&mut msrs).unwrap();
         assert_eq!(msrs.len(), 1);
-        assert_eq!(msrs[0].id, MSR_FS_BASE);
+        assert_eq!(msrs[0].id, MSR_TSC_AUX);
         assert_eq!(msrs[0].value, 42);
     }
 

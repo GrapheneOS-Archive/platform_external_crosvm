@@ -8,6 +8,7 @@ use libc::{
     SIG_BLOCK, SIG_UNBLOCK,
 };
 
+use std::cmp::Ordering;
 use std::fmt::{self, Display};
 use std::io;
 use std::mem;
@@ -96,6 +97,8 @@ fn valid_rt_signal_num(num: c_int) -> bool {
 
 /// Registers `handler` as the signal handler of signum `num`.
 ///
+/// # Safety
+///
 /// This is considered unsafe because the given handler will be called asynchronously, interrupting
 /// whatever the thread was doing and therefore must only do async-signal-safe operations.
 pub unsafe fn register_signal_handler(num: c_int, handler: extern "C" fn()) -> errno::Result<()> {
@@ -114,6 +117,8 @@ pub unsafe fn register_signal_handler(num: c_int, handler: extern "C" fn()) -> e
 /// Registers `handler` as the signal handler for the real-time signal with signum `num`.
 ///
 /// The value of `num` must be within [`SIGRTMIN`, `SIGRTMAX`] range.
+///
+/// # Safety
 ///
 /// This is considered unsafe because the given handler will be called asynchronously, interrupting
 /// whatever the thread was doing and therefore must only do async-signal-safe operations.
@@ -189,11 +194,15 @@ pub fn block_signal(num: c_int) -> SignalResult<()> {
             return Err(Error::BlockSignal(errno::Error::last()));
         }
         let ret = sigismember(&old_sigset, num);
-        if ret < 0 {
-            return Err(Error::CompareBlockedSignals(errno::Error::last()));
-        } else if ret > 0 {
-            return Err(Error::SignalAlreadyBlocked(num));
-        }
+        match ret.cmp(&0) {
+            Ordering::Less => {
+                return Err(Error::CompareBlockedSignals(errno::Error::last()));
+            }
+            Ordering::Greater => {
+                return Err(Error::SignalAlreadyBlocked(num));
+            }
+            _ => (),
+        };
     }
     Ok(())
 }

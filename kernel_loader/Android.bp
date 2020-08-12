@@ -9,8 +9,9 @@ rust_test_host {
     auto_gen_config: true,
     edition: "2018",
     rustlibs: [
+        "libbase_rust",
         "liblibc",
-        "libsys_util",
+        "libvm_memory",
     ],
 }
 
@@ -21,21 +22,37 @@ rust_library_host {
     srcs: ["src/lib.rs"],
     edition: "2018",
     rustlibs: [
+        "libbase_rust",
         "liblibc",
-        "libsys_util",
+        "libvm_memory",
     ],
 }
 
 // dependent_library ["feature_list"]
 //   ../assertions/src/lib.rs
+//   ../base/src/lib.rs
+//   ../cros_async/src/lib.rs
 //   ../data_model/src/lib.rs
+//   ../io_uring/src/lib.rs
 //   ../sync/src/lib.rs
 //   ../sys_util/poll_token_derive/poll_token_derive.rs
 //   ../sys_util/src/lib.rs
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
-//   libc-0.2.62 "default,std"
+//   ../vm_memory/src/lib.rs
+//   futures-0.3.5 "alloc"
+//   futures-channel-0.3.5 "alloc,futures-sink,sink"
+//   futures-core-0.3.5 "alloc"
+//   futures-io-0.3.5
+//   futures-sink-0.3.5 "alloc"
+//   futures-task-0.3.5 "alloc"
+//   futures-util-0.3.5 "alloc,futures-sink,sink"
+//   libc-0.2.74 "default,std"
+//   paste-1.0.0
+//   pin-project-0.4.23
+//   pin-project-internal-0.4.23
+//   pin-utils-0.1.0
 //   proc-macro2-1.0.19 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
-//   syn-1.0.35 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   syn-1.0.37 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   unicode-xid-0.2.1 "default"

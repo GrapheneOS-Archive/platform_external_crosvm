@@ -9,8 +9,8 @@ rust_test_host {
     auto_gen_config: true,
     edition: "2018",
     rustlibs: [
+        "libbase_rust",
         "libdata_model",
-        "libsys_util",
     ],
     shared_libs: [
         "libgbm",  // added manually
@@ -24,8 +24,8 @@ rust_library_host {
     srcs: ["src/lib.rs"],
     edition: "2018",
     rustlibs: [
+        "libbase_rust",
         "libdata_model",
-        "libsys_util",
     ],
     shared_libs: [
         "libgbm",  // added manually
@@ -34,14 +34,15 @@ rust_library_host {
 
 // dependent_library ["feature_list"]
 //   ../assertions/src/lib.rs
+//   ../base/src/lib.rs
 //   ../data_model/src/lib.rs
 //   ../sync/src/lib.rs
 //   ../sys_util/poll_token_derive/poll_token_derive.rs
 //   ../sys_util/src/lib.rs
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
-//   libc-0.2.62 "default,std"
+//   libc-0.2.74 "default,std"
 //   proc-macro2-1.0.19 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
-//   syn-1.0.35 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   syn-1.0.38 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   unicode-xid-0.2.1 "default"

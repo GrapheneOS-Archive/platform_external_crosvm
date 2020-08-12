@@ -37,9 +37,9 @@ pub type Map = fn(u32) -> Result<(u64, usize)>;
 // Unmaps the resource given a resource id.
 pub type Unmap = fn(u32) -> ();
 
-/// ExternalMapping represents wraps an external library mapping.  This is useful in cases where
-/// where the device memory is not compatible with the mmap interface, such as Vulkan VkDeviceMemory
-/// in the non-exportable case or when exported as an opaque fd.
+/// ExternalMapping wraps an external library mapping.  This is useful in cases where where the
+/// device memory is not compatible with the mmap interface, such as Vulkan VkDeviceMemory in the
+/// non-exportable case or when exported as an opaque fd.
 #[derive(Debug, PartialEq)]
 pub struct ExternalMapping {
     resource_id: u32,
@@ -52,10 +52,17 @@ unsafe impl Send for ExternalMapping {}
 unsafe impl Sync for ExternalMapping {}
 impl ExternalMapping {
     /// Creates an ExternalMapping given a library-specific resource id and map/unmap functions.
-    pub fn new(resource_id: u32, map: Map, unmap: Unmap) -> Result<ExternalMapping> {
+    ///
+    /// # Safety
+    ///
+    /// The map function must return a valid host memory region.  In addition, callers of the
+    /// function must guarantee that the map and unmap functions are thread-safe, never return a
+    /// region overlapping already Rust referenced-data, and the backing store of the resource
+    /// doesn't disappear before the unmap function is called.
+    pub unsafe fn new(resource_id: u32, map: Map, unmap: Unmap) -> Result<ExternalMapping> {
         let (ptr, size) = map(resource_id)?;
 
-        if ptr as *mut u8 == std::ptr::null_mut() {
+        if (ptr as *mut u8).is_null() {
             return Err(Error::NullAddress);
         }
         if size == 0 {
@@ -99,9 +106,9 @@ mod tests {
     fn check_valid_external_map() {
         let map1: Map = |_resource_id| Ok((0xAAAABBBB, 500));
         let map2: Map = |_resource_id| Ok((0xBBBBAAAA, 1000));
-        let unmap: Unmap = |_resource_i| {};
-        let external_map1 = ExternalMapping::new(0, map1, unmap).unwrap();
-        let external_map2 = ExternalMapping::new(0, map2, unmap).unwrap();
+        let unmap: Unmap = |_resource_id| {};
+        let external_map1 = unsafe { ExternalMapping::new(0, map1, unmap).unwrap() };
+        let external_map2 = unsafe { ExternalMapping::new(0, map2, unmap).unwrap() };
 
         assert_eq!(external_map1.as_ptr(), 0xAAAABBBB as *mut u8);
         assert_eq!(external_map1.size(), 500);
@@ -116,12 +123,12 @@ mod tests {
         let unmap: Unmap = |_resource_id| {};
 
         assert_eq!(
-            ExternalMapping::new(0, map1, unmap),
+            unsafe { ExternalMapping::new(0, map1, unmap) },
             Err(Error::InvalidSize)
         );
 
         assert_eq!(
-            ExternalMapping::new(0, map2, unmap),
+            unsafe { ExternalMapping::new(0, map2, unmap) },
             Err(Error::NullAddress)
         );
     }
@@ -131,6 +138,6 @@ mod tests {
     fn check_external_map_drop() {
         let map = |_resource_id| Ok((0xAAAABBBB, 500));
         let unmap = |_resource_id| panic!();
-        let _external_map = ExternalMapping::new(0, map, unmap);
+        let _external_map = unsafe { ExternalMapping::new(0, map, unmap) };
     }
 }

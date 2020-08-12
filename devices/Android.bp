@@ -20,6 +20,7 @@ rust_test_host {
     rustlibs: [
         "libacpi_tables",
         "libaudio_streams",
+        "libbase_rust",
         "libbit_field",
         "libbitflags",
         "libcros_async",
@@ -29,7 +30,6 @@ rust_test_host {
         "libgpu_display",  // added manually
         "libgpu_renderer",  // added manually
         "libhypervisor",
-        "libkvm",
         "libkvm_sys",
         "liblibc",
         "liblibcras",
@@ -42,7 +42,6 @@ rust_test_host {
         "librand_ish",
         "libresources",
         "libsync_rust",
-        "libsys_util",
         "libsyscall_defines",
         "libtempfile",
         "libusb_util",
@@ -50,6 +49,7 @@ rust_test_host {
         "libvhost",
         "libvirtio_sys",
         "libvm_control",
+        "libvm_memory",
     ],
     proc_macros: [
         "libenumn",
@@ -78,6 +78,7 @@ rust_library_host {
     rustlibs: [
         "libacpi_tables",
         "libaudio_streams",
+        "libbase_rust",
         "libbit_field",
         "libbitflags",
         "libcros_async",
@@ -87,7 +88,6 @@ rust_library_host {
         "libgpu_display",  // added manually
         "libgpu_renderer",  // added manually
         "libhypervisor",
-        "libkvm",
         "libkvm_sys",
         "liblibc",
         "liblibcras",
@@ -100,13 +100,13 @@ rust_library_host {
         "librand_ish",
         "libresources",
         "libsync_rust",
-        "libsys_util",
         "libsyscall_defines",
         "libusb_util",
         "libvfio_sys",
         "libvhost",
         "libvirtio_sys",
         "libvm_control",
+        "libvm_memory",
     ],
     proc_macros: [
         "libenumn",
@@ -123,6 +123,7 @@ rust_library_host {
 //   ../../minijail/rust/minijail/src/lib.rs
 //   ../acpi_tables/src/lib.rs
 //   ../assertions/src/lib.rs
+//   ../base/src/lib.rs
 //   ../bit_field/bit_field_derive/bit_field_derive.rs
 //   ../bit_field/src/lib.rs
 //   ../cros_async/src/lib.rs
@@ -153,6 +154,8 @@ rust_library_host {
 //   ../vhost/src/lib.rs
 //   ../virtio_sys/src/lib.rs
 //   ../vm_control/src/lib.rs
+//   ../vm_memory/src/lib.rs
+//   async-trait-0.1.36
 //   bitflags-1.2.1 "default"
 //   futures-0.3.5 "alloc,async-await,default,executor,futures-executor,std"
 //   futures-channel-0.3.5 "alloc,futures-sink,sink,std"
@@ -163,20 +166,19 @@ rust_library_host {
 //   futures-sink-0.3.5 "alloc,std"
 //   futures-task-0.3.5 "alloc,once_cell,std"
 //   futures-util-0.3.5 "alloc,async-await,async-await-macro,channel,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,proc-macro-hack,proc-macro-nested,sink,slab,std"
-//   libc-0.2.62 "default,std"
+//   libc-0.2.74 "default,std"
 //   memchr-2.3.3 "default,std"
 //   once_cell-1.4.0 "std"
-//   paste-0.1.18
-//   paste-impl-0.1.18
-//   pin-project-0.4.13
-//   pin-project-internal-0.4.13
+//   paste-1.0.0
+//   pin-project-0.4.23
+//   pin-project-internal-0.4.23
 //   pin-utils-0.1.0
-//   pkg-config-0.3.11
-//   proc-macro-hack-0.5.16
+//   pkg-config-0.3.18
+//   proc-macro-hack-0.5.18
 //   proc-macro-nested-0.1.6
-//   proc-macro2-1.0.5 "default,proc-macro"
-//   quote-1.0.2 "default,proc-macro"
-//   remain-0.1.4
+//   proc-macro2-1.0.19 "default,proc-macro"
+//   quote-1.0.7 "default,proc-macro"
+//   remain-0.2.2
 //   slab-0.4.2
-//   syn-1.0.5 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
-//   unicode-xid-0.2.0 "default"
+//   syn-1.0.37 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   unicode-xid-0.2.1 "default"

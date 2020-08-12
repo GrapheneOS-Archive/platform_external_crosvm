@@ -14,13 +14,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::usize;
 
+use base::{error, ExternalMapping};
 use data_model::*;
 use gpu_display::*;
 use gpu_renderer::RendererFlags;
 use resources::Alloc;
 use sync::Mutex;
-use sys_util::{error, ExternalMapping, GuestAddress, GuestMemory};
 use vm_control::VmMemoryControlRequestSocket;
+use vm_memory::{GuestAddress, GuestMemory};
 
 use super::protocol::GpuResponse;
 pub use super::virtio_backend::{VirtioBackend, VirtioResource};
