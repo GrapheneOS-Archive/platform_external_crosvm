@@ -27,4 +27,4 @@ rust_library_host {
 // dependent_library ["feature_list"]
 //   ../assertions/src/lib.rs
 //   ../data_model/src/lib.rs
-//   libc-0.2.73 "default,std"
+//   libc-0.2.74 "default,std"

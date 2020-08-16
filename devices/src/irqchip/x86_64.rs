@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use base::Result;
 use hypervisor::{IoapicState, LapicState, PicSelect, PicState, PitState, VcpuX86_64};
-use sys_util::Result;
 
 use crate::IrqChip;
 
@@ -31,6 +31,9 @@ pub trait IrqChipX86_64<V: VcpuX86_64>: IrqChip<V> {
 
     /// Sets the state of the PIT.
     fn set_pit(&mut self, state: &PitState) -> Result<()>;
+
+    /// Returns true if the PIT uses port 0x61 for the PC speaker, false if 0x61 is unused.
+    fn pit_uses_speaker_port(&self) -> bool;
 }
 
 #[cfg(test)]

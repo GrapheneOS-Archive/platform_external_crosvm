@@ -7,8 +7,9 @@ edition = "2018"
 [dependencies]
 io_uring = { path = "../io_uring" }
 libc = "*"
-paste = "^1"
-sys_util = { path = "../sys_util" }
+paste = "*"
+pin-utils = "0.1.0-alpha.4"
+base = { path = "../base" }
 syscall_defines = { path = "../syscall_defines" }
 
 [dependencies.futures]
@@ -18,3 +19,4 @@ features = ["alloc"]
 
 [dev-dependencies]
 tempfile = { path = "../tempfile" }
+vm_memory = { path = "../vm_memory" }

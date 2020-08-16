@@ -10,11 +10,12 @@ rust_library_host {
     defaults: ["crosvm_defaults"],
     crate_name: "gpu_display",
     srcs: ["src/lib.rs"],
+    edition: "2018",
     rustlibs: [
+        "libbase_rust",
         "libdata_model",
         "liblibc",
         "liblinux_input_sys",
-        "libsys_util",
     ],
     shared_libs: [
         "libwayland_client",
