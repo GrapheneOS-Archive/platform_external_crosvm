@@ -25,4 +25,4 @@ rust_library_host {
 }
 
 // dependent_library ["feature_list"]
-//   libc-0.2.62 "default,std"
+//   libc-0.2.74 "default,std"

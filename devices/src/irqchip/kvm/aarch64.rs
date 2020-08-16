@@ -5,10 +5,10 @@
 use std::sync::Arc;
 use sync::Mutex;
 
+use base::{errno_result, ioctl_with_ref, Result, SafeDescriptor};
 use hypervisor::kvm::{KvmVcpu, KvmVm};
 use hypervisor::{DeviceKind, IrqRoute, Vm};
 use kvm_sys::*;
-use sys_util::{errno_result, ioctl_with_ref, Result, SafeDescriptor};
 
 use crate::IrqChipAArch64;
 
@@ -46,7 +46,7 @@ const AARCH64_GIC_REDIST_SIZE: u64 = 0x20000;
 
 // This is the minimum number of SPI interrupts aligned to 32 + 32 for the
 // PPI (16) and GSI (16).
-const AARCH64_GIC_NR_IRQS: u32 = 64;
+pub const AARCH64_GIC_NR_IRQS: u32 = 64;
 // Number of SPIs (32), which is the NR_IRQS (64) minus the number of PPIs (16) and GSIs (16)
 const AARCH64_GIC_NR_SPIS: u32 = 32;
 

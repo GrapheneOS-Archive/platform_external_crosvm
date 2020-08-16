@@ -13,9 +13,13 @@ use std::result;
 use std::sync::Arc;
 
 use crate::guest_address::GuestAddress;
-use crate::mmap::{self, MappedRegion, MemoryMapping};
-use crate::shm::{MemfdSeals, SharedMemory};
-use crate::{errno, pagesize};
+use base::{pagesize, Error as SysError};
+use base::{MappedRegion, MemoryMapping, MmapError};
+use base::{MemfdSeals, SharedMemory};
+use cros_async::{
+    uring_mem::{self, BorrowedIoVec},
+    BackingMemory,
+};
 use data_model::volatile_memory::*;
 use data_model::DataInit;
 
@@ -23,14 +27,14 @@ use data_model::DataInit;
 pub enum Error {
     DescriptorChainOverflow,
     InvalidGuestAddress(GuestAddress),
-    MemoryAccess(GuestAddress, mmap::Error),
-    MemoryMappingFailed(mmap::Error),
+    MemoryAccess(GuestAddress, MmapError),
+    MemoryMappingFailed(MmapError),
     MemoryRegionOverlap,
     MemoryRegionTooLarge(u64),
     MemoryNotAligned,
-    MemoryCreationFailed(errno::Error),
-    MemorySetSizeFailed(errno::Error),
-    MemoryAddSealsFailed(errno::Error),
+    MemoryCreationFailed(SysError),
+    MemorySetSizeFailed(SysError),
+    MemoryAddSealsFailed(SysError),
     ShortWrite { expected: usize, completed: usize },
     ShortRead { expected: usize, completed: usize },
     SplitOutOfBounds(usize),
@@ -198,7 +202,8 @@ impl GuestMemory {
     /// # Examples
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory, MemoryMapping};
+    /// # use base::MemoryMapping;
+    /// # use vm_memory::{GuestAddress, GuestMemory};
     /// # fn test_end_addr() -> Result<(), ()> {
     ///     let start_addr = GuestAddress(0x1000);
     ///     let mut gm = GuestMemory::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
@@ -292,7 +297,8 @@ impl GuestMemory {
     /// * Write a slice at guestaddress 0x200.
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory, MemoryMapping};
+    /// # use base::MemoryMapping;
+    /// # use vm_memory::{GuestAddress, GuestMemory};
     /// # fn test_write_u64() -> Result<(), ()> {
     /// #   let start_addr = GuestAddress(0x1000);
     /// #   let mut gm = GuestMemory::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
@@ -319,7 +325,7 @@ impl GuestMemory {
     /// # Examples
     ///
     /// ```
-    /// use sys_util::{guest_memory, GuestAddress, GuestMemory};
+    /// use vm_memory::{guest_memory, GuestAddress, GuestMemory};
     ///
     /// fn test_write_all() -> guest_memory::Result<()> {
     ///     let ranges = &[(GuestAddress(0x1000), 0x400)];
@@ -349,7 +355,8 @@ impl GuestMemory {
     /// * Read a slice of length 16 at guestaddress 0x200.
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory, MemoryMapping};
+    /// # use base::MemoryMapping;
+    /// # use vm_memory::{GuestAddress, GuestMemory};
     /// # fn test_write_u64() -> Result<(), ()> {
     /// #   let start_addr = GuestAddress(0x1000);
     /// #   let mut gm = GuestMemory::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
@@ -376,7 +383,7 @@ impl GuestMemory {
     /// # Examples
     ///
     /// ```
-    /// use sys_util::{guest_memory, GuestAddress, GuestMemory, MemoryMapping};
+    /// use vm_memory::{guest_memory, GuestAddress, GuestMemory};
     ///
     /// fn test_read_exact() -> guest_memory::Result<()> {
     ///     let ranges = &[(GuestAddress(0x1000), 0x400)];
@@ -407,7 +414,8 @@ impl GuestMemory {
     /// * Read a u64 from two areas of guest memory backed by separate mappings.
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory, MemoryMapping};
+    /// # use base::MemoryMapping;
+    /// # use vm_memory::{GuestAddress, GuestMemory};
     /// # fn test_read_u64() -> Result<u64, ()> {
     /// #     let start_addr1 = GuestAddress(0x0);
     /// #     let start_addr2 = GuestAddress(0x400);
@@ -433,7 +441,8 @@ impl GuestMemory {
     /// * Write a u64 at guest address 0x1100.
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory, MemoryMapping};
+    /// # use base::MemoryMapping;
+    /// # use vm_memory::{GuestAddress, GuestMemory};
     /// # fn test_write_u64() -> Result<(), ()> {
     /// #   let start_addr = GuestAddress(0x1000);
     /// #   let mut gm = GuestMemory::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
@@ -456,7 +465,8 @@ impl GuestMemory {
     /// * Write `99` to 30 bytes starting at guest address 0x1010.
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory, GuestMemoryError, MemoryMapping};
+    /// # use base::MemoryMapping;
+    /// # use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
     /// # fn test_volatile_slice() -> Result<(), GuestMemoryError> {
     /// #   let start_addr = GuestAddress(0x1000);
     /// #   let mut gm = GuestMemory::new(&vec![(start_addr, 0x400)])?;
@@ -487,7 +497,8 @@ impl GuestMemory {
     /// * Get a &u64 at offset 0x1010.
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory, GuestMemoryError, MemoryMapping};
+    /// # use base::MemoryMapping;
+    /// # use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
     /// # fn test_ref_u64() -> Result<(), GuestMemoryError> {
     /// #   let start_addr = GuestAddress(0x1000);
     /// #   let mut gm = GuestMemory::new(&vec![(start_addr, 0x400)])?;
@@ -516,7 +527,8 @@ impl GuestMemory {
     /// * Read bytes from /dev/urandom
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory, MemoryMapping};
+    /// # use base::MemoryMapping;
+    /// # use vm_memory::{GuestAddress, GuestMemory};
     /// # use std::fs::File;
     /// # use std::path::Path;
     /// # fn test_read_random() -> Result<u32, ()> {
@@ -555,7 +567,8 @@ impl GuestMemory {
     /// * Write 128 bytes to /dev/null
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory, MemoryMapping};
+    /// # use base::MemoryMapping;
+    /// # use vm_memory::{GuestAddress, GuestMemory};
     /// # use std::fs::File;
     /// # use std::path::Path;
     /// # fn test_write_null() -> Result<(), ()> {
@@ -591,7 +604,7 @@ impl GuestMemory {
     /// # Examples
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory};
+    /// # use vm_memory::{GuestAddress, GuestMemory};
     /// # fn test_host_addr() -> Result<(), ()> {
     ///     let start_addr = GuestAddress(0x1000);
     ///     let mut gm = GuestMemory::new(&vec![(start_addr, 0x500)]).map_err(|_| ())?;
@@ -637,7 +650,7 @@ impl GuestMemory {
     /// # Examples
     ///
     /// ```
-    /// # use sys_util::{GuestAddress, GuestMemory};
+    /// # use vm_memory::{GuestAddress, GuestMemory};
     /// let addr_a = GuestAddress(0x1000);
     /// let addr_b = GuestAddress(0x8000);
     /// let mut gm = GuestMemory::new(&vec![
@@ -656,39 +669,58 @@ impl GuestMemory {
     }
 }
 
+// It is safe to implement BackingMemory because GuestMemory can be mutated any time already.
+unsafe impl BackingMemory for GuestMemory {
+    fn get_iovec<'s>(
+        &'s self,
+        mem_range: cros_async::MemRegion,
+    ) -> uring_mem::Result<uring_mem::BorrowedIoVec<'s>> {
+        let vs = self
+            .get_slice_at_addr(GuestAddress(mem_range.offset as u64), mem_range.len)
+            .map_err(|_| uring_mem::Error::InvalidOffset(mem_range.offset, mem_range.len))?;
+        // Safe because 'vs' is valid in the backing memory as checked above.
+        unsafe {
+            Ok(BorrowedIoVec::from_raw_parts(
+                vs.as_mut_ptr(),
+                vs.size() as usize,
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_has_memfd;
+    use base::kernel_has_memfd;
 
     #[test]
     fn test_alignment() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
 
-        assert!(GuestMemory::new(&vec![(start_addr1, 0x100), (start_addr2, 0x400)]).is_err());
-        assert!(GuestMemory::new(&vec![(start_addr1, 0x1000), (start_addr2, 0x1000)]).is_ok());
+        assert!(GuestMemory::new(&[(start_addr1, 0x100), (start_addr2, 0x400)]).is_err());
+        assert!(GuestMemory::new(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).is_ok());
     }
 
     #[test]
     fn two_regions() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x4000);
-        assert!(GuestMemory::new(&vec![(start_addr1, 0x4000), (start_addr2, 0x4000)]).is_ok());
+        assert!(GuestMemory::new(&[(start_addr1, 0x4000), (start_addr2, 0x4000)]).is_ok());
     }
 
     #[test]
     fn overlap_memory() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        assert!(GuestMemory::new(&vec![(start_addr1, 0x2000), (start_addr2, 0x2000)]).is_err());
+        assert!(GuestMemory::new(&[(start_addr1, 0x2000), (start_addr2, 0x2000)]).is_err());
     }
 
     #[test]
     fn region_hole() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x4000);
-        let gm = GuestMemory::new(&vec![(start_addr1, 0x2000), (start_addr2, 0x2000)]).unwrap();
+        let gm = GuestMemory::new(&[(start_addr1, 0x2000), (start_addr2, 0x2000)]).unwrap();
         assert_eq!(gm.address_in_range(GuestAddress(0x1000)), true);
         assert_eq!(gm.address_in_range(GuestAddress(0x3000)), false);
         assert_eq!(gm.address_in_range(GuestAddress(0x5000)), true);
@@ -715,7 +747,7 @@ mod tests {
     fn test_read_u64() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let gm = GuestMemory::new(&vec![(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let gm = GuestMemory::new(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
 
         let val1: u64 = 0xaa55aa55aa55aa55;
         let val2: u64 = 0x55aa55aa55aa55aa;
@@ -732,7 +764,7 @@ mod tests {
     fn test_ref_load_u64() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let gm = GuestMemory::new(&vec![(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let gm = GuestMemory::new(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
 
         let val1: u64 = 0xaa55aa55aa55aa55;
         let val2: u64 = 0x55aa55aa55aa55aa;
@@ -752,7 +784,7 @@ mod tests {
     fn test_ref_store_u64() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let gm = GuestMemory::new(&vec![(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let gm = GuestMemory::new(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
 
         let val1: u64 = 0xaa55aa55aa55aa55;
         let val2: u64 = 0x55aa55aa55aa55aa;
@@ -772,11 +804,8 @@ mod tests {
         let size_region1 = 0x1000;
         let start_region2 = GuestAddress(0x10000);
         let size_region2 = 0x2000;
-        let gm = GuestMemory::new(&vec![
-            (start_region1, size_region1),
-            (start_region2, size_region2),
-        ])
-        .unwrap();
+        let gm = GuestMemory::new(&[(start_region1, size_region1), (start_region2, size_region2)])
+            .unwrap();
 
         let mem_size = gm.memory_size();
         assert_eq!(mem_size, size_region1 + size_region2);
@@ -791,7 +820,7 @@ mod tests {
     fn guest_to_host() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let mem = GuestMemory::new(&vec![(start_addr1, 0x1000), (start_addr2, 0x4000)]).unwrap();
+        let mem = GuestMemory::new(&[(start_addr1, 0x1000), (start_addr2, 0x4000)]).unwrap();
 
         // Verify the host addresses match what we expect from the mappings.
         let addr1_base = get_mapping(&mem, start_addr1).unwrap();
@@ -816,11 +845,8 @@ mod tests {
         let size_region1 = 0x1000;
         let start_region2 = GuestAddress(0x10000);
         let size_region2 = 0x2000;
-        let gm = GuestMemory::new(&vec![
-            (start_region1, size_region1),
-            (start_region2, size_region2),
-        ])
-        .unwrap();
+        let gm = GuestMemory::new(&[(start_region1, size_region1), (start_region2, size_region2)])
+            .unwrap();
 
         gm.write_obj_at_addr(0x1337u16, GuestAddress(0x0)).unwrap();
         gm.write_obj_at_addr(0x0420u16, GuestAddress(0x10000))

@@ -2,14 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::cell::RefCell;
 use std::cmp::min;
 use std::num::Wrapping;
 use std::os::unix::io::AsRawFd;
+use std::rc::Rc;
 use std::sync::atomic::{fence, Ordering};
 
+use base::error;
 use cros_async::{AsyncError, U64Source};
-use sys_util::{error, GuestAddress, GuestMemory};
 use virtio_sys::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+use vm_memory::{GuestAddress, GuestMemory};
 
 use super::{Interrupt, VIRTIO_MSI_NO_VECTOR};
 
@@ -23,24 +26,24 @@ const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 0x1;
 
 /// An iterator over a single descriptor chain.  Not to be confused with AvailIter,
 /// which iterates over the descriptor chain heads in a queue.
-pub struct DescIter<'a> {
-    next: Option<DescriptorChain<'a>>,
+pub struct DescIter {
+    next: Option<DescriptorChain>,
 }
 
-impl<'a> DescIter<'a> {
+impl DescIter {
     /// Returns an iterator that only yields the readable descriptors in the chain.
-    pub fn readable(self) -> impl Iterator<Item = DescriptorChain<'a>> {
+    pub fn readable(self) -> impl Iterator<Item = DescriptorChain> {
         self.take_while(DescriptorChain::is_read_only)
     }
 
     /// Returns an iterator that only yields the writable descriptors in the chain.
-    pub fn writable(self) -> impl Iterator<Item = DescriptorChain<'a>> {
+    pub fn writable(self) -> impl Iterator<Item = DescriptorChain> {
         self.skip_while(DescriptorChain::is_read_only)
     }
 }
 
-impl<'a> Iterator for DescIter<'a> {
-    type Item = DescriptorChain<'a>;
+impl Iterator for DescIter {
+    type Item = DescriptorChain;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(current) = self.next.take() {
@@ -54,8 +57,8 @@ impl<'a> Iterator for DescIter<'a> {
 
 /// A virtio descriptor chain.
 #[derive(Clone)]
-pub struct DescriptorChain<'a> {
-    mem: &'a GuestMemory,
+pub struct DescriptorChain {
+    mem: GuestMemory,
     desc_table: GuestAddress,
     queue_size: u16,
     ttl: u16, // used to prevent infinite chain cycles
@@ -77,7 +80,7 @@ pub struct DescriptorChain<'a> {
     pub next: u16,
 }
 
-impl<'a> DescriptorChain<'a> {
+impl DescriptorChain {
     pub(crate) fn checked_new(
         mem: &GuestMemory,
         desc_table: GuestAddress,
@@ -102,7 +105,7 @@ impl<'a> DescriptorChain<'a> {
         let flags: u16 = mem.read_obj_from_addr(desc_head.unchecked_add(12)).unwrap();
         let next: u16 = mem.read_obj_from_addr(desc_head.unchecked_add(14)).unwrap();
         let chain = DescriptorChain {
-            mem,
+            mem: mem.clone(),
             desc_table,
             queue_size,
             ttl: queue_size,
@@ -161,12 +164,12 @@ impl<'a> DescriptorChain<'a> {
     ///
     /// Note that this is distinct from the next descriptor chain returned by `AvailIter`, which is
     /// the head of the next _available_ descriptor chain.
-    pub fn next_descriptor(&self) -> Option<DescriptorChain<'a>> {
+    pub fn next_descriptor(&self) -> Option<DescriptorChain> {
         if self.has_next() {
             // Once we see a write-only descriptor, all subsequent descriptors must be write-only.
             let required_flags = self.flags & VIRTQ_DESC_F_WRITE;
             DescriptorChain::checked_new(
-                self.mem,
+                &self.mem,
                 self.desc_table,
                 self.queue_size,
                 self.next,
@@ -182,7 +185,7 @@ impl<'a> DescriptorChain<'a> {
     }
 
     /// Produces an iterator over all the descriptors in this chain.
-    pub fn into_iter(self) -> DescIter<'a> {
+    pub fn into_iter(self) -> DescIter {
         DescIter { next: Some(self) }
     }
 }
@@ -194,7 +197,7 @@ pub struct AvailIter<'a, 'b> {
 }
 
 impl<'a, 'b> Iterator for AvailIter<'a, 'b> {
-    type Item = DescriptorChain<'a>;
+    type Item = DescriptorChain;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.queue.pop(self.mem)
@@ -231,6 +234,11 @@ pub struct Queue {
     // Device feature bits accepted by the driver
     features: u64,
     last_used: Wrapping<u16>,
+
+    // Count of notification disables. Users of the queue can disable guest notification while
+    // processing requests. This is the count of how many are in flight(could be several contexts
+    // handling requests in parallel). When this count is zero, notifications are re-enabled.
+    notification_disable_count: usize,
 }
 
 impl Queue {
@@ -248,6 +256,7 @@ impl Queue {
             next_used: Wrapping(0),
             features: 0,
             last_used: Wrapping(0),
+            notification_disable_count: 0,
         }
     }
 
@@ -323,7 +332,7 @@ impl Queue {
 
     /// Get the first available descriptor chain without removing it from the queue.
     /// Call `pop_peeked` to remove the returned descriptor chain from the queue.
-    pub fn peek<'a>(&mut self, mem: &'a GuestMemory) -> Option<DescriptorChain<'a>> {
+    pub fn peek(&mut self, mem: &GuestMemory) -> Option<DescriptorChain> {
         if !self.is_valid(mem) {
             return None;
         }
@@ -362,7 +371,7 @@ impl Queue {
     }
 
     /// If a new DescriptorHead is available, returns one and removes it from the queue.
-    pub fn pop<'a>(&mut self, mem: &'a GuestMemory) -> Option<DescriptorChain<'a>> {
+    pub fn pop(&mut self, mem: &GuestMemory) -> Option<DescriptorChain> {
         let descriptor_chain = self.peek(mem);
         if descriptor_chain.is_some() {
             self.pop_peeked(mem);
@@ -377,11 +386,11 @@ impl Queue {
 
     /// Asynchronously read the next descriptor chain from the queue.
     /// Returns a `DescriptorChain` when it is `await`ed.
-    pub async fn next_async<'mem, F: AsRawFd + Unpin>(
+    pub async fn next_async<F: AsRawFd + Unpin>(
         &mut self,
-        mem: &'mem GuestMemory,
+        mem: &GuestMemory,
         eventfd: &mut U64Source<F>,
-    ) -> std::result::Result<DescriptorChain<'mem>, AsyncError> {
+    ) -> std::result::Result<DescriptorChain, AsyncError> {
         loop {
             // Check if there are more descriptors available.
             if let Some(chain) = self.pop(mem) {
@@ -422,6 +431,12 @@ impl Queue {
     /// Enable / Disable guest notify device that requests are available on
     /// the descriptor chain.
     pub fn set_notify(&mut self, mem: &GuestMemory, enable: bool) {
+        if enable {
+            self.notification_disable_count -= 1;
+        } else {
+            self.notification_disable_count += 1;
+        }
+
         if self.features & ((1u64) << VIRTIO_RING_F_EVENT_IDX) != 0 {
             let avail_index_addr = mem.checked_offset(self.avail_ring, 2).unwrap();
             let avail_index: u16 = mem.read_obj_from_addr(avail_index_addr).unwrap();
@@ -431,7 +446,7 @@ impl Queue {
             mem.write_obj_at_addr(avail_index, avail_event_off).unwrap();
         } else {
             let mut used_flags: u16 = mem.read_obj_from_addr(self.used_ring).unwrap();
-            if enable {
+            if self.notification_disable_count == 0 {
                 used_flags &= !VIRTQ_USED_F_NO_NOTIFY;
             } else {
                 used_flags |= VIRTQ_USED_F_NO_NOTIFY;
@@ -486,14 +501,37 @@ impl Queue {
     }
 }
 
+/// Used to temporarily disable notifications while processing a request. Notification will be
+/// re-enabled on drop.
+pub struct NotifyGuard {
+    queue: Rc<RefCell<Queue>>,
+    mem: Rc<GuestMemory>,
+}
+
+impl NotifyGuard {
+    /// Disable notifications for the lifetime of the returned guard. Useful when the caller is
+    /// processing a descriptor and doesn't need notifications of further messages from the guest.
+    pub fn new(queue: Rc<RefCell<Queue>>, mem: Rc<GuestMemory>) -> Self {
+        // Disable notification until we're done processing the next request.
+        queue.borrow_mut().set_notify(&mem, false);
+        NotifyGuard { queue, mem }
+    }
+}
+
+impl Drop for NotifyGuard {
+    fn drop(&mut self) {
+        self.queue.borrow_mut().set_notify(&self.mem, true);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base::EventFd;
     use data_model::{DataInit, Le16, Le32, Le64};
     use std::convert::TryInto;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
-    use sys_util::EventFd;
 
     const GUEST_MEMORY_SIZE: u64 = 0x10000;
     const DESC_OFFSET: u64 = 0;

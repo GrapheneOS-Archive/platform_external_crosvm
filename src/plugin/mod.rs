@@ -26,15 +26,15 @@ use libc::{
 use protobuf::ProtobufError;
 use remain::sorted;
 
+use base::{
+    block_signal, clear_signal, drop_capabilities, error, getegid, geteuid, info, pipe,
+    register_rt_signal_handler, validate_raw_fd, warn, Error as SysError, EventFd, Killable,
+    MmapError, PollContext, PollToken, Result as SysResult, SignalFd, SignalFdError, SIGRTMIN,
+};
 use kvm::{Cap, Datamatch, IoeventAddress, Kvm, Vcpu, VcpuExit, Vm};
 use minijail::{self, Minijail};
 use net_util::{Error as TapError, Tap, TapT};
-use sys_util::{
-    block_signal, clear_signal, drop_capabilities, error, getegid, geteuid, info, pipe,
-    register_rt_signal_handler, validate_raw_fd, warn, Error as SysError, EventFd, GuestMemory,
-    Killable, MmapError, PollContext, PollToken, Result as SysResult, SignalFd, SignalFdError,
-    SIGRTMIN,
-};
+use vm_memory::GuestMemory;
 
 use self::process::*;
 use self::vcpu::*;
@@ -456,6 +456,11 @@ pub fn run_vcpus(
                             .expect("failed to set up KVM VCPU signal mask");
                     }
 
+                    #[cfg(feature = "chromeos")]
+                    if let Err(e) = base::sched::enable_core_scheduling() {
+                        error!("Failed to enable core scheduling: {}", e);
+                    }
+
                     let vcpu = vcpu
                         .to_runnable(Some(SIGRTMIN() + 0))
                         .expect("Failed to set thread id");
@@ -684,7 +689,7 @@ pub fn run_config(cfg: Config) -> Result<()> {
         Some(Executable::Plugin(ref plugin_path)) => plugin_path.as_path(),
         _ => panic!("Executable was not a plugin"),
     };
-    let vcpu_count = cfg.vcpu_count.unwrap_or(1);
+    let vcpu_count = cfg.vcpu_count.unwrap_or(1) as u32;
     let mem = GuestMemory::new(&[]).unwrap();
     let kvm = Kvm::new().map_err(Error::CreateKvm)?;
     let mut vm = Vm::new(&kvm, mem).map_err(Error::CreateVm)?;

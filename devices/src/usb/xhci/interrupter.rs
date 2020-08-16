@@ -9,8 +9,9 @@ use super::xhci_abi::{
 };
 use super::xhci_regs::*;
 use crate::register_space::Register;
+use base::{Error as SysError, EventFd};
 use std::fmt::{self, Display};
-use sys_util::{Error as SysError, EventFd, GuestAddress, GuestMemory};
+use vm_memory::{GuestAddress, GuestMemory};
 
 #[derive(Debug)]
 pub enum Error {

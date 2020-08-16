@@ -4,7 +4,6 @@
 
 //! Small system utility modules for usage by other modules.
 
-pub mod affinity;
 mod alloc;
 #[macro_use]
 pub mod handle_eintr;
@@ -21,14 +20,13 @@ mod external_mapping;
 mod file_flags;
 pub mod file_traits;
 mod fork;
-mod guest_address;
-pub mod guest_memory;
 mod mmap;
 pub mod net;
 mod passwd;
 mod poll;
 mod priority;
 mod raw_fd;
+pub mod sched;
 mod seek_hole;
 mod shm;
 pub mod signal;
@@ -39,7 +37,6 @@ mod terminal;
 mod timerfd;
 mod write_zeroes;
 
-pub use crate::affinity::*;
 pub use crate::alloc::LayoutAllocation;
 pub use crate::capabilities::drop_capabilities;
 pub use crate::clock::{Clock, FakeClock};
@@ -49,14 +46,13 @@ pub use crate::eventfd::*;
 pub use crate::external_mapping::*;
 pub use crate::file_flags::*;
 pub use crate::fork::*;
-pub use crate::guest_address::*;
-pub use crate::guest_memory::*;
 pub use crate::ioctl::*;
 pub use crate::mmap::*;
 pub use crate::passwd::*;
 pub use crate::poll::*;
 pub use crate::priority::*;
 pub use crate::raw_fd::*;
+pub use crate::sched::*;
 pub use crate::shm::*;
 pub use crate::signal::*;
 pub use crate::signalfd::*;
@@ -72,7 +68,6 @@ pub use crate::file_traits::{
     AsRawFds, FileAllocate, FileGetLen, FileReadWriteAtVolatile, FileReadWriteVolatile, FileSetLen,
     FileSync,
 };
-pub use crate::guest_memory::Error as GuestMemoryError;
 pub use crate::mmap::Error as MmapError;
 pub use crate::seek_hole::SeekHole;
 pub use crate::signalfd::Error as SignalFdError;

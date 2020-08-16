@@ -6,9 +6,9 @@
 // See https://pdos.csail.mit.edu/6.828/2016/readings/ia32/ioapic.pdf for a specification.
 
 use crate::BusDevice;
+use base::{error, warn, EventFd, Result};
 use hypervisor::{IoapicState, MsiAddressMessage, MsiDataMessage, TriggerMode, NUM_IOAPIC_PINS};
 use msg_socket::{MsgReceiver, MsgSender};
-use sys_util::{error, warn, EventFd, Result};
 use vm_control::{VmIrqRequest, VmIrqRequestSocket, VmIrqResponse};
 
 const IOAPIC_VERSION_ID: u32 = 0x00170011;
@@ -241,7 +241,7 @@ impl Ioapic {
                     return;
                 }
                 let (index, is_high_bits) = decode_irq_from_selector(self.state.ioregsel);
-                if index >= kvm::NUM_IOAPIC_PINS {
+                if index >= hypervisor::NUM_IOAPIC_PINS {
                     // Invalid write; ignore.
                     return;
                 }
@@ -344,7 +344,7 @@ mod tests {
     }
 
     fn set_up(trigger: TriggerMode) -> (Ioapic, usize) {
-        let irq = kvm::NUM_IOAPIC_PINS - 1;
+        let irq = hypervisor::NUM_IOAPIC_PINS - 1;
         let ioapic = set_up_with_irq(irq, trigger);
         (ioapic, irq)
     }
@@ -473,7 +473,7 @@ mod tests {
     #[should_panic(expected = "index out of bounds: the len is 24 but the index is 24")]
     fn service_invalid_irq() {
         let mut ioapic = self::new();
-        ioapic.service_irq(kvm::NUM_IOAPIC_PINS, false);
+        ioapic.service_irq(hypervisor::NUM_IOAPIC_PINS, false);
     }
 
     // Test a level triggered IRQ interrupt.

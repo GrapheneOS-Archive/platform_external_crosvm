@@ -10,14 +10,15 @@ use super::xhci_abi::{
     TrbCompletionCode, TrbType,
 };
 use super::xhci_regs::MAX_INTERRUPTER;
+use base::{error, Error as SysError, EventFd};
 use bit_field::Error as BitFieldError;
 use std::cmp::min;
 use std::fmt::{self, Display};
 use std::mem;
 use std::sync::{Arc, Weak};
 use sync::Mutex;
-use sys_util::{error, Error as SysError, EventFd, GuestMemory};
 use usb_util::{TransferStatus, UsbRequestSetup};
+use vm_memory::GuestMemory;
 
 #[derive(Debug)]
 pub enum Error {
