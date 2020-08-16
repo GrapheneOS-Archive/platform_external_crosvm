@@ -96,6 +96,13 @@ impl<F: AsRawFd + Unpin> PollOrRing<F> {
             .map(PollOrRing::Poll)
     }
 
+    pub fn into_source(self) -> F {
+        match self {
+            PollOrRing::Poll(s) => s.into_source(),
+            PollOrRing::Uring(s) => s.into_source(),
+        }
+    }
+
     /// Reads from the iosource at `file_offset` and fill the given `vec`.
     pub async fn read_to_vec(&self, file_offset: u64, vec: Vec<u8>) -> Result<(usize, Vec<u8>)> {
         match &self {
@@ -205,6 +212,25 @@ impl<F: AsRawFd + Unpin> PollOrRing<F> {
     }
 }
 
+impl<F: AsRawFd> std::ops::Deref for PollOrRing<F> {
+    type Target = F;
+    fn deref(&self) -> &Self::Target {
+        match &self {
+            PollOrRing::Poll(s) => &s,
+            PollOrRing::Uring(s) => &s,
+        }
+    }
+}
+
+impl<F: AsRawFd> std::ops::DerefMut for PollOrRing<F> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            PollOrRing::Poll(s) => s,
+            PollOrRing::Uring(s) => s,
+        }
+    }
+}
+
 /// Convenience helper for reading a series of u64s which is common for timerfd and eventfd.
 pub struct U64Source<F: AsRawFd + Unpin> {
     inner: PollOrRing<F>,
@@ -238,6 +264,19 @@ impl<F: AsRawFd + Unpin> U64Source<F> {
                 Ok(u64::from_ne_bytes(bytes))
             }
         }
+    }
+}
+
+impl<F: AsRawFd + Unpin> std::ops::Deref for U64Source<F> {
+    type Target = F;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<F: AsRawFd + Unpin> std::ops::DerefMut for U64Source<F> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
@@ -322,17 +361,25 @@ mod tests {
                 .read_to_mem(
                     0,
                     Rc::<VecIoWrapper>::clone(&mem),
-                    &[MemRegion { offset: 0, len: 32 }],
+                    &[
+                        MemRegion { offset: 0, len: 32 },
+                        MemRegion {
+                            offset: 200,
+                            len: 56,
+                        },
+                    ],
                 )
                 .await
                 .unwrap();
-            assert_eq!(ret, 32);
+            assert_eq!(ret, 32 + 56);
             let vec: Vec<u8> = match Rc::try_unwrap(mem) {
                 Ok(v) => v.into(),
                 Err(_) => panic!("Too many vec refs"),
             };
             assert!(vec.iter().take(32).all(|&b| b == 0));
-            assert!(vec.iter().skip(32).all(|&b| b == 0x55));
+            assert!(vec.iter().skip(32).take(168).all(|&b| b == 0x55));
+            assert!(vec.iter().skip(200).take(56).all(|&b| b == 0));
+            assert!(vec.iter().skip(256).all(|&b| b == 0x55));
         }
 
         let f = File::open("/dev/zero").unwrap();
@@ -407,7 +454,7 @@ mod tests {
 
     #[test]
     fn read_eventfds() {
-        use sys_util::EventFd;
+        use base::EventFd;
 
         async fn go<F: AsRawFd + Unpin>(mut source: U64Source<F>) -> u64 {
             source.next_val().await.unwrap()

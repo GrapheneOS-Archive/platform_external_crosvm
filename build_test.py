@@ -34,6 +34,7 @@ TEST_MODULES_PARALLEL = [
     'devices',
     'disk',
     'enumn',
+    'hypervisor',
     'kernel_cmdline',
     'kernel_loader',
     'kvm',
@@ -55,6 +56,7 @@ TEST_MODULES_PARALLEL = [
 
 TEST_MODULES_SERIAL = [
     'sys_util',
+    'base',
 ]
 
 # Bright green.

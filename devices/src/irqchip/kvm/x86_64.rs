@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 use sync::Mutex;
 
+#[cfg(not(test))]
+use base::Clock;
+#[cfg(test)]
+use base::FakeClock as Clock;
 use hypervisor::kvm::{KvmVcpu, KvmVm};
 use hypervisor::{
     IoapicState, IrqRoute, IrqSource, IrqSourceChip, LapicState, MPState, PicSelect, PicState,
@@ -13,12 +17,8 @@ use hypervisor::{
 };
 use kvm_sys::*;
 use resources::SystemAllocator;
-#[cfg(not(test))]
-use sys_util::Clock;
-#[cfg(test)]
-use sys_util::FakeClock as Clock;
 
-use sys_util::{error, Error, EventFd, Result};
+use base::{error, Error, EventFd, Result};
 use vm_control::VmIrqRequestSocket;
 
 use crate::irqchip::{Ioapic, Pic, IOAPIC_BASE_ADDRESS, IOAPIC_MEM_LENGTH_BYTES};
@@ -123,6 +123,12 @@ impl IrqChipX86_64<KvmVcpu> for KvmKernelIrqChip {
     /// Sets the state of the PIT. Sets the pit state via the KVM API.
     fn set_pit(&mut self, state: &PitState) -> Result<()> {
         self.vm.set_pit_state(&kvm_pit_state2::from(state))
+    }
+
+    /// Returns true if the PIT uses port 0x61 for the PC speaker, false if 0x61 is unused.
+    /// KVM's kernel PIT doesn't use 0x61.
+    fn pit_uses_speaker_port(&self) -> bool {
+        false
     }
 }
 
@@ -634,14 +640,21 @@ impl IrqChipX86_64<KvmVcpu> for KvmSplitIrqChip {
         self.pit.lock().set_pit_state(state);
         Ok(())
     }
+
+    /// Returns true if the PIT uses port 0x61 for the PC speaker, false if 0x61 is unused.
+    /// devices::Pit uses 0x61.
+    fn pit_uses_speaker_port(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
 
     use super::*;
+    use base::EventReadResult;
     use hypervisor::kvm::Kvm;
-    use sys_util::{EventReadResult, GuestMemory};
+    use vm_memory::GuestMemory;
 
     use hypervisor::{IoapicRedirectionTableEntry, PitRWMode, TriggerMode, Vm, VmX86_64};
     use vm_control::{VmIrqRequest, VmIrqResponse};

@@ -52,7 +52,7 @@ impl<F: AsRawFd> UringSource<F> {
     }
 
     /// Consume `self` and return the object used to create it.
-    pub fn to_source(self) -> F {
+    pub fn into_source(self) -> F {
         self.source
     }
 }
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn read_to_mem() {
-        use sys_util::{GuestAddress, GuestMemory};
+        use vm_memory::{GuestAddress, GuestMemory};
 
         use crate::uring_mem::VecIoWrapper;
 

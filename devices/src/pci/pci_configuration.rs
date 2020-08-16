@@ -6,7 +6,7 @@ use std::convert::TryInto;
 use std::fmt::{self, Display};
 
 use crate::pci::PciInterruptPin;
-use sys_util::warn;
+use base::warn;
 
 // The number of 32bit registers in the config space, 256 bytes.
 const NUM_CONFIGURATION_REGISTERS: usize = 64;
@@ -15,7 +15,9 @@ const STATUS_REG: usize = 1;
 const STATUS_REG_CAPABILITIES_USED_MASK: u32 = 0x0010_0000;
 const BAR0_REG: usize = 4;
 const BAR_IO_ADDR_MASK: u32 = 0xffff_fffc;
+const BAR_IO_MIN_SIZE: u64 = 4;
 const BAR_MEM_ADDR_MASK: u32 = 0xffff_fff0;
+const BAR_MEM_MIN_SIZE: u64 = 16;
 const NUM_BAR_REGS: usize = 6;
 const CAPABILITY_LIST_HEAD_OFFSET: usize = 0x34;
 const FIRST_CAPABILITY_OFFSET: usize = 0x40;
@@ -172,6 +174,7 @@ pub struct PciConfiguration {
     registers: [u32; NUM_CONFIGURATION_REGISTERS],
     writable_bits: [u32; NUM_CONFIGURATION_REGISTERS], // writable bits for each register.
     bar_used: [bool; NUM_BAR_REGS],
+    bar_configs: [Option<PciBarConfiguration>; NUM_BAR_REGS],
     // Contains the byte offset and size of the last capability.
     last_capability: Option<(usize, usize)>,
 }
@@ -184,13 +187,13 @@ pub enum PciBarRegionType {
     Memory64BitRegion = 0x04,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PciBarPrefetchable {
     NotPrefetchable = 0,
     Prefetchable = 0x08,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct PciBarConfiguration {
     addr: u64,
     size: u64,
@@ -199,7 +202,28 @@ pub struct PciBarConfiguration {
     prefetchable: PciBarPrefetchable,
 }
 
-#[derive(Debug)]
+pub struct PciBarIter<'a> {
+    config: &'a PciConfiguration,
+    bar_num: usize,
+}
+
+impl<'a> Iterator for PciBarIter<'a> {
+    type Item = PciBarConfiguration;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.bar_num < NUM_BAR_REGS {
+            let bar_config = self.config.get_bar_configuration(self.bar_num);
+            self.bar_num += 1;
+            if let Some(bar_config) = bar_config {
+                return Some(bar_config);
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub enum Error {
     BarAddressInvalid(u64, u64),
     BarAlignmentInvalid(u64, u64),
@@ -281,6 +305,7 @@ impl PciConfiguration {
             registers,
             writable_bits,
             bar_used: [false; NUM_BAR_REGS],
+            bar_configs: [None; NUM_BAR_REGS],
             last_capability: None,
         }
     }
@@ -369,7 +394,11 @@ impl PciConfiguration {
     /// report this region and size to the guest kernel.  Enforces a few constraints
     /// (i.e, region size must be power of two, register not already used). Returns 'None' on
     /// failure all, `Some(BarIndex)` on success.
-    pub fn add_pci_bar(&mut self, config: &PciBarConfiguration) -> Result<usize> {
+    pub fn add_pci_bar(&mut self, config: PciBarConfiguration) -> Result<usize> {
+        if config.reg_idx >= NUM_BAR_REGS {
+            return Err(Error::BarInvalid(config.reg_idx));
+        }
+
         if self.bar_used[config.reg_idx] {
             return Err(Error::BarInUse(config.reg_idx));
         }
@@ -378,8 +407,14 @@ impl PciConfiguration {
             return Err(Error::BarSizeInvalid(config.size));
         }
 
-        if config.reg_idx >= NUM_BAR_REGS {
-            return Err(Error::BarInvalid(config.reg_idx));
+        let min_size = if config.region_type == PciBarRegionType::IORegion {
+            BAR_IO_MIN_SIZE
+        } else {
+            BAR_MEM_MIN_SIZE
+        };
+
+        if config.size < min_size {
+            return Err(Error::BarSizeInvalid(config.size));
         }
 
         if config.addr % config.size != 0 {
@@ -427,20 +462,35 @@ impl PciConfiguration {
         self.registers[bar_idx] = ((config.addr as u32) & mask) | lower_bits;
         self.writable_bits[bar_idx] = !(config.size - 1) as u32;
         self.bar_used[config.reg_idx] = true;
+        self.bar_configs[config.reg_idx] = Some(config);
         Ok(config.reg_idx)
+    }
+
+    /// Returns an iterator of the currently configured base address registers.
+    #[allow(dead_code)] // TODO(dverkamp): remove this once used
+    pub fn get_bars(&self) -> PciBarIter {
+        PciBarIter {
+            config: &self,
+            bar_num: 0,
+        }
+    }
+
+    fn get_bar_configuration(&self, bar_num: usize) -> Option<PciBarConfiguration> {
+        let config = self.bar_configs.get(bar_num)?;
+
+        if let Some(mut config) = config {
+            // The address may have been modified by the guest, so the value in bar_configs
+            // may be outdated. Replace it with the current value.
+            config.addr = self.get_bar_addr(bar_num);
+            Some(config)
+        } else {
+            None
+        }
     }
 
     /// Returns the type of the given BAR region.
     pub fn get_bar_type(&self, bar_num: usize) -> Option<PciBarRegionType> {
-        let reg_idx = BAR0_REG + bar_num;
-        let reg_value = self.registers.get(reg_idx)?;
-
-        match (reg_value & 1, (reg_value >> 1u32) & 3) {
-            (1, _) => Some(PciBarRegionType::IORegion),
-            (0, 0b00) => Some(PciBarRegionType::Memory32BitRegion),
-            (0, 0b10) => Some(PciBarRegionType::Memory64BitRegion),
-            _ => None,
-        }
+        self.bar_configs.get(bar_num)?.map(|c| c.region_type)
     }
 
     /// Returns the address of the given BAR region.
@@ -696,6 +746,27 @@ mod tests {
     }
 
     #[test]
+    fn query_unused_bar() {
+        let cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            Some(&TestPI::Test),
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+        );
+
+        // No BAR 0 has been configured, so these should return None or 0 as appropriate.
+        assert_eq!(cfg.get_bar_type(0), None);
+        assert_eq!(cfg.get_bar_addr(0), 0);
+
+        let mut bar_iter = cfg.get_bars();
+        assert_eq!(bar_iter.next(), None);
+    }
+
+    #[test]
     fn add_pci_bar_mem_64bit() {
         let mut cfg = PciConfiguration::new(
             0x1234,
@@ -709,9 +780,9 @@ mod tests {
         );
 
         cfg.add_pci_bar(
-            &PciBarConfiguration::new(
+            PciBarConfiguration::new(
                 0,
-                0x4,
+                0x10,
                 PciBarRegionType::Memory64BitRegion,
                 PciBarPrefetchable::NotPrefetchable,
             )
@@ -725,7 +796,20 @@ mod tests {
         );
         assert_eq!(cfg.get_bar_addr(0), 0x01234567_89ABCDE0);
         assert_eq!(cfg.writable_bits[BAR0_REG + 1], 0xFFFFFFFF);
-        assert_eq!(cfg.writable_bits[BAR0_REG + 0], 0xFFFFFFFC);
+        assert_eq!(cfg.writable_bits[BAR0_REG + 0], 0xFFFFFFF0);
+
+        let mut bar_iter = cfg.get_bars();
+        assert_eq!(
+            bar_iter.next(),
+            Some(PciBarConfiguration {
+                addr: 0x01234567_89ABCDE0,
+                size: 0x10,
+                reg_idx: 0,
+                region_type: PciBarRegionType::Memory64BitRegion,
+                prefetchable: PciBarPrefetchable::NotPrefetchable
+            })
+        );
+        assert_eq!(bar_iter.next(), None);
     }
 
     #[test]
@@ -742,9 +826,9 @@ mod tests {
         );
 
         cfg.add_pci_bar(
-            &PciBarConfiguration::new(
+            PciBarConfiguration::new(
                 0,
-                0x4,
+                0x10,
                 PciBarRegionType::Memory32BitRegion,
                 PciBarPrefetchable::NotPrefetchable,
             )
@@ -757,7 +841,20 @@ mod tests {
             Some(PciBarRegionType::Memory32BitRegion)
         );
         assert_eq!(cfg.get_bar_addr(0), 0x12345670);
-        assert_eq!(cfg.writable_bits[BAR0_REG], 0xFFFFFFFC);
+        assert_eq!(cfg.writable_bits[BAR0_REG], 0xFFFFFFF0);
+
+        let mut bar_iter = cfg.get_bars();
+        assert_eq!(
+            bar_iter.next(),
+            Some(PciBarConfiguration {
+                addr: 0x12345670,
+                size: 0x10,
+                reg_idx: 0,
+                region_type: PciBarRegionType::Memory32BitRegion,
+                prefetchable: PciBarPrefetchable::NotPrefetchable
+            })
+        );
+        assert_eq!(bar_iter.next(), None);
     }
 
     #[test]
@@ -774,7 +871,7 @@ mod tests {
         );
 
         cfg.add_pci_bar(
-            &PciBarConfiguration::new(
+            PciBarConfiguration::new(
                 0,
                 0x4,
                 PciBarRegionType::IORegion,
@@ -787,5 +884,195 @@ mod tests {
         assert_eq!(cfg.get_bar_type(0), Some(PciBarRegionType::IORegion));
         assert_eq!(cfg.get_bar_addr(0), 0x1230);
         assert_eq!(cfg.writable_bits[BAR0_REG], 0xFFFFFFFC);
+
+        let mut bar_iter = cfg.get_bars();
+        assert_eq!(
+            bar_iter.next(),
+            Some(PciBarConfiguration {
+                addr: 0x1230,
+                size: 0x4,
+                reg_idx: 0,
+                region_type: PciBarRegionType::IORegion,
+                prefetchable: PciBarPrefetchable::NotPrefetchable
+            })
+        );
+        assert_eq!(bar_iter.next(), None);
+    }
+
+    #[test]
+    fn add_pci_bar_multiple() {
+        let mut cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            Some(&TestPI::Test),
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+        );
+
+        // bar_num 0-1: 64-bit memory
+        cfg.add_pci_bar(
+            PciBarConfiguration::new(
+                0,
+                0x10,
+                PciBarRegionType::Memory64BitRegion,
+                PciBarPrefetchable::NotPrefetchable,
+            )
+            .set_address(0x01234567_89ABCDE0),
+        )
+        .expect("add_pci_bar failed");
+
+        // bar 2: 32-bit memory
+        cfg.add_pci_bar(
+            PciBarConfiguration::new(
+                2,
+                0x10,
+                PciBarRegionType::Memory32BitRegion,
+                PciBarPrefetchable::NotPrefetchable,
+            )
+            .set_address(0x12345670),
+        )
+        .expect("add_pci_bar failed");
+
+        // bar 3: I/O
+        cfg.add_pci_bar(
+            PciBarConfiguration::new(
+                3,
+                0x4,
+                PciBarRegionType::IORegion,
+                PciBarPrefetchable::NotPrefetchable,
+            )
+            .set_address(0x1230),
+        )
+        .expect("add_pci_bar failed");
+
+        // Confirm default memory and I/O region configurations.
+        let mut bar_iter = cfg.get_bars();
+        assert_eq!(
+            bar_iter.next(),
+            Some(PciBarConfiguration {
+                addr: 0x01234567_89ABCDE0,
+                size: 0x10,
+                reg_idx: 0,
+                region_type: PciBarRegionType::Memory64BitRegion,
+                prefetchable: PciBarPrefetchable::NotPrefetchable
+            })
+        );
+        assert_eq!(
+            bar_iter.next(),
+            Some(PciBarConfiguration {
+                addr: 0x12345670,
+                size: 0x10,
+                reg_idx: 2,
+                region_type: PciBarRegionType::Memory32BitRegion,
+                prefetchable: PciBarPrefetchable::NotPrefetchable
+            })
+        );
+        assert_eq!(
+            bar_iter.next(),
+            Some(PciBarConfiguration {
+                addr: 0x1230,
+                size: 0x4,
+                reg_idx: 3,
+                region_type: PciBarRegionType::IORegion,
+                prefetchable: PciBarPrefetchable::NotPrefetchable
+            })
+        );
+        assert_eq!(bar_iter.next(), None);
+
+        // Reassign the address for BAR 0 and verify that get_memory_regions() matches.
+        cfg.write_reg(4 + 0, 0, &0xBBAA9980u32.to_le_bytes());
+        cfg.write_reg(4 + 1, 0, &0xFFEEDDCCu32.to_le_bytes());
+
+        let mut bar_iter = cfg.get_bars();
+        assert_eq!(
+            bar_iter.next(),
+            Some(PciBarConfiguration {
+                addr: 0xFFEEDDCC_BBAA9980,
+                size: 0x10,
+                reg_idx: 0,
+                region_type: PciBarRegionType::Memory64BitRegion,
+                prefetchable: PciBarPrefetchable::NotPrefetchable
+            })
+        );
+        assert_eq!(
+            bar_iter.next(),
+            Some(PciBarConfiguration {
+                addr: 0x12345670,
+                size: 0x10,
+                reg_idx: 2,
+                region_type: PciBarRegionType::Memory32BitRegion,
+                prefetchable: PciBarPrefetchable::NotPrefetchable
+            })
+        );
+        assert_eq!(
+            bar_iter.next(),
+            Some(PciBarConfiguration {
+                addr: 0x1230,
+                size: 0x4,
+                reg_idx: 3,
+                region_type: PciBarRegionType::IORegion,
+                prefetchable: PciBarPrefetchable::NotPrefetchable
+            })
+        );
+        assert_eq!(bar_iter.next(), None);
+    }
+
+    #[test]
+    fn add_pci_bar_invalid_size() {
+        let mut cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            Some(&TestPI::Test),
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+        );
+
+        // I/O BAR with size 2 (too small)
+        assert_eq!(
+            cfg.add_pci_bar(
+                PciBarConfiguration::new(
+                    0,
+                    0x2,
+                    PciBarRegionType::IORegion,
+                    PciBarPrefetchable::NotPrefetchable,
+                )
+                .set_address(0x1230),
+            ),
+            Err(Error::BarSizeInvalid(0x2))
+        );
+
+        // I/O BAR with size 3 (not a power of 2)
+        assert_eq!(
+            cfg.add_pci_bar(
+                PciBarConfiguration::new(
+                    0,
+                    0x3,
+                    PciBarRegionType::IORegion,
+                    PciBarPrefetchable::NotPrefetchable,
+                )
+                .set_address(0x1230),
+            ),
+            Err(Error::BarSizeInvalid(0x3))
+        );
+
+        // Memory BAR with size 8 (too small)
+        assert_eq!(
+            cfg.add_pci_bar(
+                PciBarConfiguration::new(
+                    0,
+                    0x8,
+                    PciBarRegionType::Memory32BitRegion,
+                    PciBarPrefetchable::NotPrefetchable,
+                )
+                .set_address(0x12345670),
+            ),
+            Err(Error::BarSizeInvalid(0x8))
+        );
     }
 }
