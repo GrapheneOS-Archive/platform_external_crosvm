@@ -10,8 +10,9 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::thread;
 
+use base::{error, warn, Error as SysError, EventFd};
 use data_model::{DataInit, Le32};
-use sys_util::{error, warn, Error as SysError, EventFd, GuestMemory};
+use vm_memory::GuestMemory;
 
 use crate::virtio::{
     copy_config, DescriptorError, Interrupt, Queue, VirtioDevice, TYPE_FS, VIRTIO_F_VERSION_1,

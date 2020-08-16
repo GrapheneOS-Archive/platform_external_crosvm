@@ -12,7 +12,7 @@ use arch::fdt::{
 };
 use arch::SERIAL_ADDR;
 use devices::{PciAddress, PciInterruptPin};
-use sys_util::{GuestAddress, GuestMemory};
+use vm_memory::{GuestAddress, GuestMemory};
 
 // This is the start of DRAM in the physical address space.
 use crate::AARCH64_PHYS_MEM_START;
@@ -54,7 +54,7 @@ const GIC_FDT_IRQ_NUM_CELLS: u32 = 3;
 const GIC_FDT_IRQ_TYPE_SPI: u32 = 0;
 const GIC_FDT_IRQ_TYPE_PPI: u32 = 1;
 const GIC_FDT_IRQ_PPI_CPU_SHIFT: u32 = 8;
-const GIC_FDT_IRQ_PPI_CPU_MASK: u32 = (0xff << GIC_FDT_IRQ_PPI_CPU_SHIFT);
+const GIC_FDT_IRQ_PPI_CPU_MASK: u32 = 0xff << GIC_FDT_IRQ_PPI_CPU_SHIFT;
 const IRQ_TYPE_EDGE_RISING: u32 = 0x00000001;
 const IRQ_TYPE_LEVEL_HIGH: u32 = 0x00000004;
 const IRQ_TYPE_LEVEL_LOW: u32 = 0x00000008;

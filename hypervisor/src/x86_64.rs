@@ -2,8 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use base::{error, Result};
 use bit_field::*;
-use sys_util::{error, GuestAddress, Result};
+use vm_memory::GuestAddress;
 
 use crate::{Hypervisor, IrqRoute, IrqSource, IrqSourceChip, Vcpu, Vm};
 
@@ -21,7 +22,11 @@ pub trait HypervisorX86_64: Hypervisor {
 
 /// A wrapper for using a VM on x86_64 and getting/setting its state.
 pub trait VmX86_64: Vm {
+    type Hypervisor: HypervisorX86_64;
     type Vcpu: VcpuX86_64;
+
+    /// Gets the `HypervisorX86_64` that created this VM.
+    fn get_hypervisor(&self) -> &Self::Hypervisor;
 
     /// Create a Vcpu with the specified Vcpu ID.
     fn create_vcpu(&self, id: usize) -> Result<Self::Vcpu>;
@@ -100,7 +105,7 @@ pub struct CpuIdEntry {
     pub index: u32,
     // flags is needed for KVM.  We store it on CpuIdEntry to preserve the flags across
     // get_supported_cpuids() -> kvm_cpuid2 -> CpuId -> kvm_cpuid2 -> set_cpuid().
-    pub(super) flags: u32,
+    pub flags: u32,
     pub eax: u32,
     pub ebx: u32,
     pub ecx: u32,

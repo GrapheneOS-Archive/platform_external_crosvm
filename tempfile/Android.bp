@@ -25,4 +25,4 @@ rust_test_host {
 }
 
 // dependent_library ["feature_list"]
-//   libc-0.2.73 "default,std"
+//   libc-0.2.74 "default,std"

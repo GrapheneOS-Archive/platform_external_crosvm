@@ -27,15 +27,15 @@ use libc::{
     open, sigset_t, EBUSY, EFAULT, EINVAL, EIO, ENOENT, ENOSPC, EOVERFLOW, O_CLOEXEC, O_RDWR,
 };
 
+use base::{
+    block_signal, errno_result, error, ioctl, ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val,
+    pagesize, signal, unblock_signal, AsRawDescriptor, Error, EventFd, FromRawDescriptor,
+    MappedRegion, MemoryMapping, MmapError, RawDescriptor, Result, SafeDescriptor,
+};
 use data_model::vec_with_array_field;
 use kvm_sys::*;
 use sync::Mutex;
-use sys_util::{
-    block_signal, errno_result, error, ioctl, ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val,
-    pagesize, signal, unblock_signal, AsRawDescriptor, Error, EventFd, FromRawDescriptor,
-    GuestAddress, GuestMemory, MappedRegion, MemoryMapping, MmapError, RawDescriptor, Result,
-    SafeDescriptor,
-};
+use vm_memory::{GuestAddress, GuestMemory};
 
 use crate::{
     ClockState, Datamatch, DeviceKind, Hypervisor, HypervisorCap, IoEventAddress, IrqRoute,
@@ -202,7 +202,7 @@ impl KvmVm {
                 )
             }
         })?;
-        // TODO(colindr/srichman): add default IRQ routes in IrqChip constructor or configure_vm
+
         Ok(KvmVm {
             kvm: kvm.try_clone()?,
             vm: vm_descriptor,
@@ -229,7 +229,11 @@ impl KvmVm {
         let run_mmap =
             MemoryMapping::from_fd(&vcpu, run_mmap_size).map_err(|_| Error::new(ENOSPC))?;
 
-        Ok(KvmVcpu { vcpu, run_mmap })
+        Ok(KvmVcpu {
+            vm: self.vm.try_clone()?,
+            vcpu,
+            run_mmap,
+        })
     }
 
     /// Creates an in kernel interrupt controller.
@@ -512,7 +516,7 @@ impl Vm for KvmVm {
 
         // Safe because we know that our file is a VM fd, we know the kernel will only write correct
         // amount of memory to our pointer, and we verify the return result.
-        let ret = unsafe { sys_util::ioctl_with_ref(self, KVM_CREATE_DEVICE(), &device) };
+        let ret = unsafe { base::ioctl_with_ref(self, KVM_CREATE_DEVICE(), &device) };
         if ret == 0 {
             // Safe because we verify that ret is valid and we own the fd.
             Ok(unsafe { SafeDescriptor::from_raw_descriptor(device.fd as i32) })
@@ -521,7 +525,7 @@ impl Vm for KvmVm {
         }
     }
 
-    fn get_dirty_log(&self, slot: u32, dirty_log: &mut [u8]) -> Result<()> {
+    fn get_dirty_log(&self, slot: MemSlot, dirty_log: &mut [u8]) -> Result<()> {
         let regions = self.mem_regions.lock();
         let mmap = regions.get(&slot).ok_or(Error::new(ENOENT))?;
         // Ensures that there are as many bytes in dirty_log as there are pages in the mmap.
@@ -585,6 +589,7 @@ impl AsRawFd for KvmVm {
 
 /// A wrapper around using a KVM Vcpu.
 pub struct KvmVcpu {
+    vm: SafeDescriptor,
     vcpu: SafeDescriptor,
     run_mmap: MemoryMapping,
 }
@@ -600,11 +605,12 @@ impl Vcpu for KvmVcpu {
     type Runnable = RunnableKvmVcpu;
 
     fn try_clone(&self) -> Result<Self> {
+        let vm = self.vm.try_clone()?;
         let vcpu = self.vcpu.try_clone()?;
         let run_mmap =
             MemoryMapping::from_fd(&vcpu, self.run_mmap.size()).map_err(|_| Error::new(ENOSPC))?;
 
-        Ok(KvmVcpu { vcpu, run_mmap })
+        Ok(KvmVcpu { vm, vcpu, run_mmap })
     }
 
     #[allow(clippy::cast_ptr_alignment)]
@@ -1095,9 +1101,10 @@ impl From<&MPState> for kvm_mp_state {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base::{pagesize, MemoryMapping, MemoryMappingArena};
     use std::os::unix::io::FromRawFd;
     use std::thread;
-    use sys_util::{pagesize, GuestAddress, MemoryMapping, MemoryMappingArena};
+    use vm_memory::GuestAddress;
 
     #[test]
     fn dirty_log_size() {
@@ -1303,23 +1310,12 @@ mod tests {
     }
 
     #[test]
-    fn enable_feature() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm).unwrap();
-        vm.create_irq_chip().unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        vcpu.enable_raw_capability(kvm_sys::KVM_CAP_HYPERV_SYNIC, &[0; 4])
-            .unwrap();
-    }
-
-    #[test]
     fn set_signal_mask() {
         let kvm = Kvm::new().unwrap();
         let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vm = KvmVm::new(&kvm, gm).unwrap();
         let vcpu = vm.create_vcpu(0).unwrap();
-        vcpu.set_signal_mask(&[sys_util::SIGRTMIN() + 0]).unwrap();
+        vcpu.set_signal_mask(&[base::SIGRTMIN() + 0]).unwrap();
     }
 
     #[test]

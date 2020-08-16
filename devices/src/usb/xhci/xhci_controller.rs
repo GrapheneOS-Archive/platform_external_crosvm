@@ -12,12 +12,13 @@ use crate::usb::xhci::xhci::Xhci;
 use crate::usb::xhci::xhci_backend_device_provider::XhciBackendDeviceProvider;
 use crate::usb::xhci::xhci_regs::{init_xhci_mmio_space_and_regs, XhciRegs};
 use crate::utils::FailHandle;
+use base::{error, EventFd};
 use resources::{Alloc, MmioType, SystemAllocator};
 use std::mem;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use sys_util::{error, EventFd, GuestMemory};
+use vm_memory::GuestMemory;
 
 const XHCI_BAR0_SIZE: u64 = 0x10000;
 
@@ -229,7 +230,7 @@ impl PciDevice for XhciController {
             .set_address(bar0_addr)
             .set_size(XHCI_BAR0_SIZE);
         self.config_regs
-            .add_pci_bar(&bar0_config)
+            .add_pci_bar(bar0_config)
             .map_err(|e| PciDeviceError::IoRegistrationFailed(bar0_addr, e))?;
         Ok(vec![(bar0_addr, XHCI_BAR0_SIZE)])
     }
