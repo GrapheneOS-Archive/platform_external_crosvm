@@ -23,10 +23,9 @@ use std::time::Duration;
 
 use data_model::*;
 
+use base::{debug, error, warn, EventFd, ExternalMapping, PollContext, PollToken};
 use sync::Mutex;
-use sys_util::{
-    debug, error, warn, EventFd, ExternalMapping, GuestAddress, GuestMemory, PollContext, PollToken,
-};
+use vm_memory::{GuestAddress, GuestMemory};
 
 use gpu_buffer::Format;
 pub use gpu_display::EventDevice;

@@ -73,15 +73,15 @@ rust_binary_host {
         "libarch",
         "libassertions",
         "libaudio_streams",
+        "libbase_rust",
         "libbit_field",
         "libcrosvm",
         "libdata_model",
         "libdevices",
         "libdisk",
+        "libhypervisor",
         "libkernel_cmdline",
         "libkernel_loader",
-        "libkvm",
-        "libkvm_sys",
         "liblibc",
         "liblibcras",
         "libminijail_rust",
@@ -91,9 +91,9 @@ rust_binary_host {
         "librand_ish",
         "libresources",
         "libsync_rust",
-        "libsys_util",
         "libvhost",
         "libvm_control",
+        "libvm_memory",
         "libx86_64_rust",
     ],
     proc_macros: [
@@ -119,14 +119,14 @@ rust_test_host {
         "libarch",
         "libassertions",
         "libaudio_streams",
+        "libbase_rust",
         "libbit_field",
         "libdata_model",
         "libdevices",
         "libdisk",
+        "libhypervisor",
         "libkernel_cmdline",
         "libkernel_loader",
-        "libkvm",
-        "libkvm_sys",
         "liblibc",
         "liblibcras",
         "libminijail_rust",
@@ -136,9 +136,9 @@ rust_test_host {
         "librand_ish",
         "libresources",
         "libsync_rust",
-        "libsys_util",
         "libvhost",
         "libvm_control",
+        "libvm_memory",
         "libx86_64_rust",
     ],
     proc_macros: [
@@ -164,15 +164,15 @@ rust_test_host {
         "libarch",
         "libassertions",
         "libaudio_streams",
+        "libbase_rust",
         "libbit_field",
         "libcrosvm",
         "libdata_model",
         "libdevices",
         "libdisk",
+        "libhypervisor",
         "libkernel_cmdline",
         "libkernel_loader",
-        "libkvm",
-        "libkvm_sys",
         "liblibc",
         "liblibcras",
         "libminijail_rust",
@@ -182,9 +182,9 @@ rust_test_host {
         "librand_ish",
         "libresources",
         "libsync_rust",
-        "libsys_util",
         "libvhost",
         "libvm_control",
+        "libvm_memory",
         "libx86_64_rust",
     ],
     proc_macros: [
@@ -210,14 +210,14 @@ rust_library_host {
         "libarch",
         "libassertions",
         "libaudio_streams",
+        "libbase_rust",
         "libbit_field",
         "libdata_model",
         "libdevices",
         "libdisk",
+        "libhypervisor",
         "libkernel_cmdline",
         "libkernel_loader",
-        "libkvm",
-        "libkvm_sys",
         "liblibc",
         "liblibcras",
         "libminijail_rust",
@@ -227,9 +227,9 @@ rust_library_host {
         "librand_ish",
         "libresources",
         "libsync_rust",
-        "libsys_util",
         "libvhost",
         "libvm_control",
+        "libvm_memory",
         "libx86_64_rust",
     ],
     proc_macros: [
@@ -238,13 +238,13 @@ rust_library_host {
     ],
 }
 
-
 // dependent_library ["feature_list"]
 //   ../adhd/audio_streams/src/audio_streams.rs
 //   ../adhd/cras/client/cras-sys/src/lib.rs
 //   ../adhd/cras/client/libcras/src/libcras.rs
 //   ../minijail/rust/minijail-sys/lib.rs
 //   ../minijail/rust/minijail/src/lib.rs
+//   async-trait-0.1.36
 //   bitflags-1.2.1 "default"
 //   futures-0.3.5 "alloc,async-await,default,executor,futures-executor,std"
 //   futures-channel-0.3.5 "alloc,futures-sink,sink,std"
@@ -255,20 +255,19 @@ rust_library_host {
 //   futures-sink-0.3.5 "alloc,std"
 //   futures-task-0.3.5 "alloc,once_cell,std"
 //   futures-util-0.3.5 "alloc,async-await,async-await-macro,channel,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,proc-macro-hack,proc-macro-nested,sink,slab,std"
-//   libc-0.2.73 "default,std"
+//   libc-0.2.74 "default,std"
 //   memchr-2.3.3 "default,std"
 //   once_cell-1.4.0 "std"
-//   paste-0.1.18
-//   paste-impl-0.1.18
-//   pin-project-0.4.22
-//   pin-project-internal-0.4.22
+//   paste-1.0.0
+//   pin-project-0.4.23
+//   pin-project-internal-0.4.23
 //   pin-utils-0.1.0
 //   pkg-config-0.3.18
-//   proc-macro-hack-0.5.16
+//   proc-macro-hack-0.5.18
 //   proc-macro-nested-0.1.6
 //   proc-macro2-1.0.19 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
 //   remain-0.2.2
 //   slab-0.4.2
-//   syn-1.0.35 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.38 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   unicode-xid-0.2.1 "default"

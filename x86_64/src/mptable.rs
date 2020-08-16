@@ -11,7 +11,7 @@ use std::slice;
 use libc::c_char;
 
 use devices::{PciAddress, PciInterruptPin};
-use sys_util::{GuestAddress, GuestMemory};
+use vm_memory::{GuestAddress, GuestMemory};
 
 use crate::mpspec::*;
 
@@ -355,7 +355,7 @@ pub fn setup_mptable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sys_util::pagesize;
+    use base::pagesize;
 
     fn compute_page_aligned_mp_size(num_cpus: u8) -> u64 {
         let mp_size = compute_mp_size(num_cpus);

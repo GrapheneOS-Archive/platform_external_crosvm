@@ -15,10 +15,11 @@ use super::xhci_abi::{
 };
 use super::xhci_regs::{valid_slot_id, MAX_SLOTS};
 use crate::utils::EventLoop;
+use base::{error, warn, Error as SysError, EventFd};
 use std::fmt::{self, Display};
 use std::sync::Arc;
 use sync::Mutex;
-use sys_util::{error, warn, Error as SysError, EventFd, GuestAddress, GuestMemory};
+use vm_memory::{GuestAddress, GuestMemory};
 
 #[derive(Debug)]
 pub enum Error {

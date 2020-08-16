@@ -5,12 +5,15 @@
 use std::marker::{Send, Sized};
 
 use crate::Bus;
+use base::{EventFd, Result};
 use hypervisor::{IrqRoute, MPState, Vcpu};
 use resources::SystemAllocator;
-use sys_util::{EventFd, Result};
 
 mod kvm;
 pub use self::kvm::KvmKernelIrqChip;
+
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+pub use self::kvm::AARCH64_GIC_NR_IRQS;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use self::kvm::KvmSplitIrqChip;

@@ -7,18 +7,19 @@ use std::fs::OpenOptions;
 use std::io;
 
 use crate::Pstore;
-use kvm::Vm;
+use base::MemoryMapping;
+use hypervisor::Vm;
 use resources::SystemAllocator;
 use resources::{Alloc, MmioType};
-use sys_util::{GuestAddress, MemoryMapping};
+use vm_memory::GuestAddress;
 
 /// Error for pstore.
 #[derive(Debug)]
 pub enum Error {
     IoError(io::Error),
-    MmapError(sys_util::MmapError),
+    MmapError(base::MmapError),
     ResourcesError(resources::Error),
-    SysUtilError(sys_util::Error),
+    SysUtilError(base::Error),
 }
 
 impl Display for Error {
@@ -44,7 +45,7 @@ pub struct RamoopsRegion {
 
 /// Creates a mmio memory region for pstore.
 pub fn create_memory_region(
-    vm: &mut Vm,
+    vm: &mut impl Vm,
     resources: &mut SystemAllocator,
     pstore: &Pstore,
 ) -> Result<RamoopsRegion> {

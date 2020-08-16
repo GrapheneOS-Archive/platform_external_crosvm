@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use sync::Mutex;
 
+use base::{warn, EventFd, Result};
 use data_model::{DataInit, Le32};
-use kvm::Datamatch;
+use hypervisor::Datamatch;
 use libc::ERANGE;
 use resources::{Alloc, MmioType, SystemAllocator};
-use sys_util::{warn, EventFd, GuestMemory, Result};
+use vm_memory::GuestMemory;
 
 use super::*;
 use crate::pci::{
@@ -238,7 +239,7 @@ impl VirtioPciDevice {
         let num_queues = device.queue_max_sizes().len();
 
         // One MSI-X vector per queue plus one for configuration changes.
-        let msix_num = u16::try_from(num_queues + 1).map_err(|_| sys_util::Error::new(ERANGE))?;
+        let msix_num = u16::try_from(num_queues + 1).map_err(|_| base::Error::new(ERANGE))?;
         let msix_config = Arc::new(Mutex::new(MsixConfig::new(
             msix_num,
             Arc::new(msi_device_socket),
@@ -294,7 +295,11 @@ impl VirtioPciDevice {
 
     fn are_queues_valid(&self) -> bool {
         if let Some(mem) = self.mem.as_ref() {
-            self.queues.iter().all(|q| q.is_valid(mem))
+            // All queues marked as ready must be valid.
+            self.queues
+                .iter()
+                .filter(|q| q.ready)
+                .all(|q| q.is_valid(mem))
         } else {
             false
         }
@@ -441,7 +446,7 @@ impl PciDevice for VirtioPciDevice {
             .set_size(CAPABILITY_BAR_SIZE);
         let settings_bar = self
             .config_regs
-            .add_pci_bar(&config)
+            .add_pci_bar(config)
             .map_err(|e| PciDeviceError::IoRegistrationFailed(settings_config_addr, e))?
             as u8;
         ranges.push((settings_config_addr, CAPABILITY_BAR_SIZE));
@@ -481,7 +486,7 @@ impl PciDevice for VirtioPciDevice {
             let config = config.set_address(device_addr);
             let _device_bar = self
                 .config_regs
-                .add_pci_bar(&config)
+                .add_pci_bar(config)
                 .map_err(|e| PciDeviceError::IoRegistrationFailed(device_addr, e))?;
             ranges.push((device_addr, config.get_size()));
         }

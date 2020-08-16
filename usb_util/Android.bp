@@ -8,9 +8,9 @@ rust_library_host {
     edition: "2018",
     rustlibs: [
         "libassertions",
+        "libbase_rust",
         "libdata_model",
         "liblibc",
-        "libsys_util",
         "libusb_sys",
     ],
     proc_macros: [
@@ -28,9 +28,9 @@ rust_test_host {
     edition: "2018",
     rustlibs: [
         "libassertions",
+        "libbase_rust",
         "libdata_model",
         "liblibc",
-        "libsys_util",
         "libusb_sys",
     ],
     proc_macros: [
@@ -40,6 +40,7 @@ rust_test_host {
 
 // dependent_library ["feature_list"]
 //   ../assertions/src/lib.rs
+//   ../base/src/lib.rs
 //   ../data_model/src/lib.rs
 //   ../sync/src/lib.rs
 //   ../sys_util/poll_token_derive/poll_token_derive.rs
@@ -47,9 +48,9 @@ rust_test_host {
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
 //   ../usb_sys/src/lib.rs
-//   libc-0.2.73 "default,std"
+//   libc-0.2.74 "default,std"
 //   proc-macro2-1.0.19 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
 //   remain-0.2.2
-//   syn-1.0.35 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.37 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   unicode-xid-0.2.1 "default"

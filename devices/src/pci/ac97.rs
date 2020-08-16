@@ -12,9 +12,10 @@ use audio_streams::{
     shm_streams::{NullShmStreamSource, ShmStreamSource},
     StreamEffect,
 };
+use base::{error, EventFd};
 use libcras::{CrasClient, CrasClientType, CrasSocketType};
 use resources::{Alloc, MmioType, SystemAllocator};
-use sys_util::{error, EventFd, GuestMemory};
+use vm_memory::GuestMemory;
 
 use crate::pci::ac97_bus_master::Ac97BusMaster;
 use crate::pci::ac97_mixer::Ac97Mixer;
@@ -256,7 +257,7 @@ impl PciDevice for Ac97Dev {
             .set_address(mixer_regs_addr)
             .set_size(MIXER_REGS_SIZE);
         self.config_regs
-            .add_pci_bar(&mixer_config)
+            .add_pci_bar(mixer_config)
             .map_err(|e| pci_device::Error::IoRegistrationFailed(mixer_regs_addr, e))?;
         ranges.push((mixer_regs_addr, MIXER_REGS_SIZE));
 
@@ -279,7 +280,7 @@ impl PciDevice for Ac97Dev {
             .set_address(master_regs_addr)
             .set_size(MASTER_REGS_SIZE);
         self.config_regs
-            .add_pci_bar(&master_config)
+            .add_pci_bar(master_config)
             .map_err(|e| pci_device::Error::IoRegistrationFailed(master_regs_addr, e))?;
         ranges.push((master_regs_addr, MASTER_REGS_SIZE));
         Ok(ranges)
@@ -336,7 +337,7 @@ impl PciDevice for Ac97Dev {
 mod tests {
     use super::*;
     use audio_streams::shm_streams::MockShmStreamSource;
-    use sys_util::GuestAddress;
+    use vm_memory::GuestAddress;
 
     #[test]
     fn create() {
