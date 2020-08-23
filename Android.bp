@@ -2,10 +2,10 @@
 // Most modules in this file are edited manually:
 // * global defaults defined in crosvm_defaults, enabled for linux_glibc_x86_64
 //   * all modules use crosvm_defaults or other defaults derived from it
-// * root host binary is crosvm.experimental
-// * crosvm.experimental and libcrosvm have extra features:
+// * root host binary is crosvm
+// * crosvm and libcrosvm have extra features:
 //   * audio, gfxstream, gpu, virtio-gpu-next
-// * crosvm.experimental has extra flags and ld_flags
+// * crosvm has extra flags and ld_flags
 // * crosvm_host_test_tests_boot and crosvm_host_test_tests_plugins
 //   are not ready yet
 // We use cargo2android.py only to discover new changes.
@@ -31,7 +31,7 @@ rust_defaults {
 }
 
 rust_binary {
-    name: "crosvm.experimental",
+    name: "crosvm",
     defaults: ["crosvm_defaults"],
     host_supported: true,
     crate_name: "crosvm",
