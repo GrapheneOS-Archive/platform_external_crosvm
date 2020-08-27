@@ -4,6 +4,10 @@
     {
       "name": "resources_host_test_src_lib",
       "host": true
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
+//    {
+//      "name": "resources_device_test_src_lib"
     }
   ]
 }

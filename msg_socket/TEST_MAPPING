@@ -5,21 +5,41 @@
       "name": "msg_socket_host_test_src_lib",
       "host": true
     },
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    {
+//      "name": "msg_socket_device_test_src_lib"
+//    },
     {
       "name": "msg_socket_host_test_tests_enum",
       "host": true
     },
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    {
+//      "name": "msg_socket_device_test_tests_enum"
+//    },
     {
       "name": "msg_socket_host_test_tests_struct",
       "host": true
     },
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    {
+//      "name": "msg_socket_device_test_tests_struct"
+//    },
     {
       "name": "msg_socket_host_test_tests_tuple",
       "host": true
     },
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    {
+//      "name": "msg_socket_device_test_tests_tuple"
+//    },
     {
       "name": "msg_socket_host_test_tests_unit",
       "host": true
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
+//    {
+//      "name": "msg_socket_device_test_tests_unit"
     }
   ]
 }
