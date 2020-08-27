@@ -5,6 +5,9 @@
 //    {
 //      "name": "devices_host_test_src_lib",
 //      "host": true
+//    },
+//    {
+//      "name": "devices_device_test_src_lib"
 //    }
 //  ]
 }
