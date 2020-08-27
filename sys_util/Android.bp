@@ -18,6 +18,13 @@ rust_library {
         "libpoll_token_derive",
     ],
     shared_libs: ["libcap"],  // specified in src/capabilities.rs
+    target: {
+        android: {
+            rustlibs: [
+                "libandroid_log_sys",
+            ],
+        },
+    },
 }
 
 rust_defaults {
@@ -50,6 +57,9 @@ rust_test_host {
 //rust_test {
 //    name: "sys_util_device_test_src_lib",
 //    defaults: ["sys_util_defaults"],
+//    rustlibs: [
+//        "libandroid_log_sys",
+//    ],
 //}
 
 // dependent_library ["feature_list"]
