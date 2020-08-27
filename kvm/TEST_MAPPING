@@ -7,16 +7,28 @@
 //      "host": true
 //    },
 //    {
+//      "name": "kvm_device_test_src_lib"
+//    },
+//    {
 //      "name": "kvm_host_test_tests_dirty_log",
 //      "host": true
+//    },
+//    {
+//      "name": "kvm_device_test_tests_dirty_log"
 //    },
 //    {
 //      "name": "kvm_host_test_tests_read_only_memory",
 //      "host": true
 //    },
 //    {
+//      "name": "kvm_device_test_tests_read_only_memory"
+//    },
+//    {
 //      "name": "kvm_host_test_tests_real_run_adder",
 //      "host": true
+//    },
+//    {
+//      "name": "kvm_device_test_tests_real_run_adder"
 //    }
 //  ]
 }

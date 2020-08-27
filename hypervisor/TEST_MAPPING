@@ -5,6 +5,9 @@
 //    {
 //      "name": "hypervisor_host_test_src_lib",
 //      "host": true
+//    },
+//    {
+//      "name": "hypervisor_device_test_src_lib"
 //    }
 //  ]
 }
