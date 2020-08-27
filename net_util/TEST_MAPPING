@@ -5,6 +5,9 @@
 //    {
 //      "name": "net_util_host_test_src_lib",
 //      "host": true
+//    },
+//    {
+//      "name": "net_util_device_test_src_lib"
 //    }
 //  ]
 }
