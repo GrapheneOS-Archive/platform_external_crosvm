@@ -45,6 +45,9 @@ pub enum CmdResponse {
     },
     QueryControl(QueryCtrlResponse),
     GetControl(CtrlVal),
+    // TODO(alexlau): SetControl is unused, remove this after encoder CL lands.
+    #[allow(dead_code)]
+    SetControl,
     Error(CmdError),
 }
 
@@ -72,6 +75,7 @@ impl Response for CmdResponse {
             GetParams { .. } => VIRTIO_VIDEO_RESP_OK_GET_PARAMS,
             QueryControl(_) => VIRTIO_VIDEO_RESP_OK_QUERY_CONTROL,
             GetControl(_) => VIRTIO_VIDEO_RESP_OK_GET_CONTROL,
+            SetControl => VIRTIO_VIDEO_RESP_OK_NODATA,
             Error(e) => {
                 match e {
                     // TODO(b/1518105): Add more detailed error code when a new protocol supports
@@ -121,6 +125,7 @@ impl Response for CmdResponse {
                 w.write_obj(virtio_video_get_control_resp { hdr })?;
                 val.write(w)
             }
+            SetControl => w.write_obj(virtio_video_set_control_resp { hdr }),
         }
     }
 }
