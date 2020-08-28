@@ -39,12 +39,7 @@ rust_binary {
 
     target: {
         host: {
-            rustlibs: [
-                "libaudio_streams",
-                "liblibcras",
-            ],
             features: [
-                "audio",
                 "gfxstream",
                 "gpu",
             ],
@@ -79,6 +74,7 @@ rust_binary {
 
     edition: "2018",
     features: [
+        "audio",
         "default",
     ],
 
@@ -94,6 +90,7 @@ rust_binary {
         "libacpi_tables",
         "libarch",
         "libassertions",
+        "libaudio_streams",
         "libbase_rust",
         "libbit_field",
         "libcrosvm",
@@ -104,6 +101,7 @@ rust_binary {
         "libkernel_cmdline",
         "libkernel_loader",
         "liblibc",
+        "liblibcras",
         "libminijail_rust",
         "libmsg_socket",
         "libnet_util",
@@ -185,6 +183,13 @@ rust_test_host {
 rust_test {
     name: "crosvm_device_test_src_crosvm",
     defaults: ["crosvm_defaults_test"],
+    features: [
+        "audio",
+    ],
+    rustlibs: [
+        "libaudio_streams",
+        "liblibcras",
+    ],
 }
 
 rust_defaults {
@@ -264,13 +269,8 @@ rust_library {
     target: {
         host: {
             features: [
-                "audio",
                 "gfxstream",
                 "gpu",
-            ],
-            rustlibs: [
-                "libaudio_streams",
-                "liblibcras",
             ],
         },
     },
@@ -283,12 +283,14 @@ rust_library {
         },
     },
     features: [
+        "audio",
         "default",
     ],
     rustlibs: [
         "libacpi_tables",
         "libarch",
         "libassertions",
+        "libaudio_streams",
         "libbase_rust",
         "libbit_field",
         "libdata_model",
@@ -298,6 +300,7 @@ rust_library {
         "libkernel_cmdline",
         "libkernel_loader",
         "liblibc",
+        "liblibcras",
         "libminijail_rust",
         "libmsg_socket",
         "libnet_util",
