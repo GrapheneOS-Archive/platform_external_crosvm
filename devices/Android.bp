@@ -83,7 +83,6 @@ rust_library {
     target: { // added manually
         host: {
             features: [
-                "audio",
                 "gfxstream",
                 "gpu",
                 "gpu_buffer",
@@ -91,16 +90,18 @@ rust_library {
                 "gpu_renderer",
             ],
             rustlibs: [
-                "libaudio_streams",
                 "libgpu_buffer",  // added manually
                 "libgpu_display",  // added manually
                 "libgpu_renderer",  // added manually
-                "liblibcras",
             ],
         },
     },
+    features: [
+        "audio",
+    ],
     rustlibs: [
         "libacpi_tables",
+        "libaudio_streams",
         "libbase_rust",
         "libbit_field",
         "libbitflags",
@@ -110,6 +111,7 @@ rust_library {
         "libhypervisor",
         "libkvm_sys",
         "liblibc",
+        "liblibcras",
         "liblinux_input_sys",
         "libminijail_rust",
         "libmsg_socket",
