@@ -63,9 +63,21 @@ rust_test_host {
         "libgpu_renderer",  // added manually
         "liblibcras",  // moved manually
     ],
-    shared_libs: [
-        "libvirglrenderer",  // added manually
-    ],
+
+    // added manually
+    target: {
+        host: {
+            shared_libs: ["libvirglrenderer"],
+        },
+        android: {
+            shared_libs: ["libdrm"],
+            static_libs: [
+                "libepoxy",
+                "libgbm",
+                "libvirglrenderer",
+            ],
+        },
+    },
 }
 
 rust_test {
@@ -84,20 +96,15 @@ rust_library {
         host: {
             features: [
                 "gfxstream",
-                "gpu",
-                "gpu_buffer",
-                "gpu_display",
-                "gpu_renderer",
-            ],
-            rustlibs: [
-                "libgpu_buffer",  // added manually
-                "libgpu_display",  // added manually
-                "libgpu_renderer",  // added manually
             ],
         },
     },
     features: [
         "audio",
+        "gpu",
+        "gpu_buffer",
+        "gpu_display",
+        "gpu_renderer",
     ],
     rustlibs: [
         "libacpi_tables",
@@ -108,6 +115,9 @@ rust_library {
         "libcros_async",
         "libdata_model",
         "libdisk",
+        "libgpu_buffer",  // added manually
+        "libgpu_display",  // added manually
+        "libgpu_renderer",  // added manually
         "libhypervisor",
         "libkvm_sys",
         "liblibc",
