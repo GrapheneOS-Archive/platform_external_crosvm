@@ -3,10 +3,10 @@
 // found in the LICENSE file.
 
 #[cfg(feature = "plugin")]
-pub mod plugin;
+pub extern crate crosvm_plugin_proto as plugin;
 
 #[cfg(feature = "trunks")]
 pub mod trunks;
 
 #[cfg(feature = "composite-disk")]
-pub mod cdisk_spec;
+pub extern crate cdisk_spec_proto as cdisk_spec;
