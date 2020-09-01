@@ -5,9 +5,10 @@
 //   does not generate cc_library module yet
 //   does not generate wayland_protocol_codegen module yet
 
-rust_library_host {
+rust_library {
     name: "libgpu_display",
     defaults: ["crosvm_defaults"],
+    host_supported: true,
     crate_name: "gpu_display",
     srcs: ["src/lib.rs"],
     edition: "2018",
@@ -17,16 +18,27 @@ rust_library_host {
         "liblibc",
         "liblinux_input_sys",
     ],
-    shared_libs: [
-        "libwayland_client",
-    ],
     static_libs: [
         "libdisplay_wl",
     ],
+
+    // added manually
+    target: {
+        host: {
+            shared_libs: ["libwayland_client"],
+        },
+        android: {
+            static_libs: [
+                "libwayland_client_static",
+                "libffi"
+            ],
+        },
+    },
 }
 
-cc_library_host_static {
+cc_library_static {
     name: "libdisplay_wl",
+    host_supported: true,
     c_std: "c11",
     srcs: ["src/display_wl.c"],
 
@@ -34,9 +46,17 @@ cc_library_host_static {
     generated_headers: ["gpu_display_client_protocol_headers"],
     export_generated_headers: ["gpu_display_client_protocol_headers"],
 
-    shared_libs: ["libwayland_client"],
-
+    // added manually
     target: {
+        host: {
+            shared_libs: ["libwayland_client"],
+        },
+        android: {
+            static_libs: [
+                "libwayland_client_static",
+                "libffi"
+            ],
+        },
         linux_glibc_x86: {
             // libffi broken on x86, see b/162610242
             enabled: false,
