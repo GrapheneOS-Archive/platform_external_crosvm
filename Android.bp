@@ -30,6 +30,16 @@ rust_defaults {
     },
 }
 
+rust_defaults {
+    name: "crosvm_proc_macro_defaults",
+    defaults: ["crosvm_defaults"],
+    target: {
+        darwin: {
+            enabled: true,
+        },
+    },
+}
+
 rust_binary {
     name: "crosvm",
     defaults: ["crosvm_defaults"],
