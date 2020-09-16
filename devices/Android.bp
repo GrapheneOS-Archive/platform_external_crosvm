@@ -93,7 +93,7 @@ rust_library {
     srcs: ["src/lib.rs"],
     edition: "2018",
     target: { // added manually
-        host: {
+        linux_glibc: {
             features: [
                 "gfxstream",
             ],
