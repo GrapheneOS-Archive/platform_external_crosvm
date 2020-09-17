@@ -709,7 +709,7 @@ impl X8664arch {
 
         let mem_gap_start = END_ADDR_BEFORE_32BITS;
         let mem_below_4g = std::cmp::min(mem_gap_start, mem_size);
-        let mem_above_4g = mem_size.saturating_sub(FIRST_ADDR_PAST_32BITS);
+        let mem_above_4g = mem_size.saturating_sub(END_ADDR_BEFORE_32BITS);
 
         io_bus
             .insert(
