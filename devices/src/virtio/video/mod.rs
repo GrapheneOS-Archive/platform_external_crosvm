@@ -21,6 +21,7 @@ use crate::virtio::{self, copy_config, DescriptorError, Interrupt, VIRTIO_F_VERS
 
 #[macro_use]
 mod macros;
+mod async_cmd_desc_map;
 mod command;
 mod control;
 mod decoder;
@@ -50,12 +51,8 @@ pub enum Error {
     PollContextCreationFailed(SysError),
     /// A DescriptorChain contains invalid data.
     InvalidDescriptorChain(DescriptorError),
-    /// Invalid output buffer is specified for EOS notification.
-    InvalidEOSResource { stream_id: u32, resource_id: u32 },
     /// No available descriptor in which an event is written to.
     DescriptorNotAvailable,
-    /// Output buffer for EOS is unavailable.
-    NoEOSBuffer { stream_id: u32 },
     /// Error while polling for events.
     PollError(SysError),
     /// Failed to read a virtio-video command.
@@ -76,22 +73,9 @@ impl Display for Error {
             LibvdaCreationFailed(e) => write!(f, "failed to create a libvda instance: {}", e),
             PollContextCreationFailed(e) => write!(f, "failed to create PollContext: {}", e),
             InvalidDescriptorChain(e) => write!(f, "DescriptorChain contains invalid data: {}", e),
-            InvalidEOSResource {
-                stream_id,
-                resource_id,
-            } => write!(
-                f,
-                "invalid resource {} was specified for stream {}'s EOS",
-                resource_id, stream_id
-            ),
             DescriptorNotAvailable => {
                 write!(f, "no available descriptor in which an event is written to")
             }
-            NoEOSBuffer { stream_id } => write!(
-                f,
-                "no output resource is available to notify EOS: {}",
-                stream_id
-            ),
             PollError(err) => write!(f, "failed to poll events: {}", err),
             ReadFailure(e) => write!(f, "failed to read a command from the guest: {}", e),
             UnexpectedResponse(tag) => {
