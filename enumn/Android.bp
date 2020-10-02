@@ -17,7 +17,7 @@ rust_test_host {
 
 rust_proc_macro {
     name: "libenumn",
-    defaults: ["crosvm_proc_macro_defaults"],
+    defaults: ["crosvm_defaults"],
     crate_name: "enumn",
     srcs: ["src/lib.rs"],
     edition: "2018",
@@ -29,7 +29,7 @@ rust_proc_macro {
 }
 
 // dependent_library ["feature_list"]
-//   proc-macro2-1.0.19 "default,proc-macro"
+//   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
-//   syn-1.0.37 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   syn-1.0.42 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   unicode-xid-0.2.1 "default"
