@@ -17,7 +17,7 @@ rust_test_host {
 
 rust_proc_macro {
     name: "libbit_field_derive",
-    defaults: ["crosvm_defaults"],
+    defaults: ["crosvm_proc_macro_defaults"],
     crate_name: "bit_field_derive",
     srcs: ["bit_field_derive.rs"],
     edition: "2018",
