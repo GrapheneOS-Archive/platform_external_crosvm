@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cmp::max;
+use std::cmp::{max, Reverse};
 use std::convert::TryFrom;
 use std::error::Error as StdError;
 use std::ffi::CStr;
@@ -33,12 +33,12 @@ use base::net::{UnixSeqpacket, UnixSeqpacketListener, UnlinkUnixSeqpacketListene
 #[cfg(feature = "gpu")]
 use devices::virtio::EventDevice;
 use devices::virtio::{self, Console, VirtioDevice};
+#[cfg(feature = "audio")]
+use devices::Ac97Dev;
 use devices::{
     self, HostBackendDeviceProvider, KvmKernelIrqChip, PciDevice, VfioContainer, VfioDevice,
     VfioPciDevice, VirtioPciDevice, XhciController,
 };
-#[cfg(feature = "audio")]
-use devices::{Ac97Backend, Ac97Dev};
 use hypervisor::kvm::{Kvm, KvmVcpu, KvmVm};
 use hypervisor::{Hypervisor, HypervisorCap, RunnableVcpu, Vcpu, VcpuExit, Vm, VmCap};
 use minijail::{self, Minijail};
@@ -51,9 +51,9 @@ use sync::{Condvar, Mutex};
 use base::{
     self, block_signal, clear_signal, drop_capabilities, error, flock, get_blocked_signals,
     get_group_id, get_user_id, getegid, geteuid, info, register_rt_signal_handler,
-    set_cpu_affinity, signal, validate_raw_fd, warn, EventFd, ExternalMapping, FlockOperation,
-    Killable, MemoryMappingArena, PollContext, PollToken, Protection, ScopedEvent, SignalFd,
-    Terminal, TimerFd, WatchingEvents, SIGRTMIN,
+    set_cpu_affinity, set_rt_prio_limit, set_rt_round_robin, signal, validate_raw_fd, warn,
+    EventFd, ExternalMapping, FlockOperation, Killable, MemoryMappingArena, PollContext, PollToken,
+    Protection, ScopedEvent, SignalFd, Terminal, TimerFd, WatchingEvents, SIGRTMIN,
 };
 use vm_control::{
     BalloonControlCommand, BalloonControlRequestSocket, BalloonControlResponseSocket,
@@ -67,8 +67,8 @@ use vm_memory::{GuestAddress, GuestMemory};
 
 use crate::{Config, DiskOption, Executable, SharedDir, SharedDirKind, TouchDeviceOption};
 use arch::{
-    self, LinuxArch, RunnableLinuxVm, SerialHardware, SerialParameters, VirtioDeviceStub,
-    VmComponents, VmImage,
+    self, LinuxArch, RunnableLinuxVm, SerialHardware, SerialParameters, VcpuAffinity,
+    VirtioDeviceStub, VmComponents, VmImage,
 };
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -730,8 +730,11 @@ fn create_gpu_device(
             jail.mount_bind(sys_dev_char_path, sys_dev_char_path, false)?;
             let sys_devices_path = Path::new("/sys/devices");
             jail.mount_bind(sys_devices_path, sys_devices_path, false)?;
+
             let drm_dri_path = Path::new("/dev/dri");
-            jail.mount_bind(drm_dri_path, drm_dri_path, false)?;
+            if drm_dri_path.exists() {
+                jail.mount_bind(drm_dri_path, drm_dri_path, false)?;
+            }
 
             // If the ARM specific devices exist on the host, bind mount them in.
             let mali0_path = Path::new("/dev/mali0");
@@ -1351,12 +1354,8 @@ fn create_devices(
     #[cfg(feature = "audio")]
     for ac97_param in &cfg.ac97_parameters {
         let dev = Ac97Dev::try_new(mem.clone(), ac97_param.clone()).map_err(Error::CreateAc97)?;
-        let policy = match ac97_param.backend {
-            Ac97Backend::CRAS => "cras_audio_device",
-            Ac97Backend::NULL => "null_audio_device",
-        };
-
-        pci_devices.push((Box::new(dev), simple_jail(&cfg, &policy)?));
+        let jail = simple_jail(&cfg, dev.minijail_policy())?;
+        pci_devices.push((Box::new(dev), jail));
     }
 
     // Create xhci controller.
@@ -1513,6 +1512,7 @@ fn runnable_vcpu<V, R>(
     vm: impl VmArch<Vcpu = V>,
     irq_chip: &mut impl IrqChipArch<V>,
     vcpu_count: usize,
+    run_rt: bool,
     vcpu_affinity: Vec<usize>,
     has_bios: bool,
     use_hypervisor_signals: bool,
@@ -1553,6 +1553,15 @@ where
     #[cfg(feature = "chromeos")]
     if let Err(e) = base::sched::enable_core_scheduling() {
         error!("Failed to enable core scheduling: {}", e);
+    }
+
+    if run_rt {
+        const DEFAULT_VCPU_RT_LEVEL: u16 = 6;
+        if let Err(e) = set_rt_prio_limit(u64::from(DEFAULT_VCPU_RT_LEVEL))
+            .and_then(|_| set_rt_round_robin(i32::from(DEFAULT_VCPU_RT_LEVEL)))
+        {
+            warn!("Failed to set vcpu to real time: {}", e);
+        }
     }
 
     if use_hypervisor_signals {
@@ -1606,6 +1615,7 @@ fn run_vcpu<V, R>(
     vm: impl VmArch<Vcpu = V> + 'static,
     mut irq_chip: impl IrqChipArch<V> + 'static,
     vcpu_count: usize,
+    run_rt: bool,
     vcpu_affinity: Vec<usize>,
     start_barrier: Arc<Barrier>,
     has_bios: bool,
@@ -1633,6 +1643,7 @@ where
                 vm,
                 &mut irq_chip,
                 vcpu_count,
+                run_rt,
                 vcpu_affinity,
                 has_bios,
                 use_hypervisor_signals,
@@ -1893,6 +1904,7 @@ where
             .iter()
             .map(|path| SDT::from_file(path).map_err(|e| Error::OpenAcpiTable(path.clone(), e)))
             .collect::<Result<Vec<SDT>>>()?,
+        rt_cpus: cfg.rt_cpus.clone(),
     };
 
     let control_server_socket = match &cfg.socket_path {
@@ -2079,13 +2091,19 @@ fn run_control<V: VmArch + 'static, I: IrqChipArch<V::Vcpu> + 'static>(
         None => iter::repeat_with(|| None).take(linux.vcpu_count).collect(),
     };
     for (cpu_id, vcpu) in vcpus.into_iter().enumerate() {
+        let vcpu_affinity = match linux.vcpu_affinity.clone() {
+            Some(VcpuAffinity::Global(v)) => v,
+            Some(VcpuAffinity::PerVcpu(mut m)) => m.remove(&cpu_id).unwrap_or_default(),
+            None => Default::default(),
+        };
         let handle = run_vcpu(
             cpu_id,
             vcpu,
             linux.vm.try_clone().map_err(Error::CloneEventFd)?,
             linux.irq_chip.try_clone().map_err(Error::CloneEventFd)?,
             linux.vcpu_count,
-            linux.vcpu_affinity.clone(),
+            linux.rt_cpus.contains(&cpu_id),
+            vcpu_affinity,
             vcpu_thread_barrier.clone(),
             linux.has_bios,
             linux.io_bus.clone(),
@@ -2393,7 +2411,7 @@ fn run_control<V: VmArch + 'static, I: IrqChipArch<V::Vcpu> + 'static>(
 
         // Sort in reverse so the highest indexes are removed first. This removal algorithm
         // preserves correct indexes as each element is removed.
-        vm_control_indices_to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        vm_control_indices_to_remove.sort_unstable_by_key(|&k| Reverse(k));
         vm_control_indices_to_remove.dedup();
         for index in vm_control_indices_to_remove {
             // Delete the socket from the `poll_ctx` synchronously. Otherwise, the kernel will do
