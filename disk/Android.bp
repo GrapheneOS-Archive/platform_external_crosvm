@@ -71,7 +71,7 @@ rust_library {
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
 //   ../vm_memory/src/lib.rs
-//   async-trait-0.1.36
+//   async-trait-0.1.41
 //   futures-0.3.5 "alloc"
 //   futures-channel-0.3.5 "alloc,futures-sink,sink"
 //   futures-core-0.3.5 "alloc"
@@ -79,13 +79,14 @@ rust_library {
 //   futures-sink-0.3.5 "alloc"
 //   futures-task-0.3.5 "alloc"
 //   futures-util-0.3.5 "alloc,futures-sink,sink"
-//   libc-0.2.74 "default,std"
-//   paste-1.0.0
-//   pin-project-0.4.23
-//   pin-project-internal-0.4.23
+//   libc-0.2.78 "default,std"
+//   paste-1.0.1
+//   pin-project-0.4.25
+//   pin-project-internal-0.4.25
 //   pin-utils-0.1.0
-//   proc-macro2-1.0.19 "default,proc-macro"
+//   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
 //   remain-0.2.2
-//   syn-1.0.37 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   slab-0.4.2
+//   syn-1.0.42 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   unicode-xid-0.2.1 "default"

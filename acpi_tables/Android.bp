@@ -38,4 +38,4 @@ rust_library {
 // dependent_library ["feature_list"]
 //   ../assertions/src/lib.rs
 //   ../data_model/src/lib.rs
-//   libc-0.2.74 "default,std"
+//   libc-0.2.78 "default,std"

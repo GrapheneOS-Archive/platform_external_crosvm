@@ -59,6 +59,7 @@ pub enum QueueType {
 }
 impl_try_from_le32_for_enumn!(QueueType, "queue_type");
 
+#[derive(Debug)]
 pub enum VideoCmd {
     QueryCapability {
         queue_type: QueueType,
@@ -118,7 +119,7 @@ pub enum VideoCmd {
 
 impl<'a> VideoCmd {
     /// Reads a request on virtqueue and construct a VideoCmd value.
-    pub fn from_reader(r: &'a mut Reader<'a>) -> Result<Self, ReadCmdError> {
+    pub fn from_reader(r: &'a mut Reader) -> Result<Self, ReadCmdError> {
         use self::ReadCmdError::*;
         use self::VideoCmd::*;
 
@@ -270,7 +271,6 @@ impl<'a> VideoCmd {
             VIRTIO_VIDEO_CMD_QUERY_CONTROL => {
                 let body = r.read_obj::<virtio_video_query_control>()?;
                 let query_ctrl_type = match body.control.into() {
-                    VIRTIO_VIDEO_CONTROL_BITRATE => QueryCtrlType::Bitrate,
                     VIRTIO_VIDEO_CONTROL_PROFILE => QueryCtrlType::Profile(
                         r.read_obj::<virtio_video_query_control_profile>()?
                             .format

@@ -186,7 +186,7 @@ rust_library {
 //   ../virtio_sys/src/lib.rs
 //   ../vm_control/src/lib.rs
 //   ../vm_memory/src/lib.rs
-//   async-trait-0.1.36
+//   async-trait-0.1.41
 //   bitflags-1.2.1 "default"
 //   futures-0.3.5 "alloc,async-await,default,executor,futures-executor,std"
 //   futures-channel-0.3.5 "alloc,futures-sink,sink,std"
@@ -197,19 +197,19 @@ rust_library {
 //   futures-sink-0.3.5 "alloc,std"
 //   futures-task-0.3.5 "alloc,once_cell,std"
 //   futures-util-0.3.5 "alloc,async-await,async-await-macro,channel,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,proc-macro-hack,proc-macro-nested,sink,slab,std"
-//   libc-0.2.74 "default,std"
+//   libc-0.2.78 "default,std"
 //   memchr-2.3.3 "default,std"
-//   once_cell-1.4.0 "std"
-//   paste-1.0.0
-//   pin-project-0.4.23
-//   pin-project-internal-0.4.23
+//   once_cell-1.4.1 "std"
+//   paste-1.0.1
+//   pin-project-0.4.25
+//   pin-project-internal-0.4.25
 //   pin-utils-0.1.0
 //   pkg-config-0.3.18
 //   proc-macro-hack-0.5.18
 //   proc-macro-nested-0.1.6
-//   proc-macro2-1.0.19 "default,proc-macro"
+//   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
 //   remain-0.2.2
 //   slab-0.4.2
-//   syn-1.0.37 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.42 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   unicode-xid-0.2.1 "default"
