@@ -161,6 +161,28 @@ function gen_blueprint_arch_policy_files() {
   done
 }
 
+function gen_crosvm_seccomp_policy_product_packages_mk_fragment() {
+  local archs=("$@")
+  declare -A policy_genrules
+  for arch in ${archs[@]}; do
+    for file in $(scan_policy_name ${arch}); do
+      local base_name="$(basename $file)"
+      policy_genrules[${base_name}]="${policy_genrules[${base_name}]} $arch"
+    done
+  done
+  echo "PRODUCT_PACKAGES += \\"
+  for file in "${!policy_genrules[@]}"; do
+    echo "    ${file} \\"
+  done | sort
+  echo
+
+  echo "# TODO: Remove this when crosvm is added to generic system image"
+  echo "PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += \\"
+  for file in "${!policy_genrules[@]}"; do
+    echo "    system/etc/seccomp_policy/crosvm/${file} \\"
+  done | sort
+}
+
 function gen_host_package_mk_arch_fragment() {
   local arch="$1"
   local arch_dir="$(get_arch_dir ${arch})"
@@ -178,8 +200,11 @@ function gen_host_package_mk_arch_fragment() {
 check_location
 gen_license >Android.bp
 gen_license \# >host_package.mk
+gen_license \# >crosvm_seccomp_policy_product_packages.mk
 gen_blueprint_boilerplate >>Android.bp
 gen_blueprint_arch_policy_files "${seccomp_archs[@]}" >>Android.bp
+gen_crosvm_seccomp_policy_product_packages_mk_fragment \
+  "${seccomp_archs[@]}" >>crosvm_seccomp_policy_product_packages.mk
 for arch in ${seccomp_archs[@]}; do
   gen_host_package_mk_arch_fragment ${arch} >>host_package.mk
 done
