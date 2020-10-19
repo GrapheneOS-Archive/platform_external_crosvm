@@ -25,7 +25,7 @@ use base::{
 };
 use hypervisor::{IrqRoute, IrqSource, Vm};
 use msg_socket::{MsgError, MsgOnSocket, MsgReceiver, MsgResult, MsgSender, MsgSocket};
-use resources::{Alloc, GpuMemoryDesc, MmioType, SystemAllocator};
+use resources::{Alloc, GpuMemoryDesc, SystemAllocator};
 use sync::Mutex;
 use vm_memory::GuestAddress;
 
@@ -583,13 +583,13 @@ fn register_memory(
 
     let addr = match pci_allocation {
         Some(pci_allocation) => allocator
-            .mmio_allocator(MmioType::High)
+            .mmio_allocator_any()
             .address_from_pci_offset(pci_allocation.0, pci_allocation.1, size as u64)
             .map_err(|_e| SysError::new(EINVAL))?,
         None => {
             let alloc = allocator.get_anon_alloc();
             allocator
-                .mmio_allocator(MmioType::High)
+                .mmio_allocator_any()
                 .allocate(size as u64, alloc, "vmcontrol_register_memory".to_string())
                 .map_err(|_e| SysError::new(EINVAL))?
         }
@@ -607,7 +607,7 @@ fn register_memory_hva(
     pci_allocation: (Alloc, u64),
 ) -> Result<(u64, MemSlot)> {
     let addr = allocator
-        .mmio_allocator(MmioType::High)
+        .mmio_allocator_any()
         .address_from_pci_offset(pci_allocation.0, pci_allocation.1, mem.size() as u64)
         .map_err(|_e| SysError::new(EINVAL))?;
 
