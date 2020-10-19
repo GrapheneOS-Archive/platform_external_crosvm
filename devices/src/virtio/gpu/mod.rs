@@ -85,7 +85,7 @@ const FENCE_POLL_MS: u64 = 1;
 
 const GPU_BAR_NUM: u8 = 4;
 const GPU_BAR_OFFSET: u64 = 0;
-const GPU_BAR_SIZE: u64 = 1 << 33;
+const GPU_BAR_SIZE: u64 = 1 << 28;
 
 impl Default for GpuParameters {
     fn default() -> Self {
