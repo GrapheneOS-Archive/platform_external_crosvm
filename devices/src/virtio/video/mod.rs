@@ -11,7 +11,7 @@ use std::fmt::{self, Display};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::thread;
 
-use base::{error, Error as SysError, EventFd};
+use base::{error, Error as SysError, Event};
 use data_model::{DataInit, Le32};
 use vm_memory::GuestMemory;
 
@@ -45,8 +45,6 @@ const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE, QUEUE_SIZE];
 /// An error indicating something went wrong in virtio-video's worker.
 #[derive(Debug)]
 pub enum Error {
-    /// Failed to create a libvda instance.
-    LibvdaCreationFailed(libvda::Error),
     /// Creating PollContext failed.
     PollContextCreationFailed(SysError),
     /// A DescriptorChain contains invalid data.
@@ -70,7 +68,6 @@ impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use Error::*;
         match self {
-            LibvdaCreationFailed(e) => write!(f, "failed to create a libvda instance: {}", e),
             PollContextCreationFailed(e) => write!(f, "failed to create PollContext: {}", e),
             InvalidDescriptorChain(e) => write!(f, "DescriptorChain contains invalid data: {}", e),
             DescriptorNotAvailable => {
@@ -101,7 +98,7 @@ pub enum VideoDeviceType {
 
 pub struct VideoDevice {
     device_type: VideoDeviceType,
-    kill_evt: Option<EventFd>,
+    kill_evt: Option<Event>,
     resource_bridge: Option<ResourceRequestSocket>,
 }
 
@@ -167,7 +164,7 @@ impl VirtioDevice for VideoDevice {
         mem: GuestMemory,
         interrupt: Interrupt,
         mut queues: Vec<virtio::queue::Queue>,
-        mut queue_evts: Vec<EventFd>,
+        mut queue_evts: Vec<Event>,
     ) {
         if queues.len() != QUEUE_SIZES.len() {
             error!(
@@ -179,16 +176,16 @@ impl VirtioDevice for VideoDevice {
         }
         if queue_evts.len() != QUEUE_SIZES.len() {
             error!(
-                "wrong number of event FDs are passed: expected {}, actual {}",
+                "wrong number of events are passed: expected {}, actual {}",
                 queue_evts.len(),
                 QUEUE_SIZES.len()
             );
         }
 
-        let (self_kill_evt, kill_evt) = match EventFd::new().and_then(|e| Ok((e.try_clone()?, e))) {
+        let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
             Ok(v) => v,
             Err(e) => {
-                error!("failed to create kill EventFd pair: {:?}", e);
+                error!("failed to create kill Event pair: {:?}", e);
                 return;
             }
         };
@@ -217,16 +214,28 @@ impl VirtioDevice for VideoDevice {
             VideoDeviceType::Decoder => thread::Builder::new()
                 .name("virtio video decoder".to_owned())
                 .spawn(move || {
-                    let vda = libvda::decode::VdaInstance::new(libvda::decode::VdaImplType::Gavda)
-                        .map_err(Error::LibvdaCreationFailed)?;
+                    let vda = match libvda::decode::VdaInstance::new(
+                        libvda::decode::VdaImplType::Gavda,
+                    ) {
+                        Ok(vda) => vda,
+                        Err(e) => {
+                            error!("Failed to initialize vda: {}", e);
+                            return;
+                        }
+                    };
                     let device = decoder::Decoder::new(&vda);
-                    worker.run(cmd_queue, event_queue, device)
+                    if let Err(e) = worker.run(cmd_queue, event_queue, device) {
+                        error!("Failed to start decoder worker: {}", e);
+                    };
+                    // Don't return any information since the return value is never checked.
                 }),
             VideoDeviceType::Encoder => thread::Builder::new()
                 .name("virtio video encoder".to_owned())
                 .spawn(move || {
                     let device = encoder::Encoder::new();
-                    worker.run(cmd_queue, event_queue, device)
+                    if let Err(e) = worker.run(cmd_queue, event_queue, device) {
+                        error!("Failed to start encoder worker: {}", e);
+                    }
                 }),
         };
         if let Err(e) = worker_result {
