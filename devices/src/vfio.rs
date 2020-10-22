@@ -17,8 +17,8 @@ use std::u32;
 use sync::Mutex;
 
 use base::{
-    ioctl, ioctl_with_mut_ref, ioctl_with_ptr, ioctl_with_ref, ioctl_with_val, warn, Error,
-    EventFd, SafeDescriptor,
+    ioctl, ioctl_with_mut_ref, ioctl_with_ptr, ioctl_with_ref, ioctl_with_val, warn,
+    AsRawDescriptor, Error, Event, RawDescriptor, SafeDescriptor,
 };
 use hypervisor::{DeviceKind, Vm};
 use vm_memory::GuestMemory;
@@ -375,10 +375,10 @@ impl VfioDevice {
         })
     }
 
-    /// Enable vfio device's irq and associate Irqfd EventFd with device.
+    /// Enable vfio device's irq and associate Irqfd Event with device.
     /// When MSIx is enabled, multi vectors will be supported, so fds is vector and the vector
     /// length is the num of MSIx vectors
-    pub fn irq_enable(&self, fds: Vec<&EventFd>, irq_type: VfioIrqType) -> Result<(), VfioError> {
+    pub fn irq_enable(&self, fds: Vec<&Event>, irq_type: VfioIrqType) -> Result<(), VfioError> {
         let count = fds.len();
         let u32_size = mem::size_of::<u32>();
         let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(count);
@@ -421,7 +421,7 @@ impl VfioDevice {
     /// This function enable resample irqfd and let vfio kernel could get EOI notification.
     ///
     /// fd: should be resample IrqFd.
-    pub fn resample_virq_enable(&self, fd: &EventFd) -> Result<(), VfioError> {
+    pub fn resample_virq_enable(&self, fd: &Event) -> Result<(), VfioError> {
         let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(1);
         irq_set[0].argsz = (mem::size_of::<vfio_irq_set>() + mem::size_of::<u32>()) as u32;
         irq_set[0].flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_UNMASK;
@@ -447,7 +447,7 @@ impl VfioDevice {
         }
     }
 
-    /// disable vfio device's irq and disconnect Irqfd EventFd with device
+    /// disable vfio device's irq and disconnect Irqfd Event with device
     pub fn irq_disable(&self, irq_type: VfioIrqType) -> Result<(), VfioError> {
         let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(0);
         irq_set[0].argsz = mem::size_of::<vfio_irq_set>() as u32;
@@ -807,8 +807,15 @@ impl VfioDevice {
     }
 }
 
+// TODO(mikehoyle): Remove this in favor of AsRawDescriptor
 impl AsRawFd for VfioDevice {
     fn as_raw_fd(&self) -> RawFd {
         self.dev.as_raw_fd()
+    }
+}
+
+impl AsRawDescriptor for VfioDevice {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
+        self.dev.as_raw_descriptor()
     }
 }

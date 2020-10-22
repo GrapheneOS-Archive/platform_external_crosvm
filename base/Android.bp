@@ -9,6 +9,8 @@ rust_defaults {
     auto_gen_config: true,
     edition: "2018",
     rustlibs: [
+        "libdata_model",
+        "libsync_rust",
         "libsys_util",
     ],
 }
@@ -32,6 +34,8 @@ rust_library {
     srcs: ["src/lib.rs"],
     edition: "2018",
     rustlibs: [
+        "libdata_model",
+        "libsync_rust",
         "libsys_util",
     ],
 }

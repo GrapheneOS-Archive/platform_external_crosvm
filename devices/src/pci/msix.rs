@@ -3,12 +3,11 @@
 // found in the LICENSE file.
 
 use crate::pci::{PciCapability, PciCapabilityID};
-use base::{error, Error as SysError, EventFd};
+use base::{error, Error as SysError, Event};
 use msg_socket::{MsgError, MsgReceiver, MsgSender};
 use std::convert::TryInto;
 use std::fmt::{self, Display};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::Arc;
 use vm_control::{MaybeOwnedFd, VmIrqRequest, VmIrqRequestSocket, VmIrqResponse};
 
 use data_model::DataInit;
@@ -46,7 +45,7 @@ impl Default for MsixTableEntry {
 }
 
 struct IrqfdGsi {
-    irqfd: EventFd,
+    irqfd: Event,
     gsi: u32,
 }
 
@@ -57,7 +56,7 @@ pub struct MsixConfig {
     irq_vec: Vec<IrqfdGsi>,
     masked: bool,
     enabled: bool,
-    msi_device_socket: Arc<VmIrqRequestSocket>,
+    msi_device_socket: VmIrqRequestSocket,
     msix_num: u16,
 }
 
@@ -96,7 +95,7 @@ pub enum MsixStatus {
 }
 
 impl MsixConfig {
-    pub fn new(msix_vectors: u16, vm_socket: Arc<VmIrqRequestSocket>) -> Self {
+    pub fn new(msix_vectors: u16, vm_socket: VmIrqRequestSocket) -> Self {
         assert!(msix_vectors <= MAX_MSIX_VECTORS_PER_DEVICE);
 
         let mut table_entries: Vec<MsixTableEntry> = Vec::new();
@@ -236,7 +235,7 @@ impl MsixConfig {
     fn msix_enable(&mut self) -> MsixResult<()> {
         self.irq_vec.clear();
         for i in 0..self.msix_num {
-            let irqfd = EventFd::new().unwrap();
+            let irqfd = Event::new().unwrap();
             self.msi_device_socket
                 .send(&VmIrqRequest::AllocateOneMsi {
                     irqfd: MaybeOwnedFd::Borrowed(irqfd.as_raw_fd()),
@@ -507,11 +506,17 @@ impl MsixConfig {
     ///
     ///  # Arguments
     ///  * 'vector' - the index to the MSI-X table entry
-    pub fn get_irqfd(&self, vector: usize) -> Option<&EventFd> {
+    pub fn get_irqfd(&self, vector: usize) -> Option<&Event> {
         match self.irq_vec.get(vector) {
             Some(irq) => Some(&irq.irqfd),
             None => None,
         }
+    }
+}
+
+impl AsRawFd for MsixConfig {
+    fn as_raw_fd(&self) -> RawFd {
+        self.msi_device_socket.as_raw_fd()
     }
 }
 
