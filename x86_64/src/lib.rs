@@ -60,7 +60,7 @@ use arch::{
     get_serial_cmdline, GetSerialCmdlineError, RunnableLinuxVm, SerialHardware, SerialParameters,
     VmComponents, VmImage,
 };
-use base::EventFd;
+use base::Event;
 use devices::{IrqChip, IrqChipX86_64, PciConfigIo, PciDevice};
 use hypervisor::{HypervisorX86_64, Vcpu, VcpuX86_64, VmX86_64};
 use minijail::Minijail;
@@ -74,11 +74,11 @@ use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 pub enum Error {
     AllocateIOResouce(resources::Error),
     AllocateIrq,
-    CloneEventFd(base::Error),
+    CloneEvent(base::Error),
     Cmdline(kernel_cmdline::Error),
     ConfigureSystem,
     CreateDevices(Box<dyn StdError>),
-    CreateEventFd(base::Error),
+    CreateEvent(base::Error),
     CreateFdt(arch::fdt::Error),
     CreateIoapicDevice(base::Error),
     CreateIrqChip(Box<dyn StdError>),
@@ -124,11 +124,11 @@ impl Display for Error {
         match self {
             AllocateIOResouce(e) => write!(f, "error allocating IO resource: {}", e),
             AllocateIrq => write!(f, "error allocating a single irq"),
-            CloneEventFd(e) => write!(f, "unable to clone an EventFd: {}", e),
+            CloneEvent(e) => write!(f, "unable to clone an Event: {}", e),
             Cmdline(e) => write!(f, "the given kernel command line was invalid: {}", e),
             ConfigureSystem => write!(f, "error configuring the system"),
             CreateDevices(e) => write!(f, "error creating devices: {}", e),
-            CreateEventFd(e) => write!(f, "unable to make an EventFd: {}", e),
+            CreateEvent(e) => write!(f, "unable to make an Event: {}", e),
             CreateFdt(e) => write!(f, "failed to create fdt: {}", e),
             CreateIoapicDevice(e) => write!(f, "failed to create IOAPIC device: {}", e),
             CreateIrqChip(e) => write!(f, "failed to create IRQ chip: {}", e),
@@ -299,7 +299,7 @@ fn arch_memory_regions(size: u64, has_bios: bool) -> Vec<(GuestAddress, u64)> {
     let end_32bit_gap_start = GuestAddress(END_ADDR_BEFORE_32BITS);
 
     let mut regions = Vec::new();
-    if mem_end < end_32bit_gap_start {
+    if mem_end <= end_32bit_gap_start {
         regions.push((GuestAddress(0), size));
         if has_bios {
             regions.push((GuestAddress(BIOS_START), BIOS_LEN as u64));
@@ -336,7 +336,7 @@ impl arch::LinuxArch for X8664arch {
             &GuestMemory,
             &mut V,
             &mut SystemAllocator,
-            &EventFd,
+            &Event,
         ) -> std::result::Result<Vec<(Box<dyn PciDevice>, Option<Minijail>)>, E1>,
         FV: FnOnce(GuestMemory) -> std::result::Result<V, E2>,
         FI: FnOnce(&V, /* vcpu_count: */ usize) -> std::result::Result<I, E3>,
@@ -361,7 +361,7 @@ impl arch::LinuxArch for X8664arch {
 
         let mut mmio_bus = devices::Bus::new();
 
-        let exit_evt = EventFd::new().map_err(Error::CreateEventFd)?;
+        let exit_evt = Event::new().map_err(Error::CreateEvent)?;
 
         let pci_devices = create_devices(&mem, &mut vm, &mut resources, &exit_evt)
             .map_err(|e| Error::CreateDevices(Box::new(e)))?;
@@ -377,11 +377,11 @@ impl arch::LinuxArch for X8664arch {
         let pci_bus = Arc::new(Mutex::new(PciConfigIo::new(pci)));
 
         // Event used to notify crosvm that guest OS is trying to suspend.
-        let suspend_evt = EventFd::new().map_err(Error::CreateEventFd)?;
+        let suspend_evt = Event::new().map_err(Error::CreateEvent)?;
 
         let mut io_bus = Self::setup_io_bus(
             irq_chip.pit_uses_speaker_port(),
-            exit_evt.try_clone().map_err(Error::CloneEventFd)?,
+            exit_evt.try_clone().map_err(Error::CloneEvent)?,
             Some(pci_bus.clone()),
             components.memory_size,
         )?;
@@ -391,7 +391,7 @@ impl arch::LinuxArch for X8664arch {
         let acpi_dev_resource = Self::setup_acpi_devices(
             &mut io_bus,
             &mut resources,
-            suspend_evt.try_clone().map_err(Error::CloneEventFd)?,
+            suspend_evt.try_clone().map_err(Error::CloneEvent)?,
             components.acpi_sdts,
         )?;
 
@@ -474,6 +474,7 @@ impl arch::LinuxArch for X8664arch {
             vcpu_count,
             vcpus: None,
             vcpu_affinity: components.vcpu_affinity,
+            no_smt: components.no_smt,
             irq_chip,
             has_bios,
             io_bus,
@@ -492,8 +493,10 @@ impl arch::LinuxArch for X8664arch {
         vcpu_id: usize,
         num_cpus: usize,
         has_bios: bool,
+        no_smt: bool,
     ) -> Result<()> {
-        cpuid::setup_cpuid(hypervisor, vcpu, vcpu_id, num_cpus).map_err(Error::SetupCpuid)?;
+        cpuid::setup_cpuid(hypervisor, vcpu, vcpu_id, num_cpus, no_smt)
+            .map_err(Error::SetupCpuid)?;
 
         if has_bios {
             return Ok(());
@@ -690,11 +693,11 @@ impl X8664arch {
     /// # Arguments
     ///
     /// * - `pit_uses_speaker_port` - does the PIT use port 0x61 for the PC speaker
-    /// * - `exit_evt` - the event fd object which should receive exit events
+    /// * - `exit_evt` - the event object which should receive exit events
     /// * - `mem_size` - the size in bytes of physical ram for the guest
     fn setup_io_bus(
         pit_uses_speaker_port: bool,
-        exit_evt: EventFd,
+        exit_evt: Event,
         pci: Option<Arc<Mutex<devices::PciConfigIo>>>,
         mem_size: u64,
     ) -> Result<devices::Bus> {
@@ -732,7 +735,7 @@ impl X8664arch {
 
         let nul_device = Arc::new(Mutex::new(NoDevice));
         let i8042 = Arc::new(Mutex::new(devices::I8042Device::new(
-            exit_evt.try_clone().map_err(Error::CloneEventFd)?,
+            exit_evt.try_clone().map_err(Error::CloneEvent)?,
         )));
 
         if pit_uses_speaker_port {
@@ -768,11 +771,11 @@ impl X8664arch {
     /// * - `io_bus` the I/O bus to add the devices to
     /// * - `resources` the SystemAllocator to allocate IO and MMIO for acpi
     ///                devices.
-    /// * - `suspend_evt` - the event fd object which used to suspend the vm
+    /// * - `suspend_evt` - the event object which used to suspend the vm
     fn setup_acpi_devices(
         io_bus: &mut devices::Bus,
         resources: &mut SystemAllocator,
-        suspend_evt: EventFd,
+        suspend_evt: Event,
         sdts: Vec<SDT>,
     ) -> Result<acpi::ACPIDevResource> {
         // The AML data for the acpi devices
@@ -825,8 +828,8 @@ impl X8664arch {
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
     ) -> Result<()> {
-        let com_evt_1_3 = EventFd::new().map_err(Error::CreateEventFd)?;
-        let com_evt_2_4 = EventFd::new().map_err(Error::CreateEventFd)?;
+        let com_evt_1_3 = Event::new().map_err(Error::CreateEvent)?;
+        let com_evt_2_4 = Event::new().map_err(Error::CreateEvent)?;
 
         arch::add_serial_devices(
             io_bus,
@@ -886,5 +889,25 @@ mod tests {
         assert_eq!(GuestAddress(BIOS_START), regions[1].0);
         assert_eq!(BIOS_LEN as u64, regions[1].1);
         assert_eq!(GuestAddress(1u64 << 32), regions[2].0);
+    }
+
+    #[test]
+    fn regions_eq_4gb_nobios() {
+        // Test with size = 3328, which is exactly 4 GiB minus the size of the gap (768 MiB).
+        let regions = arch_memory_regions(3328 << 20, /* has_bios */ false);
+        assert_eq!(1, regions.len());
+        assert_eq!(GuestAddress(0), regions[0].0);
+        assert_eq!(3328 << 20, regions[0].1);
+    }
+
+    #[test]
+    fn regions_eq_4gb_bios() {
+        // Test with size = 3328, which is exactly 4 GiB minus the size of the gap (768 MiB).
+        let regions = arch_memory_regions(3328 << 20, /* has_bios */ true);
+        assert_eq!(2, regions.len());
+        assert_eq!(GuestAddress(0), regions[0].0);
+        assert_eq!(3328 << 20, regions[0].1);
+        assert_eq!(GuestAddress(BIOS_START), regions[1].0);
+        assert_eq!(BIOS_LEN as u64, regions[1].1);
     }
 }

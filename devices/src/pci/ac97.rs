@@ -8,11 +8,8 @@ use std::fmt::{self, Display};
 use std::os::unix::io::RawFd;
 use std::str::FromStr;
 
-use audio_streams::{
-    shm_streams::{NullShmStreamSource, ShmStreamSource},
-    StreamEffect,
-};
-use base::{error, EventFd};
+use audio_streams::shm_streams::{NullShmStreamSource, ShmStreamSource};
+use base::{error, Event};
 use libcras::{CrasClient, CrasClientType, CrasSocketType};
 use resources::{Alloc, MmioType, SystemAllocator};
 use vm_memory::GuestMemory;
@@ -78,7 +75,6 @@ impl FromStr for Ac97Backend {
 pub struct Ac97Parameters {
     pub backend: Ac97Backend,
     pub capture: bool,
-    pub capture_effects: Vec<StreamEffect>,
 }
 
 pub struct Ac97Dev {
@@ -86,8 +82,8 @@ pub struct Ac97Dev {
     pci_address: Option<PciAddress>,
     // The irq events are temporarily saved here. They need to be passed to the device after the
     // jail forks. This happens when the bus is first written.
-    irq_evt: Option<EventFd>,
-    irq_resample_evt: Option<EventFd>,
+    irq_evt: Option<Event>,
+    irq_resample_evt: Option<Event>,
     bus_master: Ac97BusMaster,
     mixer: Ac97Mixer,
     backend: Ac97Backend,
@@ -146,11 +142,6 @@ impl Ac97Dev {
         }
     }
 
-    /// Provides the effect needed in capture stream creation
-    pub fn set_capture_effects(&mut self, effect: Vec<StreamEffect>) {
-        self.bus_master.set_capture_effects(effect);
-    }
-
     fn create_cras_audio_device(params: Ac97Parameters, mem: GuestMemory) -> Result<Self> {
         let mut server = Box::new(
             CrasClient::with_type(CrasSocketType::Unified)
@@ -161,8 +152,7 @@ impl Ac97Dev {
             server.enable_cras_capture();
         }
 
-        let mut cras_audio = Self::new(mem, Ac97Backend::CRAS, server);
-        cras_audio.set_capture_effects(params.capture_effects);
+        let cras_audio = Self::new(mem, Ac97Backend::CRAS, server);
         Ok(cras_audio)
     }
 
@@ -200,7 +190,7 @@ impl Ac97Dev {
         match data.len() {
             1 => data[0] = self.bus_master.readb(offset),
             2 => {
-                let val: u16 = self.bus_master.readw(offset);
+                let val: u16 = self.bus_master.readw(offset, &self.mixer);
                 data[0] = val as u8;
                 data[1] = (val >> 8) as u8;
             }
@@ -227,6 +217,7 @@ impl Ac97Dev {
                     | (u32::from(data[1]) << 8)
                     | (u32::from(data[2]) << 16)
                     | (u32::from(data[3]) << 24),
+                &mut self.mixer,
             ),
             l => error!("write length of {}", l),
         }
@@ -244,8 +235,8 @@ impl PciDevice for Ac97Dev {
 
     fn assign_irq(
         &mut self,
-        irq_evt: EventFd,
-        irq_resample_evt: EventFd,
+        irq_evt: Event,
+        irq_resample_evt: Event,
         irq_num: u32,
         irq_pin: PciInterruptPin,
     ) {
@@ -345,7 +336,7 @@ impl PciDevice for Ac97Dev {
                 if let (Some(irq_evt), Some(irq_resample_evt)) =
                     (self.irq_evt.take(), self.irq_resample_evt.take())
                 {
-                    self.bus_master.set_irq_event_fd(irq_evt, irq_resample_evt);
+                    self.bus_master.set_irq_event(irq_evt, irq_resample_evt);
                 }
                 self.write_bus_master(addr - bar1, data)
             }
