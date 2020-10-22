@@ -44,8 +44,8 @@ rust_test {
 //   ../sys_util/src/lib.rs
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
-//   libc-0.2.74 "default,std"
-//   proc-macro2-1.0.19 "default,proc-macro"
+//   libc-0.2.79 "default,std"
+//   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
-//   syn-1.0.37 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   syn-1.0.45 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   unicode-xid-0.2.1 "default"

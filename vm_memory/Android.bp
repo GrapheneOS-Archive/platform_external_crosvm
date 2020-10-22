@@ -54,19 +54,23 @@ rust_test {
 //   ../sys_util/src/lib.rs
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
-//   futures-0.3.5 "alloc"
-//   futures-channel-0.3.5 "alloc,futures-sink,sink"
-//   futures-core-0.3.5 "alloc"
-//   futures-io-0.3.5
-//   futures-sink-0.3.5 "alloc"
-//   futures-task-0.3.5 "alloc"
-//   futures-util-0.3.5 "alloc,futures-sink,sink"
-//   libc-0.2.74 "default,std"
-//   paste-1.0.0
-//   pin-project-0.4.23
-//   pin-project-internal-0.4.23
+//   async-trait-0.1.41
+//   futures-0.3.6 "alloc"
+//   futures-channel-0.3.6 "alloc,futures-sink,sink"
+//   futures-core-0.3.6 "alloc"
+//   futures-io-0.3.6
+//   futures-sink-0.3.6 "alloc"
+//   futures-task-0.3.6 "alloc"
+//   futures-util-0.3.6 "alloc,futures-sink,sink"
+//   libc-0.2.79 "default,std"
+//   paste-1.0.1
+//   pin-project-0.4.27
+//   pin-project-internal-0.4.27
 //   pin-utils-0.1.0
-//   proc-macro2-1.0.19 "default,proc-macro"
+//   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
-//   syn-1.0.38 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   slab-0.4.2
+//   syn-1.0.45 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   thiserror-1.0.21
+//   thiserror-impl-1.0.21
 //   unicode-xid-0.2.1 "default"

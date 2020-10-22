@@ -15,7 +15,7 @@ use std::u32;
 
 use base::Error as SysError;
 use base::Result as SysResult;
-use base::{error, info, iov_max, warn, EventFd, PollContext, PollToken, TimerFd};
+use base::{error, info, iov_max, warn, Event, PollContext, PollToken, Timer};
 use data_model::{DataInit, Le16, Le32, Le64};
 use disk::DiskFile;
 use msg_socket::{MsgReceiver, MsgSender};
@@ -141,7 +141,7 @@ enum ExecuteError {
         sector: u64,
         desc_error: io::Error,
     },
-    TimerFd(SysError),
+    Timer(SysError),
     WriteIo {
         length: usize,
         sector: u64,
@@ -179,7 +179,7 @@ impl Display for ExecuteError {
                 "io error reading {} bytes from sector {}: {}",
                 length, sector, desc_error,
             ),
-            TimerFd(e) => write!(f, "{}", e),
+            Timer(e) => write!(f, "{}", e),
             WriteIo {
                 length,
                 sector,
@@ -225,7 +225,7 @@ impl ExecuteError {
             ExecuteError::WriteStatus(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::Flush(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::ReadIo { .. } => VIRTIO_BLK_S_IOERR,
-            ExecuteError::TimerFd(_) => VIRTIO_BLK_S_IOERR,
+            ExecuteError::Timer(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::WriteIo { .. } => VIRTIO_BLK_S_IOERR,
             ExecuteError::DiscardWriteZeroes { .. } => VIRTIO_BLK_S_IOERR,
             ExecuteError::ReadOnly { .. } => VIRTIO_BLK_S_IOERR,
@@ -254,7 +254,7 @@ impl Worker {
         sparse: bool,
         disk: &mut dyn DiskFile,
         disk_size: u64,
-        flush_timer: &mut TimerFd,
+        flush_timer: &mut Timer,
         flush_timer_armed: &mut bool,
         mem: &GuestMemory,
     ) -> result::Result<usize, ExecuteError> {
@@ -297,7 +297,7 @@ impl Worker {
     fn process_queue(
         &mut self,
         queue_index: usize,
-        flush_timer: &mut TimerFd,
+        flush_timer: &mut Timer,
         flush_timer_armed: &mut bool,
     ) {
         let queue = &mut self.queues[queue_index];
@@ -359,7 +359,7 @@ impl Worker {
         DiskControlResult::Ok
     }
 
-    fn run(&mut self, queue_evt: EventFd, kill_evt: EventFd) {
+    fn run(&mut self, queue_evt: Event, kill_evt: Event) {
         #[derive(PollToken)]
         enum Token {
             FlushTimer,
@@ -369,7 +369,7 @@ impl Worker {
             Kill,
         }
 
-        let mut flush_timer = match TimerFd::new() {
+        let mut flush_timer = match Timer::new() {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to create the flush timer: {}", e);
@@ -421,7 +421,7 @@ impl Worker {
                     }
                     Token::QueueAvailable => {
                         if let Err(e) = queue_evt.read() {
-                            error!("failed reading queue EventFd: {}", e);
+                            error!("failed reading queue Event: {}", e);
                             break 'poll;
                         }
                         self.process_queue(0, &mut flush_timer, &mut flush_timer_armed);
@@ -473,7 +473,7 @@ impl Worker {
 
 /// Virtio device for exposing block level read/write operations on a host file.
 pub struct Block {
-    kill_evt: Option<EventFd>,
+    kill_evt: Option<Event>,
     worker_thread: Option<thread::JoinHandle<Worker>>,
     disk_image: Option<Box<dyn DiskFile>>,
     disk_size: Arc<Mutex<u64>>,
@@ -572,7 +572,7 @@ impl Block {
         sparse: bool,
         disk: &mut dyn DiskFile,
         disk_size: u64,
-        flush_timer: &mut TimerFd,
+        flush_timer: &mut Timer,
         flush_timer_armed: &mut bool,
     ) -> result::Result<(), ExecuteError> {
         let req_header: virtio_blk_req_header = reader.read_obj().map_err(ExecuteError::Read)?;
@@ -636,7 +636,7 @@ impl Block {
                 if !*flush_timer_armed {
                     flush_timer
                         .reset(flush_delay, None)
-                        .map_err(ExecuteError::TimerFd)?;
+                        .map_err(ExecuteError::Timer)?;
                     *flush_timer_armed = true;
                 }
             }
@@ -694,7 +694,7 @@ impl Block {
             }
             VIRTIO_BLK_T_FLUSH => {
                 disk.fsync().map_err(ExecuteError::Flush)?;
-                flush_timer.clear().map_err(ExecuteError::TimerFd)?;
+                flush_timer.clear().map_err(ExecuteError::Timer)?;
                 *flush_timer_armed = false;
             }
             t => return Err(ExecuteError::Unsupported(t)),
@@ -721,7 +721,7 @@ impl VirtioDevice for Block {
         let mut keep_fds = Vec::new();
 
         if let Some(disk_image) = &self.disk_image {
-            keep_fds.extend(disk_image.as_raw_fds());
+            keep_fds.extend(disk_image.as_raw_descriptors());
         }
 
         if let Some(control_socket) = &self.control_socket {
@@ -756,16 +756,16 @@ impl VirtioDevice for Block {
         mem: GuestMemory,
         interrupt: Interrupt,
         queues: Vec<Queue>,
-        mut queue_evts: Vec<EventFd>,
+        mut queue_evts: Vec<Event>,
     ) {
         if queues.len() != 1 || queue_evts.len() != 1 {
             return;
         }
 
-        let (self_kill_evt, kill_evt) = match EventFd::new().and_then(|e| Ok((e.try_clone()?, e))) {
+        let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
             Ok(v) => v,
             Err(e) => {
-                error!("failed creating kill EventFd pair: {}", e);
+                error!("failed creating kill Event pair: {}", e);
                 return;
             }
         };
@@ -935,7 +935,7 @@ mod tests {
         )
         .expect("create_descriptor_chain failed");
 
-        let mut flush_timer = TimerFd::new().expect("failed to create flush_timer");
+        let mut flush_timer = Timer::new().expect("failed to create flush_timer");
         let mut flush_timer_armed = false;
 
         Worker::process_one_request(
@@ -988,7 +988,7 @@ mod tests {
         )
         .expect("create_descriptor_chain failed");
 
-        let mut flush_timer = TimerFd::new().expect("failed to create flush_timer");
+        let mut flush_timer = Timer::new().expect("failed to create flush_timer");
         let mut flush_timer_armed = false;
 
         Worker::process_one_request(
