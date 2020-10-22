@@ -22,8 +22,6 @@ use arch::{
     set_default_serial_parameters, Pstore, SerialHardware, SerialParameters, SerialType,
     VcpuAffinity,
 };
-#[cfg(feature = "audio")]
-use audio_streams::StreamEffect;
 use base::{
     debug, error, getpid, info, kill_process_group, net::UnixSeqpacket, reap_child, syslog,
     validate_raw_fd, warn,
@@ -324,6 +322,8 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
                                 ),
                             })?;
                 }
+                "cache-path" => gpu_params.cache_path = Some(v.to_string()),
+                "cache-size" => gpu_params.cache_size = Some(v.to_string()),
                 "" => {}
                 _ => {
                     return Err(argument::Error::UnknownArgument(format!(
@@ -377,18 +377,6 @@ fn parse_ac97_options(s: &str) -> argument::Result<Ac97Parameters> {
                     argument::Error::Syntax(format!("invalid capture option: {}", e))
                 })?;
             }
-            "capture_effects" => {
-                ac97_params.capture_effects = v
-                    .split('|')
-                    .map(|val| {
-                        val.parse::<StreamEffect>()
-                            .map_err(|e| argument::Error::InvalidValue {
-                                value: val.to_string(),
-                                expected: e.to_string(),
-                            })
-                    })
-                    .collect::<argument::Result<Vec<_>>>()?;
-            }
             _ => {
                 return Err(argument::Error::UnknownArgument(format!(
                     "unknown ac97 parameter {}",
@@ -415,7 +403,7 @@ fn parse_serial_options(s: &str) -> argument::Result<SerialParameters> {
 
     let opts = s
         .split(',')
-        .map(|frag| frag.split('='))
+        .map(|frag| frag.splitn(2, '='))
         .map(|mut kv| (kv.next().unwrap_or(""), kv.next().unwrap_or("")));
 
     for (k, v) in opts {
@@ -649,6 +637,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 ));
             }
             cfg.vcpu_affinity = Some(parse_cpu_affinity(value.unwrap())?);
+        }
+        "no-smt" => {
+            cfg.no_smt = true;
         }
         "rt-cpus" => {
             if !cfg.rt_cpus.is_empty() {
@@ -1444,6 +1435,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::short_value('c', "cpus", "N", "Number of VCPUs. (default: 1)"),
           Argument::value("cpu-affinity", "CPUSET", "Comma-separated list of CPUs or CPU ranges to run VCPUs on (e.g. 0,1-3,5)
                               or colon-separated list of assignments of guest to host CPU assignments (e.g. 0=0:1=1:2=2) (default: no mask)"),
+          Argument::flag("no-smt", "Don't use SMT in the guest"),
           Argument::value("rt-cpus", "CPUSET", "Comma-separated list of CPUs or CPU ranges to run VCPUs on. (e.g. 0,1-3,5) (default: none)"),
           Argument::short_value('m',
                                 "mem",
@@ -2200,23 +2192,8 @@ mod tests {
 
     #[cfg(feature = "audio")]
     #[test]
-    fn parse_ac97_dup_effect_vaild() {
-        parse_ac97_options("backend=cras,capture=true,capture_effects=aec|aec")
-            .expect("parse should have succeded");
-    }
-
-    #[cfg(feature = "audio")]
-    #[test]
-    fn parse_ac97_effect_invaild() {
-        parse_ac97_options("backend=cras,capture=true,capture_effects=abc")
-            .expect_err("parse should have failed");
-    }
-
-    #[cfg(feature = "audio")]
-    #[test]
-    fn parse_ac97_effect_vaild() {
-        parse_ac97_options("backend=cras,capture=true,capture_effects=aec")
-            .expect("parse should have succeded");
+    fn parse_ac97_capture_vaild() {
+        parse_ac97_options("backend=cras,capture=true").expect("parse should have succeded");
     }
 
     #[test]
@@ -2234,6 +2211,13 @@ mod tests {
     #[test]
     fn parse_serial_valid_no_num() {
         parse_serial_options("type=syslog").expect("parse should have succeded");
+    }
+
+    #[test]
+    fn parse_serial_equals_in_value() {
+        let parsed = parse_serial_options("type=syslog,path=foo=bar==.log")
+            .expect("parse should have succeded");
+        assert_eq!(parsed.path, Some(PathBuf::from("foo=bar==.log")));
     }
 
     #[test]
