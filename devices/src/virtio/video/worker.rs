@@ -6,13 +6,13 @@
 
 use std::collections::VecDeque;
 
-use base::{error, EventFd, PollContext};
+use base::{error, Event, PollContext};
 use vm_memory::GuestMemory;
 
 use crate::virtio::queue::{DescriptorChain, Queue};
 use crate::virtio::resource_bridge::ResourceRequestSocket;
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
-use crate::virtio::video::command::VideoCmd;
+use crate::virtio::video::command::{QueueType, VideoCmd};
 use crate::virtio::video::device::{
     AsyncCmdResponse, Device, Token, VideoCmdResponseType, VideoEvtResponseType,
 };
@@ -24,9 +24,9 @@ use crate::virtio::{Interrupt, Reader, Writer};
 pub struct Worker {
     pub interrupt: Interrupt,
     pub mem: GuestMemory,
-    pub cmd_evt: EventFd,
-    pub event_evt: EventFd,
-    pub kill_evt: EventFd,
+    pub cmd_evt: Event,
+    pub event_evt: Event,
+    pub kill_evt: Event,
     pub resource_bridge: ResourceRequestSocket,
 }
 
@@ -95,28 +95,42 @@ impl Worker {
         // If a destruction command comes, cancel pending requests.
         // TODO(b/161774071): Allow `process_cmd` to return multiple responses and move this
         // into encoder/decoder.
-        match cmd {
-            VideoCmd::ResourceDestroyAll { stream_id } | VideoCmd::StreamDestroy { stream_id } => {
-                for async_response in desc_map.create_cancellation_responses(&stream_id, None) {
-                    let AsyncCmdResponse {
-                        tag,
-                        response: cmd_result,
-                    } = async_response;
-                    let destroy_desc = desc_map
-                        .remove(&tag)
-                        .ok_or_else(|| Error::UnexpectedResponse(tag))?;
-                    let destroy_response = match cmd_result {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!("returning async error response: {}", &e);
-                            e.into()
-                        }
-                    };
-                    responses.push_back((destroy_desc, destroy_response));
-                }
+        let async_responses = match cmd {
+            VideoCmd::ResourceDestroyAll {
+                stream_id,
+                queue_type,
+            } => desc_map.create_cancellation_responses(&stream_id, Some(queue_type), None),
+            VideoCmd::StreamDestroy { stream_id } => {
+                desc_map.create_cancellation_responses(&stream_id, None, None)
             }
-            _ => (),
+            VideoCmd::QueueClear {
+                stream_id,
+                queue_type: QueueType::Output,
+            } => {
+                // TODO(b/153406792): Due to a workaround for a limitation in the VDA api,
+                // clearing the output queue doesn't go through the same Async path as clearing
+                // the input queue. However, we still need to cancel the pending resources.
+                desc_map.create_cancellation_responses(&stream_id, Some(QueueType::Output), None)
+            }
+            _ => Default::default(),
         };
+        for async_response in async_responses {
+            let AsyncCmdResponse {
+                tag,
+                response: cmd_result,
+            } = async_response;
+            let destroy_desc = desc_map
+                .remove(&tag)
+                .ok_or_else(|| Error::UnexpectedResponse(tag))?;
+            let destroy_response = match cmd_result {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("returning async error response: {}", &e);
+                    e.into()
+                }
+            };
+            responses.push_back((destroy_desc, destroy_response));
+        }
 
         // Process the command by the device.
         let process_cmd_response = device.process_cmd(cmd, &poll_ctx, &self.resource_bridge);
@@ -155,8 +169,8 @@ impl Worker {
         Ok(())
     }
 
-    /// Handles an event notified via an event FD.
-    fn handle_event_fd<T: Device>(
+    /// Handles an event notified via an event.
+    fn handle_event<T: Device>(
         &self,
         cmd_queue: &mut Queue,
         event_queue: &mut Queue,
@@ -165,7 +179,7 @@ impl Worker {
         stream_id: u32,
     ) -> Result<()> {
         let mut responses: VecDeque<WritableResp> = Default::default();
-        if let Some(event_responses) = device.process_event_fd(desc_map, stream_id) {
+        if let Some(event_responses) = device.process_event(desc_map, stream_id) {
             for event_response in event_responses {
                 match event_response {
                     VideoEvtResponseType::AsyncCmd(async_response) => {
@@ -241,8 +255,8 @@ impl Worker {
                     Token::EventQueue => {
                         let _ = self.event_evt.read();
                     }
-                    Token::EventFd { id } => {
-                        self.handle_event_fd(
+                    Token::Event { id } => {
+                        self.handle_event(
                             &mut cmd_queue,
                             &mut event_queue,
                             &mut device,

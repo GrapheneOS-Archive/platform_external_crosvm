@@ -16,14 +16,14 @@ use audio_streams::{
     shm_streams::{ShmStream, ShmStreamSource},
     BoxError, DummyStreamControl, SampleFormat, StreamControl, StreamDirection, StreamEffect,
 };
-use base::{self, error, set_rt_prio_limit, set_rt_round_robin, warn, EventFd};
+use base::{self, error, set_rt_prio_limit, set_rt_round_robin, warn, Event};
 use sync::{Condvar, Mutex};
 use vm_memory::{GuestAddress, GuestMemory};
 
 use crate::pci::ac97_mixer::Ac97Mixer;
 use crate::pci::ac97_regs::*;
 
-const DEVICE_SAMPLE_RATE: usize = 48000;
+const INPUT_SAMPLE_RATE: u32 = 48000;
 const DEVICE_INPUT_CHANNEL_COUNT: usize = 2;
 
 // Bus Master registers. Keeps the state of the bus master register values. Used to share the state
@@ -37,7 +37,7 @@ struct Ac97BusMasterRegs {
     glob_sta: u32,
 
     // IRQ event - driven by the glob_sta register.
-    irq_evt: Option<EventFd>,
+    irq_evt: Option<Event>,
 }
 
 impl Ac97BusMasterRegs {
@@ -87,6 +87,11 @@ impl Ac97BusMasterRegs {
             Ac97Function::Output => output_channel_count(self.glob_cnt),
             _ => DEVICE_INPUT_CHANNEL_COUNT,
         }
+    }
+
+    /// Returns whether the irq is set for any one of the bus master function registers.
+    pub fn has_irq(&self) -> bool {
+        self.pi_regs.has_irq() || self.po_regs.has_irq() || self.mc_regs.has_irq()
     }
 }
 
@@ -185,9 +190,7 @@ pub struct Ac97BusMaster {
     // Bookkeeping info for playback and capture stream.
     po_info: AudioThreadInfo,
     pi_info: AudioThreadInfo,
-
-    // Audio effect
-    capture_effects: Vec<StreamEffect>,
+    pmic_info: AudioThreadInfo,
 
     // Audio server used to create playback or capture streams.
     audio_server: Box<dyn ShmStreamSource>,
@@ -207,17 +210,11 @@ impl Ac97BusMaster {
 
             po_info: AudioThreadInfo::new(),
             pi_info: AudioThreadInfo::new(),
-
-            capture_effects: Vec::new(),
+            pmic_info: AudioThreadInfo::new(),
             audio_server,
 
             irq_resample_thread: None,
         }
-    }
-
-    /// Provides the effect needed in capture stream creation.
-    pub fn set_capture_effects(&mut self, effects: Vec<StreamEffect>) {
-        self.capture_effects = effects;
     }
 
     /// Returns any file descriptors that need to be kept open when entering a jail.
@@ -228,7 +225,7 @@ impl Ac97BusMaster {
     }
 
     /// Provides the events needed to raise interrupts in the guest.
-    pub fn set_irq_event_fd(&mut self, irq_evt: EventFd, irq_resample_evt: EventFd) {
+    pub fn set_irq_event(&mut self, irq_evt: Event, irq_resample_evt: Event) {
         let thread_regs = self.regs.clone();
         self.regs.lock().irq_evt = Some(irq_evt);
         self.irq_resample_thread = Some(thread::spawn(move || {
@@ -243,12 +240,7 @@ impl Ac97BusMaster {
                 {
                     // Scope for the lock on thread_regs.
                     let regs = thread_regs.lock();
-                    // Check output and input irq
-                    let po_int_mask = regs.func_regs(Ac97Function::Output).int_mask();
-                    let pi_int_mask = regs.func_regs(Ac97Function::Input).int_mask();
-                    if regs.func_regs(Ac97Function::Output).sr & po_int_mask != 0
-                        || regs.func_regs(Ac97Function::Input).sr & pi_int_mask != 0
-                    {
+                    if regs.has_irq() {
                         if let Some(irq_evt) = regs.irq_evt.as_ref() {
                             if let Err(e) = irq_evt.write(1) {
                                 error!("Failed to set the irq from the resample thread: {}.", e);
@@ -301,7 +293,7 @@ impl Ac97BusMaster {
     }
 
     /// Reads a word from the given `offset`.
-    pub fn readw(&mut self, offset: u64) -> u16 {
+    pub fn readw(&mut self, offset: u64, mixer: &Ac97Mixer) -> u16 {
         let regs = self.regs.lock();
         match offset {
             PI_SR_06 => regs.pi_regs.sr,
@@ -319,8 +311,8 @@ impl Ac97BusMaster {
                     // Round down to the next 10 millisecond boundary. The linux driver often
                     // assumes that two rapid reads from picb will return the same value.
                     let millis = micros / 1000 / 10 * 10;
-
-                    let frames_consumed = DEVICE_SAMPLE_RATE as u64 * u64::from(millis) / 1000;
+                    let sample_rate = self.current_sample_rate(Ac97Function::Output, mixer);
+                    let frames_consumed = sample_rate as u64 * u64::from(millis) / 1000;
 
                     regs.po_regs
                         .picb
@@ -369,6 +361,7 @@ impl Ac97BusMaster {
             PO_CR_1B => self.set_cr(Ac97Function::Output, val, mixer),
             MC_CIV_24 => (), // RO
             MC_LVI_25 => self.set_lvi(Ac97Function::Microphone, val),
+            MC_SR_26 => self.set_sr(Ac97Function::Microphone, u16::from(val)),
             MC_PIV_2A => (), // RO
             MC_CR_2B => self.set_cr(Ac97Function::Microphone, val, mixer),
             ACC_SEMA_34 => self.acc_sema = val,
@@ -394,7 +387,7 @@ impl Ac97BusMaster {
     }
 
     /// Writes the 32-bit `val` to the register specified by `offset`.
-    pub fn writel(&mut self, offset: u64, val: u32) {
+    pub fn writel(&mut self, offset: u64, val: u32, mixer: &mut Ac97Mixer) {
         // Only process writes to the control register when cold reset is set.
         if self.is_cold_reset() && offset != 0x2c {
             return;
@@ -403,7 +396,7 @@ impl Ac97BusMaster {
             PI_BDBAR_00 => self.set_bdbar(Ac97Function::Input, val),
             PO_BDBAR_10 => self.set_bdbar(Ac97Function::Output, val),
             MC_BDBAR_20 => self.set_bdbar(Ac97Function::Microphone, val),
-            GLOB_CNT_2C => self.set_glob_cnt(val),
+            GLOB_CNT_2C => self.set_glob_cnt(val, mixer),
             GLOB_STA_30 => (), // RO
             o => warn!("write long to 0x{:x}", o),
         }
@@ -434,7 +427,7 @@ impl Ac97BusMaster {
             match func {
                 Ac97Function::Input => self.pi_info.thread_semaphore.notify_one(),
                 Ac97Function::Output => self.po_info.thread_semaphore.notify_one(),
-                Ac97Function::Microphone => (),
+                Ac97Function::Microphone => self.pmic_info.thread_semaphore.notify_one(),
             }
         }
     }
@@ -483,11 +476,11 @@ impl Ac97BusMaster {
         }
     }
 
-    fn set_glob_cnt(&mut self, new_glob_cnt: u32) {
+    fn set_glob_cnt(&mut self, new_glob_cnt: u32, mixer: &mut Ac97Mixer) {
         // Only the reset bits are emulated, the GPI and PCM formatting are not supported.
         if new_glob_cnt & GLOB_CNT_COLD_RESET == 0 {
             self.reset_audio_regs();
-
+            mixer.reset();
             let mut regs = self.regs.lock();
             regs.glob_cnt = new_glob_cnt & GLOB_CNT_STABLE_BITS;
             self.acc_sema = 0;
@@ -498,6 +491,7 @@ impl Ac97BusMaster {
             // is playing or recording audio.
             if !self.po_info.thread_run.load(Ordering::Relaxed)
                 && !self.pi_info.thread_run.load(Ordering::Relaxed)
+                && !self.pmic_info.thread_run.load(Ordering::Relaxed)
             {
                 self.stop_all_audio();
                 let mut regs = self.regs.lock();
@@ -508,11 +502,25 @@ impl Ac97BusMaster {
         self.regs.lock().glob_cnt = new_glob_cnt;
     }
 
+    fn stream_effects(func: Ac97Function) -> Vec<StreamEffect> {
+        match func {
+            Ac97Function::Microphone => vec![StreamEffect::EchoCancellation],
+            _ => vec![StreamEffect::NoEffect],
+        }
+    }
+
+    fn current_sample_rate(&self, func: Ac97Function, mixer: &Ac97Mixer) -> u32 {
+        match func {
+            Ac97Function::Output => mixer.get_sample_rate().into(),
+            _ => INPUT_SAMPLE_RATE,
+        }
+    }
+
     fn start_audio(&mut self, func: Ac97Function, mixer: &Ac97Mixer) -> AudioResult<()> {
         const AUDIO_THREAD_RTPRIO: u16 = 10; // Matches other cros audio clients.
-
+        let sample_rate = self.current_sample_rate(func, mixer);
         let (direction, thread_info) = match func {
-            Ac97Function::Microphone => return Ok(()),
+            Ac97Function::Microphone => (StreamDirection::Capture, &mut self.pmic_info),
             Ac97Function::Input => (StreamDirection::Capture, &mut self.pi_info),
             Ac97Function::Output => (StreamDirection::Playback, &mut self.po_info),
         };
@@ -547,10 +555,10 @@ impl Ac97BusMaster {
                 direction,
                 num_channels,
                 SampleFormat::S16LE,
-                DEVICE_SAMPLE_RATE,
+                sample_rate,
                 buffer_frames,
-                self.capture_effects.as_slice(),
-                self.mem.as_ref(),
+                &Self::stream_effects(func),
+                self.mem.as_ref().inner(),
                 starting_offsets,
             )
             .map_err(AudioError::CreateStream)?;
@@ -564,7 +572,7 @@ impl Ac97BusMaster {
             }
 
             let message_interval =
-                Duration::from_secs_f64(buffer_frames as f64 / DEVICE_SAMPLE_RATE as f64);
+                Duration::from_secs_f64(buffer_frames as f64 / sample_rate as f64);
 
             if let Err(e) = audio_thread(
                 func,
@@ -587,7 +595,7 @@ impl Ac97BusMaster {
 
     fn stop_audio(&mut self, func: Ac97Function) {
         let thread_info = match func {
-            Ac97Function::Microphone => return,
+            Ac97Function::Microphone => &mut self.pmic_info,
             Ac97Function::Input => &mut self.pi_info,
             Ac97Function::Output => &mut self.po_info,
         };
@@ -758,10 +766,6 @@ fn audio_thread(
     // A queue of the pending buffers at the server.
     mut pending_buffers: VecDeque<Option<GuestBuffer>>,
 ) -> AudioResult<()> {
-    if func == Ac97Function::Microphone {
-        return Ok(());
-    }
-
     // Set up picb.
     {
         let mut locked_regs = regs.lock();
@@ -916,20 +920,21 @@ mod test {
             GuestMemory::new(&[]).expect("Creating guest memory failed."),
             Box::new(MockShmStreamSource::new()),
         );
+        let mut mixer = Ac97Mixer::new();
 
         let bdbars = [0x00u64, 0x10, 0x20];
 
         // Make sure writes have no affect during cold reset.
-        bm.writel(0x00, 0x5555_555f);
+        bm.writel(0x00, 0x5555_555f, &mut mixer);
         assert_eq!(bm.readl(0x00), 0x0000_0000);
 
         // Relesase cold reset.
-        bm.writel(GLOB_CNT_2C, 0x0000_0002);
+        bm.writel(GLOB_CNT_2C, 0x0000_0002, &mut mixer);
 
         // Tests that the base address is writable and that the bottom three bits are read only.
         for bdbar in &bdbars {
             assert_eq!(bm.readl(*bdbar), 0x0000_0000);
-            bm.writel(*bdbar, 0x5555_555f);
+            bm.writel(*bdbar, 0x5555_555f, &mut mixer);
             assert_eq!(bm.readl(*bdbar), 0x5555_5558);
         }
     }
@@ -940,13 +945,14 @@ mod test {
             GuestMemory::new(&[]).expect("Creating guest memory failed."),
             Box::new(MockShmStreamSource::new()),
         );
+        let mixer = Ac97Mixer::new();
 
         let sr_addrs = [0x06u64, 0x16, 0x26];
 
         for sr in &sr_addrs {
-            assert_eq!(bm.readw(*sr), 0x0001);
+            assert_eq!(bm.readw(*sr, &mixer), 0x0001);
             bm.writew(*sr, 0xffff);
-            assert_eq!(bm.readw(*sr), 0x0001);
+            assert_eq!(bm.readw(*sr, &mixer), 0x0001);
         }
     }
 
@@ -956,36 +962,44 @@ mod test {
             GuestMemory::new(&[]).expect("Creating guest memory failed."),
             Box::new(MockShmStreamSource::new()),
         );
+        let mut mixer = Ac97Mixer::new();
 
         assert_eq!(bm.readl(GLOB_CNT_2C), 0x0000_0000);
 
         // Relesase cold reset.
-        bm.writel(GLOB_CNT_2C, 0x0000_0002);
+        bm.writel(GLOB_CNT_2C, 0x0000_0002, &mut mixer);
 
         // Check interrupt enable bits are writable.
-        bm.writel(GLOB_CNT_2C, 0x0000_0072);
+        bm.writel(GLOB_CNT_2C, 0x0000_0072, &mut mixer);
         assert_eq!(bm.readl(GLOB_CNT_2C), 0x0000_0072);
 
         // A Warm reset should doesn't affect register state and is auto cleared.
-        bm.writel(0x00, 0x5555_5558);
-        bm.writel(GLOB_CNT_2C, 0x0000_0076);
+        bm.writel(0x00, 0x5555_5558, &mut mixer);
+        bm.writel(GLOB_CNT_2C, 0x0000_0076, &mut mixer);
         assert_eq!(bm.readl(GLOB_CNT_2C), 0x0000_0072);
         assert_eq!(bm.readl(0x00), 0x5555_5558);
         // Check that a cold reset works, but setting bdbar and checking it is zeroed.
-        bm.writel(0x00, 0x5555_555f);
-        bm.writel(GLOB_CNT_2C, 0x000_0070);
+        bm.writel(0x00, 0x5555_555f, &mut mixer);
+        bm.writel(GLOB_CNT_2C, 0x000_0070, &mut mixer);
         assert_eq!(bm.readl(GLOB_CNT_2C), 0x0000_0070);
         assert_eq!(bm.readl(0x00), 0x0000_0000);
     }
 
     #[test]
-    fn run_playback() {
-        start_playback(2);
-        start_playback(4);
-        start_playback(6);
+    fn run_multi_channel_playback() {
+        start_playback(2, 48000);
+        start_playback(4, 48000);
+        start_playback(6, 48000);
     }
 
-    fn start_playback(num_channels: usize) {
+    #[test]
+    fn run_multi_rate_playback() {
+        start_playback(2, 32000);
+        start_playback(2, 44100);
+        start_playback(2, 48000);
+    }
+
+    fn start_playback(num_channels: usize, rate: u16) {
         const TIMEOUT: Duration = Duration::from_millis(500);
         const LVI_MASK: u8 = 0x1f; // Five bits for 32 total entries.
         const IOC_MASK: u32 = 0x8000_0000; // Interrupt on completion.
@@ -998,13 +1012,13 @@ mod test {
             .expect("Creating guest memory failed.");
         let stream_source = MockShmStreamSource::new();
         let mut bm = Ac97BusMaster::new(mem.clone(), Box::new(stream_source.clone()));
-        let mixer = Ac97Mixer::new();
+        let mut mixer = Ac97Mixer::new();
 
         // Release cold reset.
-        bm.writel(GLOB_CNT_2C, 0x0000_0002);
+        bm.writel(GLOB_CNT_2C, 0x0000_0002, &mut mixer);
 
         // Setup ping-pong buffers. A and B repeating for every possible index.
-        bm.writel(PO_BDBAR_10, GUEST_ADDR_BASE);
+        bm.writel(PO_BDBAR_10, GUEST_ADDR_BASE, &mut mixer);
         for i in 0..num_buffers {
             let pointer_addr = GuestAddress(GUEST_ADDR_BASE as u64 + i as u64 * 8);
             let control_addr = GuestAddress(GUEST_ADDR_BASE as u64 + i as u64 * 8 + 4);
@@ -1022,15 +1036,18 @@ mod test {
         bm.writeb(PO_LVI_15, LVI_MASK, &mixer);
         assert_eq!(bm.readb(PO_CIV_14), 0);
 
-        // Set channel count.
+        // Set channel count and sample rate.
         let mut cnt = bm.readl(GLOB_CNT_2C);
         cnt &= !GLOB_CNT_PCM_246_MASK;
+        mixer.writew(MIXER_PCM_FRONT_DAC_RATE_2C, rate);
         if num_channels == 4 {
             cnt |= GLOB_CNT_PCM_4;
+            mixer.writew(MIXER_PCM_SURR_DAC_RATE_2E, rate);
         } else if num_channels == 6 {
             cnt |= GLOB_CNT_PCM_6;
+            mixer.writew(MIXER_PCM_LFE_DAC_RATE_30, rate);
         }
-        bm.writel(GLOB_CNT_2C, cnt);
+        bm.writel(GLOB_CNT_2C, cnt, &mut mixer);
 
         // Start.
         bm.writeb(PO_CR_1B, CR_IOCE | CR_RPBM, &mixer);
@@ -1043,6 +1060,7 @@ mod test {
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
 
         assert_eq!(stream.num_channels(), num_channels);
+        assert_eq!(stream.frame_rate(), rate as u32);
 
         let mut civ = bm.readb(PO_CIV_14);
         assert_eq!(civ, 0);
@@ -1055,29 +1073,29 @@ mod test {
         assert_eq!(civ, 1);
 
         // Buffer complete should be set as the IOC bit was set in the descriptor.
-        assert!(bm.readw(PO_SR_16) & SR_BCIS != 0);
+        assert!(bm.readw(PO_SR_16, &mixer) & SR_BCIS != 0);
         // Clear the BCIS bit
         bm.writew(PO_SR_16, SR_BCIS);
-        assert!(bm.readw(PO_SR_16) & SR_BCIS == 0);
+        assert!(bm.readw(PO_SR_16, &mixer) & SR_BCIS == 0);
 
         std::thread::sleep(Duration::from_millis(50));
-        let picb = bm.readw(PO_PICB_18);
+        let picb = bm.readw(PO_PICB_18, &mixer);
         let pos = (FRAGMENT_SIZE - (picb as usize * 2)) / 4;
 
         // Check that frames are consumed at least at a reasonable rate.
         // This can't be exact as during unit tests the thread scheduling is highly variable, so the
         // test only checks that some samples are consumed.
         assert!(pos > 0);
-        assert!(bm.readw(PO_SR_16) & SR_DCH == 0); // DMA is running.
+        assert!(bm.readw(PO_SR_16, &mixer) & SR_DCH == 0); // DMA is running.
 
         // Set last valid to next buffer to be sent and trigger callback so we hit it.
         bm.writeb(PO_LVI_15, civ + 2, &mixer);
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
-        assert!(bm.readw(PO_SR_16) & SR_LVBCI != 0); // Hit last buffer
-        assert!(bm.readw(PO_SR_16) & SR_DCH == SR_DCH); // DMA stopped because of lack of buffers.
-        assert!(bm.readw(PO_SR_16) & SR_CELV == SR_CELV); // Processed the last buffer
+        assert!(bm.readw(PO_SR_16, &mixer) & SR_LVBCI != 0); // Hit last buffer
+        assert!(bm.readw(PO_SR_16, &mixer) & SR_DCH == SR_DCH); // DMA stopped because of lack of buffers.
+        assert!(bm.readw(PO_SR_16, &mixer) & SR_CELV == SR_CELV); // Processed the last buffer
         assert_eq!(bm.readb(PO_LVI_15), bm.readb(PO_CIV_14));
         assert!(
             bm.readl(GLOB_STA_30) & GS_POINT != 0,
@@ -1086,11 +1104,11 @@ mod test {
 
         // Clear the LVB bit
         bm.writeb(PO_SR_16, SR_LVBCI as u8, &mixer);
-        assert!(bm.readw(PO_SR_16) & SR_LVBCI == 0);
+        assert!(bm.readw(PO_SR_16, &mixer) & SR_LVBCI == 0);
         // Reset the LVI to the last buffer and check that playback resumes
         bm.writeb(PO_LVI_15, LVI_MASK, &mixer);
-        assert!(bm.readw(PO_SR_16) & SR_DCH == 0); // DMA restarts.
-        assert_eq!(bm.readw(PO_SR_16) & SR_CELV, 0);
+        assert!(bm.readw(PO_SR_16, &mixer) & SR_DCH == 0); // DMA restarts.
+        assert_eq!(bm.readw(PO_SR_16, &mixer) & SR_CELV, 0);
 
         let restart_civ = bm.readb(PO_CIV_14);
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
@@ -1100,7 +1118,7 @@ mod test {
 
         // Stop.
         bm.writeb(PO_CR_1B, 0, &mixer);
-        assert!(bm.readw(PO_SR_16) & 0x01 != 0); // DMA is not running.
+        assert!(bm.readw(PO_SR_16, &mixer) & 0x01 != 0); // DMA is not running.
         bm.writeb(PO_CR_1B, CR_RR, &mixer);
         assert!(
             bm.readl(GLOB_STA_30) & GS_POINT == 0,
@@ -1109,7 +1127,12 @@ mod test {
     }
 
     #[test]
-    fn start_capture() {
+    fn run_capture() {
+        start_capture(Ac97Function::Input);
+        start_capture(Ac97Function::Microphone);
+    }
+
+    fn start_capture(func: Ac97Function) {
         const TIMEOUT: Duration = Duration::from_millis(500);
         const LVI_MASK: u8 = 0x1f; // Five bits for 32 total entries.
         const IOC_MASK: u32 = 0x8000_0000; // Interrupt on completion.
@@ -1122,13 +1145,38 @@ mod test {
             .expect("Creating guest memory failed.");
         let stream_source = MockShmStreamSource::new();
         let mut bm = Ac97BusMaster::new(mem.clone(), Box::new(stream_source.clone()));
-        let mixer = Ac97Mixer::new();
+        let mut mixer = Ac97Mixer::new();
+
+        let (bdbar_addr, lvi_addr, cr_addr, civ_addr, pcib_addr, sr_addr, int_mask) = match func {
+            Ac97Function::Input => (
+                PI_BDBAR_00,
+                PI_LVI_05,
+                PI_CR_0B,
+                PI_CIV_04,
+                PI_PICB_08,
+                PI_SR_06,
+                GS_PIINT,
+            ),
+            Ac97Function::Microphone => (
+                MC_BDBAR_20,
+                MC_LVI_25,
+                MC_CR_2B,
+                MC_CIV_24,
+                MC_PICB_28,
+                MC_SR_26,
+                GS_MINT,
+            ),
+            _ => {
+                assert!(false, "Invalid Ac97Function.");
+                (0, 0, 0, 0, 0, 0, 0)
+            }
+        };
 
         // Release cold reset.
-        bm.writel(GLOB_CNT_2C, 0x0000_0002);
+        bm.writel(GLOB_CNT_2C, 0x0000_0002, &mut mixer);
 
         // Setup ping-pong buffers.
-        bm.writel(PI_BDBAR_00, GUEST_ADDR_BASE);
+        bm.writel(bdbar_addr, GUEST_ADDR_BASE, &mut mixer);
         for i in 0..num_buffers {
             let pointer_addr = GuestAddress(GUEST_ADDR_BASE as u64 + i as u64 * 8);
             let control_addr = GuestAddress(GUEST_ADDR_BASE as u64 + i as u64 * 8 + 4);
@@ -1138,10 +1186,10 @@ mod test {
                 .expect("Writing guest memory failed.");
         }
 
-        bm.writeb(PI_LVI_05, LVI_MASK, &mixer);
+        bm.writeb(lvi_addr, LVI_MASK, &mixer);
 
         // Start.
-        bm.writeb(PI_CR_0B, CR_IOCE | CR_RPBM, &mixer);
+        bm.writeb(cr_addr, CR_IOCE | CR_RPBM, &mixer);
         // TODO(crbug.com/1086337): Test flakiness in build time.
         // assert_eq!(bm.readw(PI_PICB_08), 0);
 
@@ -1152,55 +1200,55 @@ mod test {
         // server before creating the stream. When we triggered the callback
         // above, that means the first of those buffers was filled, so CIV
         // increments to 1.
-        let civ = bm.readb(PI_CIV_04);
+        let civ = bm.readb(civ_addr);
         assert_eq!(civ, 1);
         std::thread::sleep(Duration::from_millis(20));
-        let picb = bm.readw(PI_PICB_08);
+        let picb = bm.readw(pcib_addr, &mixer);
         assert!(picb > 0);
-        assert!(bm.readw(PI_SR_06) & SR_DCH == 0); // DMA is running.
+        assert!(bm.readw(sr_addr, &mixer) & SR_DCH == 0); // DMA is running.
 
         // Trigger 2 callbacks so that we'll move to buffer 3 since at that
         // point we can be certain that buffers 1 and 2 have been captured to.
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
-        assert_eq!(bm.readb(PI_CIV_04), 3);
+        assert_eq!(bm.readb(civ_addr), 3);
 
-        let civ = bm.readb(PI_CIV_04);
+        let civ = bm.readb(civ_addr);
         // Sets LVI to CIV + 2 to trigger last buffer hit
-        bm.writeb(PI_LVI_05, civ + 2, &mixer);
+        bm.writeb(lvi_addr, civ + 2, &mixer);
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
-        assert_ne!(bm.readw(PI_SR_06) & SR_LVBCI, 0); // Hit last buffer
-        assert_eq!(bm.readw(PI_SR_06) & SR_DCH, SR_DCH); // DMA stopped because of lack of buffers.
-        assert_eq!(bm.readw(PI_SR_06) & SR_CELV, SR_CELV);
-        assert_eq!(bm.readb(PI_LVI_05), bm.readb(PI_CIV_04));
+        assert_ne!(bm.readw(sr_addr, &mixer) & SR_LVBCI, 0); // Hit last buffer
+        assert_eq!(bm.readw(sr_addr, &mixer) & SR_DCH, SR_DCH); // DMA stopped because of lack of buffers.
+        assert_eq!(bm.readw(sr_addr, &mixer) & SR_CELV, SR_CELV);
+        assert_eq!(bm.readb(lvi_addr), bm.readb(civ_addr));
         assert!(
-            bm.readl(GLOB_STA_30) & GS_PIINT != 0,
-            "PIINT bit should be set."
+            bm.readl(GLOB_STA_30) & int_mask != 0,
+            "int_mask bit should be set."
         );
 
         // Clear the LVB bit
-        bm.writeb(PI_SR_06, SR_LVBCI as u8, &mixer);
-        assert!(bm.readw(PI_SR_06) & SR_LVBCI == 0);
+        bm.writeb(sr_addr, SR_LVBCI as u8, &mixer);
+        assert!(bm.readw(sr_addr, &mixer) & SR_LVBCI == 0);
         // Reset the LVI to the last buffer and check that playback resumes
-        bm.writeb(PI_LVI_05, LVI_MASK, &mixer);
-        assert!(bm.readw(PI_SR_06) & SR_DCH == 0); // DMA restarts.
-        assert_eq!(bm.readw(PI_SR_06) & SR_CELV, 0);
+        bm.writeb(lvi_addr, LVI_MASK, &mixer);
+        assert!(bm.readw(sr_addr, &mixer) & SR_DCH == 0); // DMA restarts.
+        assert_eq!(bm.readw(sr_addr, &mixer) & SR_CELV, 0);
 
-        let restart_civ = bm.readb(PI_CIV_04);
+        let restart_civ = bm.readb(civ_addr);
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
         assert!(stream.trigger_callback_with_timeout(TIMEOUT));
-        assert_ne!(bm.readb(PI_CIV_04), restart_civ);
+        assert_ne!(bm.readb(civ_addr), restart_civ);
 
         // Stop.
-        bm.writeb(PI_CR_0B, 0, &mixer);
-        assert!(bm.readw(PI_SR_06) & 0x01 != 0); // DMA is not running.
-        bm.writeb(PI_CR_0B, CR_RR, &mixer);
+        bm.writeb(cr_addr, 0, &mixer);
+        assert!(bm.readw(sr_addr, &mixer) & 0x01 != 0); // DMA is not running.
+        bm.writeb(cr_addr, CR_RR, &mixer);
         assert!(
-            bm.readl(GLOB_STA_30) & GS_PIINT == 0,
-            "PIINT bit should be disabled."
+            bm.readl(GLOB_STA_30) & int_mask == 0,
+            "int_mask bit should be disabled."
         );
     }
 }

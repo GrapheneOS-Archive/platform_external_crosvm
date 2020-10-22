@@ -89,3 +89,20 @@ wayland_protocol_codegen {
     ],
     tools: ["wayland_scanner"],
 }
+
+// dependent_library ["feature_list"]
+//   ../assertions/src/lib.rs
+//   ../base/src/lib.rs
+//   ../data_model/src/lib.rs
+//   ../linux_input_sys/src/lib.rs
+//   ../sync/src/lib.rs
+//   ../sys_util/poll_token_derive/poll_token_derive.rs
+//   ../sys_util/src/lib.rs
+//   ../syscall_defines/src/lib.rs
+//   ../tempfile/src/lib.rs
+//   cc-1.0.25
+//   libc-0.2.78 "default,std"
+//   proc-macro2-1.0.24 "default,proc-macro"
+//   quote-1.0.7 "default,proc-macro"
+//   syn-1.0.42 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   unicode-xid-0.2.1 "default"

@@ -28,11 +28,9 @@ pub enum GpuDisplayError {
     /// Connecting to the compositor failed.
     Connect,
     /// Creating event file descriptor failed.
-    CreateEventFd,
+    CreateEvent,
     /// Creating shared memory failed.
     CreateShm(SysError),
-    /// Setting the size of shared memory failed.
-    SetSize(SysError),
     /// Failed to create a surface on the compositor.
     CreateSurface,
     /// Failed to import a buffer to the compositor.
@@ -54,14 +52,13 @@ impl Display for GpuDisplayError {
         match self {
             Allocate => write!(f, "internal allocation failed"),
             Connect => write!(f, "failed to connect to compositor"),
-            CreateEventFd => write!(f, "failed to create event file descriptor"),
+            CreateEvent => write!(f, "failed to create event file descriptor"),
             CreateShm(e) => write!(f, "failed to create shared memory: {}", e),
             CreateSurface => write!(f, "failed to crate surface on the compositor"),
             FailedImport => write!(f, "failed to import a buffer to the compositor"),
             InvalidPath => write!(f, "invalid path"),
             InvalidSurfaceId => write!(f, "invalid surface ID"),
             RequiredFeature(feature) => write!(f, "required feature was missing: {}", feature),
-            SetSize(e) => write!(f, "failed to set size of shared memory: {}", e),
             Unsupported => write!(f, "unsupported by the implementation"),
         }
     }

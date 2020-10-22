@@ -6,4 +6,5 @@ edition = "2018"
 [dependencies]
 libc = "*"
 base = { path = "../base" }
+tempfile = "*"
 vm_memory = { path = "../vm_memory" }
