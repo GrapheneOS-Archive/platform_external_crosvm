@@ -51,28 +51,11 @@ rust_binary {
     srcs: ["src/main.rs"],
 
     target: {
-        linux_glibc: {
-            features: [
-                "gfxstream",
-            ],
-            flags: [
-                "-C panic=abort",
-            ],
-        },
         linux_bionic_arm64: {
             relative_install_path: "aarch64-linux-bionic",
         },
         linux_glibc_x86_64: {
             relative_install_path: "x86_64-linux-gnu",
-
-            // Install the crosvm prebuilts as requirements until we're building these as well.
-            required: [
-                "x86_64_linux_gnu_libandroid_emu_shared.so_for_crosvm",
-                "x86_64_linux_gnu_libc++.so.1_for_crosvm",
-                "x86_64_linux_gnu_libemugl_common.so_for_crosvm",
-                "x86_64_linux_gnu_libgfxstream_backend.so_for_crosvm",
-                "x86_64_linux_gnu_libOpenglRender.so_for_crosvm",
-            ],
         },
         darwin: {
             enabled: false,
@@ -92,6 +75,7 @@ rust_binary {
         "audio",
         "default",
         "gpu",
+        "gfxstream",
     ],
 
     flags: [
