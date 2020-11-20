@@ -50,13 +50,14 @@ rust_defaults {
 rust_test_host {
     name: "devices_host_test_src_lib",
     defaults: ["devices_defaults"],
+    shared_libs: ["libgfxstream_backend",],
     features: [  // added manually
         "audio",
-        "gfxstream",
         "gpu",
         "gpu_buffer",
         "gpu_display",
         "gpu_renderer",
+        "gfxstream",
     ],
     rustlibs: [
         "libaudio_streams",  // moved manually
@@ -94,20 +95,15 @@ rust_library {
     crate_name: "devices",
     srcs: ["src/lib.rs"],
     edition: "2018",
-    target: { // added manually
-        linux_glibc: {
-            features: [
-                "gfxstream",
-            ],
-        },
-    },
     features: [
         "audio",
         "gpu",
         "gpu_buffer",
         "gpu_display",
         "gpu_renderer",
+        "gfxstream",
     ],
+    shared_libs: ["libgfxstream_backend",],
     rustlibs: [
         "libacpi_tables",
         "libaudio_streams",
