@@ -7,8 +7,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
-use std::fs::File;
-use std::os::unix::io::{AsRawFd, IntoRawFd};
+use std::os::unix::io::IntoRawFd;
 
 use base::{error, PollContext};
 
@@ -74,8 +73,6 @@ struct OutputResources {
     // Once the value is set, it won't be changed until resolution is changed or a stream is
     // destroyed.
     eos_resource_id: Option<OutputResourceId>,
-
-    keep_resources: Vec<File>,
 
     // This is a flag that shows whether libvda's set_output_buffer_count is called.
     // This will be set to true when ResourceCreate for OutputBuffer is called for the first time.
@@ -264,9 +261,6 @@ impl Context {
             // No need to set `frame_rate`, as it's only for the encoder.
             ..Default::default()
         };
-
-        // All the output buffers at VDA are dropped. Clear the output resources.
-        self.out_res = Default::default();
     }
 
     fn handle_picture_ready(
@@ -321,14 +315,14 @@ impl ContextMap {
     }
 
     fn get(&self, stream_id: &StreamId) -> VideoResult<&Context> {
-        self.map.get(&stream_id).ok_or_else(|| {
+        self.map.get(stream_id).ok_or_else(|| {
             error!("failed to get context of stream {}", *stream_id);
             VideoError::InvalidStreamId(*stream_id)
         })
     }
 
     fn get_mut(&mut self, stream_id: &StreamId) -> VideoResult<&mut Context> {
-        self.map.get_mut(&stream_id).ok_or_else(|| {
+        self.map.get_mut(stream_id).ok_or_else(|| {
             error!("failed to get context of stream {}", *stream_id);
             VideoError::InvalidStreamId(*stream_id)
         })
@@ -608,7 +602,6 @@ impl<'a> Decoder<'a> {
             QueueOutputResourceResult::Registered(buffer_id) => {
                 let resource_info =
                     ctx.get_resource_info(QueueType::Output, resource_bridge, resource_id)?;
-                let fd = resource_info.file.as_raw_fd();
                 let planes = vec![
                     libvda::FramePlane {
                         offset: resource_info.planes[0].offset as i32,
@@ -619,10 +612,6 @@ impl<'a> Decoder<'a> {
                         stride: resource_info.planes[1].stride as i32,
                     },
                 ];
-
-                // Take an ownership of `resource_info.file`.
-                // This file will be kept until the stream is destroyed.
-                ctx.out_res.keep_resources.push(resource_info.file);
 
                 // Set output_buffer_count before passing the first output buffer.
                 if ctx.out_res.set_output_buffer_count() {
@@ -637,6 +626,9 @@ impl<'a> Decoder<'a> {
                         .map_err(VideoError::VdaError)?;
                 }
 
+                // Take ownership of this file by `into_raw_fd()` as this
+                // file will be closed by libvda.
+                let fd = resource_info.file.into_raw_fd();
                 session
                     .use_output_buffer(buffer_id as i32, libvda::PixelFormat::NV12, fd, &planes)
                     .map_err(VideoError::VdaError)
@@ -750,7 +742,7 @@ impl<'a> Decoder<'a> {
                 session.reset().map_err(VideoError::VdaError)?;
             }
             QueueType::Output => {
-                ctx.out_res.queued_res_ids.clear();
+                ctx.out_res = Default::default();
             }
         }
         Ok(())

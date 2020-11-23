@@ -2,8 +2,8 @@
 {
   "presubmit": [
     {
-      "name": "aarch64_host_test_src_lib",
-      "host": true
+      "host": true,
+      "name": "aarch64_host_test_src_lib"
     },
     {
       "name": "aarch64_device_test_src_lib"

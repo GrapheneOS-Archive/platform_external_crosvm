@@ -62,7 +62,7 @@ use arch::{
 };
 use base::Event;
 use devices::{IrqChip, IrqChipX86_64, PciConfigIo, PciDevice};
-use hypervisor::{HypervisorX86_64, Vcpu, VcpuX86_64, VmX86_64};
+use hypervisor::{HypervisorX86_64, VcpuX86_64, VmX86_64};
 use minijail::Minijail;
 use remain::sorted;
 use resources::SystemAllocator;
@@ -321,17 +321,18 @@ fn arch_memory_regions(size: u64, has_bios: bool) -> Vec<(GuestAddress, u64)> {
 impl arch::LinuxArch for X8664arch {
     type Error = Error;
 
-    fn build_vm<V, I, FD, FV, FI, E1, E2, E3>(
+    fn build_vm<V, Vcpu, I, FD, FV, FI, E1, E2, E3>(
         mut components: VmComponents,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
         create_devices: FD,
         create_vm: FV,
         create_irq_chip: FI,
-    ) -> std::result::Result<RunnableLinuxVm<V, I>, Self::Error>
+    ) -> std::result::Result<RunnableLinuxVm<V, Vcpu, I>, Self::Error>
     where
         V: VmX86_64,
-        I: IrqChipX86_64<V::Vcpu>,
+        Vcpu: VcpuX86_64,
+        I: IrqChipX86_64,
         FD: FnOnce(
             &GuestMemory,
             &mut V,
@@ -386,7 +387,13 @@ impl arch::LinuxArch for X8664arch {
             components.memory_size,
         )?;
 
-        Self::setup_serial_devices(&mut irq_chip, &mut io_bus, serial_parameters, serial_jail)?;
+        Self::setup_serial_devices(
+            components.protected_vm,
+            &mut irq_chip,
+            &mut io_bus,
+            serial_parameters,
+            serial_jail,
+        )?;
 
         let acpi_dev_resource = Self::setup_acpi_devices(
             &mut io_bus,
@@ -485,11 +492,11 @@ impl arch::LinuxArch for X8664arch {
         })
     }
 
-    fn configure_vcpu<T: VcpuX86_64>(
+    fn configure_vcpu(
         guest_mem: &GuestMemory,
-        hypervisor: &impl HypervisorX86_64,
-        irq_chip: &mut impl IrqChipX86_64<T>,
-        vcpu: &mut impl VcpuX86_64,
+        hypervisor: &dyn HypervisorX86_64,
+        irq_chip: &mut dyn IrqChipX86_64,
+        vcpu: &mut dyn VcpuX86_64,
         vcpu_id: usize,
         num_cpus: usize,
         has_bios: bool,
@@ -822,8 +829,9 @@ impl X8664arch {
     /// * - `irq_chip` the IrqChip object for registering irq events
     /// * - `io_bus` the I/O bus to add the devices to
     /// * - `serial_parmaters` - definitions for how the serial devices should be configured
-    fn setup_serial_devices<T: Vcpu>(
-        irq_chip: &mut impl IrqChip<T>,
+    fn setup_serial_devices(
+        protected_vm: bool,
+        irq_chip: &mut impl IrqChip,
         io_bus: &mut devices::Bus,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
@@ -832,6 +840,7 @@ impl X8664arch {
         let com_evt_2_4 = Event::new().map_err(Error::CreateEvent)?;
 
         arch::add_serial_devices(
+            protected_vm,
             io_bus,
             &com_evt_1_3,
             &com_evt_2_4,

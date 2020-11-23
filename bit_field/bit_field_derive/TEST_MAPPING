@@ -2,8 +2,12 @@
 {
   "presubmit": [
     {
-      "name": "bit_field_derive_host_test_bit_field_derive",
-      "host": true
+      "host": true,
+      "name": "bit_field_derive_host_test_bit_field_derive"
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
+//    {
+//      "name": "bit_field_derive_device_test_bit_field_derive"
     }
   ]
 }

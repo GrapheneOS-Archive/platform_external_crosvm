@@ -14,9 +14,7 @@ rust_library {
         "libsyscall_defines",
         "libtempfile",
     ],
-    proc_macros: [
-        "libpoll_token_derive",
-    ],
+    proc_macros: ["libpoll_token_derive"],
     shared_libs: ["libcap"],  // specified in src/capabilities.rs
     target: {
         android: {
@@ -55,9 +53,7 @@ rust_defaults {
         "libsyscall_defines",
         "libtempfile",
     ],
-    proc_macros: [
-        "libpoll_token_derive",
-    ],
+    proc_macros: ["libpoll_token_derive"],
     shared_libs: ["libcap"],  // specified in src/capabilities.rs
 }
 
@@ -81,8 +77,8 @@ rust_test_host {
 //   ../sync/src/lib.rs
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
-//   libc-0.2.79 "default,std"
+//   libc-0.2.80 "default,std"
 //   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
-//   syn-1.0.45 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   syn-1.0.50 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   unicode-xid-0.2.1 "default"
