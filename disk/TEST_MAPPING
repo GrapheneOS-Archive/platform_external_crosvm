@@ -2,8 +2,8 @@
 {
   "presubmit": [
     {
-      "name": "disk_host_test_src_disk",
-      "host": true
+      "host": true,
+      "name": "disk_host_test_src_disk"
 // Presubmit tries to run x86, but we only support 64-bit builds.
 //    },
 //    {

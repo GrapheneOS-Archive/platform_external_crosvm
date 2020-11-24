@@ -2,8 +2,12 @@
 {
   "presubmit": [
     {
-      "name": "msg_on_socket_derive_host_test_msg_on_socket_derive",
-      "host": true
+      "host": true,
+      "name": "msg_on_socket_derive_host_test_msg_on_socket_derive"
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
+//    {
+//      "name": "msg_on_socket_derive_device_test_msg_on_socket_derive"
     }
   ]
 }

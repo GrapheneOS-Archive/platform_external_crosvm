@@ -39,4 +39,4 @@ rust_library {
 
 // dependent_library ["feature_list"]
 //   ../assertions/src/lib.rs
-//   libc-0.2.78 "default,std"
+//   libc-0.2.80 "default,std"

@@ -2,8 +2,8 @@
 {
   "presubmit": [
     {
-      "name": "vhost_host_test_src_lib",
-      "host": true
+      "host": true,
+      "name": "vhost_host_test_src_lib"
 // Presubmit tries to run x86, but we only support 64-bit builds.
 //    },
 //    {

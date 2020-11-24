@@ -2,20 +2,36 @@
 {
   "presubmit": [
     {
-      "name": "crosvm_host_test_src_crosvm",
-      "host": true
-    },
+      "host": true,
+      "name": "crosvm_host_test_src_crosvm"
 // Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
 //    {
 //      "name": "crosvm_device_test_src_crosvm"
-//    },
+    },
     {
-      "name": "crosvm_host_test_src_main",
-      "host": true
+      "host": true,
+      "name": "crosvm_host_test_src_main"
 // Presubmit tries to run x86, but we only support 64-bit builds.
 //    },
 //    {
 //      "name": "crosvm_device_test_src_main"
+    },
+    {
+      "host": true,
+      "name": "crosvm_host_test_tests_boot"
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
+//    {
+//      "name": "crosvm_device_test_tests_boot"
+    },
+    {
+      "host": true,
+      "name": "crosvm_host_test_tests_plugins"
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
+//    {
+//      "name": "crosvm_device_test_tests_plugins"
     }
   ]
 }

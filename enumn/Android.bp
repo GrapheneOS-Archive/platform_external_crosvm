@@ -31,5 +31,5 @@ rust_proc_macro {
 // dependent_library ["feature_list"]
 //   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
-//   syn-1.0.42 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   syn-1.0.50 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   unicode-xid-0.2.1 "default"

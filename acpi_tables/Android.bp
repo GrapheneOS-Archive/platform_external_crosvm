@@ -10,6 +10,7 @@ rust_defaults {
     edition: "2018",
     rustlibs: [
         "libdata_model",
+        "libtempfile",
     ],
 }
 
@@ -32,10 +33,12 @@ rust_library {
     edition: "2018",
     rustlibs: [
         "libdata_model",
+        "libtempfile",
     ],
 }
 
 // dependent_library ["feature_list"]
 //   ../assertions/src/lib.rs
 //   ../data_model/src/lib.rs
-//   libc-0.2.78 "default,std"
+//   ../tempfile/src/lib.rs
+//   libc-0.2.80 "default,std"
