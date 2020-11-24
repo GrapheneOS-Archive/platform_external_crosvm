@@ -14,9 +14,7 @@ rust_library {
         "liblibc",
         "libusb_sys",
     ],
-    proc_macros: [
-        "libremain",
-    ],
+    proc_macros: ["libremain"],
 }
 
 rust_defaults {
@@ -34,9 +32,7 @@ rust_defaults {
         "liblibc",
         "libusb_sys",
     ],
-    proc_macros: [
-        "libremain",
-    ],
+    proc_macros: ["libremain"],
 }
 
 rust_test_host {
@@ -59,9 +55,9 @@ rust_test {
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
 //   ../usb_sys/src/lib.rs
-//   libc-0.2.79 "default,std"
+//   libc-0.2.80 "default,std"
 //   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
 //   remain-0.2.2
-//   syn-1.0.45 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.50 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   unicode-xid-0.2.1 "default"

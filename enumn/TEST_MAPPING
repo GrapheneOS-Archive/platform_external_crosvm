@@ -2,8 +2,12 @@
 {
   "presubmit": [
     {
-      "name": "enumn_host_test_src_lib",
-      "host": true
+      "host": true,
+      "name": "enumn_host_test_src_lib"
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
+//    {
+//      "name": "enumn_device_test_src_lib"
     }
   ]
 }
