@@ -2,8 +2,12 @@
 {
   "presubmit": [
     {
-      "name": "poll_token_derive_host_test_poll_token_derive",
-      "host": true
+      "host": true,
+      "name": "poll_token_derive_host_test_poll_token_derive"
+// Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
+//    {
+//      "name": "poll_token_derive_device_test_poll_token_derive"
     }
   ]
 }

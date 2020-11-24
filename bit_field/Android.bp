@@ -8,9 +8,7 @@ rust_defaults {
     test_suites: ["general-tests"],
     auto_gen_config: true,
     edition: "2018",
-    proc_macros: [
-        "libbit_field_derive",
-    ],
+    proc_macros: ["libbit_field_derive"],
 }
 
 rust_test_host {
@@ -33,9 +31,7 @@ rust_defaults {
     rustlibs: [
         "libbit_field",
     ],
-    proc_macros: [
-        "libbit_field_derive",
-    ],
+    proc_macros: ["libbit_field_derive"],
 }
 
 rust_test_host {
@@ -69,13 +65,11 @@ rust_library {
     crate_name: "bit_field",
     srcs: ["src/lib.rs"],
     edition: "2018",
-    proc_macros: [
-        "libbit_field_derive",
-    ],
+    proc_macros: ["libbit_field_derive"],
 }
 
 // dependent_library ["feature_list"]
 //   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
-//   syn-1.0.42 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   syn-1.0.50 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   unicode-xid-0.2.1 "default"

@@ -17,7 +17,7 @@ use vm_memory::GuestMemory;
 
 use crate::virtio::resource_bridge::ResourceRequestSocket;
 use crate::virtio::virtio_device::VirtioDevice;
-use crate::virtio::{self, copy_config, DescriptorError, Interrupt, VIRTIO_F_VERSION_1};
+use crate::virtio::{self, copy_config, DescriptorError, Interrupt};
 
 #[macro_use]
 mod macros;
@@ -100,10 +100,12 @@ pub struct VideoDevice {
     device_type: VideoDeviceType,
     kill_evt: Option<Event>,
     resource_bridge: Option<ResourceRequestSocket>,
+    base_features: u64,
 }
 
 impl VideoDevice {
     pub fn new(
+        base_features: u64,
         device_type: VideoDeviceType,
         resource_bridge: Option<ResourceRequestSocket>,
     ) -> VideoDevice {
@@ -111,6 +113,7 @@ impl VideoDevice {
             device_type,
             kill_evt: None,
             resource_bridge,
+            base_features,
         }
     }
 }
@@ -145,7 +148,7 @@ impl VirtioDevice for VideoDevice {
     }
 
     fn features(&self) -> u64 {
-        1u64 << VIRTIO_F_VERSION_1
+        self.base_features
             | 1u64 << protocol::VIRTIO_VIDEO_F_RESOURCE_NON_CONTIG
             | 1u64 << protocol::VIRTIO_VIDEO_F_RESOURCE_VIRTIO_OBJECT
     }
@@ -232,7 +235,20 @@ impl VirtioDevice for VideoDevice {
             VideoDeviceType::Encoder => thread::Builder::new()
                 .name("virtio video encoder".to_owned())
                 .spawn(move || {
-                    let device = encoder::Encoder::new();
+                    let encoder = match encoder::LibvdaEncoder::new() {
+                        Ok(vea) => vea,
+                        Err(e) => {
+                            error!("Failed to initialize vea: {}", e);
+                            return;
+                        }
+                    };
+                    let device = match encoder::EncoderDevice::new(&encoder) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            error!("Failed to create encoder device: {}", e);
+                            return;
+                        }
+                    };
                     if let Err(e) = worker.run(cmd_queue, event_queue, device) {
                         error!("Failed to start encoder worker: {}", e);
                     }

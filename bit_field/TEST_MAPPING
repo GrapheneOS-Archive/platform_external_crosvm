@@ -2,24 +2,24 @@
 {
   "presubmit": [
     {
-      "name": "bit_field_host_test_src_lib",
-      "host": true
-    },
+      "host": true,
+      "name": "bit_field_host_test_src_lib"
 // Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
 //    {
 //      "name": "bit_field_device_test_src_lib"
-//    },
-    {
-      "name": "bit_field_host_test_tests_test_enum",
-      "host": true
     },
+    {
+      "host": true,
+      "name": "bit_field_host_test_tests_test_enum"
 // Presubmit tries to run x86, but we only support 64-bit builds.
+//    },
 //    {
 //      "name": "bit_field_device_test_tests_test_enum"
-//    },
+    },
     {
-      "name": "bit_field_host_test_tests_test_tuple_struct",
-      "host": true
+      "host": true,
+      "name": "bit_field_host_test_tests_test_tuple_struct"
 // Presubmit tries to run x86, but we only support 64-bit builds.
 //    },
 //    {

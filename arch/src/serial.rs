@@ -224,6 +224,7 @@ impl SerialParameters {
     ///                process. `evt` will always be added to this vector by this function.
     pub fn create_serial_device<T: SerialDevice>(
         &self,
+        protected_vm: bool,
         evt: &Event,
         keep_fds: &mut Vec<RawFd>,
     ) -> std::result::Result<T, Error> {
@@ -274,11 +275,20 @@ impl SerialParameters {
             },
             SerialType::UnixSocket => match &self.path {
                 Some(path) => {
-                    let sock = match UnixDatagram::bind(path).map_err(Error::FileError) {
+                    let sock = match UnixDatagram::bind(path) {
                         Ok(sock) => sock,
                         Err(e) => {
-                            error!("Couldn't bind: {:?}", e);
-                            UnixDatagram::unbound().map_err(Error::FileError)?
+                            if e.kind() == ErrorKind::AddrInUse {
+                                // In most cases vmlog_forwarder will
+                                // have already bound this address and
+                                // this error is expected. This
+                                // unbound socket will be connected on
+                                // first write.
+                                UnixDatagram::unbound().map_err(Error::FileError)?
+                            } else {
+                                error!("Couldn't bind: {:?}", e);
+                                return Err(Error::FileError(e));
+                            }
                         }
                     };
                     keep_fds.push(sock.as_raw_fd());
@@ -287,7 +297,7 @@ impl SerialParameters {
                 None => return Err(Error::PathRequired),
             },
         };
-        Ok(T::new(evt, input, output, keep_fds.to_vec()))
+        Ok(T::new(protected_vm, evt, input, output, keep_fds.to_vec()))
     }
 
     pub fn add_bind_mounts(&self, jail: &mut Minijail) -> Result<(), minijail::Error> {
@@ -371,6 +381,7 @@ pub const SERIAL_ADDR: [u64; 4] = [0x3f8, 0x2f8, 0x3e8, 0x2e8];
 /// * `serial_parameters` - definitions of serial parameter configurations.
 ///   All four of the traditional PC-style serial ports (COM1-COM4) must be specified.
 pub fn add_serial_devices(
+    protected_vm: bool,
     io_bus: &mut Bus,
     com_evt_1_3: &Event,
     com_evt_2_4: &Event,
@@ -392,7 +403,7 @@ pub fn add_serial_devices(
 
         let mut preserved_fds = Vec::new();
         let com = param
-            .create_serial_device::<Serial>(&com_evt, &mut preserved_fds)
+            .create_serial_device::<Serial>(protected_vm, &com_evt, &mut preserved_fds)
             .map_err(DeviceRegistrationError::CreateSerialDevice)?;
 
         match serial_jail.as_ref() {

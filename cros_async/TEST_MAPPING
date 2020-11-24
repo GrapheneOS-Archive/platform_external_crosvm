@@ -3,8 +3,8 @@
 // Failed in TH sandbox
 //  "presubmit": [
 //    {
-//      "name": "cros_async_host_test_src_lib",
-//      "host": true
+//      "host": true,
+//      "name": "cros_async_host_test_src_lib"
 //    },
 //    {
 //      "name": "cros_async_device_test_src_lib"
