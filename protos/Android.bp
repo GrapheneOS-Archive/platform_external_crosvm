@@ -19,7 +19,7 @@ rust_library {
 rust_protobuf {
     name: "libcdisk_spec_proto",
     crate_name: "cdisk_spec_proto",
-    proto: "src/cdisk_spec.proto",
+    protos: ["src/cdisk_spec.proto"],
     source_stem: "cdisk_spec",
     host_supported: true,
 }
@@ -27,7 +27,7 @@ rust_protobuf {
 rust_protobuf {
     name: "libcrosvm_plugin_proto",
     crate_name: "crosvm_plugin_proto",
-    proto: "src/plugin.proto",
+    protos: ["src/plugin.proto"],
     source_stem: "plugin",
     host_supported: true,
 }
