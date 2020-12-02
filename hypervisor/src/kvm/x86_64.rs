@@ -4,13 +4,12 @@
 
 use base::IoctlNr;
 use std::convert::TryInto;
-use std::os::unix::io::AsRawFd;
 
 use libc::E2BIG;
 
 use base::{
     errno_result, error, ioctl, ioctl_with_mut_ptr, ioctl_with_mut_ref, ioctl_with_ptr,
-    ioctl_with_ref, ioctl_with_val, Error, MappedRegion, Result,
+    ioctl_with_ref, ioctl_with_val, AsRawDescriptor, Error, MappedRegion, Result,
 };
 use data_model::vec_with_array_field;
 use kvm_sys::*;
@@ -26,8 +25,8 @@ use crate::{
 
 type KvmCpuId = kvm::CpuId;
 
-fn get_cpuid_with_initial_capacity<T: AsRawFd>(
-    fd: &T,
+fn get_cpuid_with_initial_capacity<T: AsRawDescriptor>(
+    descriptor: &T,
     kind: IoctlNr,
     initial_capacity: usize,
 ) -> Result<CpuId> {
@@ -40,7 +39,7 @@ fn get_cpuid_with_initial_capacity<T: AsRawFd>(
             // ioctl is unsafe. The kernel is trusted not to write beyond the bounds of the
             // memory allocated for the struct. The limit is read from nent within KvmCpuId,
             // which is set to the allocated size above.
-            ioctl_with_mut_ptr(fd, kind, kvm_cpuid.as_mut_ptr())
+            ioctl_with_mut_ptr(descriptor, kind, kvm_cpuid.as_mut_ptr())
         };
         if ret < 0 {
             let err = Error::last();
@@ -344,12 +343,12 @@ impl KvmVcpu {
 
 impl VcpuX86_64 for KvmVcpu {
     #[allow(clippy::cast_ptr_alignment)]
-    fn request_interrupt_window(&self) {
+    fn set_interrupt_window_requested(&self, requested: bool) {
         // Safe because we know we mapped enough memory to hold the kvm_run struct because the
         // kernel told us how large it was. The pointer is page aligned so casting to a different
         // type is well defined, hence the clippy allow attribute.
         let run = unsafe { &mut *(self.run_mmap.as_ptr() as *mut kvm_run) };
-        run.request_interrupt_window = 1;
+        run.request_interrupt_window = if requested { 1 } else { 0 };
     }
 
     #[allow(clippy::cast_ptr_alignment)]
@@ -370,6 +369,16 @@ impl VcpuX86_64 for KvmVcpu {
         // safe becuase we allocated the struct and we know the kernel will read
         // exactly the size of the struct
         let ret = unsafe { ioctl_with_ref(self, KVM_INTERRUPT(), &interrupt) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            errno_result()
+        }
+    }
+
+    fn inject_nmi(&self) -> Result<()> {
+        // Safe because we know that our file is a VCPU fd.
+        let ret = unsafe { ioctl(self, KVM_NMI()) };
         if ret == 0 {
             Ok(())
         } else {
@@ -554,6 +563,45 @@ impl VcpuX86_64 for KvmVcpu {
     fn get_hyperv_cpuid(&self) -> Result<CpuId> {
         const KVM_MAX_ENTRIES: usize = 256;
         get_cpuid_with_initial_capacity(self, KVM_GET_SUPPORTED_HV_CPUID(), KVM_MAX_ENTRIES)
+    }
+
+    fn set_guest_debug(&self, addrs: &[GuestAddress], enable_singlestep: bool) -> Result<()> {
+        use kvm_sys::*;
+        let mut dbg: kvm_guest_debug = Default::default();
+
+        if addrs.len() > 4 {
+            error!(
+                "Support 4 breakpoints at most but {} addresses are passed",
+                addrs.len()
+            );
+            return Err(base::Error::new(libc::EINVAL));
+        }
+
+        dbg.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
+        if enable_singlestep {
+            dbg.control |= KVM_GUESTDBG_SINGLESTEP;
+        }
+
+        // Set bits 9 and 10.
+        // bit 9: GE (global exact breakpoint enable) flag.
+        // bit 10: always 1.
+        dbg.arch.debugreg[7] = 0x0600;
+
+        for i in 0..addrs.len() {
+            dbg.arch.debugreg[i] = addrs[i].0;
+            // Set global breakpoint enable flag
+            dbg.arch.debugreg[7] |= 2 << (i * 2);
+        }
+
+        let ret = unsafe {
+            // Here we trust the kernel not to read past the end of the kvm_guest_debug struct.
+            ioctl_with_ref(self, KVM_SET_GUEST_DEBUG(), &dbg)
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            errno_result()
+        }
     }
 }
 

@@ -4,12 +4,11 @@
 
 use std::mem;
 use std::net::Ipv4Addr;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::thread;
 
 use net_util::{MacAddress, TapT};
 
-use base::{error, warn, Event};
+use base::{error, warn, AsRawDescriptor, Event, RawDescriptor};
 use vhost::NetT as VhostNetT;
 use virtio_sys::virtio_net;
 use vm_memory::GuestMemory;
@@ -131,37 +130,37 @@ where
     T: TapT + 'static,
     U: VhostNetT<T> + 'static,
 {
-    fn keep_fds(&self) -> Vec<RawFd> {
-        let mut keep_fds = Vec::new();
+    fn keep_rds(&self) -> Vec<RawDescriptor> {
+        let mut keep_rds = Vec::new();
 
         if let Some(tap) = &self.tap {
-            keep_fds.push(tap.as_raw_fd());
+            keep_rds.push(tap.as_raw_descriptor());
         }
 
         if let Some(vhost_net_handle) = &self.vhost_net_handle {
-            keep_fds.push(vhost_net_handle.as_raw_fd());
+            keep_rds.push(vhost_net_handle.as_raw_descriptor());
         }
 
         if let Some(vhost_interrupt) = &self.vhost_interrupt {
             for vhost_int in vhost_interrupt.iter() {
-                keep_fds.push(vhost_int.as_raw_fd());
+                keep_rds.push(vhost_int.as_raw_descriptor());
             }
         }
 
         if let Some(workers_kill_evt) = &self.workers_kill_evt {
-            keep_fds.push(workers_kill_evt.as_raw_fd());
+            keep_rds.push(workers_kill_evt.as_raw_descriptor());
         }
-        keep_fds.push(self.kill_evt.as_raw_fd());
+        keep_rds.push(self.kill_evt.as_raw_descriptor());
 
         if let Some(request_socket) = &self.request_socket {
-            keep_fds.push(request_socket.as_raw_fd());
+            keep_rds.push(request_socket.as_raw_descriptor());
         }
 
         if let Some(response_socket) = &self.response_socket {
-            keep_fds.push(response_socket.as_raw_fd());
+            keep_rds.push(response_socket.as_raw_descriptor());
         }
 
-        keep_fds
+        keep_rds
     }
 
     fn device_type(&self) -> u32 {
@@ -381,9 +380,9 @@ pub mod tests {
     }
 
     #[test]
-    fn keep_fds() {
+    fn keep_rds() {
         let net = create_net_common();
-        let fds = net.keep_fds();
+        let fds = net.keep_rds();
         assert!(fds.len() >= 1, "We should have gotten at least one fd");
     }
 
