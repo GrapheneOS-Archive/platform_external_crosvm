@@ -62,6 +62,10 @@ cc_library_static {
             enabled: false,
         },
     },
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
 }
 
 wayland_protocol_codegen {
