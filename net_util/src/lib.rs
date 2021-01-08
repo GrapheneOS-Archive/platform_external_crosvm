@@ -16,7 +16,10 @@ use libc::EPERM;
 
 use base::Error as SysError;
 use base::FileReadWriteVolatile;
-use base::{ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val, volatile_impl, IoctlNr};
+use base::{
+    ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val, volatile_impl, AsRawDescriptor,
+    FromRawDescriptor, IoctlNr, RawDescriptor,
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -171,8 +174,8 @@ pub struct Tap {
 }
 
 impl Tap {
-    pub unsafe fn from_raw_fd(fd: RawFd) -> Result<Tap> {
-        let tap_file = File::from_raw_fd(fd);
+    pub unsafe fn from_raw_descriptor(fd: RawDescriptor) -> Result<Tap> {
+        let tap_file = File::from_raw_descriptor(fd);
 
         // Get the interface name since we will need it for some ioctls.
         let mut ifreq: net_sys::ifreq = Default::default();
@@ -203,7 +206,7 @@ impl Tap {
         }
 
         // We just checked that the fd is valid.
-        let tuntap = unsafe { File::from_raw_fd(fd) };
+        let tuntap = unsafe { File::from_raw_descriptor(fd) };
         // ioctl is safe since we call it with a valid tap fd and check the return
         // value.
         let ret = unsafe { ioctl_with_mut_ref(&tuntap, net_sys::TUNSETIFF(), ifreq) };
@@ -226,7 +229,7 @@ impl Tap {
     }
 }
 
-pub trait TapT: FileReadWriteVolatile + Read + Write + AsRawFd + Send + Sized {
+pub trait TapT: FileReadWriteVolatile + Read + Write + AsRawDescriptor + Send + Sized {
     /// Create a new tap interface. Set the `vnet_hdr` flag to true to allow offloading on this tap,
     /// which will add an extra 12 byte virtio net header to incoming frames. Offloading cannot
     /// be used if `vnet_hdr` is false.
@@ -514,7 +517,13 @@ impl Write for Tap {
 
 impl AsRawFd for Tap {
     fn as_raw_fd(&self) -> RawFd {
-        self.tap_file.as_raw_fd()
+        self.tap_file.as_raw_descriptor()
+    }
+}
+
+impl AsRawDescriptor for Tap {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
+        self.tap_file.as_raw_descriptor()
     }
 }
 
@@ -617,7 +626,13 @@ pub mod fakes {
 
     impl AsRawFd for FakeTap {
         fn as_raw_fd(&self) -> RawFd {
-            self.tap_file.as_raw_fd()
+            self.tap_file.as_raw_descriptor()
+        }
+    }
+
+    impl AsRawDescriptor for FakeTap {
+        fn as_raw_descriptor(&self) -> RawDescriptor {
+            self.tap_file.as_raw_descriptor()
         }
     }
     volatile_impl!(FakeTap);

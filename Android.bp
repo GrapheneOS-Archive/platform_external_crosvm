@@ -109,6 +109,7 @@ rust_binary {
         "libminijail_rust",
         "libmsg_socket",
         "libnet_util",
+        "libp9",
         "librand_ish",
         "libresources",
         "libsync_rust",
@@ -158,6 +159,7 @@ rust_defaults {
         "libminijail_rust",
         "libmsg_socket",
         "libnet_util",
+        "libp9",
         "librand_ish",
         "libresources",
         "libsync_rust",
@@ -232,6 +234,7 @@ rust_defaults {
         "libminijail_rust",
         "libmsg_socket",
         "libnet_util",
+        "libp9",
         "librand_ish",
         "libresources",
         "libsync_rust",
@@ -308,6 +311,7 @@ rust_library {
         "libminijail_rust",
         "libmsg_socket",
         "libnet_util",
+        "libp9",
         "librand_ish",
         "libresources",
         "libsync_rust",
@@ -328,9 +332,11 @@ rust_library {
 //   ../adhd/cras/client/libcras/src/libcras.rs
 //   ../minijail/rust/minijail-sys/lib.rs
 //   ../minijail/rust/minijail/src/lib.rs
+//   ../rust/crates/libchromeos-rs/src/lib.rs
 //   ../vm_tools/p9/src/lib.rs
 //   ../vm_tools/p9/wire_format_derive/wire_format_derive.rs
 //   async-trait-0.1.42
+//   autocfg-1.0.1
 //   bitflags-1.2.1 "default"
 //   cfg-if-0.1.10
 //   downcast-rs-1.2.0 "default,std"
@@ -343,9 +349,13 @@ rust_library {
 //   futures-sink-0.3.8 "alloc,std"
 //   futures-task-0.3.8 "alloc,once_cell,std"
 //   futures-util-0.3.8 "alloc,async-await,async-await-macro,channel,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,proc-macro-hack,proc-macro-nested,sink,slab,std"
+//   getopts-0.2.21
 //   getrandom-0.1.15 "std"
+//   intrusive-collections-0.9.0 "alloc,default"
 //   libc-0.2.80 "default,std"
+//   log-0.4.11
 //   memchr-2.3.4 "default,std"
+//   memoffset-0.5.6 "default"
 //   once_cell-1.5.2 "alloc,std"
 //   paste-1.0.3
 //   pin-project-1.0.2
@@ -356,6 +366,7 @@ rust_library {
 //   proc-macro-hack-0.5.19
 //   proc-macro-nested-0.1.6
 //   proc-macro2-1.0.24 "default,proc-macro"
+//   protobuf-2.18.1
 //   quote-1.0.7 "default,proc-macro"
 //   rand-0.7.3 "alloc,default,getrandom,getrandom_package,libc,std"
 //   rand_chacha-0.2.2 "std"
@@ -363,8 +374,9 @@ rust_library {
 //   remain-0.2.2
 //   remove_dir_all-0.5.3
 //   slab-0.4.2
-//   syn-1.0.50 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.53 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   tempfile-3.1.0
 //   thiserror-1.0.22
 //   thiserror-impl-1.0.22
+//   unicode-width-0.1.8 "default"
 //   unicode-xid-0.2.1 "default"

@@ -41,7 +41,7 @@ rust_library {
     srcs: ["src/disk.rs"],
     edition: "2018",
     features: [
-        "composite-disk",
+        "composite-disk",  // Added manually
     ],
     rustlibs: [
         "libbase_rust",
@@ -49,8 +49,8 @@ rust_library {
         "libdata_model",
         "libfutures",
         "liblibc",
-        "libprotobuf",
-        "libprotos",
+        "libprotobuf",  // Added manually
+        "libprotos",  // Added manually
         "libtempfile",
         "libvm_memory",
     ],
@@ -96,7 +96,7 @@ rust_library {
 //   remain-0.2.2
 //   remove_dir_all-0.5.3
 //   slab-0.4.2
-//   syn-1.0.50 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.53 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   tempfile-3.1.0
 //   thiserror-1.0.22
 //   thiserror-impl-1.0.22

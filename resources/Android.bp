@@ -53,6 +53,7 @@ rust_test {
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
 //   async-trait-0.1.42
+//   base-0.1.0
 //   futures-0.3.8 "alloc,async-await,default,executor,futures-executor,std"
 //   futures-channel-0.3.8 "alloc,futures-sink,sink,std"
 //   futures-core-0.3.8 "alloc,std"
@@ -74,7 +75,7 @@ rust_test {
 //   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
 //   slab-0.4.2
-//   syn-1.0.50 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.53 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   thiserror-1.0.22
 //   thiserror-impl-1.0.22
 //   unicode-xid-0.2.1 "default"

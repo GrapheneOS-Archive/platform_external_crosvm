@@ -16,6 +16,7 @@ mod proxy;
 #[macro_use]
 mod register_space;
 pub mod acpi;
+pub mod bat;
 mod serial;
 mod serial_device;
 pub mod usb;
@@ -24,8 +25,9 @@ pub mod vfio;
 pub mod virtio;
 
 pub use self::acpi::ACPIPMResource;
+pub use self::bat::{BatteryError, GoldfishBattery};
 pub use self::bus::Error as BusError;
-pub use self::bus::{Bus, BusDevice, BusRange, BusResumeDevice};
+pub use self::bus::{Bus, BusAccessInfo, BusDevice, BusRange, BusResumeDevice};
 pub use self::cmos::Cmos;
 pub use self::i8042::I8042Device;
 pub use self::irqchip::*;

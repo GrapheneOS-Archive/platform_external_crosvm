@@ -3,15 +3,14 @@
 // found in the LICENSE file.
 
 use std::fmt::{self, Display};
-use std::os::unix::io::RawFd;
 
-use base::Event;
+use base::{Event, RawDescriptor};
 use hypervisor::Datamatch;
 use resources::{Error as SystemAllocatorFaliure, SystemAllocator};
 
 use crate::pci::pci_configuration;
 use crate::pci::{PciAddress, PciInterruptPin};
-use crate::BusDevice;
+use crate::{BusAccessInfo, BusDevice};
 
 #[derive(Debug)]
 pub enum Error {
@@ -54,7 +53,7 @@ pub trait PciDevice: Send {
     fn assign_address(&mut self, _address: PciAddress) {}
     /// A vector of device-specific file descriptors that must be kept open
     /// after jailing. Must be called before the process is jailed.
-    fn keep_fds(&self) -> Vec<RawFd>;
+    fn keep_rds(&self) -> Vec<RawDescriptor>;
     /// Assign a legacy PCI IRQ to this device.
     /// The device may write to `irq_evt` to trigger an interrupt.
     /// When `irq_resample_evt` is signaled, the device should re-assert `irq_evt` if necessary.
@@ -120,12 +119,12 @@ impl<T: PciDevice> BusDevice for T {
         PciDevice::debug_label(self)
     }
 
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
-        self.read_bar(offset, data)
+    fn read(&mut self, info: BusAccessInfo, data: &mut [u8]) {
+        self.read_bar(info.address, data)
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) {
-        self.write_bar(offset, data)
+    fn write(&mut self, info: BusAccessInfo, data: &[u8]) {
+        self.write_bar(info.address, data)
     }
 
     fn config_register_write(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
@@ -153,8 +152,8 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     fn assign_address(&mut self, address: PciAddress) {
         (**self).assign_address(address)
     }
-    fn keep_fds(&self) -> Vec<RawFd> {
-        (**self).keep_fds()
+    fn keep_rds(&self) -> Vec<RawDescriptor> {
+        (**self).keep_rds()
     }
     fn assign_irq(
         &mut self,

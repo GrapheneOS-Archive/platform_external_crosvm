@@ -5,11 +5,15 @@
 // Implementation of an intel 82093AA Input/Output Advanced Programmable Interrupt Controller
 // See https://pdos.csail.mit.edu/6.828/2016/readings/ia32/ioapic.pdf for a specification.
 
+use std::fmt::{self, Display};
+
+use super::IrqEvent;
+use crate::bus::BusAccessInfo;
 use crate::BusDevice;
-use base::{error, warn, Event, Result};
+use base::{error, warn, AsRawDescriptor, Error, Event, Result};
 use hypervisor::{IoapicState, MsiAddressMessage, MsiDataMessage, TriggerMode, NUM_IOAPIC_PINS};
-use msg_socket::{MsgReceiver, MsgSender};
-use vm_control::{VmIrqRequest, VmIrqRequestSocket, VmIrqResponse};
+use msg_socket::{MsgError, MsgReceiver, MsgSender};
+use vm_control::{MaybeOwnedDescriptor, VmIrqRequest, VmIrqRequestSocket, VmIrqResponse};
 
 const IOAPIC_VERSION_ID: u32 = 0x00170011;
 pub const IOAPIC_BASE_ADDRESS: u64 = 0xfec00000;
@@ -58,10 +62,11 @@ pub struct Ioapic {
     /// Remote IRR for Edge Triggered Real Time Clock interrupts, which allows the CMOS to know when
     /// one of its interrupts is being coalesced.
     rtc_remote_irr: bool,
-    /// Irq events that are used to inject interrupts
-    irq_events: Vec<Event>,
-    /// Events that should be triggered on an EOI
-    resample_events: Vec<Option<Event>>,
+    /// Outgoing irq events that are used to inject MSI interrupts.
+    out_events: Vec<Option<IrqEvent>>,
+    /// Events that should be triggered on an EOI. The outer Vec is indexed by GSI, and the inner
+    /// Vec is an unordered list of registered resample events for the GSI.
+    resample_events: Vec<Vec<Event>>,
     /// Socket used to route MSI irqs
     irq_socket: VmIrqRequestSocket,
 }
@@ -71,20 +76,20 @@ impl BusDevice for Ioapic {
         "userspace IOAPIC".to_string()
     }
 
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
+    fn read(&mut self, info: BusAccessInfo, data: &mut [u8]) {
         if data.len() > 8 || data.len() == 0 {
             warn!("IOAPIC: Bad read size: {}", data.len());
             return;
         }
-        if offset >= IOAPIC_MEM_LENGTH_BYTES {
-            warn!("IOAPIC: Bad read from offset {}", offset);
+        if info.offset >= IOAPIC_MEM_LENGTH_BYTES {
+            warn!("IOAPIC: Bad read from {}", info);
         }
-        let out = match offset as u8 {
+        let out = match info.offset as u8 {
             IOREGSEL_OFF => self.state.ioregsel.into(),
             IOREGSEL_DUMMY_UPPER_32_BITS_OFF => 0,
             IOWIN_OFF => self.ioapic_read(),
             _ => {
-                warn!("IOAPIC: Bad read from offset {}", offset);
+                warn!("IOAPIC: Bad read from {}", info);
                 return;
             }
         };
@@ -96,15 +101,15 @@ impl BusDevice for Ioapic {
         }
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) {
+    fn write(&mut self, info: BusAccessInfo, data: &[u8]) {
         if data.len() > 8 || data.len() == 0 {
             warn!("IOAPIC: Bad write size: {}", data.len());
             return;
         }
-        if offset >= IOAPIC_MEM_LENGTH_BYTES {
-            warn!("IOAPIC: Bad write to offset {}", offset);
+        if info.offset >= IOAPIC_MEM_LENGTH_BYTES {
+            warn!("IOAPIC: Bad write to {}", info);
         }
-        match offset as u8 {
+        match info.offset as u8 {
             IOREGSEL_OFF => self.state.ioregsel = data[0],
             IOREGSEL_DUMMY_UPPER_32_BITS_OFF => {} // Ignored.
             IOWIN_OFF => {
@@ -117,14 +122,14 @@ impl BusDevice for Ioapic {
                 self.ioapic_write(val);
             }
             _ => {
-                warn!("IOAPIC: Bad write to offset {}", offset);
+                warn!("IOAPIC: Bad write to {}", info);
             }
         }
     }
 }
 
 impl Ioapic {
-    pub fn new(irq_events: Vec<Event>, irq_socket: VmIrqRequestSocket) -> Result<Ioapic> {
+    pub fn new(irq_socket: VmIrqRequestSocket) -> Result<Ioapic> {
         let mut state = IoapicState::default();
 
         for i in 0..NUM_IOAPIC_PINS {
@@ -134,7 +139,7 @@ impl Ioapic {
         Ok(Ioapic {
             state,
             rtc_remote_irr: false,
-            irq_events,
+            out_events: (0..NUM_IOAPIC_PINS).map(|_| None).collect(),
             resample_events: Vec::new(),
             irq_socket,
         })
@@ -148,7 +153,7 @@ impl Ioapic {
         self.state = *state
     }
 
-    pub fn register_resample_events(&mut self, resample_events: Vec<Option<Event>>) {
+    pub fn register_resample_events(&mut self, resample_events: Vec<Vec<Event>>) {
         self.resample_events = resample_events;
     }
 
@@ -164,12 +169,18 @@ impl Ioapic {
             if self.state.redirect_table[i].get_vector() == vector
                 && self.state.redirect_table[i].get_trigger_mode() == TriggerMode::Level
             {
-                if self.resample_events.get(i).map_or(false, |e| e.is_some()) {
+                if self
+                    .resample_events
+                    .get(i)
+                    .map_or(false, |events| events.len() > 0)
+                {
                     self.service_irq(i, false);
                 }
 
-                if let Some(Some(resample_evt)) = &self.resample_events.get(i) {
-                    resample_evt.write(1).unwrap();
+                if let Some(resample_events) = self.resample_events.get(i) {
+                    for resample_evt in resample_events {
+                        resample_evt.write(1).unwrap();
+                    }
                 }
                 self.state.redirect_table[i].set_remote_irr(false);
             }
@@ -216,8 +227,8 @@ impl Ioapic {
             return false;
         }
 
-        let injected = match self.irq_events.get(irq) {
-            Some(evt) => evt.write(1).is_ok(),
+        let injected = match self.out_events.get(irq) {
+            Some(Some(evt)) => evt.event.write(1).is_ok(),
             _ => false,
         };
 
@@ -284,28 +295,83 @@ impl Ioapic {
                 data.set_delivery_mode(entry.get_delivery_mode());
                 data.set_trigger(entry.get_trigger_mode());
 
-                let request = VmIrqRequest::AddMsiRoute {
-                    gsi: index as u32,
-                    msi_address: address.get(0, 32),
-                    msi_data: data.get(0, 32) as u32,
-                };
-
-                if let Err(e) = self.irq_socket.send(&request) {
-                    error!("IOAPIC: failed to send AddMsiRoute request: {}", e);
-                    return;
-                }
-                match self.irq_socket.recv() {
-                    Ok(response) => {
-                        if let VmIrqResponse::Err(e) = response {
-                            error!("IOAPIC: failed to add msi route: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("IOAPIC: failed to receive AddMsiRoute response: {}", e);
-                    }
+                let msi_address = address.get(0, 32);
+                let msi_data = data.get(0, 32);
+                if let Err(e) = self.setup_msi(index, msi_address, msi_data as u32) {
+                    error!("IOAPIC failed to set up MSI for index {}: {}", index, e);
                 }
             }
         }
+    }
+
+    fn setup_msi(
+        &mut self,
+        index: usize,
+        msi_address: u64,
+        msi_data: u32,
+    ) -> std::result::Result<(), IoapicError> {
+        if msi_data == 0 {
+            // During boot, Linux first configures all ioapic pins with msi_data == 0; the routes
+            // aren't yet assigned to devices and aren't usable.  We skip MSI setup if msi_data is
+            // 0.
+            return Ok(());
+        }
+
+        // Allocate a GSI and event for the outgoing route, if we haven't already done it.
+        // The event will be used on the "outgoing" end of the ioapic to send an interrupt to the
+        // apics: when an incoming ioapic irq line gets signalled, the ioapic writes to the
+        // corresponding outgoing event. The GSI number is used to update the routing info (MSI
+        // data and addr) for the event. The GSI and event are allocated only once for each ioapic
+        // irq line, when the guest first sets up the ioapic with a valid route. If the guest
+        // later reconfigures an ioapic irq line, the same GSI and event are reused, and we change
+        // the GSI's route to the new MSI data+addr destination.
+        let gsi = if let Some(evt) = &self.out_events[index] {
+            evt.gsi
+        } else {
+            let event = Event::new().map_err(|e| IoapicError::CreateEvent(e))?;
+            let request = VmIrqRequest::AllocateOneMsi {
+                irqfd: MaybeOwnedDescriptor::Borrowed(event.as_raw_descriptor()),
+            };
+            self.irq_socket
+                .send(&request)
+                .map_err(IoapicError::AllocateOneMsiSend)?;
+            match self
+                .irq_socket
+                .recv()
+                .map_err(IoapicError::AllocateOneMsiRecv)?
+            {
+                VmIrqResponse::AllocateOneMsi { gsi, .. } => {
+                    self.out_events[index] = Some(IrqEvent {
+                        gsi,
+                        event,
+                        resample_event: None,
+                    });
+                    gsi
+                }
+                VmIrqResponse::Err(e) => return Err(IoapicError::AllocateOneMsi(e)),
+                _ => unreachable!(),
+            }
+        };
+
+        // Set the MSI route for the GSI.  This controls which apic(s) get the interrupt when the
+        // ioapic's outgoing event is written, and various attributes of how the interrupt is
+        // delivered.
+        let request = VmIrqRequest::AddMsiRoute {
+            gsi,
+            msi_address,
+            msi_data,
+        };
+        self.irq_socket
+            .send(&request)
+            .map_err(IoapicError::AddMsiRouteSend)?;
+        if let VmIrqResponse::Err(e) = self
+            .irq_socket
+            .recv()
+            .map_err(IoapicError::AddMsiRouteRecv)?
+        {
+            return Err(IoapicError::AddMsiRoute(e));
+        }
+        Ok(())
     }
 
     fn ioapic_read(&mut self) -> u32 {
@@ -330,6 +396,35 @@ impl Ioapic {
     }
 }
 
+#[derive(Debug)]
+enum IoapicError {
+    AddMsiRoute(Error),
+    AddMsiRouteRecv(MsgError),
+    AddMsiRouteSend(MsgError),
+    AllocateOneMsi(Error),
+    AllocateOneMsiRecv(MsgError),
+    AllocateOneMsiSend(MsgError),
+    CreateEvent(Error),
+}
+
+impl Display for IoapicError {
+    #[remain::check]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::IoapicError::*;
+
+        #[sorted]
+        match self {
+            AddMsiRoute(e) => write!(f, "AddMsiRoute failed: {}", e),
+            AddMsiRouteRecv(e) => write!(f, "failed to receive AddMsiRoute response: {}", e),
+            AddMsiRouteSend(e) => write!(f, "failed to send AddMsiRoute request: {}", e),
+            AllocateOneMsi(e) => write!(f, "AllocateOneMsi failed: {}", e),
+            AllocateOneMsiRecv(e) => write!(f, "failed to receive AllocateOneMsi response: {}", e),
+            AllocateOneMsiSend(e) => write!(f, "failed to send AllocateOneMsi request: {}", e),
+            CreateEvent(e) => write!(f, "failed to create event object: {}", e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,11 +435,20 @@ mod tests {
 
     fn new() -> Ioapic {
         let (_, device_socket) = msg_socket::pair::<VmIrqResponse, VmIrqRequest>().unwrap();
-        Ioapic::new(Vec::new(), device_socket).unwrap()
+        Ioapic::new(device_socket).unwrap()
+    }
+
+    fn ioapic_bus_address(offset: u8) -> BusAccessInfo {
+        let offset = offset as u64;
+        BusAccessInfo {
+            offset,
+            address: IOAPIC_BASE_ADDRESS + offset,
+            id: 0,
+        }
     }
 
     fn set_up(trigger: TriggerMode) -> (Ioapic, usize) {
-        let irq = hypervisor::NUM_IOAPIC_PINS - 1;
+        let irq = NUM_IOAPIC_PINS - 1;
         let ioapic = set_up_with_irq(irq, trigger);
         (ioapic, irq)
     }
@@ -352,19 +456,24 @@ mod tests {
     fn set_up_with_irq(irq: usize, trigger: TriggerMode) -> Ioapic {
         let mut ioapic = self::new();
         set_up_redirection_table_entry(&mut ioapic, irq, trigger);
+        ioapic.out_events[irq] = Some(IrqEvent {
+            gsi: NUM_IOAPIC_PINS as u32,
+            event: Event::new().unwrap(),
+            resample_event: None,
+        });
         ioapic
     }
 
     fn read_reg(ioapic: &mut Ioapic, selector: u8) -> u32 {
         let mut data = [0; 4];
-        ioapic.write(IOREGSEL_OFF.into(), &[selector]);
-        ioapic.read(IOWIN_OFF.into(), &mut data);
+        ioapic.write(ioapic_bus_address(IOREGSEL_OFF), &[selector]);
+        ioapic.read(ioapic_bus_address(IOWIN_OFF), &mut data);
         u32::from_ne_bytes(data)
     }
 
     fn write_reg(ioapic: &mut Ioapic, selector: u8, value: u32) {
-        ioapic.write(IOREGSEL_OFF.into(), &[selector]);
-        ioapic.write(IOWIN_OFF.into(), &value.to_ne_bytes());
+        ioapic.write(ioapic_bus_address(IOREGSEL_OFF), &[selector]);
+        ioapic.write(ioapic_bus_address(IOWIN_OFF), &value.to_ne_bytes());
     }
 
     fn read_entry(ioapic: &mut Ioapic, irq: usize) -> IoapicRedirectionTableEntry {
@@ -418,8 +527,8 @@ mod tests {
         let mut data_read = [0; 4];
 
         for i in 0..data_write.len() {
-            ioapic.write(IOREGSEL_OFF.into(), &data_write[i..i + 1]);
-            ioapic.read(IOREGSEL_OFF.into(), &mut data_read[i..i + 1]);
+            ioapic.write(ioapic_bus_address(IOREGSEL_OFF), &data_write[i..i + 1]);
+            ioapic.read(ioapic_bus_address(IOREGSEL_OFF), &mut data_read[i..i + 1]);
             assert_eq!(data_write[i], data_read[i]);
         }
     }
@@ -473,7 +582,7 @@ mod tests {
     #[should_panic(expected = "index out of bounds: the len is 24 but the index is 24")]
     fn service_invalid_irq() {
         let mut ioapic = self::new();
-        ioapic.service_irq(hypervisor::NUM_IOAPIC_PINS, false);
+        ioapic.service_irq(NUM_IOAPIC_PINS, false);
     }
 
     // Test a level triggered IRQ interrupt.

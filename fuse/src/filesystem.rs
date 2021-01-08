@@ -9,9 +9,11 @@ use std::io;
 use std::mem;
 use std::time::Duration;
 
-use crate::virtio::fs::fuse;
+use crate::sys;
 
-pub use fuse::{FsOptions, IoctlFlags, IoctlIovec, OpenOptions, SetattrValid, ROOT_ID};
+pub use crate::sys::{FsOptions, IoctlFlags, IoctlIovec, OpenOptions, SetattrValid, ROOT_ID};
+
+const MAX_BUFFER_SIZE: u32 = 1 << 20;
 
 /// Information about a path in the filesystem.
 pub struct Entry {
@@ -43,9 +45,9 @@ pub struct Entry {
     pub entry_timeout: Duration,
 }
 
-impl From<Entry> for fuse::EntryOut {
-    fn from(entry: Entry) -> fuse::EntryOut {
-        fuse::EntryOut {
+impl From<Entry> for sys::EntryOut {
+    fn from(entry: Entry) -> sys::EntryOut {
+        sys::EntryOut {
             nodeid: entry.inode,
             generation: entry.generation,
             entry_valid: entry.entry_timeout.as_secs(),
@@ -322,8 +324,8 @@ pub struct Context {
     pub pid: libc::pid_t,
 }
 
-impl From<fuse::InHeader> for Context {
-    fn from(source: fuse::InHeader) -> Self {
+impl From<sys::InHeader> for Context {
+    fn from(source: sys::InHeader) -> Self {
         Context {
             uid: source.uid,
             gid: source.gid,
@@ -373,6 +375,12 @@ pub trait FileSystem {
     /// An iterator over the entries of a directory. See the documentation for `readdir` for more
     /// details.
     type DirIter: DirectoryIterator;
+
+    /// Maximum size of the buffer that the filesystem can generate data to, including the header.
+    /// This corresponds to max_write in the initialization.
+    fn max_buffer_size(&self) -> u32 {
+        MAX_BUFFER_SIZE
+    }
 
     /// Initialize the file system.
     ///
