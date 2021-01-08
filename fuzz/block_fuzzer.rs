@@ -6,7 +6,6 @@
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::mem::size_of;
-use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -76,10 +75,9 @@ fuzz_target!(|bytes| {
     q.max_size = QUEUE_SIZE;
 
     let queue_evts: Vec<Event> = vec![Event::new().unwrap()];
-    let queue_fd = queue_evts[0].as_raw_fd();
-    let queue_evt = unsafe { Event::from_raw_fd(libc::dup(queue_fd)) };
+    let queue_evt = queue_evts[0].try_clone().unwrap();
 
-    let features = base_features();
+    let features = base_features(false);
 
     let disk_file = tempfile::tempfile().unwrap();
     let mut block = Block::new(features, Box::new(disk_file), false, true, 512, None).unwrap();

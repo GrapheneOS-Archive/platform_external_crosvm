@@ -2,12 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use sync::Mutex;
 
-use base::{warn, Event, Result};
+use base::{warn, AsRawDescriptor, Event, RawDescriptor, Result};
 use data_model::{DataInit, Le32};
 use hypervisor::Datamatch;
 use libc::ERANGE;
@@ -17,8 +16,8 @@ use vm_memory::GuestMemory;
 use super::*;
 use crate::pci::{
     MsixCap, MsixConfig, PciAddress, PciBarConfiguration, PciCapability, PciCapabilityID,
-    PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciInterruptPin,
-    PciSubclass,
+    PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciDisplaySubclass, PciHeaderType,
+    PciInterruptPin, PciSubclass,
 };
 use vm_control::VmIrqRequestSocket;
 
@@ -236,6 +235,17 @@ impl VirtioPciDevice {
 
         let pci_device_id = VIRTIO_PCI_DEVICE_ID_BASE + device.device_type() as u16;
 
+        let (pci_device_class, pci_device_subclass) = match device.device_type() {
+            TYPE_GPU => (
+                PciClassCode::DisplayController,
+                &PciDisplaySubclass::Other as &dyn PciSubclass,
+            ),
+            _ => (
+                PciClassCode::Other,
+                &PciVirtioSubclass::NonTransitionalBase as &dyn PciSubclass,
+            ),
+        };
+
         let num_queues = device.queue_max_sizes().len();
 
         // One MSI-X vector per queue plus one for configuration changes.
@@ -245,8 +255,8 @@ impl VirtioPciDevice {
         let config_regs = PciConfiguration::new(
             VIRTIO_PCI_VENDOR_ID,
             pci_device_id,
-            PciClassCode::Other,
-            &PciVirtioSubclass::NonTransitionalBase,
+            pci_device_class,
+            pci_device_subclass,
             None,
             PciHeaderType::Device,
             VIRTIO_PCI_VENDOR_ID,
@@ -386,17 +396,17 @@ impl PciDevice for VirtioPciDevice {
         self.pci_address = Some(address);
     }
 
-    fn keep_fds(&self) -> Vec<RawFd> {
-        let mut fds = self.device.keep_fds();
+    fn keep_rds(&self) -> Vec<RawDescriptor> {
+        let mut rds = self.device.keep_rds();
         if let Some(interrupt_evt) = &self.interrupt_evt {
-            fds.push(interrupt_evt.as_raw_fd());
+            rds.push(interrupt_evt.as_raw_descriptor());
         }
         if let Some(interrupt_resample_evt) = &self.interrupt_resample_evt {
-            fds.push(interrupt_resample_evt.as_raw_fd());
+            rds.push(interrupt_resample_evt.as_raw_descriptor());
         }
-        let fd = self.msix_config.lock().get_msi_socket();
-        fds.push(fd);
-        fds
+        let descriptor = self.msix_config.lock().get_msi_socket();
+        rds.push(descriptor);
+        rds
     }
 
     fn assign_irq(

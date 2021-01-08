@@ -17,12 +17,13 @@ use std::net::Ipv4Addr;
 #[cfg(feature = "gpu")]
 use std::num::NonZeroU8;
 use std::num::ParseIntError;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::str;
-use std::sync::{Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier};
+
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -38,8 +39,8 @@ use devices::virtio::{self, Console, VirtioDevice};
 #[cfg(feature = "audio")]
 use devices::Ac97Dev;
 use devices::{
-    self, HostBackendDeviceProvider, KvmKernelIrqChip, PciDevice, VfioContainer, VfioDevice,
-    VfioPciDevice, VirtioPciDevice, XhciController,
+    self, HostBackendDeviceProvider, IrqChip, IrqEventIndex, KvmKernelIrqChip, PciDevice,
+    VcpuRunState, VfioContainer, VfioDevice, VfioPciDevice, VirtioPciDevice, XhciController,
 };
 use hypervisor::kvm::{Kvm, KvmVcpu, KvmVm};
 use hypervisor::{HypervisorCap, Vcpu, VcpuExit, VcpuRunHandle, Vm, VmCap};
@@ -48,25 +49,30 @@ use msg_socket::{MsgError, MsgReceiver, MsgSender, MsgSocket};
 use net_util::{Error as NetError, MacAddress, Tap};
 use remain::sorted;
 use resources::{Alloc, MmioType, SystemAllocator};
-use sync::{Condvar, Mutex};
+use sync::Mutex;
 
 use base::{
     self, block_signal, clear_signal, drop_capabilities, error, flock, get_blocked_signals,
     get_group_id, get_user_id, getegid, geteuid, info, register_rt_signal_handler,
-    set_cpu_affinity, set_rt_prio_limit, set_rt_round_robin, signal, validate_raw_fd, warn, Event,
-    ExternalMapping, FlockOperation, Killable, MemoryMappingArena, PollContext, PollToken,
-    Protection, ScopedEvent, SignalFd, Terminal, Timer, WatchingEvents, SIGRTMIN,
+    set_cpu_affinity, set_rt_prio_limit, set_rt_round_robin, signal, validate_raw_descriptor, warn,
+    AsRawDescriptor, Event, EventType, ExternalMapping, FlockOperation, FromRawDescriptor,
+    Killable, MemoryMappingArena, PollToken, Protection, RawDescriptor, ScopedEvent, SignalFd,
+    Terminal, Timer, WaitContext, SIGRTMIN,
 };
 use vm_control::{
     BalloonControlCommand, BalloonControlRequestSocket, BalloonControlResponseSocket,
     BalloonControlResult, DiskControlCommand, DiskControlRequestSocket, DiskControlResponseSocket,
-    DiskControlResult, IrqSetup, UsbControlSocket, VmControlResponseSocket, VmIrqRequest,
-    VmIrqRequestSocket, VmIrqResponse, VmIrqResponseSocket, VmMemoryControlRequestSocket,
-    VmMemoryControlResponseSocket, VmMemoryRequest, VmMemoryResponse, VmMsyncRequest,
-    VmMsyncRequestSocket, VmMsyncResponse, VmMsyncResponseSocket, VmRunMode,
+    DiskControlResult, IrqSetup, UsbControlSocket, VcpuControl, VmControlResponseSocket,
+    VmIrqRequest, VmIrqRequestSocket, VmIrqResponse, VmIrqResponseSocket,
+    VmMemoryControlRequestSocket, VmMemoryControlResponseSocket, VmMemoryRequest, VmMemoryResponse,
+    VmMsyncRequest, VmMsyncRequestSocket, VmMsyncResponse, VmMsyncResponseSocket, VmRunMode,
 };
+#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+use vm_control::{VcpuDebug, VcpuDebugStatus, VcpuDebugStatusMessage, VmRequest, VmResponse};
 use vm_memory::{GuestAddress, GuestMemory};
 
+#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+use crate::gdb::{gdb_thread, GdbStub};
 use crate::{Config, DiskOption, Executable, SharedDir, SharedDirKind, TouchDeviceOption};
 use arch::{
     self, LinuxArch, RunnableLinuxVm, SerialHardware, SerialParameters, VcpuAffinity,
@@ -76,13 +82,13 @@ use arch::{
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 use {
     aarch64::AArch64 as Arch,
-    devices::{IrqChip, IrqChipAArch64 as IrqChipArch},
+    devices::IrqChipAArch64 as IrqChipArch,
     hypervisor::{VcpuAArch64 as VcpuArch, VmAArch64 as VmArch},
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use {
-    devices::{IrqChipX86_64, IrqChipX86_64 as IrqChipArch, KvmSplitIrqChip},
-    hypervisor::{VcpuX86_64, VcpuX86_64 as VcpuArch, VmX86_64 as VmArch},
+    devices::{IrqChipX86_64 as IrqChipArch, KvmSplitIrqChip},
+    hypervisor::{VcpuX86_64 as VcpuArch, VmX86_64 as VmArch},
     x86_64::X8664arch as Arch,
 };
 
@@ -107,7 +113,6 @@ pub enum Error {
     CreateConsole(arch::serial::Error),
     CreateDiskError(disk::Error),
     CreateEvent(base::Error),
-    CreatePollContext(base::Error),
     CreateSignalFd(base::SignalFdError),
     CreateSocket(io::Error),
     CreateTapDevice(NetError),
@@ -116,6 +121,7 @@ pub enum Error {
     CreateUsbProvider(devices::usb::host_backend::error::Error),
     CreateVcpu(base::Error),
     CreateVfioDevice(devices::vfio::VfioError),
+    CreateWaitContext(base::Error),
     DeviceJail(minijail::Error),
     DevicePivotRoot(minijail::Error),
     Disk(PathBuf, io::Error),
@@ -124,6 +130,8 @@ pub enum Error {
     FsDeviceNew(virtio::fs::Error),
     GetMaxOpenFiles(io::Error),
     GetSignalMask(signal::Error),
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+    HandleDebugCommand(<Arch as LinuxArch>::Error),
     InputDeviceNew(virtio::InputError),
     InputEventsOpen(std::io::Error),
     InvalidFdPath,
@@ -143,8 +151,6 @@ pub enum Error {
     PivotRootDoesntExist(&'static str),
     PmemDeviceImageTooBig,
     PmemDeviceNew(base::Error),
-    PollContextAdd(base::Error),
-    PollContextDelete(base::Error),
     ReadMemAvailable(io::Error),
     RegisterBalloon(arch::DeviceRegistrationError),
     RegisterBlock(arch::DeviceRegistrationError),
@@ -160,17 +166,23 @@ pub enum Error {
     ResetTimer(base::Error),
     RngDeviceNew(virtio::RngError),
     RunnableVcpu(base::Error),
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+    SendDebugStatus(Box<mpsc::SendError<VcpuDebugStatusMessage>>),
     SettingGidMap(minijail::Error),
     SettingMaxOpenFiles(minijail::Error),
     SettingSignalMask(base::Error),
     SettingUidMap(minijail::Error),
     SignalFd(base::SignalFdError),
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+    SpawnGdbServer(io::Error),
     SpawnVcpu(io::Error),
     Timer(base::Error),
-    ValidateRawFd(base::Error),
+    ValidateRawDescriptor(base::Error),
     VhostNetDeviceNew(virtio::vhost::Error),
     VhostVsockDeviceNew(virtio::vhost::Error),
     VirtioPciDev(base::Error),
+    WaitContextAdd(base::Error),
+    WaitContextDelete(base::Error),
     WaylandDeviceNew(base::Error),
 }
 
@@ -201,7 +213,6 @@ impl Display for Error {
             CreateConsole(e) => write!(f, "failed to create console device: {}", e),
             CreateDiskError(e) => write!(f, "failed to create virtual disk: {}", e),
             CreateEvent(e) => write!(f, "failed to create event: {}", e),
-            CreatePollContext(e) => write!(f, "failed to create poll context: {}", e),
             CreateSignalFd(e) => write!(f, "failed to create signalfd: {}", e),
             CreateSocket(e) => write!(f, "failed to create socket: {}", e),
             CreateTapDevice(e) => write!(f, "failed to create tap device: {}", e),
@@ -212,6 +223,7 @@ impl Display for Error {
             CreateUsbProvider(e) => write!(f, "failed to create usb provider: {}", e),
             CreateVcpu(e) => write!(f, "failed to create vcpu: {}", e),
             CreateVfioDevice(e) => write!(f, "Failed to create vfio device {}", e),
+            CreateWaitContext(e) => write!(f, "failed to create wait context: {}", e),
             DeviceJail(e) => write!(f, "failed to jail device: {}", e),
             DevicePivotRoot(e) => write!(f, "failed to pivot root device: {}", e),
             Disk(p, e) => write!(f, "failed to load disk image {}: {}", p.display(), e),
@@ -220,6 +232,8 @@ impl Display for Error {
             FsDeviceNew(e) => write!(f, "failed to create fs device: {}", e),
             GetMaxOpenFiles(e) => write!(f, "failed to get max number of open files: {}", e),
             GetSignalMask(e) => write!(f, "failed to retrieve signal mask for vcpu: {}", e),
+            #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+            HandleDebugCommand(e) => write!(f, "failed to handle a gdb command: {}", e),
             InputDeviceNew(e) => write!(f, "failed to set up input device: {}", e),
             InputEventsOpen(e) => write!(f, "failed to open event device: {}", e),
             InvalidFdPath => write!(f, "failed parsing a /proc/self/fd/*"),
@@ -246,8 +260,6 @@ impl Display for Error {
                 write!(f, "failed to create pmem device: pmem device image too big")
             }
             PmemDeviceNew(e) => write!(f, "failed to create pmem device: {}", e),
-            PollContextAdd(e) => write!(f, "failed to add fd to poll context: {}", e),
-            PollContextDelete(e) => write!(f, "failed to remove fd from poll context: {}", e),
             ReadMemAvailable(e) => write!(f, "failed to read /proc/meminfo: {}", e),
             RegisterBalloon(e) => write!(f, "error registering balloon device: {}", e),
             RegisterBlock(e) => write!(f, "error registering block device: {}", e),
@@ -263,17 +275,25 @@ impl Display for Error {
             ResetTimer(e) => write!(f, "failed to reset Timer: {}", e),
             RngDeviceNew(e) => write!(f, "failed to set up rng: {}", e),
             RunnableVcpu(e) => write!(f, "failed to set thread id for vcpu: {}", e),
+            #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+            SendDebugStatus(e) => write!(f, "failed to send a debug status to GDB thread: {}", e),
             SettingGidMap(e) => write!(f, "error setting GID map: {}", e),
             SettingMaxOpenFiles(e) => write!(f, "error setting max open files: {}", e),
             SettingSignalMask(e) => write!(f, "failed to set the signal mask for vcpu: {}", e),
             SettingUidMap(e) => write!(f, "error setting UID map: {}", e),
             SignalFd(e) => write!(f, "failed to read signal fd: {}", e),
+            #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+            SpawnGdbServer(e) => write!(f, "failed to spawn GDB thread: {}", e),
             SpawnVcpu(e) => write!(f, "failed to spawn VCPU thread: {}", e),
             Timer(e) => write!(f, "failed to read timer fd: {}", e),
-            ValidateRawFd(e) => write!(f, "failed to validate raw fd: {}", e),
+            ValidateRawDescriptor(e) => write!(f, "failed to validate raw descriptor: {}", e),
             VhostNetDeviceNew(e) => write!(f, "failed to set up vhost networking: {}", e),
             VhostVsockDeviceNew(e) => write!(f, "failed to set up virtual socket device: {}", e),
             VirtioPciDev(e) => write!(f, "failed to create virtio pci dev: {}", e),
+            WaitContextAdd(e) => write!(f, "failed to add descriptor to wait context: {}", e),
+            WaitContextDelete(e) => {
+                write!(f, "failed to remove descriptor from wait context: {}", e)
+            }
             WaylandDeviceNew(e) => write!(f, "failed to create wayland device: {}", e),
         }
     }
@@ -308,9 +328,9 @@ impl AsRef<UnixSeqpacket> for TaggedControlSocket {
     }
 }
 
-impl AsRawFd for TaggedControlSocket {
-    fn as_raw_fd(&self) -> RawFd {
-        self.as_ref().as_raw_fd()
+impl AsRawDescriptor for TaggedControlSocket {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
+        self.as_ref().as_raw_descriptor()
     }
 }
 
@@ -442,7 +462,7 @@ fn create_block_device(
     // Special case '/proc/self/fd/*' paths. The FD is already open, just use it.
     let raw_image: File = if disk.path.parent() == Some(Path::new("/proc/self/fd")) {
         // Safe because we will validate |raw_fd|.
-        unsafe { File::from_raw_fd(raw_fd_from_path(&disk.path)?) }
+        unsafe { File::from_raw_descriptor(raw_descriptor_from_path(&disk.path)?) }
     } else {
         OpenOptions::new()
             .read(true)
@@ -476,10 +496,8 @@ fn create_block_device(
 }
 
 fn create_rng_device(cfg: &Config) -> DeviceResult {
-    let dev = virtio::Rng::new(
-        virtio::base_features(cfg.protected_vm)
-    )
-    .map_err(Error::RngDeviceNew)?;
+    let dev =
+        virtio::Rng::new(virtio::base_features(cfg.protected_vm)).map_err(Error::RngDeviceNew)?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
@@ -636,11 +654,13 @@ fn create_balloon_device(cfg: &Config, socket: BalloonControlResponseSocket) -> 
     })
 }
 
-fn create_tap_net_device(cfg: &Config, tap_fd: RawFd) -> DeviceResult {
+fn create_tap_net_device(cfg: &Config, tap_fd: RawDescriptor) -> DeviceResult {
     // Safe because we ensure that we get a unique handle to the fd.
     let tap = unsafe {
-        Tap::from_raw_fd(validate_raw_fd(tap_fd).map_err(Error::ValidateRawFd)?)
-            .map_err(Error::CreateTapDevice)?
+        Tap::from_raw_descriptor(
+            validate_raw_descriptor(tap_fd).map_err(Error::ValidateRawDescriptor)?,
+        )
+        .map_err(Error::CreateTapDevice)?
     };
 
     let mut vq_pairs = cfg.net_vq_pairs.unwrap_or(1);
@@ -1024,6 +1044,7 @@ fn create_9p_device(
     gid_map: &str,
     src: &Path,
     tag: &str,
+    mut p9_cfg: p9::Config,
 ) -> DeviceResult {
     let max_open_files = get_max_open_files()?;
     let (jail, root) = if cfg.sandbox {
@@ -1051,7 +1072,8 @@ fn create_9p_device(
     };
 
     let features = virtio::base_features(cfg.protected_vm);
-    let dev = virtio::P9::new(features, root, tag).map_err(Error::P9DeviceNew)?;
+    p9_cfg.root = root.into();
+    let dev = virtio::P9::new(features, tag, p9_cfg).map_err(Error::P9DeviceNew)?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
@@ -1149,10 +1171,10 @@ fn create_pmem_device(
 }
 
 fn create_console_device(cfg: &Config, param: &SerialParameters) -> DeviceResult {
-    let mut keep_fds = Vec::new();
+    let mut keep_rds = Vec::new();
     let evt = Event::new().map_err(Error::CreateEvent)?;
     let dev = param
-        .create_serial_device::<Console>(cfg.protected_vm, &evt, &mut keep_fds)
+        .create_serial_device::<Console>(cfg.protected_vm, &evt, &mut keep_rds)
         .map_err(Error::CreateConsole)?;
 
     let jail = match simple_jail(&cfg, "serial")? {
@@ -1380,12 +1402,13 @@ fn create_virtio_devices(
             kind,
             uid_map,
             gid_map,
-            cfg: fs_cfg,
+            fs_cfg,
+            p9_cfg,
         } = shared_dir;
 
         let dev = match kind {
             SharedDirKind::FS => create_fs_device(cfg, uid_map, gid_map, src, tag, fs_cfg.clone())?,
-            SharedDirKind::P9 => create_9p_device(cfg, uid_map, gid_map, src, tag)?,
+            SharedDirKind::P9 => create_9p_device(cfg, uid_map, gid_map, src, tag, p9_cfg.clone())?,
         };
         devs.push(dev);
     }
@@ -1521,16 +1544,16 @@ fn add_crosvm_user_to_jail(jail: &mut Minijail, feature: &str) -> Result<Ids> {
     })
 }
 
-fn raw_fd_from_path(path: &Path) -> Result<RawFd> {
+fn raw_descriptor_from_path(path: &Path) -> Result<RawDescriptor> {
     if !path.is_file() {
         return Err(Error::InvalidFdPath);
     }
-    let raw_fd = path
+    let raw_descriptor = path
         .file_name()
         .and_then(|fd_osstr| fd_osstr.to_str())
         .and_then(|fd_str| fd_str.parse::<c_int>().ok())
         .ok_or(Error::InvalidFdPath)?;
-    validate_raw_fd(raw_fd).map_err(Error::ValidateRawFd)
+    validate_raw_descriptor(raw_descriptor).map_err(Error::ValidateRawDescriptor)
 }
 
 trait IntoUnixStream {
@@ -1541,7 +1564,7 @@ impl<'a> IntoUnixStream for &'a Path {
     fn into_unix_stream(self) -> Result<UnixStream> {
         if self.parent() == Some(Path::new("/proc/self/fd")) {
             // Safe because we will validate |raw_fd|.
-            unsafe { Ok(UnixStream::from_raw_fd(raw_fd_from_path(self)?)) }
+            unsafe { Ok(UnixStream::from_raw_fd(raw_descriptor_from_path(self)?)) }
         } else {
             UnixStream::connect(self).map_err(Error::InputEventsOpen)
         }
@@ -1578,19 +1601,6 @@ fn setup_vcpu_signal_handler<T: Vcpu>(use_hypervisor_signals: bool) -> Result<()
         }
     }
     Ok(())
-}
-
-#[derive(Default)]
-struct VcpuRunMode {
-    mtx: Mutex<VmRunMode>,
-    cvar: Condvar,
-}
-
-impl VcpuRunMode {
-    fn set_and_notify(&self, new_mode: VmRunMode) {
-        *self.mtx.lock() = new_mode;
-        self.cvar.notify_all();
-    }
 }
 
 // Sets up a vcpu and converts it into a runnable vcpu.
@@ -1674,36 +1684,81 @@ where
     Ok((vcpu, vcpu_run_handle))
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn inject_interrupt(irq_chip: &mut dyn IrqChipX86_64, vcpu: &dyn VcpuX86_64, vcpu_id: usize) {
-    if !irq_chip.interrupt_requested(vcpu_id) || !vcpu.ready_for_interrupt() {
-        return;
-    }
-
-    let vector = irq_chip
-        .get_external_interrupt(vcpu_id)
-        .unwrap_or_else(|e| {
-            error!("get_external_interrupt failed on vcpu {}: {}", vcpu_id, e);
-            None
-        });
-    if let Some(vector) = vector {
-        if let Err(e) = vcpu.interrupt(vector as u32) {
-            error!(
-                "Failed to inject interrupt {} to vcpu {}: {}",
-                vector, vcpu_id, e
-            );
+#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+fn handle_debug_msg<V>(
+    cpu_id: usize,
+    vcpu: &V,
+    guest_mem: &GuestMemory,
+    d: VcpuDebug,
+    reply_channel: &mpsc::Sender<VcpuDebugStatusMessage>,
+) -> Result<()>
+where
+    V: VcpuArch + 'static,
+{
+    match d {
+        VcpuDebug::ReadRegs => {
+            let msg = VcpuDebugStatusMessage {
+                cpu: cpu_id as usize,
+                msg: VcpuDebugStatus::RegValues(
+                    Arch::debug_read_registers(vcpu as &V).map_err(Error::HandleDebugCommand)?,
+                ),
+            };
+            reply_channel
+                .send(msg)
+                .map_err(|e| Error::SendDebugStatus(Box::new(e)))
+        }
+        VcpuDebug::WriteRegs(regs) => {
+            Arch::debug_write_registers(vcpu as &V, &regs).map_err(Error::HandleDebugCommand)?;
+            reply_channel
+                .send(VcpuDebugStatusMessage {
+                    cpu: cpu_id as usize,
+                    msg: VcpuDebugStatus::CommandComplete,
+                })
+                .map_err(|e| Error::SendDebugStatus(Box::new(e)))
+        }
+        VcpuDebug::ReadMem(vaddr, len) => {
+            let msg = VcpuDebugStatusMessage {
+                cpu: cpu_id as usize,
+                msg: VcpuDebugStatus::MemoryRegion(
+                    Arch::debug_read_memory(vcpu as &V, guest_mem, vaddr, len)
+                        .unwrap_or(Vec::new()),
+                ),
+            };
+            reply_channel
+                .send(msg)
+                .map_err(|e| Error::SendDebugStatus(Box::new(e)))
+        }
+        VcpuDebug::WriteMem(vaddr, buf) => {
+            Arch::debug_write_memory(vcpu as &V, guest_mem, vaddr, &buf)
+                .map_err(Error::HandleDebugCommand)?;
+            reply_channel
+                .send(VcpuDebugStatusMessage {
+                    cpu: cpu_id as usize,
+                    msg: VcpuDebugStatus::CommandComplete,
+                })
+                .map_err(|e| Error::SendDebugStatus(Box::new(e)))
+        }
+        VcpuDebug::EnableSinglestep => {
+            Arch::debug_enable_singlestep(vcpu as &V).map_err(Error::HandleDebugCommand)?;
+            reply_channel
+                .send(VcpuDebugStatusMessage {
+                    cpu: cpu_id as usize,
+                    msg: VcpuDebugStatus::CommandComplete,
+                })
+                .map_err(|e| Error::SendDebugStatus(Box::new(e)))
+        }
+        VcpuDebug::SetHwBreakPoint(addrs) => {
+            Arch::debug_set_hw_breakpoints(vcpu as &V, &addrs)
+                .map_err(Error::HandleDebugCommand)?;
+            reply_channel
+                .send(VcpuDebugStatusMessage {
+                    cpu: cpu_id as usize,
+                    msg: VcpuDebugStatus::CommandComplete,
+                })
+                .map_err(|e| Error::SendDebugStatus(Box::new(e)))
         }
     }
-
-    // The second interrupt request should be handled immediately, so ask vCPU to exit as soon as
-    // possible.
-    if irq_chip.interrupt_requested(vcpu_id) {
-        vcpu.request_interrupt_window();
-    }
 }
-
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-fn inject_interrupt(_irq_chip: &mut dyn IrqChip, _vcpu: &dyn Vcpu, _vcpu_id: usize) {}
 
 fn run_vcpu<V>(
     cpu_id: usize,
@@ -1720,8 +1775,11 @@ fn run_vcpu<V>(
     mmio_bus: devices::Bus,
     exit_evt: Event,
     requires_pvclock_ctrl: bool,
-    run_mode_arc: Arc<VcpuRunMode>,
+    from_main_channel: mpsc::Receiver<VcpuControl>,
     use_hypervisor_signals: bool,
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))] to_gdb_channel: Option<
+        mpsc::Sender<VcpuDebugStatusMessage>,
+    >,
 ) -> Result<JoinHandle<()>>
 where
     V: VcpuArch + 'static,
@@ -1733,6 +1791,8 @@ where
             // implementation accomplishes that.
             let _scoped_exit_evt = ScopedEvent::from(exit_evt);
 
+            #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+            let guest_mem = vm.get_memory().clone();
             let runnable_vcpu = runnable_vcpu(
                 cpu_id,
                 vcpu,
@@ -1756,70 +1816,193 @@ where
                 }
             };
 
-            loop {
-                let mut interrupted_by_signal = false;
-                match vcpu.run(&vcpu_run_handle) {
-                    Ok(VcpuExit::IoIn { port, mut size }) => {
-                        let mut data = [0; 8];
-                        if size > data.len() {
-                            error!("unsupported IoIn size of {} bytes", size);
-                            size = data.len();
+            let mut run_mode = VmRunMode::Running;
+            #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+            if to_gdb_channel.is_some() {
+                // Wait until a GDB client attaches
+                run_mode = VmRunMode::Breakpoint;
+            }
+
+            let mut interrupted_by_signal = false;
+
+            'vcpu_loop: loop {
+                // Start by checking for messages to process and the run state of the CPU.
+                // An extra check here for Running so there isn't a need to call recv unless a
+                // message is likely to be ready because a signal was sent.
+                if interrupted_by_signal || run_mode != VmRunMode::Running {
+                    'state_loop: loop {
+                        // Tries to get a pending message without blocking first.
+                        let msg = match from_main_channel.try_recv() {
+                            Ok(m) => m,
+                            Err(mpsc::TryRecvError::Empty) if run_mode == VmRunMode::Running => {
+                                // If the VM is running and no message is pending, the state won't
+                                // change.
+                                break 'state_loop;
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {
+                                // If the VM is not running, wait until a message is ready.
+                                match from_main_channel.recv() {
+                                    Ok(m) => m,
+                                    Err(mpsc::RecvError) => {
+                                        error!("Failed to read from main channel in vcpu");
+                                        break 'vcpu_loop;
+                                    }
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                error!("Failed to read from main channel in vcpu");
+                                break 'vcpu_loop;
+                            }
+                        };
+
+                        // Collect all pending messages.
+                        let mut messages = vec![msg];
+                        messages.append(&mut from_main_channel.try_iter().collect());
+
+                        for msg in messages {
+                            match msg {
+                                VcpuControl::RunState(new_mode) => {
+                                    run_mode = new_mode;
+                                    match run_mode {
+                                        VmRunMode::Running => break 'state_loop,
+                                        VmRunMode::Suspending => {
+                                            // On KVM implementations that use a paravirtualized
+                                            // clock (e.g. x86), a flag must be set to indicate to
+                                            // the guest kernel that a vCPU was suspended. The guest
+                                            // kernel will use this flag to prevent the soft lockup
+                                            // detection from triggering when this vCPU resumes,
+                                            // which could happen days later in realtime.
+                                            if requires_pvclock_ctrl {
+                                                if let Err(e) = vcpu.pvclock_ctrl() {
+                                                    error!(
+                                                        "failed to tell hypervisor vcpu {} is suspending: {}",
+                                                        cpu_id, e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        VmRunMode::Breakpoint => {}
+                                        VmRunMode::Exiting => break 'vcpu_loop,
+                                    }
+                                }
+                                #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+                                VcpuControl::Debug(d) => {
+                                    match &to_gdb_channel {
+                                        Some(ref ch) => {
+                                            if let Err(e) = handle_debug_msg(
+                                                cpu_id, &vcpu, &guest_mem, d, &ch,
+                                            ) {
+                                                error!("Failed to handle gdb message: {}", e);
+                                            }
+                                        },
+                                        None => {
+                                            error!("VcpuControl::Debug received while GDB feature is disabled: {:?}", d);
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        io_bus.read(port as u64, &mut data[..size]);
-                        if let Err(e) = vcpu.set_data(&data[..size]) {
-                            error!("failed to set return data for IoIn: {}", e);
+                    }
+                }
+
+                interrupted_by_signal = false;
+
+                // Vcpus may have run a HLT instruction, which puts them into a state other than
+                // VcpuRunState::Runnable. In that case, this call to wait_until_runnable blocks
+                // until either the irqchip receives an interrupt for this vcpu, or until the main
+                // thread kicks this vcpu as a result of some VmControl operation. In most IrqChip
+                // implementations HLT instructions do not make it to crosvm, and thus this is a
+                // no-op that always returns VcpuRunState::Runnable.
+                match irq_chip.wait_until_runnable(&vcpu) {
+                    Ok(VcpuRunState::Runnable) => {}
+                    Ok(VcpuRunState::Interrupted) => interrupted_by_signal = true,
+                    Err(e) => error!(
+                        "error waiting for vcpu {} to become runnable: {}",
+                        cpu_id, e
+                    ),
+                }
+
+                if !interrupted_by_signal {
+                    match vcpu.run(&vcpu_run_handle) {
+                        Ok(VcpuExit::IoIn { port, mut size }) => {
+                            let mut data = [0; 8];
+                            if size > data.len() {
+                                error!("unsupported IoIn size of {} bytes", size);
+                                size = data.len();
+                            }
+                            io_bus.read(port as u64, &mut data[..size]);
+                            if let Err(e) = vcpu.set_data(&data[..size]) {
+                                error!("failed to set return data for IoIn: {}", e);
+                            }
                         }
-                    }
-                    Ok(VcpuExit::IoOut {
-                        port,
-                        mut size,
-                        data,
-                    }) => {
-                        if size > data.len() {
-                            error!("unsupported IoOut size of {} bytes", size);
-                            size = data.len();
+                        Ok(VcpuExit::IoOut {
+                            port,
+                            mut size,
+                            data,
+                        }) => {
+                            if size > data.len() {
+                                error!("unsupported IoOut size of {} bytes", size);
+                                size = data.len();
+                            }
+                            io_bus.write(port as u64, &data[..size]);
                         }
-                        io_bus.write(port as u64, &data[..size]);
-                    }
-                    Ok(VcpuExit::MmioRead { address, size }) => {
-                        let mut data = [0; 8];
-                        mmio_bus.read(address, &mut data[..size]);
-                        // Setting data for mmio can not fail.
-                        let _ = vcpu.set_data(&data[..size]);
-                    }
-                    Ok(VcpuExit::MmioWrite {
-                        address,
-                        size,
-                        data,
-                    }) => {
-                        mmio_bus.write(address, &data[..size]);
-                    }
-                    Ok(VcpuExit::IoapicEoi { vector }) => {
-                        if let Err(e) = irq_chip.broadcast_eoi(vector) {
-                            error!(
-                                "failed to broadcast eoi {} on vcpu {}: {}",
-                                vector, cpu_id, e
-                            );
+                        Ok(VcpuExit::MmioRead { address, size }) => {
+                            let mut data = [0; 8];
+                            mmio_bus.read(address, &mut data[..size]);
+                            // Setting data for mmio can not fail.
+                            let _ = vcpu.set_data(&data[..size]);
                         }
-                    }
-                    Ok(VcpuExit::Hlt) => break,
-                    Ok(VcpuExit::Shutdown) => break,
-                    Ok(VcpuExit::FailEntry {
-                        hardware_entry_failure_reason,
-                    }) => {
-                        error!("vcpu hw run failure: {:#x}", hardware_entry_failure_reason);
-                        break;
-                    }
-                    Ok(VcpuExit::SystemEvent(_, _)) => break,
-                    Ok(r) => warn!("unexpected vcpu exit: {:?}", r),
-                    Err(e) => match e.errno() {
-                        libc::EINTR => interrupted_by_signal = true,
-                        libc::EAGAIN => {}
-                        _ => {
-                            error!("vcpu hit unknown error: {}", e);
+                        Ok(VcpuExit::MmioWrite {
+                            address,
+                            size,
+                            data,
+                        }) => {
+                            mmio_bus.write(address, &data[..size]);
+                        }
+                        Ok(VcpuExit::IoapicEoi { vector }) => {
+                            if let Err(e) = irq_chip.broadcast_eoi(vector) {
+                                error!(
+                                    "failed to broadcast eoi {} on vcpu {}: {}",
+                                    vector, cpu_id, e
+                                );
+                            }
+                        }
+                        Ok(VcpuExit::IrqWindowOpen) => {}
+                        Ok(VcpuExit::Hlt) => irq_chip.halted(cpu_id),
+                        Ok(VcpuExit::Shutdown) => break,
+                        Ok(VcpuExit::FailEntry {
+                            hardware_entry_failure_reason,
+                        }) => {
+                            error!("vcpu hw run failure: {:#x}", hardware_entry_failure_reason);
                             break;
                         }
-                    },
+                        Ok(VcpuExit::SystemEvent(_, _)) => break,
+                        Ok(VcpuExit::Debug { .. }) => {
+                            #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+                            {
+                                let msg = VcpuDebugStatusMessage {
+                                    cpu: cpu_id as usize,
+                                    msg: VcpuDebugStatus::HitBreakPoint,
+                                };
+                                if let Some(ref ch) = to_gdb_channel {
+                                    if let Err(e) = ch.send(msg) {
+                                        error!("failed to notify breakpoint to GDB thread: {}", e);
+                                        break;
+                                    }
+                                }
+                                run_mode = VmRunMode::Breakpoint;
+                            }
+                        }
+                        Ok(r) => warn!("unexpected vcpu exit: {:?}", r),
+                        Err(e) => match e.errno() {
+                            libc::EINTR => interrupted_by_signal = true,
+                            libc::EAGAIN => {}
+                            _ => {
+                                error!("vcpu hit unknown error: {}", e);
+                                break;
+                            }
+                        },
+                    }
                 }
 
                 if interrupted_by_signal {
@@ -1833,35 +2016,11 @@ where
                     } else {
                         vcpu.set_immediate_exit(false);
                     }
-                    let mut run_mode_lock = run_mode_arc.mtx.lock();
-                    loop {
-                        match *run_mode_lock {
-                            VmRunMode::Running => break,
-                            VmRunMode::Suspending => {
-                                // On KVM implementations that use a paravirtualized clock (e.g.
-                                // x86), a flag must be set to indicate to the guest kernel that a
-                                // VCPU was suspended. The guest kernel will use this flag to
-                                // prevent the soft lockup detection from triggering when this VCPU
-                                // resumes, which could happen days later in realtime.
-                                if requires_pvclock_ctrl {
-                                    if let Err(e) = vcpu.pvclock_ctrl() {
-                                        error!(
-                                            "failed to tell hypervisor vcpu {} is suspending: {}",
-                                            cpu_id, e
-                                        );
-                                    }
-                                }
-                            }
-                            VmRunMode::Exiting => return,
-                        }
-                        // Give ownership of our exclusive lock to the condition variable that will
-                        // block. When the condition variable is notified, `wait` will unblock and
-                        // return a new exclusive lock.
-                        run_mode_lock = run_mode_arc.cvar.wait(run_mode_lock);
-                    }
                 }
 
-                inject_interrupt(&mut irq_chip, &vcpu, cpu_id);
+                if let Err(e) = irq_chip.inject_interrupts(&vcpu) {
+                    error!("failed to inject interrupts for vcpu {}: {}", cpu_id, e);
+                }
             }
         })
         .map_err(Error::SpawnVcpu)
@@ -1979,6 +2138,18 @@ where
         _ => panic!("Did not receive a bios or kernel, should be impossible."),
     };
 
+    let mut control_sockets = Vec::new();
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+    let gdb_socket = if let Some(port) = cfg.gdb {
+        // GDB needs a control socket to interrupt vcpus.
+        let (gdb_host_socket, gdb_control_socket) =
+            msg_socket::pair::<VmResponse, VmRequest>().map_err(Error::CreateSocket)?;
+        control_sockets.push(TaggedControlSocket::Vm(gdb_host_socket));
+        Some((port, gdb_control_socket))
+    } else {
+        None
+    };
+
     let components = VmComponents {
         memory_size: cfg
             .memory
@@ -2005,6 +2176,8 @@ where
             .collect::<Result<Vec<SDT>>>()?,
         rt_cpus: cfg.rt_cpus.clone(),
         protected_vm: cfg.protected_vm,
+        #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+        gdb: gdb_socket,
     };
 
     let control_server_socket = match &cfg.socket_path {
@@ -2014,7 +2187,6 @@ where
         None => None,
     };
 
-    let mut control_sockets = Vec::new();
     let (wayland_host_socket, wayland_device_socket) =
         msg_socket::pair::<VmMemoryResponse, VmMemoryRequest>().map_err(Error::CreateSocket)?;
     control_sockets.push(TaggedControlSocket::VmMemory(wayland_host_socket));
@@ -2052,12 +2224,19 @@ where
         msg_socket::pair::<VmIrqResponse, VmIrqRequest>().map_err(Error::CreateSocket)?;
     control_sockets.push(TaggedControlSocket::VmIrq(ioapic_host_socket));
 
+    let battery = if cfg.battery_type.is_some() {
+        (&cfg.battery_type, simple_jail(&cfg, "battery")?)
+    } else {
+        (&cfg.battery_type, None)
+    };
+
     let map_request: Arc<Mutex<Option<ExternalMapping>>> = Arc::new(Mutex::new(None));
 
     let linux: RunnableLinuxVm<_, Vcpu, _> = Arch::build_vm(
         components,
         &cfg.serial_parameters,
         simple_jail(&cfg, "serial")?,
+        battery,
         |mem, vm, sys_allocator, exit_evt| {
             create_devices(
                 &cfg,
@@ -2093,6 +2272,24 @@ where
     )
 }
 
+/// Signals all running VCPUs to vmexit, sends VmRunMode message to each VCPU channel, and tells
+/// `irq_chip` to stop blocking halted VCPUs. The channel message is set first because both the
+/// signal and the irq_chip kick could cause the VCPU thread to continue through the VCPU run
+/// loop.
+fn kick_all_vcpus(
+    vcpu_handles: &[(JoinHandle<()>, mpsc::Sender<vm_control::VcpuControl>)],
+    irq_chip: &impl IrqChip,
+    run_mode: &VmRunMode,
+) {
+    for (handle, channel) in vcpu_handles {
+        if let Err(e) = channel.send(VcpuControl::RunState(run_mode.clone())) {
+            error!("failed to send VmRunMode: {}", e);
+        }
+        let _ = handle.kill(SIGRTMIN() + 0);
+    }
+    irq_chip.kick_halted_vcpus();
+}
+
 fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + 'static>(
     mut linux: RunnableLinuxVm<V, Vcpu, I>,
     control_server_socket: Option<UnlinkUnixSeqpacketListener>,
@@ -2111,7 +2308,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
         Exit,
         Suspend,
         ChildSignal,
-        IrqFd { gsi: usize },
+        IrqFd { index: IrqEventIndex },
         BalanceMemory,
         BalloonResult,
         VmControlServer,
@@ -2122,42 +2319,42 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
         .set_raw_mode()
         .expect("failed to set terminal raw mode");
 
-    let poll_ctx = PollContext::build_with(&[
+    let wait_ctx = WaitContext::build_with(&[
         (&linux.exit_evt, Token::Exit),
         (&linux.suspend_evt, Token::Suspend),
         (&sigchld_fd, Token::ChildSignal),
     ])
-    .map_err(Error::PollContextAdd)?;
+    .map_err(Error::WaitContextAdd)?;
 
     if let Some(socket_server) = &control_server_socket {
-        poll_ctx
+        wait_ctx
             .add(socket_server, Token::VmControlServer)
-            .map_err(Error::PollContextAdd)?;
+            .map_err(Error::WaitContextAdd)?;
     }
     for (index, socket) in control_sockets.iter().enumerate() {
-        poll_ctx
+        wait_ctx
             .add(socket.as_ref(), Token::VmControl { index })
-            .map_err(Error::PollContextAdd)?;
+            .map_err(Error::WaitContextAdd)?;
     }
 
     let events = linux
         .irq_chip
         .irq_event_tokens()
-        .map_err(Error::PollContextAdd)?;
+        .map_err(Error::WaitContextAdd)?;
 
-    for (gsi, evt) in events {
-        poll_ctx
-            .add(&evt, Token::IrqFd { gsi: gsi as usize })
-            .map_err(Error::PollContextAdd)?;
+    for (index, _gsi, evt) in events {
+        wait_ctx
+            .add(&evt, Token::IrqFd { index })
+            .map_err(Error::WaitContextAdd)?;
     }
 
     // Balance available memory between guest and host every second.
     let mut balancemem_timer = Timer::new().map_err(Error::CreateTimer)?;
     if Path::new(LOWMEM_AVAILABLE).exists() {
         // Create timer request balloon stats every 1s.
-        poll_ctx
+        wait_ctx
             .add(&balancemem_timer, Token::BalanceMemory)
-            .map_err(Error::PollContextAdd)?;
+            .map_err(Error::WaitContextAdd)?;
         let balancemem_dur = Duration::from_secs(1);
         let balancemem_int = Duration::from_secs(1);
         balancemem_timer
@@ -2165,9 +2362,9 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
             .map_err(Error::ResetTimer)?;
 
         // Listen for balloon statistics from the guest so we can balance.
-        poll_ctx
+        wait_ctx
             .add(&balloon_host_socket, Token::BalloonResult)
-            .map_err(Error::PollContextAdd)?;
+            .map_err(Error::WaitContextAdd)?;
     } else {
         warn!("Unable to open low mem available, maybe not a chrome os kernel");
     }
@@ -2177,9 +2374,17 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
         drop_capabilities().map_err(Error::DropCapabilities)?;
     }
 
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+    // Create a channel for GDB thread.
+    let (to_gdb_channel, from_vcpu_channel) = if linux.gdb.is_some() {
+        let (s, r) = mpsc::channel();
+        (Some(s), Some(r))
+    } else {
+        (None, None)
+    };
+
     let mut vcpu_handles = Vec::with_capacity(linux.vcpu_count);
     let vcpu_thread_barrier = Arc::new(Barrier::new(linux.vcpu_count + 1));
-    let run_mode_arc = Arc::new(VcpuRunMode::default());
     let use_hypervisor_signals = !linux
         .vm
         .get_hypervisor()
@@ -2191,6 +2396,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
         None => iter::repeat_with(|| None).take(linux.vcpu_count).collect(),
     };
     for (cpu_id, vcpu) in vcpus.into_iter().enumerate() {
+        let (to_vcpu_channel, from_main_channel) = mpsc::channel();
         let vcpu_affinity = match linux.vcpu_affinity.clone() {
             Some(VcpuAffinity::Global(v)) => v,
             Some(VcpuAffinity::PerVcpu(mut m)) => m.remove(&cpu_id).unwrap_or_default(),
@@ -2211,17 +2417,37 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
             linux.mmio_bus.clone(),
             linux.exit_evt.try_clone().map_err(Error::CloneEvent)?,
             linux.vm.check_capability(VmCap::PvClockSuspend),
-            run_mode_arc.clone(),
+            from_main_channel,
             use_hypervisor_signals,
+            #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+            to_gdb_channel.clone(),
         )?;
-        vcpu_handles.push(handle);
+        vcpu_handles.push((handle, to_vcpu_channel));
     }
+
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+    // Spawn GDB thread.
+    if let Some((gdb_port_num, gdb_control_socket)) = linux.gdb.take() {
+        let to_vcpu_channels = vcpu_handles
+            .iter()
+            .map(|(_handle, channel)| channel.clone())
+            .collect();
+        let target = GdbStub::new(
+            gdb_control_socket,
+            to_vcpu_channels,
+            from_vcpu_channel.unwrap(), // Must succeed to unwrap()
+        );
+        thread::Builder::new()
+            .name("gdb".to_owned())
+            .spawn(move || gdb_thread(target, gdb_port_num))
+            .map_err(Error::SpawnGdbServer)?;
+    };
 
     vcpu_thread_barrier.wait();
 
-    'poll: loop {
+    'wait: loop {
         let events = {
-            match poll_ctx.wait() {
+            match wait_ctx.wait() {
                 Ok(v) => v,
                 Err(e) => {
                     error!("failed to poll: {}", e);
@@ -2235,19 +2461,16 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
         }
 
         let mut vm_control_indices_to_remove = Vec::new();
-        for event in events.iter_readable() {
-            match event.token() {
+        for event in events.iter().filter(|e| e.is_readable) {
+            match event.token {
                 Token::Exit => {
                     info!("vcpu requested shutdown");
-                    break 'poll;
+                    break 'wait;
                 }
                 Token::Suspend => {
                     info!("VM requested suspend");
                     linux.suspend_evt.read().unwrap();
-                    run_mode_arc.set_and_notify(VmRunMode::Suspending);
-                    for handle in &vcpu_handles {
-                        let _ = handle.kill(SIGRTMIN() + 0);
-                    }
+                    kick_all_vcpus(&vcpu_handles, &linux.irq_chip, &VmRunMode::Suspending);
                 }
                 Token::ChildSignal => {
                     // Print all available siginfo structs, then exit the loop.
@@ -2262,11 +2485,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
                             pid_label, siginfo.ssi_signo, siginfo.ssi_status, siginfo.ssi_code
                         );
                     }
-                    break 'poll;
+                    break 'wait;
                 }
-                Token::IrqFd { gsi } => {
-                    if let Err(e) = linux.irq_chip.service_irq_event(gsi as u32) {
-                        error!("failed to signal irq {}: {}", gsi, e);
+                Token::IrqFd { index } => {
+                    if let Err(e) = linux.irq_chip.service_irq_event(index) {
+                        error!("failed to signal irq {}: {}", index, e);
                     }
                 }
                 Token::BalanceMemory => {
@@ -2355,14 +2578,14 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
                     if let Some(socket_server) = &control_server_socket {
                         match socket_server.accept() {
                             Ok(socket) => {
-                                poll_ctx
+                                wait_ctx
                                     .add(
                                         &socket,
                                         Token::VmControl {
                                             index: control_sockets.len(),
                                         },
                                     )
-                                    .map_err(Error::PollContextAdd)?;
+                                    .map_err(Error::WaitContextAdd)?;
                                 control_sockets
                                     .push(TaggedControlSocket::Vm(MsgSocket::new(socket)));
                             }
@@ -2381,6 +2604,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
                                         &balloon_host_socket,
                                         disk_host_sockets,
                                         &usb_control_socket,
+                                        &mut linux.bat_control,
                                     );
                                     if let Err(e) = socket.send(&response) {
                                         error!("failed to send VmResponse: {}", e);
@@ -2389,24 +2613,17 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
                                         info!("control socket changed run mode to {}", run_mode);
                                         match run_mode {
                                             VmRunMode::Exiting => {
-                                                break 'poll;
-                                            }
-                                            VmRunMode::Running => {
-                                                if let VmRunMode::Suspending =
-                                                    *run_mode_arc.mtx.lock()
-                                                {
-                                                    linux.io_bus.notify_resume();
-                                                }
-                                                run_mode_arc.set_and_notify(VmRunMode::Running);
-                                                for handle in &vcpu_handles {
-                                                    let _ = handle.kill(SIGRTMIN() + 0);
-                                                }
+                                                break 'wait;
                                             }
                                             other => {
-                                                run_mode_arc.set_and_notify(other);
-                                                for handle in &vcpu_handles {
-                                                    let _ = handle.kill(SIGRTMIN() + 0);
+                                                if other == VmRunMode::Running {
+                                                    linux.io_bus.notify_resume();
                                                 }
+                                                kick_all_vcpus(
+                                                    &vcpu_handles,
+                                                    &linux.irq_chip,
+                                                    &other,
+                                                );
                                             }
                                         }
                                     }
@@ -2445,7 +2662,26 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
                                         request.execute(
                                             |setup| match setup {
                                                 IrqSetup::Event(irq, ev) => {
-                                                    irq_chip.register_irq_event(irq, ev, None)
+                                                    if let Some(event_index) = irq_chip
+                                                        .register_irq_event(irq, ev, None)?
+                                                    {
+                                                        match wait_ctx.add(
+                                                            ev,
+                                                            Token::IrqFd {
+                                                                index: event_index
+                                                            },
+                                                        ) {
+                                                            Err(e) => {
+                                                                warn!("failed to add IrqFd to poll context: {}", e);
+                                                                Err(e)
+                                                            },
+                                                            Ok(_) => {
+                                                                Ok(())
+                                                            }
+                                                        }
+                                                    } else {
+                                                        Ok(())
+                                                    }
                                                 }
                                                 IrqSetup::Route(route) => irq_chip.route_irq(route),
                                             },
@@ -2485,12 +2721,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
             }
         }
 
-        for event in events.iter_hungup() {
-            match event.token() {
+        for event in events.iter().filter(|e| e.is_hungup) {
+            match event.token {
                 Token::Exit => {}
                 Token::Suspend => {}
                 Token::ChildSignal => {}
-                Token::IrqFd { gsi: _ } => {}
+                Token::IrqFd { index: _ } => {}
                 Token::BalanceMemory => {}
                 Token::BalloonResult => {}
                 Token::VmControlServer => {}
@@ -2515,45 +2751,35 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
         vm_control_indices_to_remove.sort_unstable_by_key(|&k| Reverse(k));
         vm_control_indices_to_remove.dedup();
         for index in vm_control_indices_to_remove {
-            // Delete the socket from the `poll_ctx` synchronously. Otherwise, the kernel will do
-            // this automatically when the FD inserted into the `poll_ctx` is closed after this
+            // Delete the socket from the `wait_ctx` synchronously. Otherwise, the kernel will do
+            // this automatically when the FD inserted into the `wait_ctx` is closed after this
             // if-block, but this removal can be deferred unpredictably. In some instances where the
-            // system is under heavy load, we can even get events returned by `poll_ctx` for an FD
+            // system is under heavy load, we can even get events returned by `wait_ctx` for an FD
             // that has already been closed. Because the token associated with that spurious event
             // now belongs to a different socket, the control loop will start to interact with
             // sockets that might not be ready to use. This can cause incorrect hangup detection or
             // blocking on a socket that will never be ready. See also: crbug.com/1019986
             if let Some(socket) = control_sockets.get(index) {
-                poll_ctx.delete(socket).map_err(Error::PollContextDelete)?;
+                wait_ctx.delete(socket).map_err(Error::WaitContextDelete)?;
             }
 
             // This line implicitly drops the socket at `index` when it gets returned by
             // `swap_remove`. After this line, the socket at `index` is not the one from
             // `vm_control_indices_to_remove`. Because of this socket's change in index, we need to
-            // use `poll_ctx.modify` to change the associated index in its `Token::VmControl`.
+            // use `wait_ctx.modify` to change the associated index in its `Token::VmControl`.
             control_sockets.swap_remove(index);
             if let Some(socket) = control_sockets.get(index) {
-                poll_ctx
-                    .modify(
-                        socket,
-                        WatchingEvents::empty().set_read(),
-                        Token::VmControl { index },
-                    )
-                    .map_err(Error::PollContextAdd)?;
+                wait_ctx
+                    .modify(socket, EventType::Read, Token::VmControl { index })
+                    .map_err(Error::WaitContextAdd)?;
             }
         }
     }
 
-    // VCPU threads MUST see the VmRunMode flag, otherwise they may re-enter the VM.
-    run_mode_arc.set_and_notify(VmRunMode::Exiting);
-    for handle in vcpu_handles {
-        match handle.kill(SIGRTMIN() + 0) {
-            Ok(_) => {
-                if let Err(e) = handle.join() {
-                    error!("failed to join vcpu thread: {:?}", e);
-                }
-            }
-            Err(e) => error!("failed to kill vcpu thread: {}", e),
+    kick_all_vcpus(&vcpu_handles, &linux.irq_chip, &VmRunMode::Exiting);
+    for (handle, _) in vcpu_handles {
+        if let Err(e) = handle.join() {
+            error!("failed to join vcpu thread: {:?}", e);
         }
     }
 

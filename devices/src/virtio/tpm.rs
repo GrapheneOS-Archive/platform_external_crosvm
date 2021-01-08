@@ -7,11 +7,10 @@ use std::fmt::{self, Display};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::ops::BitOrAssign;
-use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::thread;
 
-use base::{error, Event, PollContext, PollToken};
+use base::{error, Event, PollToken, RawDescriptor, WaitContext};
 use vm_memory::GuestMemory;
 
 use super::{
@@ -111,20 +110,20 @@ impl Worker {
             Kill,
         }
 
-        let poll_ctx = match PollContext::build_with(&[
+        let wait_ctx = match WaitContext::build_with(&[
             (&self.queue_evt, Token::QueueAvailable),
             (self.interrupt.get_resample_evt(), Token::InterruptResample),
             (&self.kill_evt, Token::Kill),
         ]) {
             Ok(pc) => pc,
             Err(e) => {
-                error!("vtpm failed creating PollContext: {}", e);
+                error!("vtpm failed creating WaitContext: {}", e);
                 return;
             }
         };
 
-        'poll: loop {
-            let events = match poll_ctx.wait() {
+        'wait: loop {
+            let events = match wait_ctx.wait() {
                 Ok(v) => v,
                 Err(e) => {
                     error!("vtpm failed polling for events: {}", e);
@@ -133,19 +132,19 @@ impl Worker {
             };
 
             let mut needs_interrupt = NeedsInterrupt::No;
-            for event in events.iter_readable() {
-                match event.token() {
+            for event in events.iter().filter(|e| e.is_readable) {
+                match event.token {
                     Token::QueueAvailable => {
                         if let Err(e) = self.queue_evt.read() {
                             error!("vtpm failed reading queue Event: {}", e);
-                            break 'poll;
+                            break 'wait;
                         }
                         needs_interrupt |= self.process_queue();
                     }
                     Token::InterruptResample => {
                         self.interrupt.interrupt_resample();
                     }
-                    Token::Kill => break 'poll,
+                    Token::Kill => break 'wait,
                 }
             }
             if needs_interrupt == NeedsInterrupt::Yes {
@@ -185,7 +184,7 @@ impl Drop for Tpm {
 }
 
 impl VirtioDevice for Tpm {
-    fn keep_fds(&self) -> Vec<RawFd> {
+    fn keep_rds(&self) -> Vec<RawDescriptor> {
         Vec::new()
     }
 

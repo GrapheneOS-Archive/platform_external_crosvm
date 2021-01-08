@@ -76,7 +76,7 @@ rust_library {
 //   rand_core-0.5.1 "alloc,getrandom,std"
 //   remove_dir_all-0.5.3
 //   slab-0.4.2
-//   syn-1.0.50 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.53 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   tempfile-3.1.0
 //   thiserror-1.0.22
 //   thiserror-impl-1.0.22
