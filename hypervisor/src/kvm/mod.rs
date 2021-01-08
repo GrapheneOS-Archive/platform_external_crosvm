@@ -13,12 +13,11 @@ mod x86_64;
 use x86_64::*;
 
 use std::cell::RefCell;
-use std::cmp::{min, Ordering};
+use std::cmp::{min, Reverse};
 use std::collections::{BTreeMap, BinaryHeap};
 use std::convert::TryFrom;
 use std::mem::{size_of, ManuallyDrop};
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::copy_nonoverlapping;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -126,12 +125,6 @@ impl AsRawDescriptor for Kvm {
     }
 }
 
-impl AsRawFd for Kvm {
-    fn as_raw_fd(&self) -> RawFd {
-        self.kvm.as_raw_descriptor()
-    }
-}
-
 impl Hypervisor for Kvm {
     fn try_clone(&self) -> Result<Self> {
         Ok(Kvm {
@@ -151,31 +144,14 @@ impl Hypervisor for Kvm {
     }
 }
 
-// Used to invert the order when stored in a max-heap.
-#[derive(Copy, Clone, Eq, PartialEq)]
-struct MemSlotOrd(MemSlot);
-
-impl Ord for MemSlotOrd {
-    fn cmp(&self, other: &MemSlotOrd) -> Ordering {
-        // Notice the order is inverted so the lowest magnitude slot has the highest priority in a
-        // max-heap.
-        other.0.cmp(&self.0)
-    }
-}
-
-impl PartialOrd for MemSlotOrd {
-    fn partial_cmp(&self, other: &MemSlotOrd) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 /// A wrapper around creating and using a KVM VM.
 pub struct KvmVm {
     kvm: Kvm,
     vm: SafeDescriptor,
     guest_mem: GuestMemory,
     mem_regions: Arc<Mutex<BTreeMap<MemSlot, Box<dyn MappedRegion>>>>,
-    mem_slot_gaps: Arc<Mutex<BinaryHeap<MemSlotOrd>>>,
+    /// A min heap of MemSlot numbers that were used and then removed and can now be re-used
+    mem_slot_gaps: Arc<Mutex<BinaryHeap<Reverse<MemSlot>>>>,
 }
 
 impl KvmVm {
@@ -214,11 +190,10 @@ impl KvmVm {
     }
 
     fn create_vcpu(&self, id: usize) -> Result<KvmVcpu> {
-        let id = c_ulong::try_from(id).unwrap();
         let run_mmap_size = self.kvm.get_vcpu_mmap_size()?;
 
         // Safe because we know that our file is a VM fd and we verify the return result.
-        let fd = unsafe { ioctl_with_val(self, KVM_CREATE_VCPU(), id) };
+        let fd = unsafe { ioctl_with_val(self, KVM_CREATE_VCPU(), c_ulong::try_from(id).unwrap()) };
         if fd < 0 {
             return errno_result();
         }
@@ -235,6 +210,7 @@ impl KvmVm {
         Ok(KvmVcpu {
             vm: self.vm.try_clone()?,
             vcpu,
+            id,
             run_mmap,
             vcpu_run_handle_fingerprint: Default::default(),
         })
@@ -278,14 +254,14 @@ impl KvmVm {
         resample_evt: Option<&Event>,
     ) -> Result<()> {
         let mut irqfd = kvm_irqfd {
-            fd: evt.as_raw_fd() as u32,
+            fd: evt.as_raw_descriptor() as u32,
             gsi,
             ..Default::default()
         };
 
         if let Some(r_evt) = resample_evt {
             irqfd.flags = KVM_IRQFD_FLAG_RESAMPLE;
-            irqfd.resamplefd = r_evt.as_raw_fd() as u32;
+            irqfd.resamplefd = r_evt.as_raw_descriptor() as u32;
         }
 
         // Safe because we know that our file is a VM fd, we know the kernel will only read the
@@ -305,7 +281,7 @@ impl KvmVm {
     /// `register_irqfd`.
     pub fn unregister_irqfd(&self, gsi: u32, evt: &Event) -> Result<()> {
         let irqfd = kvm_irqfd {
-            fd: evt.as_raw_fd() as u32,
+            fd: evt.as_raw_descriptor() as u32,
             gsi,
             flags: KVM_IRQFD_FLAG_DEASSIGN,
             ..Default::default()
@@ -385,7 +361,7 @@ impl KvmVm {
                 IoEventAddress::Pio(p) => p as u64,
                 IoEventAddress::Mmio(m) => m,
             },
-            fd: evt.as_raw_fd(),
+            fd: evt.as_raw_descriptor(),
             flags,
             ..Default::default()
         };
@@ -468,7 +444,7 @@ impl Vm for KvmVm {
         };
 
         if let Err(e) = res {
-            gaps.push(MemSlotOrd(slot));
+            gaps.push(Reverse(slot));
             return Err(e);
         }
         regions.insert(slot, mem);
@@ -496,7 +472,7 @@ impl Vm for KvmVm {
         unsafe {
             set_user_memory_region(&self.vm, slot, false, false, 0, 0, std::ptr::null_mut())?;
         }
-        self.mem_slot_gaps.lock().push(MemSlotOrd(slot));
+        self.mem_slot_gaps.lock().push(Reverse(slot));
         // This remove will always succeed because of the contains_key check above.
         Ok(regions.remove(&slot).unwrap())
     }
@@ -553,7 +529,7 @@ impl Vm for KvmVm {
     }
 
     fn register_ioevent(
-        &self,
+        &mut self,
         evt: &Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
@@ -562,12 +538,17 @@ impl Vm for KvmVm {
     }
 
     fn unregister_ioevent(
-        &self,
+        &mut self,
         evt: &Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
     ) -> Result<()> {
         self.ioeventfd(evt, addr, datamatch, true)
+    }
+
+    fn handle_io_events(&self, _addr: IoEventAddress, _data: &[u8]) -> Result<()> {
+        // KVM delivers IO events in-kernel with ioeventfds, so this is a no-op
+        Ok(())
     }
 
     fn get_pvclock(&self) -> Result<ClockState> {
@@ -585,16 +566,11 @@ impl AsRawDescriptor for KvmVm {
     }
 }
 
-impl AsRawFd for KvmVm {
-    fn as_raw_fd(&self) -> RawFd {
-        self.vm.as_raw_descriptor()
-    }
-}
-
 /// A wrapper around using a KVM Vcpu.
 pub struct KvmVcpu {
     vm: SafeDescriptor,
     vcpu: SafeDescriptor,
+    id: usize,
     run_mmap: MemoryMapping,
     vcpu_run_handle_fingerprint: Arc<AtomicU64>,
 }
@@ -619,6 +595,7 @@ impl Vcpu for KvmVcpu {
         Ok(KvmVcpu {
             vm,
             vcpu,
+            id: self.id,
             run_mmap,
             vcpu_run_handle_fingerprint,
         })
@@ -680,6 +657,10 @@ impl Vcpu for KvmVcpu {
         Ok(ManuallyDrop::into_inner(vcpu_run_handle))
     }
 
+    fn id(&self) -> usize {
+        self.id
+    }
+
     #[allow(clippy::cast_ptr_alignment)]
     fn set_immediate_exit(&self, exit: bool) {
         // Safe because we know we mapped enough memory to hold the kvm_run struct because the
@@ -704,11 +685,6 @@ impl Vcpu for KvmVcpu {
             KvmVcpu::set_local_immediate_exit(true);
         }
         f
-    }
-
-    fn handle_io_events(&self, _addr: IoEventAddress) -> Result<()> {
-        // KVM delivers IO events in-kernel with ioeventfds, so this is a no-op
-        Ok(())
     }
 
     #[allow(clippy::cast_ptr_alignment)]
@@ -996,8 +972,8 @@ impl KvmVcpu {
     }
 }
 
-impl AsRawFd for KvmVcpu {
-    fn as_raw_fd(&self) -> RawFd {
+impl AsRawDescriptor for KvmVcpu {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
         self.vcpu.as_raw_descriptor()
     }
 }
@@ -1040,7 +1016,7 @@ impl From<&IrqRoute> for kvm_irq_routing_entry {
                         address_lo: *address as u32,
                         address_hi: (*address >> 32) as u32,
                         data: *data,
-                        pad: 0,
+                        ..Default::default()
                     },
                 },
                 ..Default::default()
@@ -1109,8 +1085,7 @@ impl From<&MPState> for kvm_mp_state {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base::{pagesize, MemoryMappingArena, MemoryMappingBuilder};
-    use std::os::unix::io::FromRawFd;
+    use base::{pagesize, FromRawDescriptor, MemoryMappingArena, MemoryMappingBuilder};
     use std::thread;
     use vm_memory::GuestAddress;
 
@@ -1313,7 +1288,7 @@ mod tests {
         vm.register_irqfd(4, &evtfd1, Some(&evtfd2)).unwrap();
         vm.unregister_irqfd(4, &evtfd1).unwrap();
         // Ensures the ioctl is actually reading the resamplefd.
-        vm.register_irqfd(4, &evtfd1, Some(unsafe { &Event::from_raw_fd(-1) }))
+        vm.register_irqfd(4, &evtfd1, Some(unsafe { &Event::from_raw_descriptor(-1) }))
             .unwrap_err();
     }
 
@@ -1339,7 +1314,7 @@ mod tests {
     fn register_ioevent() {
         let kvm = Kvm::new().unwrap();
         let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm).unwrap();
+        let mut vm = KvmVm::new(&kvm, gm).unwrap();
         let evtfd = Event::new().unwrap();
         vm.register_ioevent(&evtfd, IoEventAddress::Pio(0xf4), Datamatch::AnyLength)
             .unwrap();
@@ -1375,7 +1350,7 @@ mod tests {
     fn unregister_ioevent() {
         let kvm = Kvm::new().unwrap();
         let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm).unwrap();
+        let mut vm = KvmVm::new(&kvm, gm).unwrap();
         let evtfd = Event::new().unwrap();
         vm.register_ioevent(&evtfd, IoEventAddress::Pio(0xf4), Datamatch::AnyLength)
             .unwrap();

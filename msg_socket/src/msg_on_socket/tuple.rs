@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use base::RawDescriptor;
 use std::mem::size_of;
-use std::os::unix::io::RawFd;
 
 use crate::{MsgOnSocket, MsgResult};
 
@@ -16,7 +16,7 @@ fn tuple_size_helper<T: MsgOnSocket>(v: &T) -> usize {
 
 unsafe fn tuple_read_helper<T: MsgOnSocket>(
     buffer: &[u8],
-    fds: &[RawFd],
+    fds: &[RawDescriptor],
     buffer_index: &mut usize,
     fd_index: &mut usize,
 ) -> MsgResult<T> {
@@ -36,7 +36,7 @@ unsafe fn tuple_read_helper<T: MsgOnSocket>(
 fn tuple_write_helper<T: MsgOnSocket>(
     v: &T,
     buffer: &mut [u8],
-    fds: &mut [RawFd],
+    fds: &mut [RawDescriptor],
     buffer_index: &mut usize,
     fd_index: &mut usize,
 ) -> MsgResult<()> {
@@ -59,12 +59,12 @@ macro_rules! tuple_impls {
     ($t: ident) => {
         #[allow(unused_variables, non_snake_case)]
         impl<$t: MsgOnSocket> MsgOnSocket for ($t,) {
-            fn uses_fd() -> bool {
-                $t::uses_fd()
+            fn uses_descriptor() -> bool {
+                $t::uses_descriptor()
             }
 
-            fn fd_count(&self) -> usize {
-                self.0.fd_count()
+            fn descriptor_count(&self) -> usize {
+                self.0.descriptor_count()
             }
 
             fn fixed_size() -> Option<usize> {
@@ -75,7 +75,7 @@ macro_rules! tuple_impls {
                 self.0.msg_size()
             }
 
-            unsafe fn read_from_buffer(buffer: &[u8], fds: &[RawFd]) -> MsgResult<(Self, usize)> {
+            unsafe fn read_from_buffer(buffer: &[u8], fds: &[RawDescriptor]) -> MsgResult<(Self, usize)> {
                 let (t, s) = $t::read_from_buffer(buffer, fds)?;
                 Ok(((t,), s))
             }
@@ -83,7 +83,7 @@ macro_rules! tuple_impls {
             fn write_to_buffer(
                 &self,
                 buffer: &mut [u8],
-                fds: &mut [RawFd],
+                fds: &mut [RawDescriptor],
             ) -> MsgResult<usize> {
                 self.0.write_to_buffer(buffer, fds)
             }
@@ -92,16 +92,16 @@ macro_rules! tuple_impls {
     ($t: ident, $($ts:ident),*) => {
         #[allow(unused_variables, non_snake_case)]
         impl<$t: MsgOnSocket $(, $ts: MsgOnSocket)*> MsgOnSocket for ($t$(, $ts)*) {
-            fn uses_fd() -> bool {
-                $t::uses_fd() $(|| $ts::uses_fd())*
+            fn uses_descriptor() -> bool {
+                $t::uses_descriptor() $(|| $ts::uses_descriptor())*
             }
 
-            fn fd_count(&self) -> usize {
-                if Self::uses_fd() {
+            fn descriptor_count(&self) -> usize {
+                if Self::uses_descriptor() {
                     return 0;
                 }
                 let ($t $(,$ts)*) = self;
-                $t.fd_count() $(+ $ts.fd_count())*
+                $t.descriptor_count() $(+ $ts.descriptor_count())*
             }
 
             fn fixed_size() -> Option<usize> {
@@ -118,7 +118,7 @@ macro_rules! tuple_impls {
                 tuple_size_helper($t) $(+ tuple_size_helper($ts))*
             }
 
-            unsafe fn read_from_buffer(buffer: &[u8], fds: &[RawFd]) -> MsgResult<(Self, usize)> {
+            unsafe fn read_from_buffer(buffer: &[u8], fds: &[RawDescriptor]) -> MsgResult<(Self, usize)> {
                 let mut buffer_index = 0;
                 let mut fd_index = 0;
                 Ok((
@@ -137,7 +137,7 @@ macro_rules! tuple_impls {
             fn write_to_buffer(
                 &self,
                 buffer: &mut [u8],
-                fds: &mut [RawFd],
+                fds: &mut [RawDescriptor],
             ) -> MsgResult<usize> {
                 let mut buffer_index = 0;
                 let mut fd_index = 0;

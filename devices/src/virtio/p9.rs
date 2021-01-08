@@ -5,12 +5,10 @@
 use std::fmt::{self, Display};
 use std::io::{self, Write};
 use std::mem;
-use std::os::unix::io::RawFd;
-use std::path::{Path, PathBuf};
 use std::result;
 use std::thread;
 
-use base::{error, warn, Error as SysError, Event, PollContext, PollToken};
+use base::{error, warn, Error as SysError, Event, PollToken, RawDescriptor, WaitContext};
 use vm_memory::GuestMemory;
 
 use super::{
@@ -28,12 +26,12 @@ const VIRTIO_9P_MOUNT_TAG: u8 = 0;
 pub enum P9Error {
     /// The tag for the 9P device was too large to fit in the config space.
     TagTooLong(usize),
-    /// The root directory for the 9P server is not absolute.
-    RootNotAbsolute(PathBuf),
-    /// Creating PollContext failed.
-    CreatePollContext(SysError),
+    /// Creating WaitContext failed.
+    CreateWaitContext(SysError),
+    /// Failed to create a 9p server.
+    CreateServer(io::Error),
     /// Error while polling for events.
-    PollError(SysError),
+    WaitError(SysError),
     /// Error while reading from the virtio queue's Event.
     ReadQueueEvent(SysError),
     /// A request is missing readable descriptors.
@@ -61,13 +59,9 @@ impl Display for P9Error {
                 len,
                 ::std::u16::MAX
             ),
-            RootNotAbsolute(buf) => write!(
-                f,
-                "P9 root directory is not absolute: root = {}",
-                buf.display()
-            ),
-            CreatePollContext(err) => write!(f, "failed to create PollContext: {}", err),
-            PollError(err) => write!(f, "failed to poll events: {}", err),
+            CreateWaitContext(err) => write!(f, "failed to create WaitContext: {}", err),
+            WaitError(err) => write!(f, "failed to wait for events: {}", err),
+            CreateServer(err) => write!(f, "failed to create 9p server: {}", err),
             ReadQueueEvent(err) => write!(f, "failed to read from virtio queue Event: {}", err),
             NoReadableDescriptors => write!(f, "request does not have any readable descriptors"),
             NoWritableDescriptors => write!(f, "request does not have any writable descriptors"),
@@ -121,17 +115,17 @@ impl Worker {
             Kill,
         }
 
-        let poll_ctx: PollContext<Token> = PollContext::build_with(&[
+        let wait_ctx: WaitContext<Token> = WaitContext::build_with(&[
             (&queue_evt, Token::QueueReady),
             (self.interrupt.get_resample_evt(), Token::InterruptResample),
             (&kill_evt, Token::Kill),
         ])
-        .map_err(P9Error::CreatePollContext)?;
+        .map_err(P9Error::CreateWaitContext)?;
 
         loop {
-            let events = poll_ctx.wait().map_err(P9Error::PollError)?;
-            for event in events.iter_readable() {
-                match event.token() {
+            let events = wait_ctx.wait().map_err(P9Error::WaitError)?;
+            for event in events.iter().filter(|e| e.is_readable) {
+                match event.token {
                     Token::QueueReady => {
                         queue_evt.read().map_err(P9Error::ReadQueueEvent)?;
                         self.process_queue()?;
@@ -157,17 +151,9 @@ pub struct P9 {
 }
 
 impl P9 {
-    pub fn new<P: AsRef<Path> + Into<Box<Path>>>(
-        base_features: u64,
-        root: P,
-        tag: &str,
-    ) -> P9Result<P9> {
+    pub fn new(base_features: u64, tag: &str, p9_cfg: p9::Config) -> P9Result<P9> {
         if tag.len() > ::std::u16::MAX as usize {
             return Err(P9Error::TagTooLong(tag.len()));
-        }
-
-        if !root.as_ref().is_absolute() {
-            return Err(P9Error::RootNotAbsolute(root.as_ref().into()));
         }
 
         let len = tag.len() as u16;
@@ -177,13 +163,10 @@ impl P9 {
 
         cfg.write_all(tag.as_bytes()).map_err(P9Error::Internal)?;
 
+        let server = p9::Server::with_config(p9_cfg).map_err(P9Error::CreateServer)?;
         Ok(P9 {
             config: cfg,
-            server: Some(p9::Server::new(
-                root,
-                Default::default(),
-                Default::default(),
-            )),
+            server: Some(server),
             kill_evt: None,
             avail_features: base_features | 1 << VIRTIO_9P_MOUNT_TAG,
             acked_features: 0,
@@ -193,8 +176,11 @@ impl P9 {
 }
 
 impl VirtioDevice for P9 {
-    fn keep_fds(&self) -> Vec<RawFd> {
-        Vec::new()
+    fn keep_rds(&self) -> Vec<RawDescriptor> {
+        self.server
+            .as_ref()
+            .map(p9::Server::keep_fds)
+            .unwrap_or_else(Vec::new)
     }
 
     fn device_type(&self) -> u32 {
