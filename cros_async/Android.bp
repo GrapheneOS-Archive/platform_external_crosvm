@@ -9,12 +9,12 @@ rust_defaults {
     auto_gen_config: true,
     edition: "2018",
     rustlibs: [
-        "libbase_rust",
         "libfutures",
         "libio_uring",
         "liblibc",
         "libpin_utils",
         "libslab",
+        "libsys_util",
         "libsyscall_defines",
         "libtempfile",
         "libthiserror",
@@ -44,12 +44,12 @@ rust_library {
     srcs: ["src/lib.rs"],
     edition: "2018",
     rustlibs: [
-        "libbase_rust",
         "libfutures",
         "libio_uring",
         "liblibc",
         "libpin_utils",
         "libslab",
+        "libsys_util",
         "libsyscall_defines",
         "libthiserror",
     ],
@@ -86,7 +86,7 @@ rust_library {
 //   proc-macro2-1.0.24 "default,proc-macro"
 //   quote-1.0.7 "default,proc-macro"
 //   slab-0.4.2
-//   syn-1.0.50 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.53 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   thiserror-1.0.22
 //   thiserror-impl-1.0.22
 //   unicode-xid-0.2.1 "default"

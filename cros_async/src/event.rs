@@ -2,26 +2,29 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::{new, AsyncResult, IoSourceExt};
-use std::os::unix::io::AsRawFd;
+use crate::io_ext::async_from;
+use crate::{AsyncError, AsyncResult, IntoAsync, IoSourceExt};
+use std::convert::TryFrom;
+use sys_util::EventFd;
 
-/// An async version of sys_util::EventFd.
-pub struct EventAsync<F: AsRawFd + 'static> {
-    io_source: Box<dyn IoSourceExt<F> + 'static>,
+/// An async version of `sys_util::EventFd`.
+pub struct EventAsync {
+    io_source: Box<dyn IoSourceExt<EventFd>>,
 }
 
-impl<F: AsRawFd + 'static> EventAsync<F> {
-    /// Creates a new EventAsync wrapper around the provided eventfd.
-    #[allow(dead_code)]
-    pub fn new(f: F) -> AsyncResult<EventAsync<F>> {
-        Ok(EventAsync { io_source: new(f)? })
+impl EventAsync {
+    #[cfg(test)]
+    pub(crate) fn new_poll(event: EventFd) -> AsyncResult<EventAsync> {
+        Ok(EventAsync {
+            io_source: crate::io_ext::async_poll_from(event)?,
+        })
     }
 
-    /// Like new, but allows the source to be constructed directly. Used for
-    /// testing only.
     #[cfg(test)]
-    pub(crate) fn new_from_source(io_source: Box<dyn IoSourceExt<F> + 'static>) -> EventAsync<F> {
-        EventAsync { io_source }
+    pub(crate) fn new_uring(event: EventFd) -> AsyncResult<EventAsync> {
+        Ok(EventAsync {
+            io_source: crate::io_ext::async_uring_from(event)?,
+        })
     }
 
     /// Gets the next value from the eventfd.
@@ -31,21 +34,33 @@ impl<F: AsRawFd + 'static> EventAsync<F> {
     }
 }
 
+impl TryFrom<EventFd> for EventAsync {
+    type Error = AsyncError;
+
+    /// Creates a new EventAsync wrapper around the provided eventfd.
+    fn try_from(event: EventFd) -> AsyncResult<Self> {
+        Ok(EventAsync {
+            io_source: async_from(event)?,
+        })
+    }
+}
+
+impl IntoAsync for EventFd {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io_ext::{new_poll, new_uring};
-    use base::Event;
     use futures::pin_mut;
+    use std::convert::TryInto;
 
     #[test]
     fn next_val_reads_value() {
-        async fn go(event: Event) -> u64 {
-            let event_async = EventAsync::new(event).unwrap();
+        async fn go(event: EventFd) -> u64 {
+            let event_async: EventAsync = event.try_into().unwrap();
             event_async.next_val().await.unwrap()
         }
 
-        let eventfd = Event::new().unwrap();
+        let eventfd = EventFd::new().unwrap();
         eventfd.write(0xaa).unwrap();
         let fut = go(eventfd);
         pin_mut!(fut);
@@ -55,23 +70,22 @@ mod tests {
 
     #[test]
     fn next_val_reads_value_poll_and_ring() {
-        async fn go(source: Box<dyn IoSourceExt<Event> + 'static>) -> u64 {
-            let event_async = EventAsync::new_from_source(source);
+        async fn go(event_async: EventAsync) -> u64 {
             event_async.next_val().await.unwrap()
         }
 
-        let eventfd = Event::new().unwrap();
+        let eventfd = EventFd::new().unwrap();
         eventfd.write(0xaa).unwrap();
-        let fut = go(new_poll(eventfd).unwrap());
+        let fut = go(EventAsync::new_uring(eventfd).unwrap());
         pin_mut!(fut);
-        let val = crate::run_executor(crate::RunOne::new(fut)).unwrap();
+        let val = crate::run_one_uring(fut).unwrap();
         assert_eq!(val, 0xaa);
 
-        let eventfd = Event::new().unwrap();
+        let eventfd = EventFd::new().unwrap();
         eventfd.write(0xaa).unwrap();
-        let fut = go(new_uring(eventfd).unwrap());
+        let fut = go(EventAsync::new_poll(eventfd).unwrap());
         pin_mut!(fut);
-        let val = crate::run_executor(crate::RunOne::new(fut)).unwrap();
+        let val = crate::run_one_poll(fut).unwrap();
         assert_eq!(val, 0xaa);
     }
 }

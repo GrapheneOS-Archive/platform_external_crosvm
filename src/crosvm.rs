@@ -6,7 +6,10 @@
 //! configs.
 
 pub mod argument;
-pub mod linux;
+#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+pub mod gdb;
+#[path = "linux.rs"]
+pub mod platform;
 #[cfg(feature = "plugin")]
 pub mod plugin;
 
@@ -23,6 +26,7 @@ use devices::virtio::gpu::GpuParameters;
 #[cfg(feature = "audio")]
 use devices::Ac97Parameters;
 use libc::{getegid, geteuid};
+use vm_control::BatteryType;
 
 static SECCOMP_POLICY_DIR: &str = "/usr/share/policy/crosvm";
 
@@ -142,7 +146,8 @@ pub struct SharedDir {
     pub kind: SharedDirKind,
     pub uid_map: String,
     pub gid_map: String,
-    pub cfg: passthrough::Config,
+    pub fs_cfg: passthrough::Config,
+    pub p9_cfg: p9::Config,
 }
 
 impl Default for SharedDir {
@@ -153,7 +158,8 @@ impl Default for SharedDir {
             kind: Default::default(),
             uid_map: format!("0 {} 1", unsafe { geteuid() }),
             gid_map: format!("0 {} 1", unsafe { getegid() }),
-            cfg: Default::default(),
+            fs_cfg: Default::default(),
+            p9_cfg: Default::default(),
         }
     }
 }
@@ -210,6 +216,9 @@ pub struct Config {
     pub video_enc: bool,
     pub acpi_tables: Vec<PathBuf>,
     pub protected_vm: bool,
+    pub battery_type: Option<BatteryType>,
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+    pub gdb: Option<u32>,
 }
 
 impl Default for Config {
@@ -265,6 +274,9 @@ impl Default for Config {
             video_enc: false,
             acpi_tables: Vec::new(),
             protected_vm: false,
+            battery_type: None,
+            #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+            gdb: None,
         }
     }
 }

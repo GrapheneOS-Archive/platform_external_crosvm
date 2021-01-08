@@ -12,7 +12,7 @@ pub mod x86_64;
 
 use std::os::raw::c_int;
 
-use base::{Event, MappedRegion, Result, SafeDescriptor};
+use base::{Event, MappedRegion, RawDescriptor, Result, SafeDescriptor};
 use msg_socket::MsgOnSocket;
 use vm_memory::{GuestAddress, GuestMemory};
 
@@ -109,7 +109,7 @@ pub trait Vm: Send {
     /// In all cases where `evt` is signaled, the ordinary vmexit to userspace that would be
     /// triggered is prevented.
     fn register_ioevent(
-        &self,
+        &mut self,
         evt: &Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
@@ -120,11 +120,17 @@ pub trait Vm: Send {
     /// The `evt`, `addr`, and `datamatch` set must be the same as the ones passed into
     /// `register_ioevent`.
     fn unregister_ioevent(
-        &self,
+        &mut self,
         evt: &Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
     ) -> Result<()>;
+
+    /// Trigger any matching registered io events based on an MMIO or PIO write at `addr`. The
+    /// `data` slice represents the contents and length of the write, which is used to compare with
+    /// the registered io events' Datamatch values. If the hypervisor does in-kernel IO event
+    /// delivery, this is a no-op.
+    fn handle_io_events(&self, addr: IoEventAddress, data: &[u8]) -> Result<()>;
 
     /// Retrieves the current timestamp of the paravirtual clock as seen by the current guest.
     /// Only works on VMs that support `VmCap::PvClock`.
@@ -215,6 +221,9 @@ pub trait Vcpu: downcast_rs::DowncastSync {
     /// `take_run_handle` for this `Vcpu`.
     fn run(&self, run_handle: &VcpuRunHandle) -> Result<VcpuExit>;
 
+    /// Returns the vcpu id.
+    fn id(&self) -> usize;
+
     /// Sets the bit that requests an immediate exit.
     fn set_immediate_exit(&self, exit: bool);
 
@@ -226,10 +235,6 @@ pub trait Vcpu: downcast_rs::DowncastSync {
     /// Returns a function pointer that invokes `set_local_immediate_exit` in a
     /// signal-safe way when called.
     fn set_local_immediate_exit_fn(&self) -> extern "C" fn();
-
-    /// Trigger any io events based on the memory mapped IO at `addr`.  If the hypervisor does
-    /// in-kernel IO event delivery, this is a no-op.
-    fn handle_io_events(&self, addr: IoEventAddress) -> Result<()>;
 
     /// Sets the data received by a mmio read, ioport in, or hypercall instruction.
     ///
@@ -254,13 +259,14 @@ pub trait Vcpu: downcast_rs::DowncastSync {
 downcast_rs::impl_downcast!(sync Vcpu);
 
 /// An address either in programmable I/O space or in memory mapped I/O space.
-#[derive(Copy, Clone, Debug, MsgOnSocket)]
+#[derive(Copy, Clone, Debug, MsgOnSocket, PartialEq, Eq, std::hash::Hash)]
 pub enum IoEventAddress {
     Pio(u64),
     Mmio(u64),
 }
 
 /// Used in `Vm::register_ioevent` to indicate a size and optionally value to match.
+#[derive(PartialEq, Eq)]
 pub enum Datamatch {
     AnyLength,
     U8(Option<u8>),

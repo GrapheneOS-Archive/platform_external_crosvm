@@ -18,11 +18,14 @@ use base::Event;
 use devices::{
     Bus, BusError, IrqChip, IrqChipAArch64, PciAddress, PciConfigMmio, PciDevice, PciInterruptPin,
 };
-use hypervisor::{DeviceKind, Hypervisor, HypervisorCap, VcpuAArch64, VcpuFeature, VmAArch64};
+use hypervisor::{
+    DeviceKind, Hypervisor, HypervisorCap, PsciVersion, VcpuAArch64, VcpuFeature, VmAArch64,
+};
 use minijail::Minijail;
 use remain::sorted;
 use resources::SystemAllocator;
 use sync::Mutex;
+use vm_control::BatteryType;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
 mod fdt;
@@ -123,6 +126,7 @@ pub enum Error {
     CreateVcpu(base::Error),
     CreateVm(Box<dyn StdError>),
     DowncastVcpu,
+    GetPsciVersion(base::Error),
     GetSerialCmdline(GetSerialCmdlineError),
     InitrdLoadFailure(arch::LoadImageError),
     KernelLoadFailure(arch::LoadImageError),
@@ -156,6 +160,7 @@ impl Display for Error {
             CreateVcpu(e) => write!(f, "failed to create VCPU: {}", e),
             CreateVm(e) => write!(f, "failed to create vm: {}", e),
             DowncastVcpu => write!(f, "vm created wrong kind of vcpu"),
+            GetPsciVersion(e) => write!(f, "failed to get PSCI version: {}", e),
             GetSerialCmdline(e) => write!(f, "failed to get serial cmdline: {}", e),
             InitrdLoadFailure(e) => write!(f, "initrd cound not be loaded: {}", e),
             KernelLoadFailure(e) => write!(f, "kernel cound not be loaded: {}", e),
@@ -197,6 +202,7 @@ impl arch::LinuxArch for AArch64 {
         mut components: VmComponents,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
+        _battery: (&Option<BatteryType>, Option<Minijail>),
         create_devices: FD,
         create_vm: FV,
         create_irq_chip: FI,
@@ -290,12 +296,7 @@ impl arch::LinuxArch for AArch64 {
             .map_err(Error::RegisterIrqfd)?;
 
         mmio_bus
-            .insert(
-                pci_bus.clone(),
-                AARCH64_PCI_CFG_BASE,
-                AARCH64_PCI_CFG_SIZE,
-                false,
-            )
+            .insert(pci_bus.clone(), AARCH64_PCI_CFG_BASE, AARCH64_PCI_CFG_SIZE)
             .map_err(Error::RegisterPci)?;
 
         let mut cmdline = Self::get_base_linux_cmdline();
@@ -316,6 +317,8 @@ impl arch::LinuxArch for AArch64 {
         let kernel_size = arch::load_image(&mem, kernel_image, get_kernel_addr(), u64::max_value())
             .map_err(Error::KernelLoadFailure)?;
         let kernel_end = get_kernel_addr().offset() + kernel_size as u64;
+        let psci_version = vcpus[0].get_psci_version().map_err(Error::GetPsciVersion)?;
+
         Self::setup_system_memory(
             &mem,
             components.memory_size,
@@ -327,6 +330,7 @@ impl arch::LinuxArch for AArch64 {
             kernel_end,
             irq_chip.get_vgic_version() == DeviceKind::ArmVgicV3,
             use_pmu,
+            psci_version,
         )?;
 
         Ok(RunnableLinuxVm {
@@ -344,6 +348,7 @@ impl arch::LinuxArch for AArch64 {
             pid_debug_label_map,
             suspend_evt,
             rt_cpus: components.rt_cpus,
+            bat_control: None,
         })
     }
 
@@ -374,6 +379,7 @@ impl AArch64 {
         kernel_end: u64,
         is_gicv3: bool,
         use_pmu: bool,
+        psci_version: PsciVersion,
     ) -> Result<()> {
         let initrd = match initrd_file {
             Some(initrd_file) => {
@@ -403,6 +409,7 @@ impl AArch64 {
             android_fstab,
             is_gicv3,
             use_pmu,
+            psci_version,
         )
         .map_err(Error::CreateFdt)?;
         Ok(())
@@ -450,7 +457,7 @@ impl AArch64 {
             .map_err(Error::RegisterIrqfd)?;
 
         let rtc = Arc::new(Mutex::new(devices::pl030::Pl030::new(rtc_evt)));
-        bus.insert(rtc, AARCH64_RTC_ADDR, AARCH64_RTC_SIZE, false)
+        bus.insert(rtc, AARCH64_RTC_ADDR, AARCH64_RTC_SIZE)
             .expect("failed to add rtc device");
 
         Ok(())

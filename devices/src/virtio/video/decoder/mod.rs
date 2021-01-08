@@ -2,14 +2,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-//! Implementation of a virtio video decoder device backed by LibVDA.
+//! Implementation of a virtio video decoder backed by a device.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
-use std::os::unix::io::IntoRawFd;
 
-use base::{error, PollContext};
+use backend::*;
+use base::{error, IntoRawDescriptor, WaitContext};
 
 use crate::virtio::resource_bridge::{self, ResourceInfo, ResourceRequestSocket};
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
@@ -23,7 +23,9 @@ use crate::virtio::video::params::Params;
 use crate::virtio::video::protocol;
 use crate::virtio::video::response::CmdResponse;
 
+mod backend;
 mod capability;
+
 use capability::*;
 
 type StreamId = u32;
@@ -74,7 +76,7 @@ struct OutputResources {
     // destroyed.
     eos_resource_id: Option<OutputResourceId>,
 
-    // This is a flag that shows whether libvda's set_output_buffer_count is called.
+    // This is a flag that shows whether the device's set_output_buffer_count is called.
     // This will be set to true when ResourceCreate for OutputBuffer is called for the first time.
     //
     // TODO(b/1518105): This field is added as a hack because the current virtio-video v3 spec
@@ -154,10 +156,10 @@ impl OutputResources {
     }
 }
 
-// Context is associated with one `libvda::Session`, which corresponds to one stream from the
+// Context is associated with one `DecoderSession`, which corresponds to one stream from the
 // virtio-video's point of view.
 #[derive(Default)]
-struct Context {
+struct Context<S: DecoderSession> {
     stream_id: StreamId,
 
     in_params: Params,
@@ -165,9 +167,14 @@ struct Context {
 
     in_res: InputResources,
     out_res: OutputResources,
+
+    // Set the flag if we need to clear output resource when the output queue is cleared next time.
+    is_clear_out_res_needed: bool,
+
+    session: Option<S>,
 }
 
-impl Context {
+impl<S: DecoderSession> Context<S> {
     fn new(stream_id: StreamId, format: Format) -> Self {
         Context {
             stream_id,
@@ -179,7 +186,10 @@ impl Context {
                 ..Default::default()
             },
             out_params: Default::default(),
-            ..Default::default()
+            in_res: Default::default(),
+            out_res: Default::default(),
+            is_clear_out_res_needed: false,
+            session: None,
         }
     }
 
@@ -217,7 +227,7 @@ impl Context {
     }
 
     /*
-     * Functions handling libvda events.
+     * Functions handling decoder events.
      */
 
     fn handle_provide_picture_buffers(
@@ -225,16 +235,13 @@ impl Context {
         min_num_buffers: u32,
         width: i32,
         height: i32,
-        visible_rect_left: i32,
-        visible_rect_top: i32,
-        visible_rect_right: i32,
-        visible_rect_bottom: i32,
+        visible_rect: Rect,
     ) {
         // We only support NV12.
         let format = Some(Format::NV12);
 
-        let rect_width: u32 = (visible_rect_right - visible_rect_left) as u32;
-        let rect_height: u32 = (visible_rect_bottom - visible_rect_top) as u32;
+        let rect_width: u32 = (visible_rect.right - visible_rect.left) as u32;
+        let rect_height: u32 = (visible_rect.bottom - visible_rect.top) as u32;
 
         let plane_size = rect_width * rect_height;
         let stride = rect_width;
@@ -252,8 +259,8 @@ impl Context {
             min_buffers: min_num_buffers + 1,
             max_buffers: 32,
             crop: Crop {
-                left: visible_rect_left as u32,
-                top: visible_rect_top as u32,
+                left: visible_rect.left as u32,
+                top: visible_rect.top as u32,
                 width: rect_width,
                 height: rect_height,
             },
@@ -261,6 +268,12 @@ impl Context {
             // No need to set `frame_rate`, as it's only for the encoder.
             ..Default::default()
         };
+
+        // That eos_resource_id has value means there are previous output resources.
+        // Clear the output resources when the output queue is cleared next time.
+        if self.out_res.eos_resource_id.is_some() {
+            self.is_clear_out_res_needed = true;
+        }
     }
 
     fn handle_picture_ready(
@@ -295,13 +308,18 @@ impl Context {
 }
 
 /// A thin wrapper of a map of contexts with error handlings.
-#[derive(Default)]
-struct ContextMap {
-    map: BTreeMap<StreamId, Context>,
+struct ContextMap<S: DecoderSession> {
+    map: BTreeMap<StreamId, Context<S>>,
 }
 
-impl ContextMap {
-    fn insert(&mut self, ctx: Context) -> VideoResult<()> {
+impl<S: DecoderSession> ContextMap<S> {
+    fn new() -> Self {
+        ContextMap {
+            map: Default::default(),
+        }
+    }
+
+    fn insert(&mut self, ctx: Context<S>) -> VideoResult<()> {
         match self.map.entry(ctx.stream_id) {
             Entry::Vacant(e) => {
                 e.insert(ctx);
@@ -314,14 +332,14 @@ impl ContextMap {
         }
     }
 
-    fn get(&self, stream_id: &StreamId) -> VideoResult<&Context> {
+    fn get(&self, stream_id: &StreamId) -> VideoResult<&Context<S>> {
         self.map.get(stream_id).ok_or_else(|| {
             error!("failed to get context of stream {}", *stream_id);
             VideoError::InvalidStreamId(*stream_id)
         })
     }
 
-    fn get_mut(&mut self, stream_id: &StreamId) -> VideoResult<&mut Context> {
+    fn get_mut(&mut self, stream_id: &StreamId) -> VideoResult<&mut Context<S>> {
         self.map.get_mut(stream_id).ok_or_else(|| {
             error!("failed to get context of stream {}", *stream_id);
             VideoError::InvalidStreamId(*stream_id)
@@ -329,59 +347,14 @@ impl ContextMap {
     }
 }
 
-/// A thin wrapper of a map of libvda sesssions with error handlings.
-#[derive(Default)]
-struct SessionMap<'a> {
-    map: BTreeMap<u32, libvda::decode::Session<'a>>,
-}
-
-impl<'a> SessionMap<'a> {
-    fn contains_key(&self, stream_id: StreamId) -> bool {
-        self.map.contains_key(&stream_id)
-    }
-
-    fn get(&self, stream_id: &StreamId) -> VideoResult<&libvda::decode::Session<'a>> {
-        self.map.get(&stream_id).ok_or_else(|| {
-            error!("failed to get libvda session {}", *stream_id);
-            VideoError::InvalidStreamId(*stream_id)
-        })
-    }
-
-    fn get_mut(&mut self, stream_id: &StreamId) -> VideoResult<&mut libvda::decode::Session<'a>> {
-        self.map.get_mut(&stream_id).ok_or_else(|| {
-            error!("failed to get libvda session {}", *stream_id);
-            VideoError::InvalidStreamId(*stream_id)
-        })
-    }
-
-    fn insert(
-        &mut self,
-        stream_id: StreamId,
-        session: libvda::decode::Session<'a>,
-    ) -> Option<libvda::decode::Session<'a>> {
-        self.map.insert(stream_id, session)
-    }
-}
-
-/// Represents information of a decoder backed with `libvda`.
-pub struct Decoder<'a> {
-    vda: &'a libvda::decode::VdaInstance,
+/// Represents information of a decoder backed by a `DecoderBackend`.
+pub struct Decoder<D: DecoderBackend> {
+    decoder: D,
     capability: Capability,
-    contexts: ContextMap,
-    sessions: SessionMap<'a>,
+    contexts: ContextMap<D::Session>,
 }
 
-impl<'a> Decoder<'a> {
-    pub fn new(vda: &'a libvda::decode::VdaInstance) -> Self {
-        let capability = Capability::new(vda.get_capabilities());
-        Decoder {
-            vda,
-            capability,
-            contexts: Default::default(),
-            sessions: Default::default(),
-        }
-    }
-
+impl<'a, D: DecoderBackend> Decoder<D> {
     /*
      * Functions processing virtio-video commands.
      */
@@ -397,7 +370,7 @@ impl<'a> Decoder<'a> {
 
     fn create_stream(&mut self, stream_id: StreamId, coded_format: Format) -> VideoResult<()> {
         // Create an instance of `Context`.
-        // Note that `libvda::Session` will be created not here but at the first call of
+        // Note that the `DecoderSession` will be created not here but at the first call of
         // `ResourceCreate`. This is because we need to fix a coded format for it, which
         // will be set by `SetParams`.
         self.contexts.insert(Context::new(stream_id, coded_format))
@@ -407,43 +380,26 @@ impl<'a> Decoder<'a> {
         if self.contexts.map.remove(&stream_id).is_none() {
             error!("Tried to destroy an invalid stream context {}", stream_id);
         }
-
-        // Close a libVDA session, as closing will be done in `Drop` for `session`.
-        // Note that `sessions` doesn't have an instance for `stream_id` if the
-        // first `ResourceCreate` haven't been called yet.
-        self.sessions.map.remove(&stream_id);
     }
 
     fn create_session(
-        vda: &'a libvda::decode::VdaInstance,
-        poll_ctx: &PollContext<Token>,
-        ctx: &Context,
+        decoder: &D,
+        wait_ctx: &WaitContext<Token>,
+        ctx: &Context<D::Session>,
         stream_id: StreamId,
-    ) -> VideoResult<libvda::decode::Session<'a>> {
-        let profile = match ctx.in_params.format {
-            Some(Format::VP8) => Ok(libvda::Profile::VP8),
-            Some(Format::VP9) => Ok(libvda::Profile::VP9Profile0),
-            Some(Format::H264) => Ok(libvda::Profile::H264ProfileBaseline),
-            Some(f) => {
-                error!("specified format is invalid for bitstream: {}", f);
-                Err(VideoError::InvalidParameter)
-            }
+    ) -> VideoResult<D::Session> {
+        let format = match ctx.in_params.format {
+            Some(f) => f,
             None => {
                 error!("bitstream format is not specified");
-                Err(VideoError::InvalidParameter)
+                return Err(VideoError::InvalidParameter);
             }
-        }?;
+        };
 
-        let session = vda.open_session(profile).map_err(|e| {
-            error!(
-                "failed to open a session {} for {:?}: {}",
-                stream_id, profile, e
-            );
-            VideoError::InvalidOperation
-        })?;
+        let session = decoder.new_session(format)?;
 
-        poll_ctx
-            .add(session.pipe(), Token::Event { id: stream_id })
+        wait_ctx
+            .add(session.event_pipe(), Token::Event { id: stream_id })
             .map_err(|e| {
                 error!(
                     "failed to add FD to poll context for session {}: {}",
@@ -457,7 +413,7 @@ impl<'a> Decoder<'a> {
 
     fn create_resource(
         &mut self,
-        poll_ctx: &PollContext<Token>,
+        wait_ctx: &WaitContext<Token>,
         stream_id: StreamId,
         queue_type: QueueType,
         resource_id: ResourceId,
@@ -465,11 +421,15 @@ impl<'a> Decoder<'a> {
     ) -> VideoResult<()> {
         let ctx = self.contexts.get_mut(&stream_id)?;
 
-        // Create a instance of `libvda::Session` at the first time `ResourceCreate` is
+        // Create a instance of `DecoderSession` at the first time `ResourceCreate` is
         // called here.
-        if !self.sessions.contains_key(stream_id) {
-            let session = Self::create_session(self.vda, poll_ctx, ctx, stream_id)?;
-            self.sessions.insert(stream_id, session);
+        if ctx.session.is_none() {
+            ctx.session = Some(Self::create_session(
+                &self.decoder,
+                wait_ctx,
+                ctx,
+                stream_id,
+            )?);
         }
 
         ctx.register_buffer(queue_type, resource_id, &uuid);
@@ -521,19 +481,20 @@ impl<'a> Decoder<'a> {
         timestamp: u64,
         data_sizes: Vec<u32>,
     ) -> VideoResult<()> {
-        let session = self.sessions.get(&stream_id)?;
         let ctx = self.contexts.get_mut(&stream_id)?;
+        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         if data_sizes.len() != 1 {
             error!("num_data_sizes must be 1 but {}", data_sizes.len());
             return Err(VideoError::InvalidOperation);
         }
 
-        // Take an ownership of this file by `into_raw_fd()` as this file will be closed by libvda.
+        // Take an ownership of this file by `into_raw_descriptor()` as this file will be closed
+        // by the `DecoderBackend`.
         let fd = ctx
             .get_resource_info(QueueType::Input, resource_bridge, resource_id)?
             .file
-            .into_raw_fd();
+            .into_raw_descriptor();
 
         // Register a mapping of timestamp to resource_id
         if let Some(old_resource_id) = ctx
@@ -554,16 +515,12 @@ impl<'a> Decoder<'a> {
         // a guest passes to a driver as a 32-bit integer in our implementation.
         // So, overflow must not happen in this conversion.
         let ts_sec: i32 = (timestamp / 1_000_000_000) as i32;
-        session
-            .decode(
-                ts_sec,
-                fd,            // fd
-                0,             // offset is always 0 due to the driver implementation.
-                data_sizes[0], // bytes_used
-            )
-            .map_err(VideoError::VdaError)?;
-
-        Ok(())
+        session.decode(
+            ts_sec,
+            fd,            // fd
+            0,             // offset is always 0 due to the driver implementation.
+            data_sizes[0], // bytes_used
+        )
     }
 
     fn queue_output_resource(
@@ -572,8 +529,8 @@ impl<'a> Decoder<'a> {
         stream_id: StreamId,
         resource_id: ResourceId,
     ) -> VideoResult<()> {
-        let session = self.sessions.get(&stream_id)?;
         let ctx = self.contexts.get_mut(&stream_id)?;
+        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         // Check if the current pixel format is set to NV12.
         match ctx.out_params.format {
@@ -596,18 +553,16 @@ impl<'a> Decoder<'a> {
                 // Don't enqueue this resource to the host.
                 Ok(())
             }
-            QueueOutputResourceResult::Reused(buffer_id) => session
-                .reuse_output_buffer(buffer_id)
-                .map_err(VideoError::VdaError),
+            QueueOutputResourceResult::Reused(buffer_id) => session.reuse_output_buffer(buffer_id),
             QueueOutputResourceResult::Registered(buffer_id) => {
                 let resource_info =
                     ctx.get_resource_info(QueueType::Output, resource_bridge, resource_id)?;
                 let planes = vec![
-                    libvda::FramePlane {
+                    FramePlane {
                         offset: resource_info.planes[0].offset as i32,
                         stride: resource_info.planes[0].stride as i32,
                     },
-                    libvda::FramePlane {
+                    FramePlane {
                         offset: resource_info.planes[1].offset as i32,
                         stride: resource_info.planes[1].stride as i32,
                     },
@@ -621,17 +576,13 @@ impl<'a> Decoder<'a> {
                     // TODO(b/1518105): This is a hack due to the lack of way of telling a number of
                     // frame buffers explictly in virtio-video v3 RFC. Once we have the way,
                     // set_output_buffer_count should be called with a value passed by the guest.
-                    session
-                        .set_output_buffer_count(OUTPUT_BUFFER_COUNT)
-                        .map_err(VideoError::VdaError)?;
+                    session.set_output_buffer_count(OUTPUT_BUFFER_COUNT)?;
                 }
 
-                // Take ownership of this file by `into_raw_fd()` as this
+                // Take ownership of this file by `into_raw_descriptor()` as this
                 // file will be closed by libvda.
-                let fd = resource_info.file.into_raw_fd();
-                session
-                    .use_output_buffer(buffer_id as i32, libvda::PixelFormat::NV12, fd, &planes)
-                    .map_err(VideoError::VdaError)
+                let fd = resource_info.file.into_raw_descriptor();
+                session.use_output_buffer(buffer_id as i32, Format::NV12, fd, &planes)
             }
         }
     }
@@ -653,7 +604,7 @@ impl<'a> Decoder<'a> {
         let ctx = self.contexts.get_mut(&stream_id)?;
         match queue_type {
             QueueType::Input => {
-                if self.sessions.contains_key(stream_id) {
+                if ctx.session.is_some() {
                     error!("parameter for input cannot be changed once decoding started");
                     return Err(VideoError::InvalidParameter);
                 }
@@ -719,16 +670,17 @@ impl<'a> Decoder<'a> {
     }
 
     fn drain_stream(&mut self, stream_id: StreamId) -> VideoResult<()> {
-        self.sessions
+        self.contexts
             .get(&stream_id)?
+            .session
+            .as_ref()
+            .ok_or(VideoError::InvalidOperation)?
             .flush()
-            .map_err(VideoError::VdaError)?;
-        Ok(())
     }
 
     fn clear_queue(&mut self, stream_id: StreamId, queue_type: QueueType) -> VideoResult<()> {
         let ctx = self.contexts.get_mut(&stream_id)?;
-        let session = self.sessions.get(&stream_id)?;
+        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         // TODO(b/153406792): Though QUEUE_CLEAR is defined as a per-queue command in the
         // specification, the VDA's `Reset()` clears the input buffers and may (or may not) drop
@@ -738,22 +690,25 @@ impl<'a> Decoder<'a> {
         // REQBUFS(0). To handle this problem correctly, we need to make libvda expose
         // DismissPictureBuffer() method.
         match queue_type {
-            QueueType::Input => {
-                session.reset().map_err(VideoError::VdaError)?;
-            }
+            QueueType::Input => session.reset()?,
             QueueType::Output => {
-                ctx.out_res = Default::default();
+                if std::mem::replace(&mut ctx.is_clear_out_res_needed, false) {
+                    ctx.out_res = Default::default();
+                } else {
+                    ctx.out_res.queued_res_ids.clear();
+                }
             }
-        }
+        };
+
         Ok(())
     }
 }
 
-impl<'a> Device for Decoder<'a> {
+impl<D: DecoderBackend> Device for Decoder<D> {
     fn process_cmd(
         &mut self,
         cmd: VideoCmd,
-        poll_ctx: &PollContext<Token>,
+        wait_ctx: &WaitContext<Token>,
         resource_bridge: &ResourceRequestSocket,
     ) -> VideoResult<VideoCmdResponseType> {
         use VideoCmd::*;
@@ -780,7 +735,7 @@ impl<'a> Device for Decoder<'a> {
                 // ignore `plane_offsets` as we use `resource_info` given by `resource_bridge` instead.
                 ..
             } => {
-                self.create_resource(poll_ctx, stream_id, queue_type, resource_id, uuid)?;
+                self.create_resource(wait_ctx, stream_id, queue_type, resource_id, uuid)?;
                 Ok(Sync(CmdResponse::NoData))
             }
             ResourceDestroyAll {
@@ -882,15 +837,19 @@ impl<'a> Device for Decoder<'a> {
         // result that would allow us to return an error to the caller.
 
         use crate::virtio::video::device::VideoEvtResponseType::*;
-        use libvda::decode::Event::*;
 
-        let session = match self.sessions.get_mut(&stream_id) {
-            Ok(s) => s,
+        let ctx = match self.contexts.get_mut(&stream_id) {
+            Ok(ctx) => ctx,
             Err(e) => {
-                error!(
-                    "an event notified for an unknown session {}: {}",
-                    stream_id, e
-                );
+                error!("failed to get a context for session {}: {}", stream_id, e);
+                return None;
+            }
+        };
+
+        let session = match ctx.session.as_mut() {
+            Some(s) => s,
+            None => {
+                error!("session not yet created for context {}", stream_id);
                 return None;
             }
         };
@@ -903,50 +862,31 @@ impl<'a> Device for Decoder<'a> {
             }
         };
 
-        let ctx = match self.contexts.get_mut(&stream_id) {
-            Ok(ctx) => ctx,
-            Err(_) => {
-                error!(
-                    "failed to get a context for session {}: {:?}",
-                    stream_id, event
-                );
-                return None;
-            }
-        };
-
         let event_responses = match event {
-            ProvidePictureBuffers {
+            DecoderEvent::ProvidePictureBuffers {
                 min_num_buffers,
                 width,
                 height,
-                visible_rect_left,
-                visible_rect_top,
-                visible_rect_right,
-                visible_rect_bottom,
+                visible_rect,
             } => {
-                ctx.handle_provide_picture_buffers(
-                    min_num_buffers,
-                    width,
-                    height,
-                    visible_rect_left,
-                    visible_rect_top,
-                    visible_rect_right,
-                    visible_rect_bottom,
-                );
+                ctx.handle_provide_picture_buffers(min_num_buffers, width, height, visible_rect);
                 vec![Event(VideoEvt {
                     typ: EvtType::DecResChanged,
                     stream_id,
                 })]
             }
-            PictureReady {
-                buffer_id, // FrameBufferId
+            DecoderEvent::PictureReady {
+                picture_buffer_id, // FrameBufferId
                 bitstream_id: ts_sec,
-                left,
-                top,
-                right,
-                bottom,
+                visible_rect,
             } => {
-                let resource_id = ctx.handle_picture_ready(buffer_id, left, top, right, bottom)?;
+                let resource_id = ctx.handle_picture_ready(
+                    picture_buffer_id,
+                    visible_rect.left,
+                    visible_rect.top,
+                    visible_rect.right,
+                    visible_rect.bottom,
+                )?;
                 let async_response = AsyncCmdResponse::from_response(
                     AsyncCmdTag::Queue {
                         stream_id,
@@ -964,7 +904,7 @@ impl<'a> Device for Decoder<'a> {
                 );
                 vec![AsyncCmd(async_response)]
             }
-            NotifyEndOfBitstreamBuffer { bitstream_id } => {
+            DecoderEvent::NotifyEndOfBitstreamBuffer(bitstream_id) => {
                 let resource_id = ctx.handle_notify_end_of_bitstream_buffer(bitstream_id)?;
                 let async_response = AsyncCmdResponse::from_response(
                     AsyncCmdTag::Queue {
@@ -980,9 +920,9 @@ impl<'a> Device for Decoder<'a> {
                 );
                 vec![AsyncCmd(async_response)]
             }
-            FlushResponse(flush_response) => {
-                match flush_response {
-                    libvda::decode::Response::Success => {
+            DecoderEvent::FlushCompleted(flush_result) => {
+                match flush_result {
+                    Ok(()) => {
                         let eos_resource_id = match ctx.out_res.dequeue_eos_resource_id() {
                             Some(r) => r,
                             None => {
@@ -1018,27 +958,27 @@ impl<'a> Device for Decoder<'a> {
                             )),
                         ]
                     }
-                    _ => {
+                    Err(error) => {
                         // TODO(b/151810591): If `resp` is `libvda::decode::Response::Canceled`,
                         // we should notify it to the driver in some way.
                         error!(
                             "failed to 'Flush' in VDA (stream id {}): {:?}",
-                            stream_id, flush_response
+                            stream_id, error
                         );
                         vec![AsyncCmd(AsyncCmdResponse::from_error(
                             AsyncCmdTag::Drain { stream_id },
-                            VideoError::VdaFailure(flush_response),
+                            error,
                         ))]
                     }
                 }
             }
-            ResetResponse(reset_response) => {
+            DecoderEvent::ResetCompleted(reset_result) => {
                 let tag = AsyncCmdTag::Clear {
                     stream_id,
                     queue_type: QueueType::Input,
                 };
-                match reset_response {
-                    libvda::decode::Response::Success => {
+                match reset_result {
+                    Ok(()) => {
                         let mut responses: Vec<_> = desc_map
                             .create_cancellation_responses(
                                 &stream_id,
@@ -1054,20 +994,17 @@ impl<'a> Device for Decoder<'a> {
                         )));
                         responses
                     }
-                    _ => {
+                    Err(error) => {
                         error!(
                             "failed to 'Reset' in VDA (stream id {}): {:?}",
-                            stream_id, reset_response
+                            stream_id, error
                         );
-                        vec![AsyncCmd(AsyncCmdResponse::from_error(
-                            tag,
-                            VideoError::VdaFailure(reset_response),
-                        ))]
+                        vec![AsyncCmd(AsyncCmdResponse::from_error(tag, error))]
                     }
                 }
             }
-            NotifyError(resp) => {
-                error!("an error is notified by VDA: {}", resp);
+            DecoderEvent::NotifyError(error) => {
+                error!("an error is notified by VDA: {}", error);
                 vec![Event(VideoEvt {
                     typ: EvtType::Error,
                     stream_id,
@@ -1076,5 +1013,17 @@ impl<'a> Device for Decoder<'a> {
         };
 
         Some(event_responses)
+    }
+}
+
+/// Create a new decoder instance using a Libvda decoder instance to perform
+/// the decoding.
+impl<'a> Decoder<&'a libvda::decode::VdaInstance> {
+    pub fn new(vda: &'a libvda::decode::VdaInstance) -> Self {
+        Decoder {
+            decoder: vda,
+            capability: Capability::new(vda.get_capabilities()),
+            contexts: ContextMap::new(),
+        }
     }
 }
