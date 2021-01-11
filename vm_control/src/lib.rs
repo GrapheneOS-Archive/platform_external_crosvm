@@ -10,18 +10,23 @@
 //! The wire message format is a little-endian C-struct of fixed size, along with a file descriptor
 //! if the request type expects one.
 
+#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+pub mod gdb;
+
 use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::mem::ManuallyDrop;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::result::Result as StdResult;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use libc::{EINVAL, EIO, ENODEV};
 
 use base::{
-    error, AsRawDescriptor, Error as SysError, Event, ExternalMapping, MappedRegion,
-    MemoryMappingBuilder, MmapError, RawDescriptor, Result,
+    error, AsRawDescriptor, Error as SysError, Event, ExternalMapping, FromRawDescriptor,
+    IntoRawDescriptor, MappedRegion, MemoryMappingBuilder, MmapError, RawDescriptor, Result,
+    SafeDescriptor,
 };
 use hypervisor::{IrqRoute, IrqSource, Vm};
 use msg_socket::{MsgError, MsgOnSocket, MsgReceiver, MsgResult, MsgSender, MsgSocket};
@@ -29,60 +34,80 @@ use resources::{Alloc, GpuMemoryDesc, SystemAllocator};
 use sync::Mutex;
 use vm_memory::GuestAddress;
 
+#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+pub use crate::gdb::*;
 pub use hypervisor::MemSlot;
+
+/// Control the state of a particular VM CPU.
+#[derive(Debug)]
+pub enum VcpuControl {
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+    Debug(VcpuDebug),
+    RunState(VmRunMode),
+}
 
 /// A file descriptor either borrowed or owned by this.
 #[derive(Debug)]
-pub enum MaybeOwnedFd {
+pub enum MaybeOwnedDescriptor {
     /// Owned by this enum variant, and will be destructed automatically if not moved out.
-    Owned(File),
+    Owned(SafeDescriptor),
     /// A file descriptor borrwed by this enum.
     Borrowed(RawDescriptor),
 }
 
-impl AsRawDescriptor for MaybeOwnedFd {
+impl AsRawDescriptor for MaybeOwnedDescriptor {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         match self {
-            MaybeOwnedFd::Owned(f) => f.as_raw_descriptor(),
-            MaybeOwnedFd::Borrowed(descriptor) => *descriptor,
+            MaybeOwnedDescriptor::Owned(f) => f.as_raw_descriptor(),
+            MaybeOwnedDescriptor::Borrowed(descriptor) => *descriptor,
         }
     }
 }
 
-// TODO(mikehoyle): Remove this in favor of just AsRawDescriptor
-impl AsRawFd for MaybeOwnedFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.as_raw_descriptor()
+impl AsRawDescriptor for &MaybeOwnedDescriptor {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
+        match self {
+            MaybeOwnedDescriptor::Owned(f) => f.as_raw_descriptor(),
+            MaybeOwnedDescriptor::Borrowed(descriptor) => *descriptor,
+        }
     }
 }
 
 // When sent, it could be owned or borrowed. On the receiver end, it always owned.
-impl MsgOnSocket for MaybeOwnedFd {
-    fn uses_fd() -> bool {
+impl MsgOnSocket for MaybeOwnedDescriptor {
+    fn uses_descriptor() -> bool {
         true
     }
     fn fixed_size() -> Option<usize> {
         Some(0)
     }
-    fn fd_count(&self) -> usize {
+    fn descriptor_count(&self) -> usize {
         1usize
     }
-    unsafe fn read_from_buffer(buffer: &[u8], fds: &[RawFd]) -> MsgResult<(Self, usize)> {
-        let (file, size) = File::read_from_buffer(buffer, fds)?;
-        Ok((MaybeOwnedFd::Owned(file), size))
+    unsafe fn read_from_buffer(
+        buffer: &[u8],
+        descriptors: &[RawDescriptor],
+    ) -> MsgResult<(Self, usize)> {
+        let (file, size) = File::read_from_buffer(buffer, descriptors)?;
+        let safe_descriptor = SafeDescriptor::from_raw_descriptor(file.into_raw_descriptor());
+        Ok((MaybeOwnedDescriptor::Owned(safe_descriptor), size))
     }
-    fn write_to_buffer(&self, _buffer: &mut [u8], fds: &mut [RawFd]) -> MsgResult<usize> {
-        if fds.is_empty() {
-            return Err(MsgError::WrongFdBufferSize);
+    fn write_to_buffer(
+        &self,
+        _buffer: &mut [u8],
+        descriptors: &mut [RawDescriptor],
+    ) -> MsgResult<usize> {
+        if descriptors.is_empty() {
+            return Err(MsgError::WrongDescriptorBufferSize);
         }
 
-        fds[0] = self.as_raw_fd();
+        descriptors[0] = self.as_raw_descriptor();
         Ok(1)
     }
 }
 
 /// Mode of execution for the VM.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VmRunMode {
     /// The default run mode indicating the VCPUs are running.
     Running,
@@ -90,6 +115,8 @@ pub enum VmRunMode {
     Suspending,
     /// Indicates that the VM is exiting all processes.
     Exiting,
+    /// Indicates that the VM is in a breakpoint waiting for the debugger to do continue.
+    Breakpoint,
 }
 
 impl Display for VmRunMode {
@@ -100,6 +127,7 @@ impl Display for VmRunMode {
             Running => write!(f, "running"),
             Suspending => write!(f, "suspending"),
             Exiting => write!(f, "exiting"),
+            Breakpoint => write!(f, "breakpoint"),
         }
     }
 }
@@ -215,7 +243,7 @@ pub enum UsbControlCommand {
         addr: u8,
         vid: u16,
         pid: u16,
-        fd: Option<MaybeOwnedFd>,
+        descriptor: Option<MaybeOwnedDescriptor>,
     },
     DetachDevice {
         port: u8,
@@ -271,12 +299,12 @@ impl Display for UsbControlResult {
 
 #[derive(MsgOnSocket, Debug)]
 pub enum VmMemoryRequest {
-    /// Register shared memory represented by the given fd into guest address space. The response
-    /// variant is `VmResponse::RegisterMemory`.
-    RegisterMemory(MaybeOwnedFd, usize),
+    /// Register shared memory represented by the given descriptor into guest address space.
+    /// The response variant is `VmResponse::RegisterMemory`.
+    RegisterMemory(MaybeOwnedDescriptor, usize),
     /// Similiar to `VmMemoryRequest::RegisterMemory`, but doesn't allocate new address space.
     /// Useful for cases where the address space is already allocated (PCI regions).
-    RegisterFdAtPciBarOffset(Alloc, MaybeOwnedFd, usize, u64),
+    RegisterFdAtPciBarOffset(Alloc, MaybeOwnedDescriptor, usize, u64),
     /// Similar to RegisterFdAtPciBarOffset, but is for buffers in the current address space.
     RegisterHostPointerAtPciBarOffset(Alloc, u64),
     /// Unregister the given memory slot that was previously registered with `RegisterMemory*`.
@@ -290,7 +318,7 @@ pub enum VmMemoryRequest {
     },
     /// Register mmaped memory into the hypervisor's EPT.
     RegisterMmapMemory {
-        fd: MaybeOwnedFd,
+        descriptor: MaybeOwnedDescriptor,
         size: usize,
         offset: u64,
         gpa: u64,
@@ -315,14 +343,14 @@ impl VmMemoryRequest {
     ) -> VmMemoryResponse {
         use self::VmMemoryRequest::*;
         match *self {
-            RegisterMemory(ref fd, size) => {
-                match register_memory(vm, sys_allocator, fd, size, None) {
+            RegisterMemory(ref descriptor, size) => {
+                match register_memory(vm, sys_allocator, descriptor, size, None) {
                     Ok((pfn, slot)) => VmMemoryResponse::RegisterMemory { pfn, slot },
                     Err(e) => VmMemoryResponse::Err(e),
                 }
             }
-            RegisterFdAtPciBarOffset(alloc, ref fd, size, offset) => {
-                match register_memory(vm, sys_allocator, fd, size, Some((alloc, offset))) {
+            RegisterFdAtPciBarOffset(alloc, ref descriptor, size, offset) => {
+                match register_memory(vm, sys_allocator, descriptor, size, Some((alloc, offset))) {
                     Ok((pfn, slot)) => VmMemoryResponse::RegisterMemory { pfn, slot },
                     Err(e) => VmMemoryResponse::Err(e),
                 }
@@ -363,7 +391,11 @@ impl VmMemoryRequest {
                 };
                 match register_memory(vm, sys_allocator, &fd, size as usize, None) {
                     Ok((pfn, slot)) => VmMemoryResponse::AllocateAndRegisterGpuMemory {
-                        fd: MaybeOwnedFd::Owned(fd),
+                        // Safe because ownership is transferred to SafeDescriptor via
+                        // into_raw_descriptor
+                        descriptor: MaybeOwnedDescriptor::Owned(unsafe {
+                            SafeDescriptor::from_raw_descriptor(fd.into_raw_descriptor())
+                        }),
                         pfn,
                         slot,
                         desc,
@@ -372,13 +404,13 @@ impl VmMemoryRequest {
                 }
             }
             RegisterMmapMemory {
-                ref fd,
+                ref descriptor,
                 size,
                 offset,
                 gpa,
             } => {
                 let mmap = match MemoryMappingBuilder::new(size)
-                    .from_descriptor(fd)
+                    .from_descriptor(descriptor)
                     .offset(offset as u64)
                     .build()
                 {
@@ -405,7 +437,7 @@ pub enum VmMemoryResponse {
     /// The request to allocate and register GPU memory into guest address space was successfully
     /// done at page frame number `pfn` and memory slot number `slot` for buffer with `desc`.
     AllocateAndRegisterGpuMemory {
-        fd: MaybeOwnedFd,
+        descriptor: MaybeOwnedDescriptor,
         pfn: u64,
         slot: MemSlot,
         desc: GpuMemoryDesc,
@@ -417,7 +449,7 @@ pub enum VmMemoryResponse {
 #[derive(MsgOnSocket, Debug)]
 pub enum VmIrqRequest {
     /// Allocate one gsi, and associate gsi to irqfd with register_irqfd()
-    AllocateOneMsi { irqfd: MaybeOwnedFd },
+    AllocateOneMsi { irqfd: MaybeOwnedDescriptor },
     /// Add one msi route entry into the IRQ chip.
     AddMsiRoute {
         gsi: u32,
@@ -451,15 +483,17 @@ impl VmIrqRequest {
         match *self {
             AllocateOneMsi { ref irqfd } => {
                 if let Some(irq_num) = sys_allocator.allocate_irq() {
-                    // Beacuse of the limitation of `MaybeOwnedFd` not fitting into `register_irqfd`
-                    // which expects an `&Event`, we use the unsafe `from_raw_fd` to assume that
-                    // the fd given is an `Event`, and we ignore the ownership question using
-                    // `ManuallyDrop`. This is safe because `ManuallyDrop` prevents any Drop
-                    // implementation from triggering on `irqfd` which already has an owner, and the
-                    // `Event` methods are never called. The underlying fd is merely passed to the
-                    // kernel which doesn't care about ownership and deals with incorrect FDs, in
-                    // the case of bugs on our part.
-                    let evt = unsafe { ManuallyDrop::new(Event::from_raw_fd(irqfd.as_raw_fd())) };
+                    // Because of the limitation of `MaybeOwnedDescriptor` not fitting into
+                    // `register_irqfd` which expects an `&Event`, we use the unsafe `from_raw_fd`
+                    // to assume that the descriptor given is an `Event`, and we ignore the
+                    // ownership question using `ManuallyDrop`. This is safe because `ManuallyDrop`
+                    // prevents any Drop implementation from triggering on `irqfd` which already has
+                    // an owner, and the `Event` methods are never called. The underlying descriptor
+                    // is merely passed to the kernel which doesn't care about ownership and deals
+                    // with incorrect FDs, in the case of bugs on our part.
+                    let evt = unsafe {
+                        ManuallyDrop::new(Event::from_raw_descriptor(irqfd.as_raw_descriptor()))
+                    };
 
                     match set_up_irq(IrqSetup::Event(irq_num, &evt)) {
                         Ok(_) => VmIrqResponse::AllocateOneMsi { gsi: irq_num },
@@ -536,8 +570,207 @@ impl VmMsyncRequest {
     }
 }
 
+#[derive(MsgOnSocket, Debug)]
+pub enum BatControlResult {
+    Ok,
+    NoBatDevice,
+    NoSuchHealth,
+    NoSuchProperty,
+    NoSuchStatus,
+    NoSuchBatType,
+    StringParseIntErr,
+}
+
+impl Display for BatControlResult {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::BatControlResult::*;
+
+        match self {
+            Ok => write!(f, "Setting battery property successfully"),
+            NoBatDevice => write!(f, "No battery device created"),
+            NoSuchHealth => write!(f, "Invalid Battery health setting. Only support: unknown/good/overheat/dead/overvoltage/unexpectedfailure/cold/watchdogtimerexpire/safetytimerexpire/overcurrent"),
+            NoSuchProperty => write!(f, "Battery doesn't have such property. Only support: status/health/present/capacity/aconline"),
+            NoSuchStatus => write!(f, "Invalid Battery status setting. Only support: unknown/charging/discharging/notcharging/full"),
+            NoSuchBatType => write!(f, "Invalid Battery type setting. Only support: goldfish"),
+            StringParseIntErr => write!(f, "Battery property target ParseInt error"),
+        }
+    }
+}
+
+#[derive(MsgOnSocket, Copy, Clone, Debug, PartialEq)]
+pub enum BatteryType {
+    Goldfish,
+}
+
+impl Default for BatteryType {
+    fn default() -> Self {
+        BatteryType::Goldfish
+    }
+}
+
+impl FromStr for BatteryType {
+    type Err = BatControlResult;
+
+    fn from_str(s: &str) -> StdResult<Self, Self::Err> {
+        match s {
+            "goldfish" => Ok(BatteryType::Goldfish),
+            _ => Err(BatControlResult::NoSuchBatType),
+        }
+    }
+}
+
+#[derive(MsgOnSocket, Debug)]
+pub enum BatProperty {
+    Status,
+    Health,
+    Present,
+    Capacity,
+    ACOnline,
+}
+
+impl FromStr for BatProperty {
+    type Err = BatControlResult;
+
+    fn from_str(s: &str) -> StdResult<Self, Self::Err> {
+        match s {
+            "status" => Ok(BatProperty::Status),
+            "health" => Ok(BatProperty::Health),
+            "present" => Ok(BatProperty::Present),
+            "capacity" => Ok(BatProperty::Capacity),
+            "aconline" => Ok(BatProperty::ACOnline),
+            _ => Err(BatControlResult::NoSuchProperty),
+        }
+    }
+}
+
+#[derive(MsgOnSocket, Debug)]
+pub enum BatStatus {
+    Unknown,
+    Charging,
+    DisCharging,
+    NotCharging,
+    Full,
+}
+
+impl BatStatus {
+    pub fn new(status: String) -> std::result::Result<Self, BatControlResult> {
+        match status.as_str() {
+            "unknown" => Ok(BatStatus::Unknown),
+            "charging" => Ok(BatStatus::Charging),
+            "discharging" => Ok(BatStatus::DisCharging),
+            "notcharging" => Ok(BatStatus::NotCharging),
+            "full" => Ok(BatStatus::Full),
+            _ => Err(BatControlResult::NoSuchStatus),
+        }
+    }
+}
+
+impl FromStr for BatStatus {
+    type Err = BatControlResult;
+
+    fn from_str(s: &str) -> StdResult<Self, Self::Err> {
+        match s {
+            "unknown" => Ok(BatStatus::Unknown),
+            "charging" => Ok(BatStatus::Charging),
+            "discharging" => Ok(BatStatus::DisCharging),
+            "notcharging" => Ok(BatStatus::NotCharging),
+            "full" => Ok(BatStatus::Full),
+            _ => Err(BatControlResult::NoSuchStatus),
+        }
+    }
+}
+
+impl From<BatStatus> for u32 {
+    fn from(status: BatStatus) -> Self {
+        status as u32
+    }
+}
+
+#[derive(MsgOnSocket, Debug)]
+pub enum BatHealth {
+    Unknown,
+    Good,
+    Overheat,
+    Dead,
+    OverVoltage,
+    UnexpectedFailure,
+    Cold,
+    WatchdogTimerExpire,
+    SafetyTimerExpire,
+    OverCurrent,
+}
+
+impl FromStr for BatHealth {
+    type Err = BatControlResult;
+
+    fn from_str(s: &str) -> StdResult<Self, Self::Err> {
+        match s {
+            "unknown" => Ok(BatHealth::Unknown),
+            "good" => Ok(BatHealth::Good),
+            "overheat" => Ok(BatHealth::Overheat),
+            "dead" => Ok(BatHealth::Dead),
+            "overvoltage" => Ok(BatHealth::OverVoltage),
+            "unexpectedfailure" => Ok(BatHealth::UnexpectedFailure),
+            "cold" => Ok(BatHealth::Cold),
+            "watchdogtimerexpire" => Ok(BatHealth::WatchdogTimerExpire),
+            "safetytimerexpire" => Ok(BatHealth::SafetyTimerExpire),
+            "overcurrent" => Ok(BatHealth::OverCurrent),
+            _ => Err(BatControlResult::NoSuchHealth),
+        }
+    }
+}
+
+impl From<BatHealth> for u32 {
+    fn from(status: BatHealth) -> Self {
+        status as u32
+    }
+}
+
+#[derive(MsgOnSocket, Debug)]
+pub enum BatControlCommand {
+    SetStatus(BatStatus),
+    SetHealth(BatHealth),
+    SetPresent(u32),
+    SetCapacity(u32),
+    SetACOnline(u32),
+}
+
+impl BatControlCommand {
+    pub fn new(property: String, target: String) -> std::result::Result<Self, BatControlResult> {
+        let cmd = property.parse::<BatProperty>()?;
+        match cmd {
+            BatProperty::Status => Ok(BatControlCommand::SetStatus(target.parse::<BatStatus>()?)),
+            BatProperty::Health => Ok(BatControlCommand::SetHealth(target.parse::<BatHealth>()?)),
+            BatProperty::Present => Ok(BatControlCommand::SetPresent(
+                target
+                    .parse::<u32>()
+                    .map_err(|_| BatControlResult::StringParseIntErr)?,
+            )),
+            BatProperty::Capacity => Ok(BatControlCommand::SetCapacity(
+                target
+                    .parse::<u32>()
+                    .map_err(|_| BatControlResult::StringParseIntErr)?,
+            )),
+            BatProperty::ACOnline => Ok(BatControlCommand::SetACOnline(
+                target
+                    .parse::<u32>()
+                    .map_err(|_| BatControlResult::StringParseIntErr)?,
+            )),
+        }
+    }
+}
+
+/// Used for VM to control battery properties.
+pub struct BatControl {
+    pub type_: BatteryType,
+    pub control_socket: BatControlRequestSocket,
+}
+
 pub type BalloonControlRequestSocket = MsgSocket<BalloonControlCommand, BalloonControlResult>;
 pub type BalloonControlResponseSocket = MsgSocket<BalloonControlResult, BalloonControlCommand>;
+
+pub type BatControlRequestSocket = MsgSocket<BatControlCommand, BatControlResult>;
+pub type BatControlResponseSocket = MsgSocket<BatControlResult, BatControlCommand>;
 
 pub type DiskControlRequestSocket = MsgSocket<DiskControlCommand, DiskControlResult>;
 pub type DiskControlResponseSocket = MsgSocket<DiskControlResult, DiskControlCommand>;
@@ -577,16 +810,21 @@ pub enum VmRequest {
     },
     /// Command to use controller.
     UsbCommand(UsbControlCommand),
+    /// Command to set battery.
+    BatCommand(BatteryType, BatControlCommand),
 }
 
 fn register_memory(
     vm: &mut impl Vm,
     allocator: &mut SystemAllocator,
-    fd: &dyn AsRawDescriptor,
+    descriptor: &dyn AsRawDescriptor,
     size: usize,
     pci_allocation: Option<(Alloc, u64)>,
 ) -> Result<(u64, MemSlot)> {
-    let mmap = match MemoryMappingBuilder::new(size).from_descriptor(fd).build() {
+    let mmap = match MemoryMappingBuilder::new(size)
+        .from_descriptor(descriptor)
+        .build()
+    {
         Ok(v) => v,
         Err(MmapError::SystemCallFailed(e)) => return Err(e),
         _ => return Err(SysError::new(EINVAL)),
@@ -638,6 +876,7 @@ impl VmRequest {
         balloon_host_socket: &BalloonControlRequestSocket,
         disk_host_sockets: &[DiskControlRequestSocket],
         usb_control_socket: &UsbControlSocket,
+        bat_control: &mut Option<BatControl>,
     ) -> VmResponse {
         match *self {
             VmRequest::Exit => {
@@ -713,6 +952,31 @@ impl VmRequest {
                     }
                 }
             }
+            VmRequest::BatCommand(type_, ref cmd) => {
+                match bat_control {
+                    Some(battery) => {
+                        if battery.type_ != type_ {
+                            error!("ignored battery command due to battery type: expected {:?}, got {:?}", battery.type_, type_);
+                            return VmResponse::Err(SysError::new(EINVAL));
+                        }
+
+                        let res = battery.control_socket.send(cmd);
+                        if let Err(e) = res {
+                            error!("fail to send command to bat control socket: {}", e);
+                            return VmResponse::Err(SysError::new(EIO));
+                        }
+
+                        match battery.control_socket.recv() {
+                            Ok(response) => VmResponse::BatResponse(response),
+                            Err(e) => {
+                                error!("fail to recv command from bat control socket: {}", e);
+                                VmResponse::Err(SysError::new(EIO))
+                            }
+                        }
+                    }
+                    None => VmResponse::BatResponse(BatControlResult::NoBatDevice),
+                }
+            }
         }
     }
 }
@@ -732,7 +996,7 @@ pub enum VmResponse {
     /// The request to allocate and register GPU memory into guest address space was successfully
     /// done at page frame number `pfn` and memory slot number `slot` for buffer with `desc`.
     AllocateAndRegisterGpuMemory {
-        fd: MaybeOwnedFd,
+        descriptor: MaybeOwnedDescriptor,
         pfn: u64,
         slot: u32,
         desc: GpuMemoryDesc,
@@ -744,6 +1008,8 @@ pub enum VmResponse {
     },
     /// Results of usb control commands.
     UsbResponse(UsbControlResult),
+    /// Results of battery control commands.
+    BatResponse(BatControlResult),
 }
 
 impl Display for VmResponse {
@@ -772,6 +1038,7 @@ impl Display for VmResponse {
                 balloon_actual, stats
             ),
             UsbResponse(result) => write!(f, "usb control request get result {:?}", result),
+            BatResponse(result) => write!(f, "{}", result),
         }
     }
 }

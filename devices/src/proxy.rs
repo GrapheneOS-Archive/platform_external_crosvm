@@ -5,16 +5,15 @@
 //! Runs hardware devices in child processes.
 
 use std::fmt::{self, Display};
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 use std::{self, io};
 
-use base::{error, net::UnixSeqpacket};
+use base::{error, net::UnixSeqpacket, AsRawDescriptor, RawDescriptor};
 use libc::{self, pid_t};
 use minijail::{self, Minijail};
 use msg_socket::{MsgOnSocket, MsgReceiver, MsgSender, MsgSocket};
 
-use crate::BusDevice;
+use crate::{BusAccessInfo, BusDevice};
 
 /// Errors for proxy devices.
 #[derive(Debug)]
@@ -41,11 +40,11 @@ const SOCKET_TIMEOUT_MS: u64 = 2000;
 enum Command {
     Read {
         len: u32,
-        offset: u64,
+        info: BusAccessInfo,
     },
     Write {
         len: u32,
-        offset: u64,
+        info: BusAccessInfo,
         data: [u8; 8],
     },
     ReadConfig(u32),
@@ -79,14 +78,14 @@ fn child_proc<D: BusDevice>(sock: UnixSeqpacket, device: &mut D) {
         };
 
         let res = match cmd {
-            Command::Read { len, offset } => {
+            Command::Read { len, info } => {
                 let mut buffer = [0u8; 8];
-                device.read(offset, &mut buffer[0..len as usize]);
+                device.read(info, &mut buffer[0..len as usize]);
                 sock.send(&CommandResult::ReadResult(buffer))
             }
-            Command::Write { len, offset, data } => {
+            Command::Write { len, info, data } => {
                 let len = len as usize;
-                device.write(offset, &data[0..len]);
+                device.write(info, &data[0..len]);
                 // Command::Write does not have a result.
                 Ok(())
             }
@@ -135,19 +134,19 @@ impl ProxyDevice {
     /// # Arguments
     /// * `device` - The device to isolate to another process.
     /// * `jail` - The jail to use for isolating the given device.
-    /// * `keep_fds` - File descriptors that will be kept open in the child.
+    /// * `keep_rds` - File descriptors that will be kept open in the child.
     pub fn new<D: BusDevice>(
         mut device: D,
         jail: &Minijail,
-        mut keep_fds: Vec<RawFd>,
+        mut keep_rds: Vec<RawDescriptor>,
     ) -> Result<ProxyDevice> {
         let debug_label = device.debug_label();
         let (child_sock, parent_sock) = UnixSeqpacket::pair().map_err(Error::Io)?;
 
-        keep_fds.push(child_sock.as_raw_fd());
+        keep_rds.push(child_sock.as_raw_descriptor());
         // Forking here is safe as long as the program is still single threaded.
         let pid = unsafe {
-            match jail.fork(Some(&keep_fds)).map_err(Error::ForkingJail)? {
+            match jail.fork(Some(&keep_rds)).map_err(Error::ForkingJail)? {
                 0 => {
                     device.on_sandboxed();
                     child_proc(child_sock, &mut device);
@@ -238,23 +237,23 @@ impl BusDevice for ProxyDevice {
         }
     }
 
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
+    fn read(&mut self, info: BusAccessInfo, data: &mut [u8]) {
         let len = data.len() as u32;
         if let Some(CommandResult::ReadResult(buffer)) =
-            self.sync_send(&Command::Read { len, offset })
+            self.sync_send(&Command::Read { len, info })
         {
             let len = data.len();
             data.clone_from_slice(&buffer[0..len]);
         }
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) {
+    fn write(&mut self, info: BusAccessInfo, data: &[u8]) {
         let mut buffer = [0u8; 8];
         let len = data.len() as u32;
         buffer[0..data.len()].clone_from_slice(data);
         self.send_no_result(&Command::Write {
             len,
-            offset,
+            info,
             data: buffer,
         });
     }
@@ -263,5 +262,85 @@ impl BusDevice for ProxyDevice {
 impl Drop for ProxyDevice {
     fn drop(&mut self) {
         self.sync_send(&Command::Shutdown);
+    }
+}
+
+/// Note: These tests must be run with --test-threads=1 to allow minijail to fork
+/// the process.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A simple test echo device that outputs the same u8 that was written to it.
+    struct EchoDevice {
+        data: u8,
+        config: u8,
+    }
+    impl EchoDevice {
+        fn new() -> EchoDevice {
+            EchoDevice { data: 0, config: 0 }
+        }
+    }
+    impl BusDevice for EchoDevice {
+        fn debug_label(&self) -> String {
+            "EchoDevice".to_owned()
+        }
+
+        fn write(&mut self, _info: BusAccessInfo, data: &[u8]) {
+            assert!(data.len() == 1);
+            self.data = data[0];
+        }
+
+        fn read(&mut self, _info: BusAccessInfo, data: &mut [u8]) {
+            assert!(data.len() == 1);
+            data[0] = self.data;
+        }
+
+        fn config_register_write(&mut self, _reg_idx: usize, _offset: u64, data: &[u8]) {
+            assert!(data.len() == 1);
+            self.config = data[0];
+        }
+
+        fn config_register_read(&self, _reg_idx: usize) -> u32 {
+            self.config as u32
+        }
+    }
+
+    fn new_proxied_echo_device() -> ProxyDevice {
+        let device = EchoDevice::new();
+        let keep_fds: Vec<RawDescriptor> = Vec::new();
+        let minijail = Minijail::new().unwrap();
+        ProxyDevice::new(device, &minijail, keep_fds).unwrap()
+    }
+
+    // TODO(b/173833661): Find a way to ensure these tests are run single-threaded.
+    #[test]
+    #[ignore]
+    fn test_debug_label() {
+        let proxy_device = new_proxied_echo_device();
+        assert_eq!(proxy_device.debug_label(), "EchoDevice");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_proxied_read_write() {
+        let mut proxy_device = new_proxied_echo_device();
+        let address = BusAccessInfo {
+            offset: 0,
+            address: 0,
+            id: 0,
+        };
+        proxy_device.write(address, &[42]);
+        let mut read_buffer = [0];
+        proxy_device.read(address, &mut read_buffer);
+        assert_eq!(read_buffer, [42]);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_proxied_config() {
+        let mut proxy_device = new_proxied_echo_device();
+        proxy_device.config_register_write(0, 0, &[42]);
+        assert_eq!(proxy_device.config_register_read(0), 42);
     }
 }
