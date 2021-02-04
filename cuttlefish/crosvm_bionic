@@ -8,4 +8,4 @@
 # We have to use the target until rustc supports non-Android target using Bionic
 # as libc. Until then, let's override DT_INTERP by executing the dynamic linker
 # and feed the absolute path to the rust binary as the first argument.
-$(dirname $0)/linker64 $(readlink -f $(dirname $0)/$(uname -m)-linux-bionic/$(basename "$0")) "${@}"
+exec $(dirname $0)/linker64 $(readlink -f $(dirname $0)/$(uname -m)-linux-bionic/$(basename "$0")) "${@}"
