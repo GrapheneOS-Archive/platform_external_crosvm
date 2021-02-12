@@ -18,7 +18,9 @@ use base::Event;
 use devices::{
     Bus, BusError, IrqChip, IrqChipAArch64, PciAddress, PciConfigMmio, PciDevice, PciInterruptPin,
 };
-use hypervisor::{DeviceKind, Hypervisor, HypervisorCap, VcpuAArch64, VcpuFeature, VmAArch64};
+use hypervisor::{
+    DeviceKind, Hypervisor, HypervisorCap, PsciVersion, VcpuAArch64, VcpuFeature, VmAArch64,
+};
 use minijail::Minijail;
 use remain::sorted;
 use resources::SystemAllocator;
@@ -135,6 +137,7 @@ pub enum Error {
     CreateVcpu(base::Error),
     CreateVm(Box<dyn StdError>),
     DowncastVcpu,
+    GetPsciVersion(base::Error),
     GetSerialCmdline(GetSerialCmdlineError),
     InitrdLoadFailure(arch::LoadImageError),
     KernelLoadFailure(arch::LoadImageError),
@@ -168,6 +171,7 @@ impl Display for Error {
             CreateVcpu(e) => write!(f, "failed to create VCPU: {}", e),
             CreateVm(e) => write!(f, "failed to create vm: {}", e),
             DowncastVcpu => write!(f, "vm created wrong kind of vcpu"),
+            GetPsciVersion(e) => write!(f, "failed to get PSCI version: {}", e),
             GetSerialCmdline(e) => write!(f, "failed to get serial cmdline: {}", e),
             InitrdLoadFailure(e) => write!(f, "initrd could not be loaded: {}", e),
             KernelLoadFailure(e) => write!(f, "kernel could not be loaded: {}", e),
@@ -357,6 +361,7 @@ impl arch::LinuxArch for AArch64 {
             }
         }
 
+        let psci_version = vcpus[0].get_psci_version().map_err(Error::GetPsciVersion)?;
         fdt::create_fdt(
             AARCH64_FDT_MAX_SIZE as usize,
             &mem,
@@ -370,6 +375,7 @@ impl arch::LinuxArch for AArch64 {
             components.android_fstab,
             irq_chip.get_vgic_version() == DeviceKind::ArmVgicV3,
             use_pmu,
+            psci_version,
         )
         .map_err(Error::CreateFdt)?;
 
