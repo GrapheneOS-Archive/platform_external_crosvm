@@ -37,95 +37,80 @@
 //!
 //! What if the kernel's reference to the buffer outlives the buffer itself?  This could happen if a
 //! read operation was submitted, then the memory is dropped.  To solve this, the executor takes an
-//! Rc to the backing memory. Vecs being read to are also wrapped in an Rc before being passed to
-//! the executor.  The executor holds the Rc and ensures all operations are complete before dropping
+//! Arc to the backing memory. Vecs being read to are also wrapped in an Arc before being passed to
+//! the executor.  The executor holds the Arc and ensures all operations are complete before dropping
 //! it, that guarantees the memory is valid for the duration.
 //!
 //! The buffers _have_ to be on the heap. Because we don't have a way to cancel a future if it is
 //! dropped(can't rely on drop running), there is no way to ensure the kernel's buffer remains valid
-//! until the operation completes unless the executor holds an Rc to the memory on the heap.
+//! until the operation completes unless the executor holds an Arc to the memory on the heap.
 //!
 //! ## Using `Vec` for reads/writes.
 //!
 //! There is a convenience wrapper `VecIoWrapper` provided for fully owned vectors. This type
-//! ensures that only the kernel is allowed to access the `Vec` and wraps the the `Vec` in an Rc to
+//! ensures that only the kernel is allowed to access the `Vec` and wraps the the `Vec` in an Arc to
 //! ensure it lives long enough.
 
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::convert::TryInto;
-use std::fmt::{self, Display};
 use std::fs::File;
 use std::future::Future;
 use std::io;
+use std::mem;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::Waker;
 use std::task::{Context, Poll};
+use std::thread::{self, ThreadId};
 
-use futures::pin_mut;
-use slab::Slab;
-
+use async_task::Task;
+use futures::task::noop_waker;
 use io_uring::URingContext;
-use sys_util::WatchingEvents;
+use pin_utils::pin_mut;
+use slab::Slab;
+use sync::Mutex;
+use sys_util::{warn, WatchingEvents};
+use thiserror::Error as ThisError;
 
-use crate::executor::{ExecutableFuture, Executor, FutureList};
+use crate::queue::RunnableQueue;
 use crate::uring_mem::{BackingMemory, MemRegion};
-use crate::waker::WakerToken;
+use crate::waker::{new_waker, WakerToken, WeakWake};
 
-#[derive(Debug)]
+#[derive(Debug, ThisError)]
 pub enum Error {
-    /// Attempts to create two Executors on the same thread fail.
-    AttemptedDuplicateExecutor,
     /// Failed to copy the FD for the polling context.
+    #[error("Failed to copy the FD for the polling context: {0}")]
     DuplicatingFd(sys_util::Error),
-    /// Failed accessing the thread local storage for wakers.
-    InvalidContext,
+    /// The Executor is gone.
+    #[error("The URingExecutor is gone")]
+    ExecutorGone,
     /// Invalid offset or length given for an iovec in backing memory.
+    #[error("Invalid offset/len for getting an iovec")]
     InvalidOffset,
     /// Invalid FD source specified.
+    #[error("Invalid source, FD not registered for use")]
     InvalidSource,
     /// Error doing the IO.
+    #[error("Error during IO: {0}")]
     Io(io::Error),
     /// Creating a context to wait on FDs failed.
+    #[error("Error creating the fd waiting context: {0}")]
     CreatingContext(io_uring::Error),
     /// Failed to remove the waker remove the polling context.
+    #[error("Error removing from the URing context: {0}")]
     RemovingWaker(io_uring::Error),
     /// Failed to submit the operation to the polling context.
+    #[error("Error adding to the URing context: {0}")]
     SubmittingOp(io_uring::Error),
     /// URingContext failure.
+    #[error("URingContext failure: {0}")]
     URingContextError(io_uring::Error),
     /// Failed to submit or wait for io_uring events.
+    #[error("URing::enter: {0}")]
     URingEnter(io_uring::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            AttemptedDuplicateExecutor => write!(f, "Cannot have two executors on one thread."),
-            DuplicatingFd(e) => write!(f, "Failed to copy the FD for the polling context: {}", e),
-            InvalidContext => write!(
-                f,
-                "Invalid context, was the Fd executor created successfully?"
-            ),
-            InvalidOffset => write!(f, "Invalid offset/len for getting an iovec."),
-            InvalidSource => write!(f, "Invalid source, FD not registered for use."),
-            Io(e) => write!(f, "Error during IO: {}", e),
-            CreatingContext(e) => write!(f, "Error creating the fd waiting context: {}.", e),
-            RemovingWaker(e) => write!(f, "Error removing from the URing context: {}.", e),
-            SubmittingOp(e) => write!(f, "Error adding to the URing context: {}.", e),
-            URingContextError(e) => write!(f, "URingContext failure: {}", e),
-            URingEnter(e) => write!(f, "URing::enter: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 // Checks if the uring executor is available.
 // Caches the result so that the check is only run once.
@@ -152,233 +137,373 @@ pub(crate) fn use_uring() -> bool {
     }
 }
 
-/// Register a file and memory pair for buffered asynchronous operation.
-pub fn register_source<F: AsRawFd>(fd: &F) -> Result<RegisteredSource> {
-    RingWakerState::register_source(fd)
-}
-
-pub(crate) fn add_future(future: Pin<Box<dyn Future<Output = ()>>>) {
-    NEW_FUTURES.with(|new_futures| {
-        let mut new_futures = new_futures.borrow_mut();
-        new_futures.push_back(ExecutableFuture::new(future));
-    });
-}
-
-// Tracks active wakers and manages waking pending operations after completion.
-thread_local!(static STATE: RefCell<Option<RingWakerState>> = RefCell::new(None));
-// Tracks new futures that have been added while running the executor.
-thread_local!(static NEW_FUTURES: RefCell<VecDeque<ExecutableFuture<()>>>
-              = RefCell::new(VecDeque::new()));
-
-// Tracks `RingWakerState` instances and prevents `RegisteredSource`s created by an older executor
-// from affecting a newer one.
-static GENERATION: AtomicU64 = AtomicU64::new(0);
-
 pub struct RegisteredSource {
-    generation: u64,
     tag: usize,
-
-    // Since a `RegisteredSource` is associated with a thread-local executor, it cannot be Send or
-    // Sync. However, negative trait impls are not supported yet so use an Rc, which is neither Send
-    // nor Sync, to poison the struct. TODO: Consider using negative trait impls once
-    // https://github.com/rust-lang/rust/issues/68318 is fixed.
-    _block_send_sync: Rc<()>,
+    ex: Weak<RawExecutor>,
 }
 
 impl RegisteredSource {
     pub fn start_read_to_mem(
         &self,
         file_offset: u64,
-        mem: Rc<dyn BackingMemory>,
+        mem: Arc<dyn BackingMemory + Send + Sync>,
         addrs: &[MemRegion],
     ) -> Result<PendingOperation> {
-        let token = STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            if let Some(state) = state.as_mut() {
-                state.submit_read_to_vectored(self, mem, file_offset, addrs)
-            } else {
-                Err(Error::InvalidContext)
-            }
-        })?;
+        let ex = self.ex.upgrade().ok_or(Error::ExecutorGone)?;
+        let token = ex.submit_read_to_vectored(self, mem, file_offset, addrs)?;
 
         Ok(PendingOperation {
             waker_token: Some(token),
+            ex: self.ex.clone(),
+            submitted: false,
         })
     }
 
     pub fn start_write_from_mem(
         &self,
         file_offset: u64,
-        mem: Rc<dyn BackingMemory>,
+        mem: Arc<dyn BackingMemory + Send + Sync>,
         addrs: &[MemRegion],
     ) -> Result<PendingOperation> {
-        let token = STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            if let Some(state) = state.as_mut() {
-                state.submit_write_from_vectored(self, mem, file_offset, addrs)
-            } else {
-                Err(Error::InvalidContext)
-            }
-        })?;
+        let ex = self.ex.upgrade().ok_or(Error::ExecutorGone)?;
+        let token = ex.submit_write_from_vectored(self, mem, file_offset, addrs)?;
 
         Ok(PendingOperation {
             waker_token: Some(token),
+            ex: self.ex.clone(),
+            submitted: false,
         })
     }
 
     pub fn start_fallocate(&self, offset: u64, len: u64, mode: u32) -> Result<PendingOperation> {
-        let token = STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            if let Some(state) = state.as_mut() {
-                state.submit_fallocate(self, offset, len, mode)
-            } else {
-                Err(Error::InvalidContext)
-            }
-        })?;
+        let ex = self.ex.upgrade().ok_or(Error::ExecutorGone)?;
+        let token = ex.submit_fallocate(self, offset, len, mode)?;
 
         Ok(PendingOperation {
             waker_token: Some(token),
+            ex: self.ex.clone(),
+            submitted: false,
         })
     }
 
     pub fn start_fsync(&self) -> Result<PendingOperation> {
-        let token = STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            if let Some(state) = state.as_mut() {
-                state.submit_fsync(self)
-            } else {
-                Err(Error::InvalidContext)
-            }
-        })?;
+        let ex = self.ex.upgrade().ok_or(Error::ExecutorGone)?;
+        let token = ex.submit_fsync(self)?;
 
         Ok(PendingOperation {
             waker_token: Some(token),
+            ex: self.ex.clone(),
+            submitted: false,
         })
     }
 
     pub fn poll_fd_readable(&self) -> Result<PendingOperation> {
         let events = WatchingEvents::empty().set_read();
-        let token = STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            if let Some(state) = state.as_mut() {
-                state.submit_poll(self, &events)
-            } else {
-                Err(Error::InvalidContext)
-            }
-        })?;
+
+        let ex = self.ex.upgrade().ok_or(Error::ExecutorGone)?;
+        let token = ex.submit_poll(self, &events)?;
 
         Ok(PendingOperation {
             waker_token: Some(token),
+            ex: self.ex.clone(),
+            submitted: false,
         })
-    }
-
-    pub fn poll_complete(&self, cx: &mut Context, op: &mut PendingOperation) -> Poll<Result<u32>> {
-        pin_mut!(op);
-        op.poll(cx)
     }
 }
 
 impl Drop for RegisteredSource {
     fn drop(&mut self) {
-        let _ = RingWakerState::deregister_source(self);
+        if let Some(ex) = self.ex.upgrade() {
+            let _ = ex.deregister_source(self);
+        }
     }
 }
 
+// Indicates that the executor is either within or about to make an io_uring_enter syscall. When a
+// waker sees this value, it will add and submit a NOP to the uring, which will wake up the thread
+// blocked on the io_uring_enter syscall.
+const WAITING: i32 = 0xb80d_21b5u32 as i32;
+
+// Indicates that the executor is processing any futures that are ready to run.
+const PROCESSING: i32 = 0xdb31_83a3u32 as i32;
+
+// Indicates that one or more futures may be ready to make progress.
+const WOKEN: i32 = 0x0fc7_8f7eu32 as i32;
+
+// Number of entries in the ring.
+const NUM_ENTRIES: usize = 256;
+
 // An operation that has been submitted to the uring and is potentially being waited on.
 struct OpData {
-    _file: Rc<File>,
-    _mem: Option<Rc<dyn BackingMemory>>,
+    _file: Arc<File>,
+    _mem: Option<Arc<dyn BackingMemory + Send + Sync>>,
     waker: Option<Waker>,
     canceled: bool,
 }
 
 // The current status of an operation that's been submitted to the uring.
 enum OpStatus {
+    Nop,
     Pending(OpData),
     Completed(Option<::std::io::Result<u32>>),
 }
 
-// Tracks active wakers and associates wakers with the futures that registered them.
-struct RingWakerState {
-    ctx: URingContext,
+struct Ring {
     ops: Slab<OpStatus>,
-    registered_sources: Slab<Rc<File>>,
-    generation: u64,
+    registered_sources: Slab<Arc<File>>,
 }
 
-impl RingWakerState {
-    fn new() -> Result<Self> {
-        Ok(RingWakerState {
-            ctx: URingContext::new(256).map_err(Error::CreatingContext)?,
-            ops: Slab::with_capacity(256),
-            registered_sources: Slab::with_capacity(256),
-            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
+struct RawExecutor {
+    // The URingContext needs to be first so that it is dropped first, closing the uring fd, and
+    // releasing the resources borrowed by the kernel before we free them.
+    ctx: URingContext,
+    queue: RunnableQueue,
+    ring: Mutex<Ring>,
+    thread_id: Mutex<Option<ThreadId>>,
+    state: AtomicI32,
+}
+
+impl RawExecutor {
+    fn new() -> Result<RawExecutor> {
+        Ok(RawExecutor {
+            ctx: URingContext::new(NUM_ENTRIES).map_err(Error::CreatingContext)?,
+            queue: RunnableQueue::new(),
+            ring: Mutex::new(Ring {
+                ops: Slab::with_capacity(NUM_ENTRIES),
+                registered_sources: Slab::with_capacity(NUM_ENTRIES),
+            }),
+            thread_id: Mutex::new(None),
+            state: AtomicI32::new(PROCESSING),
         })
     }
 
-    fn register_source(fd: &dyn AsRawFd) -> Result<RegisteredSource> {
-        Self::with(|state| {
-            let duped_fd = unsafe {
-                // Safe because duplicating an FD doesn't affect memory safety, and the dup'd FD
-                // will only be added to the poll loop.
-                File::from_raw_fd(dup_fd(fd.as_raw_fd())?)
-            };
-            let tag = state.registered_sources.insert(Rc::new(duped_fd));
-            Ok(RegisteredSource {
-                generation: state.generation,
-                tag,
-                _block_send_sync: Rc::new(()),
-            })
-        })?
+    fn wake(&self) {
+        let oldstate = self.state.swap(WOKEN, Ordering::Release);
+        if oldstate == WAITING {
+            let mut ring = self.ring.lock();
+            let entry = ring.ops.vacant_entry();
+            let next_op_token = entry.key();
+            if let Err(e) = self.ctx.add_nop(usize_to_u64(next_op_token)) {
+                warn!("Failed to add NOP for waking up executor: {}", e);
+            }
+            entry.insert(OpStatus::Nop);
+            mem::drop(ring);
+
+            match self.ctx.submit() {
+                Ok(()) => {}
+                // If the kernel's submit ring is full then we know we won't block when calling
+                // io_uring_enter, which is all we really care about.
+                Err(io_uring::Error::RingEnter(libc::EBUSY)) => {}
+                Err(e) => warn!("Failed to submit NOP for waking up executor: {}", e),
+            }
+        }
     }
 
-    fn deregister_source(source: &RegisteredSource) {
-        // There isn't any need to pull pending ops out, the all have Rc's to the file and mem they
+    fn spawn<F>(self: &Arc<Self>, f: F) -> Task<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let raw = Arc::downgrade(self);
+        let schedule = move |runnable| {
+            if let Some(r) = raw.upgrade() {
+                r.queue.schedule(runnable);
+            }
+        };
+        let (runnable, task) = async_task::spawn(f, schedule);
+        self.queue.schedule(runnable);
+        task
+    }
+
+    fn spawn_local<F>(self: &Arc<Self>, f: F) -> Task<F::Output>
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        let raw = Arc::downgrade(self);
+        let schedule = move |runnable| {
+            if let Some(r) = raw.upgrade() {
+                r.queue.schedule(runnable);
+            }
+        };
+        let (runnable, task) = async_task::spawn_local(f, schedule);
+        self.queue.schedule(runnable);
+        task
+    }
+
+    fn run<F: Future>(&self, cx: &mut Context, done: F) -> Result<F::Output> {
+        let current_thread = thread::current().id();
+        let mut thread_id = self.thread_id.lock();
+        assert_eq!(
+            *thread_id.get_or_insert(current_thread),
+            current_thread,
+            "`URingExecutor::run` cannot be called from more than one thread"
+        );
+        mem::drop(thread_id);
+
+        pin_mut!(done);
+        loop {
+            self.state.store(PROCESSING, Ordering::Release);
+            self.queue.set_waker(cx.waker().clone());
+            for runnable in self.queue.iter() {
+                runnable.run();
+            }
+
+            if let Poll::Ready(val) = done.as_mut().poll(cx) {
+                return Ok(val);
+            }
+
+            let oldstate = self
+                .state
+                .compare_and_swap(PROCESSING, WAITING, Ordering::Acquire);
+            if oldstate != PROCESSING {
+                debug_assert_eq!(oldstate, WOKEN);
+                // One or more futures have become runnable.
+                continue;
+            }
+
+            let events = self.ctx.wait().map_err(Error::URingEnter)?;
+
+            // Set the state back to PROCESSING to prevent any tasks woken up by the loop below from
+            // writing to the eventfd.
+            self.state.store(PROCESSING, Ordering::Release);
+
+            let mut ring = self.ring.lock();
+            for (raw_token, result) in events {
+                // While the `expect()` might fail on arbitrary `u64`s, the `raw_token` was
+                // something that we originally gave to the kernel and that was created from a
+                // `usize` so we should always be able to convert it back into a `usize`.
+                let token = raw_token
+                    .try_into()
+                    .expect("`u64` doesn't fit inside a `usize`");
+
+                let op = ring
+                    .ops
+                    .get_mut(token)
+                    .expect("Received completion token for unexpected operation");
+                match mem::replace(op, OpStatus::Completed(Some(result))) {
+                    // No one is waiting on a Nop.
+                    OpStatus::Nop => mem::drop(ring.ops.remove(token)),
+                    OpStatus::Pending(data) => {
+                        if data.canceled {
+                            // No one is waiting for this operation and the uring is done with
+                            // it so it's safe to remove.
+                            ring.ops.remove(token);
+                        }
+                        if let Some(waker) = data.waker {
+                            waker.wake();
+                        }
+                    }
+                    OpStatus::Completed(_) => {
+                        panic!("uring operation completed more than once")
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_result(&self, token: &WakerToken, cx: &mut Context) -> Option<io::Result<u32>> {
+        let mut ring = self.ring.lock();
+
+        let op = ring
+            .ops
+            .get_mut(token.0)
+            .expect("`get_result` called on unknown operation");
+        match op {
+            OpStatus::Nop => panic!("`get_result` called on nop"),
+            OpStatus::Pending(data) => {
+                if data.canceled {
+                    panic!("`get_result` called on canceled operation");
+                }
+                data.waker = Some(cx.waker().clone());
+                None
+            }
+            OpStatus::Completed(res) => {
+                let out = res.take();
+                ring.ops.remove(token.0);
+                Some(out.expect("Missing result in completed operation"))
+            }
+        }
+    }
+
+    // Remove the waker for the given token if it hasn't fired yet.
+    fn cancel_operation(&self, token: WakerToken) {
+        let mut ring = self.ring.lock();
+        if let Some(op) = ring.ops.get_mut(token.0) {
+            match op {
+                OpStatus::Nop => panic!("`cancel_operation` called on nop"),
+                OpStatus::Pending(data) => {
+                    if data.canceled {
+                        panic!("uring operation canceled more than once");
+                    }
+
+                    // Clear the waker as it is no longer needed.
+                    data.waker = None;
+                    data.canceled = true;
+
+                    // Keep the rest of the op data as the uring might still be accessing either
+                    // the source of the backing memory so it needs to live until the kernel
+                    // completes the operation.  TODO: cancel the operation in the uring.
+                }
+                OpStatus::Completed(_) => {
+                    ring.ops.remove(token.0);
+                }
+            }
+        }
+    }
+
+    fn register_source(&self, f: Arc<File>) -> usize {
+        self.ring.lock().registered_sources.insert(f)
+    }
+
+    fn deregister_source(&self, source: &RegisteredSource) {
+        // There isn't any need to pull pending ops out, the all have Arc's to the file and mem they
         // need.let them complete. deregister with pending ops is not a common path no need to
         // optimize that case yet.
-        let _ = Self::with(|state| {
-            if source.generation == state.generation {
-                state.registered_sources.remove(source.tag);
-            }
-        });
+        self.ring.lock().registered_sources.remove(source.tag);
     }
 
     fn submit_poll(
-        &mut self,
+        &self,
         source: &RegisteredSource,
         events: &sys_util::WatchingEvents,
     ) -> Result<WakerToken> {
-        let src = self
+        let mut ring = self.ring.lock();
+        let src = ring
             .registered_sources
             .get(source.tag)
+            .map(Arc::clone)
             .ok_or(Error::InvalidSource)?;
-        let entry = self.ops.vacant_entry();
+        let entry = ring.ops.vacant_entry();
         let next_op_token = entry.key();
         self.ctx
             .add_poll_fd(src.as_raw_fd(), events, usize_to_u64(next_op_token))
             .map_err(Error::SubmittingOp)?;
 
         entry.insert(OpStatus::Pending(OpData {
-            _file: Rc::clone(&src),
+            _file: src,
             _mem: None,
             waker: None,
             canceled: false,
         }));
+
         Ok(WakerToken(next_op_token))
     }
 
     fn submit_fallocate(
-        &mut self,
+        &self,
         source: &RegisteredSource,
         offset: u64,
         len: u64,
         mode: u32,
     ) -> Result<WakerToken> {
-        let src = self
+        let mut ring = self.ring.lock();
+        let src = ring
             .registered_sources
             .get(source.tag)
+            .map(Arc::clone)
             .ok_or(Error::InvalidSource)?;
-        let entry = self.ops.vacant_entry();
+        let entry = ring.ops.vacant_entry();
         let next_op_token = entry.key();
         self.ctx
             .add_fallocate(
@@ -391,38 +516,42 @@ impl RingWakerState {
             .map_err(Error::SubmittingOp)?;
 
         entry.insert(OpStatus::Pending(OpData {
-            _file: Rc::clone(&src),
+            _file: src,
             _mem: None,
             waker: None,
             canceled: false,
         }));
+
         Ok(WakerToken(next_op_token))
     }
 
-    fn submit_fsync(&mut self, source: &RegisteredSource) -> Result<WakerToken> {
-        let src = self
+    fn submit_fsync(&self, source: &RegisteredSource) -> Result<WakerToken> {
+        let mut ring = self.ring.lock();
+        let src = ring
             .registered_sources
             .get(source.tag)
+            .map(Arc::clone)
             .ok_or(Error::InvalidSource)?;
-        let entry = self.ops.vacant_entry();
+        let entry = ring.ops.vacant_entry();
         let next_op_token = entry.key();
         self.ctx
             .add_fsync(src.as_raw_fd(), usize_to_u64(next_op_token))
             .map_err(Error::SubmittingOp)?;
 
         entry.insert(OpStatus::Pending(OpData {
-            _file: Rc::clone(&src),
+            _file: src,
             _mem: None,
             waker: None,
             canceled: false,
         }));
+
         Ok(WakerToken(next_op_token))
     }
 
     fn submit_read_to_vectored(
-        &mut self,
+        &self,
         source: &RegisteredSource,
-        mem: Rc<dyn BackingMemory>,
+        mem: Arc<dyn BackingMemory + Send + Sync>,
         offset: u64,
         addrs: &[MemRegion],
     ) -> Result<WakerToken> {
@@ -433,13 +562,15 @@ impl RingWakerState {
             return Err(Error::InvalidOffset);
         }
 
-        let src = self
+        let mut ring = self.ring.lock();
+        let src = ring
             .registered_sources
             .get(source.tag)
+            .map(Arc::clone)
             .ok_or(Error::InvalidSource)?;
 
         // We can't insert the OpData into the slab yet because `iovecs` borrows `mem` below.
-        let entry = self.ops.vacant_entry();
+        let entry = ring.ops.vacant_entry();
         let next_op_token = entry.key();
 
         // The addresses have already been validated, so unwrapping them will succeed.
@@ -449,7 +580,7 @@ impl RingWakerState {
             .map(|&mem_range| mem.get_iovec(mem_range).unwrap().iovec());
 
         unsafe {
-            // Safe because all the addresses are within the Memory that an Rc is kept for the
+            // Safe because all the addresses are within the Memory that an Arc is kept for the
             // duration to ensure the memory is valid while the kernel accesses it.
             // Tested by `dont_drop_backing_mem_read` unit test.
             self.ctx
@@ -458,7 +589,7 @@ impl RingWakerState {
         }
 
         entry.insert(OpStatus::Pending(OpData {
-            _file: Rc::clone(&src),
+            _file: src,
             _mem: Some(mem),
             waker: None,
             canceled: false,
@@ -468,9 +599,9 @@ impl RingWakerState {
     }
 
     fn submit_write_from_vectored(
-        &mut self,
+        &self,
         source: &RegisteredSource,
-        mem: Rc<dyn BackingMemory>,
+        mem: Arc<dyn BackingMemory + Send + Sync>,
         offset: u64,
         addrs: &[MemRegion],
     ) -> Result<WakerToken> {
@@ -481,13 +612,15 @@ impl RingWakerState {
             return Err(Error::InvalidOffset);
         }
 
-        let src = self
+        let mut ring = self.ring.lock();
+        let src = ring
             .registered_sources
             .get(source.tag)
+            .map(Arc::clone)
             .ok_or(Error::InvalidSource)?;
 
         // We can't insert the OpData into the slab yet because `iovecs` borrows `mem` below.
-        let entry = self.ops.vacant_entry();
+        let entry = ring.ops.vacant_entry();
         let next_op_token = entry.key();
 
         // The addresses have already been validated, so unwrapping them will succeed.
@@ -497,7 +630,7 @@ impl RingWakerState {
             .map(|&mem_range| mem.get_iovec(mem_range).unwrap().iovec());
 
         unsafe {
-            // Safe because all the addresses are within the Memory that an Rc is kept for the
+            // Safe because all the addresses are within the Memory that an Arc is kept for the
             // duration to ensure the memory is valid while the kernel accesses it.
             // Tested by `dont_drop_backing_mem_write` unit test.
             self.ctx
@@ -506,7 +639,7 @@ impl RingWakerState {
         }
 
         entry.insert(OpStatus::Pending(OpData {
-            _file: Rc::clone(&src),
+            _file: src,
             _mem: Some(mem),
             waker: None,
             canceled: false,
@@ -514,170 +647,117 @@ impl RingWakerState {
 
         Ok(WakerToken(next_op_token))
     }
-
-    // Remove the waker for the given token if it hasn't fired yet.
-    fn cancel_waker(token: WakerToken) -> Result<()> {
-        Self::with(|state| {
-            if let Some(op) = state.ops.get_mut(token.0) {
-                match op {
-                    OpStatus::Pending(data) => {
-                        if data.canceled {
-                            panic!("uring operation canceled more than once");
-                        }
-
-                        // Clear the waker as it is no longer needed.
-                        data.waker = None;
-                        data.canceled = true;
-
-                        // Keep the rest of the op data as the uring might still be accessing either
-                        // the source of the backing memory so it needs to live until the kernel
-                        // completes the operation.  TODO: cancel the operation in the uring.
-                    }
-                    OpStatus::Completed(_) => {
-                        state.ops.remove(token.0);
-                    }
-                }
-            }
-            Ok(())
-        })?
-    }
-
-    // Waits until one of the FDs is readable and wakes the associated waker.
-    fn wait_wake_event() -> Result<()> {
-        Self::with(|state| {
-            let events = state.ctx.wait().map_err(Error::URingEnter)?;
-            for (raw_token, result) in events {
-                // While the `expect()` might fail on arbitrary `u64`s, the `raw_token` was
-                // something that we originally gave to the kernel and that was created from a
-                // `usize` so we should always be able to convert it back into a `usize`.
-                let token = raw_token
-                    .try_into()
-                    .expect("`u64` doesn't fit inside a `usize`");
-
-                if let Some(op) = state.ops.get_mut(token) {
-                    match op {
-                        OpStatus::Pending(data) => {
-                            if data.canceled {
-                                // No one is waiting for this operation and the uring is done with
-                                // it so it's safe to remove.
-                                state.ops.remove(token);
-                            } else {
-                                let waker = data.waker.take();
-                                *op = OpStatus::Completed(Some(result));
-
-                                if let Some(waker) = waker {
-                                    waker.wake();
-                                }
-                            }
-                        }
-                        OpStatus::Completed(_) => {
-                            panic!("uring operation completed more than once")
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })?
-    }
-
-    fn get_result(token: &WakerToken, waker: Waker) -> Result<Option<io::Result<u32>>> {
-        Self::with(|state| {
-            if let Some(op) = state.ops.get_mut(token.0) {
-                match op {
-                    OpStatus::Pending(data) => {
-                        if data.canceled {
-                            panic!("`get_result` called on canceled operation");
-                        }
-                        data.waker = Some(waker);
-                        None
-                    }
-                    OpStatus::Completed(res) => {
-                        let out = res.take();
-                        state.ops.remove(token.0);
-                        out
-                    }
-                }
-            } else {
-                None
-            }
-        })
-    }
-
-    fn with<R, F: FnOnce(&mut RingWakerState) -> R>(f: F) -> Result<R> {
-        STATE.with(|state| {
-            if state.borrow().is_none() {
-                state.replace(Some(RingWakerState::new()?));
-            }
-            state
-                .borrow_mut()
-                .as_mut()
-                .map(f)
-                .ok_or(Error::InvalidContext)
-        })
-    }
 }
 
-/// Runs futures to completion on a single thread. Futures are allowed to block on file descriptors
-/// only. Futures can only block on FDs becoming readable or writable. `URingExecutor` is meant to
-/// be used where a poll or select loop would be used otherwise.
-pub(crate) struct URingExecutor<T: FutureList> {
-    futures: T,
-}
-
-impl<T: FutureList> Executor for URingExecutor<T> {
-    type Output = Result<T::Output>;
-
-    fn run(&mut self) -> Self::Output {
-        self.append_futures();
-
-        loop {
-            if let Some(output) = self.futures.poll_results() {
-                return Ok(output);
-            }
-
-            self.append_futures();
-
-            // If no futures are ready, sleep until a waker is signaled.
-            if !self.futures.any_ready() {
-                RingWakerState::wait_wake_event()?;
-            }
+impl WeakWake for RawExecutor {
+    fn wake_by_ref(weak_self: &Weak<Self>) {
+        if let Some(arc_self) = weak_self.upgrade() {
+            RawExecutor::wake(&arc_self);
         }
     }
 }
 
-impl<T: FutureList> URingExecutor<T> {
-    /// Create a new executor.
-    pub fn new(futures: T) -> Result<URingExecutor<T>> {
-        RingWakerState::with(|_| ())?;
-        Ok(URingExecutor { futures })
-    }
+impl Drop for RawExecutor {
+    fn drop(&mut self) {
+        // Wake up any futures still waiting on uring operations.
+        let ring = self.ring.get_mut();
+        for (_, op) in ring.ops.iter_mut() {
+            match op {
+                OpStatus::Nop => {}
+                OpStatus::Pending(data) => {
+                    // If the operation wasn't already canceled then wake up the future waiting on
+                    // it. When polled that future will get an ExecutorGone error anyway so there's
+                    // no point in waiting until the operation completes to wake it up.
+                    if !data.canceled {
+                        if let Some(waker) = data.waker.take() {
+                            waker.wake();
+                        }
+                    }
 
-    // Add any new futures and wakers to the lists.
-    fn append_futures(&mut self) {
-        NEW_FUTURES.with(|new_futures| {
-            let mut new_futures = new_futures.borrow_mut();
-            self.futures.futures_mut().append(&mut new_futures);
-        })
+                    data.canceled = true;
+                }
+                OpStatus::Completed(_) => {}
+            }
+        }
+
+        // Since the RawExecutor is wrapped in an Arc it may end up being dropped from a different
+        // thread than the one that called `run` or `run_until`. Since we know there are no other
+        // references, just clear the thread id so that we don't panic.
+        *self.thread_id.lock() = None;
+
+        // Now run the executor loop once more to poll any futures we just woke up.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let res = self.run(&mut cx, async {});
+
+        if let Err(e) = res {
+            warn!("Failed to drive uring to completion: {}", e);
+        }
     }
 }
 
-impl<T: FutureList> Drop for URingExecutor<T> {
-    fn drop(&mut self) {
-        STATE.with(|state| {
-            state.replace(None);
-        });
-        // Drop any pending futures that were added.
-        NEW_FUTURES.with(|new_futures| {
-            let mut new_futures = new_futures.borrow_mut();
-            new_futures.clear();
-        });
+/// An executor that uses io_uring for its asynchronous I/O operations. See the documentation of
+/// `Executor` for more details about the methods.
+#[derive(Clone)]
+pub struct URingExecutor {
+    raw: Arc<RawExecutor>,
+}
+
+impl URingExecutor {
+    pub fn new() -> Result<URingExecutor> {
+        let raw = RawExecutor::new().map(Arc::new)?;
+
+        Ok(URingExecutor { raw })
+    }
+
+    pub fn spawn<F>(&self, f: F) -> Task<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.raw.spawn(f)
+    }
+
+    pub fn spawn_local<F>(&self, f: F) -> Task<F::Output>
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        self.raw.spawn_local(f)
+    }
+
+    pub fn run(&self) -> Result<()> {
+        let waker = new_waker(Arc::downgrade(&self.raw));
+        let mut cx = Context::from_waker(&waker);
+
+        self.raw.run(&mut cx, crate::empty::<()>())
+    }
+
+    pub fn run_until<F: Future>(&self, f: F) -> Result<F::Output> {
+        let waker = new_waker(Arc::downgrade(&self.raw));
+        let mut ctx = Context::from_waker(&waker);
+        self.raw.run(&mut ctx, f)
+    }
+
+    /// Register a file and memory pair for buffered asynchronous operation.
+    pub(crate) fn register_source<F: AsRawFd>(&self, fd: &F) -> Result<RegisteredSource> {
+        let duped_fd = unsafe {
+            // Safe because duplicating an FD doesn't affect memory safety, and the dup'd FD
+            // will only be added to the poll loop.
+            File::from_raw_fd(dup_fd(fd.as_raw_fd())?)
+        };
+
+        Ok(RegisteredSource {
+            tag: self.raw.register_source(Arc::new(duped_fd)),
+            ex: Arc::downgrade(&self.raw),
+        })
     }
 }
 
 // Used to dup the FDs passed to the executor so there is a guarantee they aren't closed while
 // waiting in TLS to be added to the main polling context.
 unsafe fn dup_fd(fd: RawFd) -> Result<RawFd> {
-    let ret = libc::dup(fd);
+    let ret = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0);
     if ret < 0 {
         Err(Error::DuplicatingFd(sys_util::Error::last()))
     } else {
@@ -691,154 +771,163 @@ fn usize_to_u64(val: usize) -> u64 {
     val.try_into().expect("`usize` doesn't fit inside a `u64`")
 }
 
-#[derive(Debug)]
 pub struct PendingOperation {
     waker_token: Option<WakerToken>,
+    ex: Weak<RawExecutor>,
+    submitted: bool,
 }
 
 impl Future for PendingOperation {
     type Output = Result<u32>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        if let Some(waker_token) = &self.waker_token {
-            if let Some(result) = RingWakerState::get_result(waker_token, cx.waker().clone())? {
+        let token = self
+            .waker_token
+            .as_ref()
+            .expect("PendingOperation polled after returning Poll::Ready");
+        if let Some(ex) = self.ex.upgrade() {
+            if let Some(result) = ex.get_result(token, cx) {
                 self.waker_token = None;
-                return Poll::Ready(result.map_err(Error::Io));
+                Poll::Ready(result.map_err(Error::Io))
+            } else {
+                // If we haven't submitted the operation yet, do it now.
+                if !self.submitted {
+                    match ex.ctx.submit() {
+                        Ok(()) => self.submitted = true,
+                        // If the kernel ring is full then wait until some ops are removed from the
+                        // completion queue. This op should get submitted the next time the executor
+                        // calls UringContext::wait.
+                        Err(io_uring::Error::RingEnter(libc::EBUSY)) => {}
+                        Err(e) => return Poll::Ready(Err(Error::URingEnter(e))),
+                    }
+                }
+                Poll::Pending
             }
+        } else {
+            Poll::Ready(Err(Error::ExecutorGone))
         }
-        Poll::Pending
     }
 }
 
 impl Drop for PendingOperation {
     fn drop(&mut self) {
         if let Some(waker_token) = self.waker_token.take() {
-            let _ = RingWakerState::cancel_waker(waker_token);
+            if let Some(ex) = self.ex.upgrade() {
+                ex.cancel_operation(waker_token);
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::io::{Read, Write};
     use std::mem;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use futures::executor::block_on;
 
     use super::*;
     use crate::uring_mem::{BackingMemory, MemRegion, VecIoWrapper};
 
+    // A future that returns ready when the uring queue is empty.
+    struct UringQueueEmpty<'a> {
+        ex: &'a URingExecutor,
+    }
+
+    impl<'a> Future for UringQueueEmpty<'a> {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.ex.raw.ring.lock().ops.is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
     #[test]
     fn dont_drop_backing_mem_read() {
-        // Create a backing memory wrapped in an Rc and check that the drop isn't called while the
+        // Create a backing memory wrapped in an Arc and check that the drop isn't called while the
         // op is pending.
-        let bm = Rc::new(VecIoWrapper::from(vec![0u8; 4096])) as Rc<dyn BackingMemory>;
+        let bm =
+            Arc::new(VecIoWrapper::from(vec![0u8; 4096])) as Arc<dyn BackingMemory + Send + Sync>;
 
         // Use pipes to create a future that will block forever.
         let (rx, mut tx) = sys_util::pipe(true).unwrap();
 
         // Set up the TLS for the uring_executor by creating one.
-        let _ex = URingExecutor::new(crate::executor::UnitFutures::new()).unwrap();
+        let ex = URingExecutor::new().unwrap();
 
         // Register the receive side of the pipe with the executor.
-        let registered_source = register_source(&rx).expect("register source failed");
+        let registered_source = ex.register_source(&rx).expect("register source failed");
 
-        // Submit the op to the kernel. Next, test that the source keeps its Rc open for the duration
+        // Submit the op to the kernel. Next, test that the source keeps its Arc open for the duration
         // of the op.
         let pending_op = registered_source
-            .start_read_to_mem(0, Rc::clone(&bm), &[MemRegion { offset: 0, len: 8 }])
+            .start_read_to_mem(0, Arc::clone(&bm), &[MemRegion { offset: 0, len: 8 }])
             .expect("failed to start read to mem");
 
-        // Here the Rc count must be two, one for `bm` and one to signify that the kernel has a
+        // Here the Arc count must be two, one for `bm` and one to signify that the kernel has a
         // reference while the op is active.
-        assert_eq!(Rc::strong_count(&bm), 2);
+        assert_eq!(Arc::strong_count(&bm), 2);
 
-        // Dropping the operation shouldn't reduce the Rc count, as the kernel could still be using
+        // Dropping the operation shouldn't reduce the Arc count, as the kernel could still be using
         // it.
         drop(pending_op);
-        assert_eq!(Rc::strong_count(&bm), 2);
+        assert_eq!(Arc::strong_count(&bm), 2);
 
-        // Finishing the operation should put the Rc count back to 1.
+        // Finishing the operation should put the Arc count back to 1.
         // write to the pipe to wake the read pipe and then wait for the uring result in the
         // executor.
-        tx.write(&[0u8; 8]).expect("write failed");
-        RingWakerState::wait_wake_event().expect("Failed to wait for read pipe ready");
-        assert_eq!(Rc::strong_count(&bm), 1);
+        tx.write_all(&[0u8; 8]).expect("write failed");
+        ex.run_until(UringQueueEmpty { ex: &ex })
+            .expect("Failed to wait for read pipe ready");
+        assert_eq!(Arc::strong_count(&bm), 1);
     }
 
     #[test]
     fn dont_drop_backing_mem_write() {
-        // Create a backing memory wrapped in an Rc and check that the drop isn't called while the
+        // Create a backing memory wrapped in an Arc and check that the drop isn't called while the
         // op is pending.
-        let bm = Rc::new(VecIoWrapper::from(vec![0u8; 4096])) as Rc<dyn BackingMemory>;
+        let bm =
+            Arc::new(VecIoWrapper::from(vec![0u8; 4096])) as Arc<dyn BackingMemory + Send + Sync>;
 
         // Use pipes to create a future that will block forever.
         let (mut rx, tx) = sys_util::new_pipe_full().expect("Pipe failed");
 
         // Set up the TLS for the uring_executor by creating one.
-        let _ex = URingExecutor::new(crate::executor::UnitFutures::new()).unwrap();
+        let ex = URingExecutor::new().unwrap();
 
         // Register the receive side of the pipe with the executor.
-        let registered_source = register_source(&tx).expect("register source failed");
+        let registered_source = ex.register_source(&tx).expect("register source failed");
 
-        // Submit the op to the kernel. Next, test that the source keeps its Rc open for the duration
+        // Submit the op to the kernel. Next, test that the source keeps its Arc open for the duration
         // of the op.
         let pending_op = registered_source
-            .start_write_from_mem(0, Rc::clone(&bm), &[MemRegion { offset: 0, len: 8 }])
+            .start_write_from_mem(0, Arc::clone(&bm), &[MemRegion { offset: 0, len: 8 }])
             .expect("failed to start write to mem");
 
-        // Here the Rc count must be two, one for `bm` and one to signify that the kernel has a
+        // Here the Arc count must be two, one for `bm` and one to signify that the kernel has a
         // reference while the op is active.
-        assert_eq!(Rc::strong_count(&bm), 2);
+        assert_eq!(Arc::strong_count(&bm), 2);
 
-        // Dropping the operation shouldn't reduce the Rc count, as the kernel could still be using
+        // Dropping the operation shouldn't reduce the Arc count, as the kernel could still be using
         // it.
         drop(pending_op);
-        assert_eq!(Rc::strong_count(&bm), 2);
+        assert_eq!(Arc::strong_count(&bm), 2);
 
-        // Finishing the operation should put the Rc count back to 1.
+        // Finishing the operation should put the Arc count back to 1.
         // write to the pipe to wake the read pipe and then wait for the uring result in the
         // executor.
         let mut buf = vec![0u8; sys_util::round_up_to_page_size(1)];
-        rx.read(&mut buf).expect("read to empty failed");
-        RingWakerState::wait_wake_event().expect("Failed to wait for read pipe ready");
-        assert_eq!(Rc::strong_count(&bm), 1);
-    }
-
-    #[test]
-    fn registered_source_outlives_executor() {
-        let bm = Rc::new(VecIoWrapper::from(vec![0u8; 4096])) as Rc<dyn BackingMemory>;
-        let (rx, tx) = sys_util::pipe(true).unwrap();
-
-        // Register a source before creating the executor.
-        let rx_source = register_source(&rx).expect("register source failed");
-
-        let ex = URingExecutor::new(crate::executor::UnitFutures::new()).unwrap();
-        let _pending_op = rx_source
-            .start_read_to_mem(0, Rc::clone(&bm), &[MemRegion { offset: 0, len: 8 }])
-            .expect("failed to start read to mem");
-
-        // Now drop the executor without finishing the operation.
-        mem::drop(ex);
-
-        // Register another source.
-        let tx_source = register_source(&tx).expect("register source failed");
-
-        assert!(RingWakerState::with(|state| state
-            .registered_sources
-            .get(tx_source.tag)
-            .is_some())
-        .expect("failed to check registered source"));
-
-        // Since they were created by separate executors, they should both have the same tag.
-        assert_eq!(tx_source.tag, rx_source.tag);
-
-        // Dropping `rx_source` shouldn't affect `tx_source`.
-        mem::drop(rx_source);
-
-        assert!(RingWakerState::with(|state| state
-            .registered_sources
-            .get(tx_source.tag)
-            .is_some())
-        .expect("failed to check registered source"));
+        rx.read_exact(&mut buf).expect("read to empty failed");
+        ex.run_until(UringQueueEmpty { ex: &ex })
+            .expect("Failed to wait for write pipe ready");
+        assert_eq!(Arc::strong_count(&bm), 1);
     }
 
     #[test]
@@ -852,43 +941,108 @@ mod tests {
             assert_eq!(expected, actual);
         }
 
-        let bm = Rc::new(VecIoWrapper::from(vec![0u8; 16])) as Rc<dyn BackingMemory>;
+        let bm =
+            Arc::new(VecIoWrapper::from(vec![0u8; 16])) as Arc<dyn BackingMemory + Send + Sync>;
 
         let (rx, tx) = sys_util::pipe(true).expect("Pipe failed");
 
-        let mut ex = URingExecutor::new(crate::executor::UnitFutures::new()).unwrap();
+        let ex = URingExecutor::new().unwrap();
 
-        let rx_source = register_source(&rx).expect("register source failed");
-        let tx_source = register_source(&tx).expect("register source failed");
+        let rx_source = ex.register_source(&rx).expect("register source failed");
+        let tx_source = ex.register_source(&tx).expect("register source failed");
 
-        let read_op = rx_source
-            .start_read_to_mem(0, Rc::clone(&bm), &[MemRegion { offset: 0, len: 8 }])
+        let read_task = rx_source
+            .start_read_to_mem(0, Arc::clone(&bm), &[MemRegion { offset: 0, len: 8 }])
             .expect("failed to start read to mem");
 
-        let read_token = read_op
-            .waker_token
-            .as_ref()
-            .map(|t| t.0)
-            .expect("No `WakerToken` in `PendingOperation`");
-        assert!(
-            RingWakerState::with(|state| state.ops.get(read_token).is_some())
-                .expect("Failed to check `RingWakerState` for pending operation")
-        );
-
-        add_future(Box::pin(cancel_io(read_op)));
+        ex.spawn_local(cancel_io(read_task)).detach();
 
         // Write to the pipe so that the kernel operation will complete.
-        let buf = Rc::new(VecIoWrapper::from(vec![0xc2u8; 16])) as Rc<dyn BackingMemory>;
-        let write_op = tx_source
-            .start_write_from_mem(0, Rc::clone(&buf), &[MemRegion { offset: 0, len: 8 }])
+        let buf =
+            Arc::new(VecIoWrapper::from(vec![0xc2u8; 16])) as Arc<dyn BackingMemory + Send + Sync>;
+        let write_task = tx_source
+            .start_write_from_mem(0, Arc::clone(&buf), &[MemRegion { offset: 0, len: 8 }])
             .expect("failed to start write from mem");
-        add_future(Box::pin(check_result(write_op, 8)));
 
-        ex.run().expect("Failed to run executor");
+        ex.run_until(check_result(write_task, 8))
+            .expect("Failed to run executor");
+    }
 
-        assert!(
-            RingWakerState::with(|state| state.ops.get(read_token).is_none())
-                .expect("Failed to check `RingWakerState` for canceled operation")
-        );
+    #[test]
+    fn drop_before_completion() {
+        const VALUE: u64 = 0xef6c_a8df_b842_eb9c;
+
+        async fn check_op(op: PendingOperation) {
+            let err = op.await.expect_err("Op completed successfully");
+            match err {
+                Error::ExecutorGone => {}
+                e => panic!("Unexpected error from op: {}", e),
+            }
+        }
+
+        let (mut rx, mut tx) = sys_util::pipe(true).expect("Pipe failed");
+
+        let ex = URingExecutor::new().unwrap();
+
+        let tx_source = ex.register_source(&tx).expect("Failed to register source");
+        let bm = Arc::new(VecIoWrapper::from(VALUE.to_ne_bytes().to_vec()));
+        let op = tx_source
+            .start_write_from_mem(
+                0,
+                bm,
+                &[MemRegion {
+                    offset: 0,
+                    len: mem::size_of::<u64>(),
+                }],
+            )
+            .expect("Failed to start write from mem");
+
+        ex.spawn_local(check_op(op)).detach();
+
+        // Now drop the executor. It shouldn't run the write operation.
+        mem::drop(ex);
+
+        // Make sure the executor did not complete the uring operation.
+        let new_val = [0x2e; 8];
+        tx.write_all(&new_val).unwrap();
+
+        let mut buf = 0u64.to_ne_bytes();
+        rx.read_exact(&mut buf[..])
+            .expect("Failed to read from pipe");
+
+        assert_eq!(buf, new_val);
+    }
+
+    #[test]
+    fn drop_on_different_thread() {
+        let ex = URingExecutor::new().unwrap();
+
+        let ex2 = ex.clone();
+        let t = thread::spawn(move || ex2.run_until(async {}));
+
+        t.join().unwrap().unwrap();
+
+        // Leave an uncompleted operation in the queue so that the drop impl will try to drive it to
+        // completion.
+        let (_rx, tx) = sys_util::pipe(true).expect("Pipe failed");
+        let tx = ex.register_source(&tx).expect("Failed to register source");
+        let bm = Arc::new(VecIoWrapper::from(0xf2e96u64.to_ne_bytes().to_vec()));
+        let op = tx
+            .start_write_from_mem(
+                0,
+                bm,
+                &[MemRegion {
+                    offset: 0,
+                    len: mem::size_of::<u64>(),
+                }],
+            )
+            .expect("Failed to start write from mem");
+
+        mem::drop(ex);
+
+        match block_on(op).expect_err("Pending operation completed after executor was dropped") {
+            Error::ExecutorGone => {}
+            e => panic!("Unexpected error after dropping executor: {}", e),
+        }
     }
 }
