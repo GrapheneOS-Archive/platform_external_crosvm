@@ -5,6 +5,16 @@
 //   does not generate cc_library module yet
 //   does not generate wayland_protocol_codegen module yet
 
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "external_crosvm_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-BSD
+    //   SPDX-license-identifier-MIT
+    default_applicable_licenses: ["external_crosvm_license"],
+}
+
 rust_library {
     name: "libgpu_display",
     defaults: ["crosvm_defaults"],

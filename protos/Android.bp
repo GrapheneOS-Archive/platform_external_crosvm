@@ -1,4 +1,13 @@
 // Only enable composite-disk and include cdisk_spec.rs for now.
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "external_crosvm_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-BSD
+    default_applicable_licenses: ["external_crosvm_license"],
+}
+
 rust_library {
     name: "libprotos",
     defaults: ["crosvm_defaults"],
