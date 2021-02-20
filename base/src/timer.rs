@@ -14,10 +14,10 @@ use sys_util::{FakeTimerFd, TimerFd};
 
 /// See [TimerFd](sys_util::TimerFd) for struct- and method-level
 /// documentation.
-pub struct Timer(TimerFd);
+pub struct Timer(pub TimerFd);
 impl Timer {
     pub fn new() -> Result<Timer> {
-        TimerFd::new().map(|timerfd| Timer(timerfd))
+        TimerFd::new().map(Timer)
     }
 }
 
