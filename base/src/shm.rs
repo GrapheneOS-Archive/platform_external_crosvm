@@ -18,7 +18,7 @@ impl SharedMemory {
     pub fn named<T: Into<Vec<u8>>>(name: T, size: u64) -> Result<SharedMemory> {
         SysUtilSharedMemory::named(name)
             .and_then(|mut shm| shm.set_size(size).map(|_| shm))
-            .map(|shm| SharedMemory(shm))
+            .map(SharedMemory)
     }
 
     pub fn anon(size: u64) -> Result<SharedMemory> {
@@ -28,7 +28,7 @@ impl SharedMemory {
     pub fn new(name: Option<&CStr>, size: u64) -> Result<SharedMemory> {
         SysUtilSharedMemory::new(name)
             .and_then(|mut shm| shm.set_size(size).map(|_| shm))
-            .map(|shm| SharedMemory(shm))
+            .map(SharedMemory)
     }
 
     pub fn size(&self) -> u64 {
@@ -49,11 +49,11 @@ pub trait Unix {
     /// new SharedMemory object.
     fn from_safe_descriptor(descriptor: SafeDescriptor) -> Result<SharedMemory> {
         let file = unsafe { File::from_raw_descriptor(descriptor.into_raw_descriptor()) };
-        SysUtilSharedMemory::from_file(file).map(|shm| SharedMemory(shm))
+        SysUtilSharedMemory::from_file(file).map(SharedMemory)
     }
 
     fn from_file(file: File) -> Result<SharedMemory> {
-        SysUtilSharedMemory::from_file(file).map(|shm| SharedMemory(shm))
+        SysUtilSharedMemory::from_file(file).map(SharedMemory)
     }
 
     fn get_seals(&self) -> Result<MemfdSeals>;
@@ -74,5 +74,11 @@ impl Unix for SharedMemory {
 impl AsRawDescriptor for SharedMemory {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.0.as_raw_fd()
+    }
+}
+
+impl Into<File> for SharedMemory {
+    fn into(self) -> File {
+        self.0.into()
     }
 }

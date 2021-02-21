@@ -184,7 +184,7 @@ impl<'a> Encoder for &'a LibvdaEncoder {
         let input_format = match config
             .src_params
             .format
-            .ok_or_else(|| EncoderError::InvalidArgument)?
+            .ok_or(EncoderError::InvalidArgument)?
         {
             Format::NV12 => libvda::PixelFormat::NV12,
             Format::YUV420 => libvda::PixelFormat::YV12,
@@ -208,10 +208,10 @@ impl<'a> Encoder for &'a LibvdaEncoder {
             input_visible_height: config.src_params.frame_height,
             output_profile,
             initial_bitrate: config.dst_bitrate,
-            initial_framerate: if config.dst_params.frame_rate == 0 {
+            initial_framerate: if config.frame_rate == 0 {
                 None
             } else {
-                Some(config.dst_params.frame_rate)
+                Some(config.frame_rate)
             },
             h264_output_level: config.dst_h264_level.map(|level| {
                 // This value is aligned to the H264 standard definition of SPS.level_idc.
@@ -347,13 +347,13 @@ impl<'a> EncoderSession for LibvdaEncoderSession<'a> {
             ProcessedOutputBuffer {
                 output_buffer_id,
                 payload_size,
+                key_frame,
                 timestamp,
-                // TODO(alexlau): Pass the `key_frame` field here when it's possible to
-                // propagate back to the client.
                 ..
             } => EncoderEvent::ProcessedOutputBuffer {
                 id: output_buffer_id as u32,
                 bytesused: payload_size,
+                keyframe: key_frame,
                 timestamp: timestamp as u64,
             },
             FlushResponse { flush_done } => EncoderEvent::FlushResponse { flush_done },

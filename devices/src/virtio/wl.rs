@@ -37,7 +37,7 @@ use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 use std::os::raw::{c_uint, c_ulonglong};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -46,26 +46,26 @@ use std::result;
 use std::thread;
 use std::time::Duration;
 
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 use libc::{EBADF, EINVAL};
 
 use data_model::VolatileMemoryError;
 use data_model::*;
 
-#[cfg(feature = "wl-dmabuf")]
-use base::ioctl_iow_nr;
 use base::{
     error, pipe, round_up_to_page_size, warn, AsRawDescriptor, Error, Event, FileFlags,
     FromRawDescriptor, PollToken, RawDescriptor, Result, ScmSocket, SharedMemory, SharedMemoryUnix,
     WaitContext,
 };
+#[cfg(feature = "minigbm")]
+use base::{ioctl_iow_nr, ioctl_with_ref};
+#[cfg(feature = "gpu")]
+use base::{IntoRawDescriptor, SafeDescriptor};
 use msg_socket::{MsgError, MsgReceiver, MsgSender};
-#[cfg(feature = "wl-dmabuf")]
-use resources::GpuMemoryDesc;
 use vm_memory::{GuestMemory, GuestMemoryError};
 
-#[cfg(feature = "wl-dmabuf")]
-use base::ioctl_with_ref;
+#[cfg(feature = "minigbm")]
+use vm_control::GpuMemoryDesc;
 
 use super::resource_bridge::*;
 use super::{DescriptorChain, Interrupt, Queue, Reader, VirtioDevice, Writer, TYPE_WL};
@@ -81,16 +81,16 @@ const VIRTIO_WL_CMD_VFD_RECV: u32 = 259;
 const VIRTIO_WL_CMD_VFD_NEW_CTX: u32 = 260;
 const VIRTIO_WL_CMD_VFD_NEW_PIPE: u32 = 261;
 const VIRTIO_WL_CMD_VFD_HUP: u32 = 262;
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 const VIRTIO_WL_CMD_VFD_NEW_DMABUF: u32 = 263;
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 const VIRTIO_WL_CMD_VFD_DMABUF_SYNC: u32 = 264;
 #[cfg(feature = "gpu")]
 const VIRTIO_WL_CMD_VFD_SEND_FOREIGN_ID: u32 = 265;
 const VIRTIO_WL_CMD_VFD_NEW_CTX_NAMED: u32 = 266;
 const VIRTIO_WL_RESP_OK: u32 = 4096;
 const VIRTIO_WL_RESP_VFD_NEW: u32 = 4097;
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 const VIRTIO_WL_RESP_VFD_NEW_DMABUF: u32 = 4098;
 const VIRTIO_WL_RESP_ERR: u32 = 4352;
 const VIRTIO_WL_RESP_OUT_OF_MEMORY: u32 = 4353;
@@ -103,6 +103,7 @@ const VIRTIO_WL_VFD_READ: u32 = 0x2;
 const VIRTIO_WL_VFD_MAP: u32 = 0x2;
 const VIRTIO_WL_VFD_CONTROL: u32 = 0x4;
 const VIRTIO_WL_F_TRANS_FLAGS: u32 = 0x01;
+const VIRTIO_WL_F_SEND_FENCES: u32 = 0x02;
 
 const QUEUE_SIZE: u16 = 16;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE, QUEUE_SIZE];
@@ -114,24 +115,26 @@ const VFD_ID_HOST_MASK: u32 = NEXT_VFD_ID_BASE;
 const IN_BUFFER_LEN: usize =
     0x1000 - size_of::<CtrlVfdRecv>() - VIRTWL_SEND_MAX_ALLOCS * size_of::<Le32>();
 
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 const VIRTIO_WL_VFD_DMABUF_SYNC_VALID_FLAG_MASK: u32 = 0x7;
 
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 const DMA_BUF_IOCTL_BASE: c_uint = 0x62;
 
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct dma_buf_sync {
     flags: c_ulonglong,
 }
 
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 ioctl_iow_nr!(DMA_BUF_IOCTL_SYNC, DMA_BUF_IOCTL_BASE, 0, dma_buf_sync);
 
 const VIRTIO_WL_CTRL_VFD_SEND_KIND_LOCAL: u32 = 0;
 const VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU: u32 = 1;
+const VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU_FENCE: u32 = 2;
+const VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU_SIGNALED_FENCE: u32 = 3;
 
 fn encode_vfd_new(
     writer: &mut Writer,
@@ -161,7 +164,7 @@ fn encode_vfd_new(
         .map_err(WlError::WriteResponse)
 }
 
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 fn encode_vfd_new_dmabuf(
     writer: &mut Writer,
     vfd_id: u32,
@@ -240,7 +243,7 @@ fn encode_resp(writer: &mut Writer, resp: WlResp) -> WlResult<()> {
             size,
             resp,
         } => encode_vfd_new(writer, resp, id, flags, pfn, size),
-        #[cfg(feature = "wl-dmabuf")]
+        #[cfg(feature = "minigbm")]
         WlResp::VfdNewDmabuf {
             id,
             flags,
@@ -382,7 +385,7 @@ unsafe impl DataInit for CtrlVfdNewCtxNamed {}
 
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 struct CtrlVfdNewDmabuf {
     hdr: CtrlHeader,
     id: Le32,
@@ -400,19 +403,19 @@ struct CtrlVfdNewDmabuf {
     offset2: Le32,
 }
 
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 unsafe impl DataInit for CtrlVfdNewDmabuf {}
 
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 struct CtrlVfdDmabufSync {
     hdr: CtrlHeader,
     id: Le32,
     flags: Le32,
 }
 
-#[cfg(feature = "wl-dmabuf")]
+#[cfg(feature = "minigbm")]
 unsafe impl DataInit for CtrlVfdDmabufSync {}
 
 #[repr(C)]
@@ -454,6 +457,38 @@ struct CtrlVfdSendVfd {
 
 unsafe impl DataInit for CtrlVfdSendVfd {}
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+union CtrlVfdSendVfdV2Payload {
+    id: Le32,
+    seqno: Le64,
+}
+
+unsafe impl DataInit for CtrlVfdSendVfdV2Payload {}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct CtrlVfdSendVfdV2 {
+    kind: Le32,
+    payload: CtrlVfdSendVfdV2Payload,
+}
+
+unsafe impl DataInit for CtrlVfdSendVfdV2 {}
+
+impl CtrlVfdSendVfdV2 {
+    fn id(&self) -> Le32 {
+        assert!(
+            self.kind == VIRTIO_WL_CTRL_VFD_SEND_KIND_LOCAL
+                || self.kind == VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU
+        );
+        unsafe { self.payload.id }
+    }
+    fn seqno(&self) -> Le64 {
+        assert!(self.kind == VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU_FENCE);
+        unsafe { self.payload.seqno }
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 enum WlResp<'a> {
@@ -467,7 +502,7 @@ enum WlResp<'a> {
         // is important for the `get_code` method.
         resp: bool,
     },
-    #[cfg(feature = "wl-dmabuf")]
+    #[cfg(feature = "minigbm")]
     VfdNewDmabuf {
         id: u32,
         flags: u32,
@@ -502,7 +537,7 @@ impl<'a> WlResp<'a> {
                     VIRTIO_WL_CMD_VFD_NEW
                 }
             }
-            #[cfg(feature = "wl-dmabuf")]
+            #[cfg(feature = "minigbm")]
             WlResp::VfdNewDmabuf { .. } => VIRTIO_WL_RESP_VFD_NEW_DMABUF,
             WlResp::VfdRecv { .. } => VIRTIO_WL_CMD_VFD_RECV,
             WlResp::VfdHup { .. } => VIRTIO_WL_CMD_VFD_HUP,
@@ -523,7 +558,7 @@ struct WlVfd {
     remote_pipe: Option<File>,
     local_pipe: Option<(u32 /* flags */, File)>,
     slot: Option<(MemSlot, u64 /* pfn */, VmRequester)>,
-    #[cfg(feature = "wl-dmabuf")]
+    #[cfg(feature = "minigbm")]
     is_dmabuf: bool,
 }
 
@@ -574,7 +609,7 @@ impl WlVfd {
         }
     }
 
-    #[cfg(feature = "wl-dmabuf")]
+    #[cfg(feature = "minigbm")]
     fn dmabuf(
         vm: VmRequester,
         width: u32,
@@ -606,7 +641,7 @@ impl WlVfd {
         }
     }
 
-    #[cfg(feature = "wl-dmabuf")]
+    #[cfg(feature = "minigbm")]
     fn dmabuf_sync(&self, flags: u32) -> WlResult<()> {
         if !self.is_dmabuf {
             return Err(WlError::DmabufSync(io::Error::from_raw_os_error(EINVAL)));
@@ -721,8 +756,8 @@ impl WlVfd {
         self.guest_shared_memory
             .as_ref()
             .map(|(_, shm)| shm.as_raw_descriptor())
-            .or(self.socket.as_ref().map(|s| s.as_raw_descriptor()))
-            .or(self.remote_pipe.as_ref().map(|p| p.as_raw_descriptor()))
+            .or_else(|| self.socket.as_ref().map(|s| s.as_raw_descriptor()))
+            .or_else(|| self.remote_pipe.as_ref().map(|p| p.as_raw_descriptor()))
     }
 
     // The FD that is used for polling for events on this VFD.
@@ -730,10 +765,11 @@ impl WlVfd {
         self.socket
             .as_ref()
             .map(|s| s as &dyn AsRawDescriptor)
-            .or(self
-                .local_pipe
-                .as_ref()
-                .map(|(_, p)| p as &dyn AsRawDescriptor))
+            .or_else(|| {
+                self.local_pipe
+                    .as_ref()
+                    .map(|(_, p)| p as &dyn AsRawDescriptor)
+            })
     }
 
     // Sends data/files from the guest to the host over this VFD.
@@ -840,6 +876,9 @@ struct WlState {
     in_queue: VecDeque<(u32 /* vfd_id */, WlRecv)>,
     current_recv_vfd: Option<u32>,
     recv_vfds: Vec<u32>,
+    #[cfg(feature = "gpu")]
+    signaled_fence: Option<SafeDescriptor>,
+    use_send_vfd_v2: bool,
 }
 
 impl WlState {
@@ -847,6 +886,7 @@ impl WlState {
         wayland_paths: Map<String, PathBuf>,
         vm_socket: VmMemoryControlRequestSocket,
         use_transition_flags: bool,
+        use_send_vfd_v2: bool,
         resource_bridge: Option<ResourceRequestSocket>,
     ) -> WlState {
         WlState {
@@ -861,6 +901,9 @@ impl WlState {
             in_queue: VecDeque::new(),
             current_recv_vfd: None,
             recv_vfds: Vec::new(),
+            #[cfg(feature = "gpu")]
+            signaled_fence: None,
+            use_send_vfd_v2,
         }
     }
 
@@ -933,7 +976,7 @@ impl WlState {
         }
     }
 
-    #[cfg(feature = "wl-dmabuf")]
+    #[cfg(feature = "minigbm")]
     fn new_dmabuf(&mut self, id: u32, width: u32, height: u32, format: u32) -> WlResult<WlResp> {
         if id & VFD_ID_HOST_MASK != 0 {
             return Ok(WlResp::InvalidId);
@@ -956,7 +999,7 @@ impl WlState {
         }
     }
 
-    #[cfg(feature = "wl-dmabuf")]
+    #[cfg(feature = "minigbm")]
     fn dmabuf_sync(&mut self, vfd_id: u32, flags: u32) -> WlResult<WlResp> {
         if flags & !(VIRTIO_WL_VFD_DMABUF_SYNC_VALID_FLAG_MASK) != 0 {
             return Ok(WlResp::InvalidFlags);
@@ -988,7 +1031,7 @@ impl WlState {
                     &self
                         .wayland_paths
                         .get(name)
-                        .ok_or(WlError::UnknownSocketName(name.to_string()))?,
+                        .ok_or_else(|| WlError::UnknownSocketName(name.to_string()))?,
                 )?);
                 self.wait_ctx
                     .add(vfd.wait_descriptor().unwrap(), id)
@@ -1007,7 +1050,7 @@ impl WlState {
 
     fn process_wait_context(&mut self) {
         let events = match self.wait_ctx.wait_timeout(Duration::from_secs(0)) {
-            Ok(v) => v.to_owned(),
+            Ok(v) => v,
             Err(e) => {
                 error!("failed polling for vfd evens: {}", e);
                 return;
@@ -1058,6 +1101,26 @@ impl WlState {
         }
     }
 
+    #[cfg(feature = "gpu")]
+    fn get_info(&mut self, request: ResourceRequest) -> Option<File> {
+        let sock = self.resource_bridge.as_ref().unwrap();
+        match get_resource_info(sock, request) {
+            Ok(ResourceInfo::Buffer(BufferInfo { file, planes: _ })) => Some(file),
+            Ok(ResourceInfo::Fence { file }) => Some(file),
+            Err(ResourceBridgeError::InvalidResource(req)) => {
+                warn!("attempt to send non-existent gpu resource {}", req);
+                None
+            }
+            Err(e) => {
+                error!("{}", e);
+                // If there was an error with the resource bridge, it can no longer be
+                // trusted to continue to function.
+                self.resource_bridge = None;
+                None
+            }
+        }
+    }
+
     fn send(
         &mut self,
         vfd_id: u32,
@@ -1066,16 +1129,29 @@ impl WlState {
         reader: &mut Reader,
     ) -> WlResult<WlResp> {
         // First stage gathers and normalizes all id information from guest memory.
-        let mut send_vfd_ids = [CtrlVfdSendVfd::default(); VIRTWL_SEND_MAX_ALLOCS];
+        let mut send_vfd_ids = [CtrlVfdSendVfdV2 {
+            kind: Le32::from(0),
+            payload: CtrlVfdSendVfdV2Payload { id: Le32::from(0) },
+        }; VIRTWL_SEND_MAX_ALLOCS];
         for vfd_id in send_vfd_ids.iter_mut().take(vfd_count) {
             *vfd_id = if foreign_id {
-                reader.read_obj().map_err(WlError::ParseDesc)?
-            } else {
-                CtrlVfdSendVfd {
-                    kind: Le32::from(VIRTIO_WL_CTRL_VFD_SEND_KIND_LOCAL),
-                    id: reader.read_obj().map_err(WlError::ParseDesc)?,
+                if self.use_send_vfd_v2 {
+                    reader.read_obj().map_err(WlError::ParseDesc)?
+                } else {
+                    let vfd: CtrlVfdSendVfd = reader.read_obj().map_err(WlError::ParseDesc)?;
+                    CtrlVfdSendVfdV2 {
+                        kind: vfd.kind,
+                        payload: CtrlVfdSendVfdV2Payload { id: vfd.id },
+                    }
                 }
-            }
+            } else {
+                CtrlVfdSendVfdV2 {
+                    kind: Le32::from(VIRTIO_WL_CTRL_VFD_SEND_KIND_LOCAL),
+                    payload: CtrlVfdSendVfdV2Payload {
+                        id: reader.read_obj().map_err(WlError::ParseDesc)?,
+                    },
+                }
+            };
         }
 
         // Next stage collects corresponding file descriptors for each id.
@@ -1083,48 +1159,82 @@ impl WlState {
         #[cfg(feature = "gpu")]
         let mut bridged_files = Vec::new();
         for (&send_vfd_id, descriptor) in send_vfd_ids[..vfd_count].iter().zip(rds.iter_mut()) {
-            let id = send_vfd_id.id.to_native();
             match send_vfd_id.kind.to_native() {
-                VIRTIO_WL_CTRL_VFD_SEND_KIND_LOCAL => match self.vfds.get(&id) {
-                    Some(vfd) => match vfd.send_descriptor() {
-                        Some(vfd_fd) => *descriptor = vfd_fd,
-                        None => return Ok(WlResp::InvalidType),
-                    },
-                    None => {
-                        warn!("attempt to send non-existant vfd 0x{:08x}", id);
-                        return Ok(WlResp::InvalidId);
-                    }
-                },
-                #[cfg(feature = "gpu")]
-                VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU if self.resource_bridge.is_some() => {
-                    let sock = self.resource_bridge.as_ref().unwrap();
-                    match get_resource_info(sock, id) {
-                        Ok(info) => {
-                            *descriptor = info.file.as_raw_descriptor();
-                            bridged_files.push(info.file);
-                        }
-                        Err(ResourceBridgeError::InvalidResource(id)) => {
-                            warn!("attempt to send non-existent gpu resource {}", id);
-                            return Ok(WlResp::InvalidId);
-                        }
-                        Err(e) => {
-                            error!("{}", e);
-                            // If there was an error with the resource bridge, it can no longer be
-                            // trusted to continue to function.
-                            self.resource_bridge = None;
+                VIRTIO_WL_CTRL_VFD_SEND_KIND_LOCAL => {
+                    match self.vfds.get(&send_vfd_id.id().to_native()) {
+                        Some(vfd) => match vfd.send_descriptor() {
+                            Some(vfd_fd) => *descriptor = vfd_fd,
+                            None => return Ok(WlResp::InvalidType),
+                        },
+                        None => {
+                            warn!(
+                                "attempt to send non-existant vfd 0x{:08x}",
+                                send_vfd_id.id().to_native()
+                            );
                             return Ok(WlResp::InvalidId);
                         }
                     }
                 }
-                VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU => {
+                #[cfg(feature = "gpu")]
+                VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU if self.resource_bridge.is_some() => {
+                    match self.get_info(ResourceRequest::GetBuffer {
+                        id: send_vfd_id.id().to_native(),
+                    }) {
+                        Some(file) => {
+                            *descriptor = file.as_raw_descriptor();
+                            bridged_files.push(file);
+                        }
+                        None => return Ok(WlResp::InvalidId),
+                    }
+                }
+                #[cfg(feature = "gpu")]
+                VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU_FENCE if self.resource_bridge.is_some() => {
+                    match self.get_info(ResourceRequest::GetFence {
+                        seqno: send_vfd_id.seqno().to_native(),
+                    }) {
+                        Some(file) => {
+                            *descriptor = file.as_raw_descriptor();
+                            bridged_files.push(file);
+                        }
+                        None => return Ok(WlResp::InvalidId),
+                    }
+                }
+                #[cfg(feature = "gpu")]
+                VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU_SIGNALED_FENCE
+                    if self.resource_bridge.is_some() =>
+                {
+                    if self.signaled_fence.is_none() {
+                        // If the guest is sending a signaled fence, we know a fence
+                        // with seqno 0 must already be signaled.
+                        match self.get_info(ResourceRequest::GetFence { seqno: 0 }) {
+                            Some(file) => {
+                                // Safe since get_info returned a valid File.
+                                let safe_descriptor = unsafe {
+                                    SafeDescriptor::from_raw_descriptor(file.into_raw_descriptor())
+                                };
+                                self.signaled_fence = Some(safe_descriptor)
+                            }
+                            None => return Ok(WlResp::InvalidId),
+                        }
+                    }
+                    match self.signaled_fence.as_ref().unwrap().try_clone() {
+                        Ok(dup) => {
+                            *descriptor = dup.into_raw_descriptor();
+                            // Safe because the fd comes from a valid SafeDescriptor.
+                            let file = unsafe { File::from_raw_descriptor(*descriptor) };
+                            bridged_files.push(file);
+                        }
+                        Err(_) => return Ok(WlResp::InvalidId),
+                    }
+                }
+                VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU
+                | VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU_FENCE
+                | VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU_SIGNALED_FENCE => {
                     let _ = self.resource_bridge.as_ref();
                     warn!("attempt to send foreign resource kind but feature is disabled");
                 }
                 kind => {
-                    warn!(
-                        "attempt to send unknown foreign resource kind: {} id: {:08x}",
-                        kind, id
-                    );
+                    warn!("attempt to send unknown foreign resource kind: {}", kind);
                     return Ok(WlResp::InvalidId);
                 }
             }
@@ -1142,7 +1252,7 @@ impl WlState {
         // hangup events.
         for &send_vfd_id in &send_vfd_ids[..vfd_count] {
             if send_vfd_id.kind == VIRTIO_WL_CTRL_VFD_SEND_KIND_LOCAL {
-                if let Some(vfd) = self.vfds.get_mut(&send_vfd_id.id.into()) {
+                if let Some(vfd) = self.vfds.get_mut(&send_vfd_id.id().into()) {
                     vfd.close_remote();
                 }
             }
@@ -1231,7 +1341,7 @@ impl WlState {
                     .map_err(WlError::ParseDesc)?;
                 self.new_pipe(ctrl.id.into(), ctrl.flags.into())
             }
-            #[cfg(feature = "wl-dmabuf")]
+            #[cfg(feature = "minigbm")]
             VIRTIO_WL_CMD_VFD_NEW_DMABUF => {
                 let ctrl = reader
                     .read_obj::<CtrlVfdNewDmabuf>()
@@ -1243,7 +1353,7 @@ impl WlState {
                     ctrl.format.into(),
                 )
             }
-            #[cfg(feature = "wl-dmabuf")]
+            #[cfg(feature = "minigbm")]
             VIRTIO_WL_CMD_VFD_DMABUF_SYNC => {
                 let ctrl = reader
                     .read_obj::<CtrlVfdDmabufSync>()
@@ -1368,6 +1478,7 @@ impl Worker {
         wayland_paths: Map<String, PathBuf>,
         vm_socket: VmMemoryControlRequestSocket,
         use_transition_flags: bool,
+        use_send_vfd_v2: bool,
         resource_bridge: Option<ResourceRequestSocket>,
     ) -> Worker {
         Worker {
@@ -1379,6 +1490,7 @@ impl Worker {
                 wayland_paths,
                 vm_socket,
                 use_transition_flags,
+                use_send_vfd_v2,
                 resource_bridge,
             ),
         }
@@ -1433,16 +1545,16 @@ impl Worker {
                         let min_in_desc_len = (size_of::<CtrlVfdRecv>()
                             + size_of::<Le32>() * VIRTWL_SEND_MAX_ALLOCS)
                             as u32;
-                        in_desc_chains.extend(self.in_queue.iter(&self.mem).filter_map(|d| {
+                        in_desc_chains.extend(self.in_queue.iter(&self.mem).filter(|d| {
                             if d.len >= min_in_desc_len && d.is_write_only() {
-                                Some(d)
+                                true
                             } else {
                                 // Can not use queue.add_used directly because it's being borrowed
                                 // for the iterator chain, so we buffer the descriptor index in
                                 // rejects.
                                 rejects[rejects_len] = d.index;
                                 rejects_len += 1;
-                                None
+                                false
                             }
                         }));
                         for &reject in &rejects[..rejects_len] {
@@ -1551,6 +1663,7 @@ pub struct Wl {
     vm_socket: Option<VmMemoryControlRequestSocket>,
     resource_bridge: Option<ResourceRequestSocket>,
     use_transition_flags: bool,
+    use_send_vfd_v2: bool,
     base_features: u64,
 }
 
@@ -1568,6 +1681,7 @@ impl Wl {
             vm_socket: Some(vm_socket),
             resource_bridge,
             use_transition_flags: false,
+            use_send_vfd_v2: false,
             base_features,
         })
     }
@@ -1609,12 +1723,15 @@ impl VirtioDevice for Wl {
     }
 
     fn features(&self) -> u64 {
-        self.base_features | 1 << VIRTIO_WL_F_TRANS_FLAGS
+        self.base_features | 1 << VIRTIO_WL_F_TRANS_FLAGS | 1 << VIRTIO_WL_F_SEND_FENCES
     }
 
     fn ack_features(&mut self, value: u64) {
         if value & (1 << VIRTIO_WL_F_TRANS_FLAGS) != 0 {
             self.use_transition_flags = true;
+        }
+        if value & (1 << VIRTIO_WL_F_SEND_FENCES) != 0 {
+            self.use_send_vfd_v2 = true;
         }
     }
 
@@ -1641,6 +1758,7 @@ impl VirtioDevice for Wl {
         if let Some(vm_socket) = self.vm_socket.take() {
             let wayland_paths = self.wayland_paths.clone();
             let use_transition_flags = self.use_transition_flags;
+            let use_send_vfd_v2 = self.use_send_vfd_v2;
             let resource_bridge = self.resource_bridge.take();
             let worker_result =
                 thread::Builder::new()
@@ -1654,6 +1772,7 @@ impl VirtioDevice for Wl {
                             wayland_paths,
                             vm_socket,
                             use_transition_flags,
+                            use_send_vfd_v2,
                             resource_bridge,
                         )
                         .run(queue_evts, kill_evt);

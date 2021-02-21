@@ -10,6 +10,8 @@ use resources::{Error as SystemAllocatorFaliure, SystemAllocator};
 
 use crate::pci::pci_configuration;
 use crate::pci::{PciAddress, PciInterruptPin};
+#[cfg(feature = "audio")]
+use crate::virtio::snd::vios_backend::Error as VioSError;
 use crate::{BusAccessInfo, BusDevice};
 
 #[derive(Debug)]
@@ -23,6 +25,13 @@ pub enum Error {
     /// Create cras client failed.
     #[cfg(feature = "audio")]
     CreateCrasClientFailed(libcras::Error),
+    /// Create VioS client failed.
+    #[cfg(feature = "audio")]
+    CreateViosClientFailed(VioSError),
+    /// PCI Address allocation failure.
+    PciAllocationFailed,
+    /// PCI Address is not allocated.
+    PciAddressMissing,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -34,6 +43,8 @@ impl Display for Error {
             CapabilitiesSetup(e) => write!(f, "failed to add capability {}", e),
             #[cfg(feature = "audio")]
             CreateCrasClientFailed(e) => write!(f, "failed to create CRAS Client: {}", e),
+            #[cfg(feature = "audio")]
+            CreateViosClientFailed(e) => write!(f, "failed to create VioS Client: {}", e),
             IoAllocationFailed(size, e) => write!(
                 f,
                 "failed to allocate space for an IO BAR, size={}: {}",
@@ -42,6 +53,8 @@ impl Display for Error {
             IoRegistrationFailed(addr, e) => {
                 write!(f, "failed to register an IO BAR, addr={} err={}", addr, e)
             }
+            PciAllocationFailed => write!(f, "failed to allocate PCI address"),
+            PciAddressMissing => write!(f, "PCI address is not allocated"),
         }
     }
 }
@@ -49,8 +62,8 @@ impl Display for Error {
 pub trait PciDevice: Send {
     /// Returns a label suitable for debug output.
     fn debug_label(&self) -> String;
-    /// Assign a unique bus, device and function number to this device.
-    fn assign_address(&mut self, _address: PciAddress) {}
+    /// Allocate and return an unique bus, device and function number for this device.
+    fn allocate_address(&mut self, resources: &mut SystemAllocator) -> Result<PciAddress>;
     /// A vector of device-specific file descriptors that must be kept open
     /// after jailing. Must be called before the process is jailed.
     fn keep_rds(&self) -> Vec<RawDescriptor>;
@@ -149,8 +162,8 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     fn debug_label(&self) -> String {
         (**self).debug_label()
     }
-    fn assign_address(&mut self, address: PciAddress) {
-        (**self).assign_address(address)
+    fn allocate_address(&mut self, resources: &mut SystemAllocator) -> Result<PciAddress> {
+        (**self).allocate_address(resources)
     }
     fn keep_rds(&self) -> Vec<RawDescriptor> {
         (**self).keep_rds()

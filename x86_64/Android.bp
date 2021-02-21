@@ -65,6 +65,7 @@ rust_defaults {
         "libkernel_cmdline",
         "libkernel_loader",
         "liblibc",
+        "libmsg_socket",
         "libminijail_rust",
         "libresources",
         "libsync_rust",

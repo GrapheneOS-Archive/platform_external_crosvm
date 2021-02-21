@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Display};
 use std::fs::{File, OpenOptions};
 use std::io::{self, stdin, stdout, ErrorKind};
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -286,7 +285,7 @@ impl SerialParameters {
                                 .open(path.parent().ok_or(Error::InvalidPath)?)
                                 .map_err(Error::FileError)?;
 
-                            short_path.push(dir.as_raw_fd().to_string());
+                            short_path.push(dir.as_raw_descriptor().to_string());
                             short_path.push(path.file_name().ok_or(Error::InvalidPath)?);
                             path_cow = Cow::Owned(short_path);
                             _dir_fd = Some(dir);
@@ -334,16 +333,13 @@ impl SerialParameters {
 
     pub fn add_bind_mounts(&self, jail: &mut Minijail) -> Result<(), minijail::Error> {
         if let Some(path) = &self.path {
-            match self.type_ {
-                SerialType::UnixSocket => {
-                    if let Some(parent) = path.as_path().parent() {
-                        if parent.exists() {
-                            info!("Bind mounting dir {}", parent.display());
-                            jail.mount_bind(parent, parent, true)?;
-                        }
+            if let SerialType::UnixSocket = self.type_ {
+                if let Some(parent) = path.as_path().parent() {
+                    if parent.exists() {
+                        info!("Bind mounting dir {}", parent.display());
+                        jail.mount_bind(parent, parent, true)?;
                     }
                 }
-                _ => {}
             }
         }
         Ok(())
