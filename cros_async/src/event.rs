@@ -2,9 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use crate::io_ext::async_from;
+use crate::{AsyncError, AsyncResult, IntoAsync, IoSourceExt};
+use std::convert::TryFrom;
 use sys_util::EventFd;
-
-use crate::{AsyncResult, Executor, IntoAsync, IoSourceExt};
 
 /// An async version of `sys_util::EventFd`.
 pub struct EventAsync {
@@ -12,19 +13,18 @@ pub struct EventAsync {
 }
 
 impl EventAsync {
-    pub fn new(event: EventFd, ex: &Executor) -> AsyncResult<EventAsync> {
-        ex.async_from(event)
-            .map(|io_source| EventAsync { io_source })
+    #[cfg(test)]
+    pub(crate) fn new_poll(event: EventFd) -> AsyncResult<EventAsync> {
+        Ok(EventAsync {
+            io_source: crate::io_ext::async_poll_from(event)?,
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn new_poll(event: EventFd, ex: &crate::FdExecutor) -> AsyncResult<EventAsync> {
-        crate::executor::async_poll_from(event, ex).map(|io_source| EventAsync { io_source })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_uring(event: EventFd, ex: &crate::URingExecutor) -> AsyncResult<EventAsync> {
-        crate::executor::async_uring_from(event, ex).map(|io_source| EventAsync { io_source })
+    pub(crate) fn new_uring(event: EventFd) -> AsyncResult<EventAsync> {
+        Ok(EventAsync {
+            io_source: crate::io_ext::async_uring_from(event)?,
+        })
     }
 
     /// Gets the next value from the eventfd.
@@ -34,25 +34,37 @@ impl EventAsync {
     }
 }
 
+impl TryFrom<EventFd> for EventAsync {
+    type Error = AsyncError;
+
+    /// Creates a new EventAsync wrapper around the provided eventfd.
+    fn try_from(event: EventFd) -> AsyncResult<Self> {
+        Ok(EventAsync {
+            io_source: async_from(event)?,
+        })
+    }
+}
+
 impl IntoAsync for EventFd {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::{Executor, FdExecutor, URingExecutor};
+    use futures::pin_mut;
+    use std::convert::TryInto;
 
     #[test]
     fn next_val_reads_value() {
-        async fn go(event: EventFd, ex: &Executor) -> u64 {
-            let event_async = EventAsync::new(event, ex).unwrap();
+        async fn go(event: EventFd) -> u64 {
+            let event_async: EventAsync = event.try_into().unwrap();
             event_async.next_val().await.unwrap()
         }
 
         let eventfd = EventFd::new().unwrap();
         eventfd.write(0xaa).unwrap();
-        let ex = Executor::new().unwrap();
-        let val = ex.run_until(go(eventfd, &ex)).unwrap();
+        let fut = go(eventfd);
+        pin_mut!(fut);
+        let val = crate::run_executor(crate::RunOne::new(fut)).unwrap();
         assert_eq!(val, 0xaa);
     }
 
@@ -64,18 +76,16 @@ mod tests {
 
         let eventfd = EventFd::new().unwrap();
         eventfd.write(0xaa).unwrap();
-        let uring_ex = URingExecutor::new().unwrap();
-        let val = uring_ex
-            .run_until(go(EventAsync::new_uring(eventfd, &uring_ex).unwrap()))
-            .unwrap();
+        let fut = go(EventAsync::new_uring(eventfd).unwrap());
+        pin_mut!(fut);
+        let val = crate::run_one_uring(fut).unwrap();
         assert_eq!(val, 0xaa);
 
         let eventfd = EventFd::new().unwrap();
         eventfd.write(0xaa).unwrap();
-        let poll_ex = FdExecutor::new().unwrap();
-        let val = poll_ex
-            .run_until(go(EventAsync::new_poll(eventfd, &poll_ex).unwrap()))
-            .unwrap();
+        let fut = go(EventAsync::new_poll(eventfd).unwrap());
+        pin_mut!(fut);
+        let val = crate::run_one_poll(fut).unwrap();
         assert_eq!(val, 0xaa);
     }
 }

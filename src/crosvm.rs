@@ -41,17 +41,11 @@ pub enum Executable {
     Plugin(PathBuf),
 }
 
-/// Maximum length of a `DiskOption` identifier.
-///
-/// This is based on the virtio-block ID length limit.
-pub const DISK_ID_LEN: usize = 20;
-
 pub struct DiskOption {
     pub path: PathBuf,
     pub read_only: bool,
     pub sparse: bool,
     pub block_size: u32,
-    pub id: Option<[u8; DISK_ID_LEN]>,
 }
 
 /// A bind mount for directories in the plugin process.
@@ -122,7 +116,6 @@ impl TouchDeviceOption {
     }
 }
 
-#[derive(Eq, PartialEq)]
 pub enum SharedDirKind {
     FS,
     P9,
@@ -213,7 +206,6 @@ pub struct Config {
     pub serial_parameters: BTreeMap<(SerialHardware, u8), SerialParameters>,
     pub syslog_tag: Option<String>,
     pub virtio_single_touch: Option<TouchDeviceOption>,
-    pub virtio_multi_touch: Option<TouchDeviceOption>,
     pub virtio_trackpad: Option<TouchDeviceOption>,
     pub virtio_mouse: Option<PathBuf>,
     pub virtio_keyboard: Option<PathBuf>,
@@ -227,7 +219,6 @@ pub struct Config {
     pub battery_type: Option<BatteryType>,
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     pub gdb: Option<u32>,
-    pub balloon_bias: i64,
 }
 
 impl Default for Config {
@@ -273,7 +264,6 @@ impl Default for Config {
             serial_parameters: BTreeMap::new(),
             syslog_tag: None,
             virtio_single_touch: None,
-            virtio_multi_touch: None,
             virtio_trackpad: None,
             virtio_mouse: None,
             virtio_keyboard: None,
@@ -287,7 +277,6 @@ impl Default for Config {
             battery_type: None,
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             gdb: None,
-            balloon_bias: 0,
         }
     }
 }

@@ -12,29 +12,22 @@ use base::RawDescriptor;
 use msg_on_socket_derive::MsgOnSocket;
 use msg_socket::{MsgError, MsgReceiver, MsgSender, MsgSocket};
 
-#[derive(MsgOnSocket, Debug)]
+#[derive(MsgOnSocket)]
 pub enum ResourceRequest {
-    GetBuffer { id: u32 },
-    GetFence { seqno: u64 },
+    GetResource { id: u32 },
 }
 
-#[derive(MsgOnSocket, Clone, Copy, Default)]
+#[derive(MsgOnSocket, Clone)]
 pub struct PlaneInfo {
     pub offset: u32,
     pub stride: u32,
 }
 
+const RESOURE_PLANE_NUM: usize = 4;
 #[derive(MsgOnSocket)]
-pub struct BufferInfo {
+pub struct ResourceInfo {
     pub file: File,
     pub planes: [PlaneInfo; RESOURE_PLANE_NUM],
-}
-
-pub const RESOURE_PLANE_NUM: usize = 4;
-#[derive(MsgOnSocket)]
-pub enum ResourceInfo {
-    Buffer(BufferInfo),
-    Fence { file: File },
 }
 
 #[derive(MsgOnSocket)]
@@ -52,35 +45,26 @@ pub fn pair() -> std::io::Result<(ResourceRequestSocket, ResourceResponseSocket)
 
 #[derive(Debug)]
 pub enum ResourceBridgeError {
-    InvalidResource(ResourceRequest),
-    SendFailure(ResourceRequest, MsgError),
-    RecieveFailure(ResourceRequest, MsgError),
-}
-
-impl fmt::Display for ResourceRequest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ResourceRequest::GetBuffer { id } => write!(f, "Buffer-{}", id),
-            ResourceRequest::GetFence { seqno } => write!(f, "Fence-{}", seqno),
-        }
-    }
+    InvalidResource(u32),
+    SendFailure(u32, MsgError),
+    RecieveFailure(u32, MsgError),
 }
 
 impl fmt::Display for ResourceBridgeError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ResourceBridgeError::InvalidResource(req) => {
-                write!(f, "attempt to send non-existent gpu resource for {}", req)
+            ResourceBridgeError::InvalidResource(id) => {
+                write!(f, "attempt to send non-existent gpu resource for id {}", id)
             }
-            ResourceBridgeError::SendFailure(req, e) => write!(
+            ResourceBridgeError::SendFailure(id, e) => write!(
                 f,
-                "failed to send a resource bridge request for {}: {}",
-                req, e
+                "failed to send a resource bridge request for id {}: {}",
+                id, e
             ),
-            ResourceBridgeError::RecieveFailure(req, e) => write!(
+            ResourceBridgeError::RecieveFailure(id, e) => write!(
                 f,
-                "error receiving resource bridge response for {}: {}",
-                req, e
+                "error receiving resource bridge response for id {}: {}",
+                id, e
             ),
         }
     }
@@ -90,15 +74,15 @@ impl std::error::Error for ResourceBridgeError {}
 
 pub fn get_resource_info(
     sock: &ResourceRequestSocket,
-    request: ResourceRequest,
+    id: u32,
 ) -> std::result::Result<ResourceInfo, ResourceBridgeError> {
-    if let Err(e) = sock.send(&request) {
-        return Err(ResourceBridgeError::SendFailure(request, e));
+    if let Err(e) = sock.send(&ResourceRequest::GetResource { id }) {
+        return Err(ResourceBridgeError::SendFailure(id, e));
     }
 
     match sock.recv() {
         Ok(ResourceResponse::Resource(info)) => Ok(info),
-        Ok(ResourceResponse::Invalid) => Err(ResourceBridgeError::InvalidResource(request)),
-        Err(e) => Err(ResourceBridgeError::RecieveFailure(request, e)),
+        Ok(ResourceResponse::Invalid) => Err(ResourceBridgeError::InvalidResource(id)),
+        Err(e) => Err(ResourceBridgeError::RecieveFailure(id, e)),
     }
 }

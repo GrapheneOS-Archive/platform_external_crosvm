@@ -82,7 +82,7 @@ fn create_dsdt_table(amls: Vec<u8>) -> SDT {
         OEM_REVISION,
     );
 
-    if !amls.is_empty() {
+    if amls.len() != 0 {
         dsdt.append_slice(amls.as_slice());
     }
 
