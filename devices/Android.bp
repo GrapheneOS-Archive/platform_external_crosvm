@@ -14,7 +14,6 @@ rust_defaults {
     name: "devices_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "devices",
-    // has rustc warnings
     srcs: ["src/lib.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
@@ -38,14 +37,11 @@ rust_defaults {
         "libnet_sys",
         "libnet_util",
         "libp9",
-        "libpower_monitor",
         "librand_ish",
         "libresources",
         "libsync_rust",
-        "libsys_util",
         "libsyscall_defines",
         "libtempfile",
-        "libthiserror",
         "libusb_util",
         "libvfio_sys",
         "libvhost",
@@ -74,9 +70,9 @@ rust_test_host {
     ],
     rustlibs: [
         "libaudio_streams",  // moved manually
-//        "libgpu_buffer",  // added manually
+        "libgpu_buffer",  // added manually
         "libgpu_display",  // added manually
-        "librutabaga_gfx",  // added manually
+        "libgpu_renderer",  // added manually
         "liblibcras",  // moved manually
     ],
 
@@ -104,7 +100,6 @@ rust_test {
 rust_library {
     name: "libdevices",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "devices",
     srcs: ["src/lib.rs"],
@@ -127,9 +122,9 @@ rust_library {
         "libdata_model",
         "libdisk",
         "libfuse_rust",
-//        "libgpu_buffer",  // added manually
+        "libgpu_buffer",  // added manually
         "libgpu_display",  // added manually
-        "librutabaga_gfx",  // added manually
+        "libgpu_renderer",  // added manually
         "libhypervisor",
         "libkvm_sys",
         "liblibc",
@@ -140,13 +135,10 @@ rust_library {
         "libnet_sys",
         "libnet_util",
         "libp9",
-        "libpower_monitor",
         "librand_ish",
         "libresources",
         "libsync_rust",
-        "libsys_util",
         "libsyscall_defines",
-        "libthiserror",
         "libusb_util",
         "libvfio_sys",
         "libvhost",
@@ -165,9 +157,9 @@ rust_library {
 //   ../../adhd/audio_streams/src/audio_streams.rs
 //   ../../adhd/cras/client/cras-sys/src/lib.rs
 //   ../../adhd/cras/client/libcras/src/libcras.rs
-//   ../../libchromeos-rs/src/lib.rs
 //   ../../minijail/rust/minijail-sys/lib.rs
 //   ../../minijail/rust/minijail/src/lib.rs
+//   ../../rust/crates/libchromeos-rs/src/lib.rs
 //   ../../vm_tools/p9/src/lib.rs
 //   ../../vm_tools/p9/wire_format_derive/wire_format_derive.rs
 //   ../acpi_tables/src/lib.rs
@@ -189,10 +181,8 @@ rust_library {
 //   ../msg_socket/src/lib.rs
 //   ../net_sys/src/lib.rs
 //   ../net_util/src/lib.rs
-//   ../power_monitor/src/lib.rs
 //   ../rand_ish/src/lib.rs
 //   ../resources/src/lib.rs
-//   ../rutabaga_gfx/src/lib.rs
 //   ../sync/src/lib.rs
 //   ../sys_util/poll_token_derive/poll_token_derive.rs
 //   ../sys_util/src/lib.rs
@@ -205,47 +195,49 @@ rust_library {
 //   ../virtio_sys/src/lib.rs
 //   ../vm_control/src/lib.rs
 //   ../vm_memory/src/lib.rs
-//   async-task-4.0.3 "default,std"
 //   async-trait-0.1.42
 //   autocfg-1.0.1
 //   base-0.1.0
 //   bitflags-1.2.1 "default"
-//   cfg-if-1.0.0
+//   cfg-if-0.1.10
 //   downcast-rs-1.2.0 "default,std"
-//   futures-0.3.12 "alloc,async-await,default,executor,futures-executor,std"
-//   futures-channel-0.3.12 "alloc,futures-sink,sink,std"
-//   futures-core-0.3.12 "alloc,std"
-//   futures-executor-0.3.12 "std"
-//   futures-io-0.3.12 "std"
-//   futures-macro-0.3.12
-//   futures-sink-0.3.12 "alloc,std"
-//   futures-task-0.3.12 "alloc,once_cell,std"
-//   futures-util-0.3.12 "alloc,async-await,async-await-macro,channel,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,proc-macro-hack,proc-macro-nested,sink,slab,std"
-//   getrandom-0.2.2 "std"
+//   futures-0.3.8 "alloc,async-await,default,executor,futures-executor,std"
+//   futures-channel-0.3.8 "alloc,futures-sink,sink,std"
+//   futures-core-0.3.8 "alloc,std"
+//   futures-executor-0.3.8 "std"
+//   futures-io-0.3.8 "std"
+//   futures-macro-0.3.8
+//   futures-sink-0.3.8 "alloc,std"
+//   futures-task-0.3.8 "alloc,once_cell,std"
+//   futures-util-0.3.8 "alloc,async-await,async-await-macro,channel,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,proc-macro-hack,proc-macro-nested,sink,slab,std"
+//   getopts-0.2.21
+//   getrandom-0.1.15 "std"
 //   intrusive-collections-0.9.0 "alloc,default"
-//   libc-0.2.86 "default,std"
-//   log-0.4.14
+//   libc-0.2.80 "default,std"
+//   log-0.4.11
 //   memchr-2.3.4 "default,std"
 //   memoffset-0.5.6 "default"
 //   once_cell-1.5.2 "alloc,std"
-//   paste-1.0.4
-//   pin-project-lite-0.2.4
+//   paste-1.0.3
+//   pin-project-1.0.2
+//   pin-project-internal-1.0.2
 //   pin-utils-0.1.0
 //   pkg-config-0.3.19
 //   ppv-lite86-0.2.10 "simd,std"
 //   proc-macro-hack-0.5.19
-//   proc-macro-nested-0.1.7
+//   proc-macro-nested-0.1.6
 //   proc-macro2-1.0.24 "default,proc-macro"
-//   protobuf-2.22.0
-//   quote-1.0.8 "default,proc-macro"
-//   rand-0.8.3 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
-//   rand_chacha-0.3.0 "std"
-//   rand_core-0.6.1 "alloc,getrandom,std"
+//   protobuf-2.18.1
+//   quote-1.0.7 "default,proc-macro"
+//   rand-0.7.3 "alloc,default,getrandom,getrandom_package,libc,std"
+//   rand_chacha-0.2.2 "std"
+//   rand_core-0.5.1 "alloc,getrandom,std"
 //   remain-0.2.2
 //   remove_dir_all-0.5.3
 //   slab-0.4.2
-//   syn-1.0.60 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
-//   tempfile-3.2.0
-//   thiserror-1.0.23
-//   thiserror-impl-1.0.23
+//   syn-1.0.53 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   tempfile-3.1.0
+//   thiserror-1.0.22
+//   thiserror-impl-1.0.22
+//   unicode-width-0.1.8 "default"
 //   unicode-xid-0.2.1 "default"
