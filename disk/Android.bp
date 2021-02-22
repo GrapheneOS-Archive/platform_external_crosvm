@@ -81,32 +81,32 @@ rust_library {
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
 //   ../vm_memory/src/lib.rs
-//   async-task-4.0.3 "default,std"
 //   async-trait-0.1.42
-//   cfg-if-1.0.0
-//   futures-0.3.12 "alloc"
-//   futures-channel-0.3.12 "alloc,futures-sink,sink"
-//   futures-core-0.3.12 "alloc"
-//   futures-io-0.3.12
-//   futures-sink-0.3.12 "alloc"
-//   futures-task-0.3.12 "alloc"
-//   futures-util-0.3.12 "alloc,futures-sink,sink"
-//   getrandom-0.2.2 "std"
-//   libc-0.2.86 "default,std"
-//   paste-1.0.4
-//   pin-project-lite-0.2.4
+//   cfg-if-0.1.10
+//   futures-0.3.8 "alloc"
+//   futures-channel-0.3.8 "alloc,futures-sink,sink"
+//   futures-core-0.3.8 "alloc"
+//   futures-io-0.3.8
+//   futures-sink-0.3.8 "alloc"
+//   futures-task-0.3.8 "alloc"
+//   futures-util-0.3.8 "alloc,futures-sink,sink"
+//   getrandom-0.1.15 "std"
+//   libc-0.2.80 "default,std"
+//   paste-1.0.3
+//   pin-project-1.0.2
+//   pin-project-internal-1.0.2
 //   pin-utils-0.1.0
 //   ppv-lite86-0.2.10 "simd,std"
 //   proc-macro2-1.0.24 "default,proc-macro"
-//   quote-1.0.8 "default,proc-macro"
-//   rand-0.8.3 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
-//   rand_chacha-0.3.0 "std"
-//   rand_core-0.6.1 "alloc,getrandom,std"
+//   quote-1.0.7 "default,proc-macro"
+//   rand-0.7.3 "alloc,default,getrandom,getrandom_package,libc,std"
+//   rand_chacha-0.2.2 "std"
+//   rand_core-0.5.1 "alloc,getrandom,std"
 //   remain-0.2.2
 //   remove_dir_all-0.5.3
 //   slab-0.4.2
-//   syn-1.0.60 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
-//   tempfile-3.2.0
-//   thiserror-1.0.23
-//   thiserror-impl-1.0.23
+//   syn-1.0.53 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   tempfile-3.1.0
+//   thiserror-1.0.22
+//   thiserror-impl-1.0.22
 //   unicode-xid-0.2.1 "default"
