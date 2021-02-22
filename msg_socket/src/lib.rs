@@ -5,14 +5,12 @@
 mod msg_on_socket;
 mod serializable_descriptors;
 
-use std::io::{IoSlice, Result};
-use std::marker::PhantomData;
-
 use base::{
     handle_eintr, net::UnixSeqpacket, AsRawDescriptor, Error as SysError, RawDescriptor, ScmSocket,
     UnsyncMarker,
 };
-use cros_async::{Executor, IoSourceExt};
+use std::io::{IoSlice, Result};
+use std::marker::PhantomData;
 
 pub use crate::msg_on_socket::*;
 pub use msg_on_socket_derive::*;
@@ -47,8 +45,8 @@ impl<I: MsgOnSocket, O: MsgOnSocket> MsgSocket<I, O> {
     }
 
     // Creates an async receiver that implements `futures::Stream`.
-    pub fn async_receiver(&self, ex: &Executor) -> MsgResult<AsyncReceiver<I, O>> {
-        AsyncReceiver::new(self, ex)
+    pub fn async_receiver(&self) -> MsgResult<AsyncReceiver<I, O>> {
+        AsyncReceiver::new(self)
     }
 }
 
@@ -169,7 +167,7 @@ pub trait MsgReceiver: AsRef<UnixSeqpacket> {
             }
         };
 
-        if msg_buffer.is_empty() && Self::M::fixed_size() != Some(0) {
+        if msg_buffer.len() == 0 && Self::M::fixed_size() != Some(0) {
             return Err(MsgError::RecvZero);
         }
 
@@ -207,26 +205,18 @@ impl<O: MsgOnSocket> MsgReceiver for Receiver<O> {
 }
 
 /// Asynchronous adaptor for `MsgSocket`.
-pub struct AsyncReceiver<'m, I: MsgOnSocket, O: MsgOnSocket> {
-    // This weirdness is because we can't directly implement IntoAsync for &MsgSocket because there
-    // is no AsRawFd impl for references.
-    inner: &'m MsgSocket<I, O>,
-    sock: Box<dyn IoSourceExt<&'m UnixSeqpacket> + 'm>,
+pub struct AsyncReceiver<'a, I: MsgOnSocket, O: MsgOnSocket> {
+    inner: &'a MsgSocket<I, O>,
 }
 
-impl<'m, I: MsgOnSocket, O: MsgOnSocket> AsyncReceiver<'m, I, O> {
-    fn new(msg_socket: &'m MsgSocket<I, O>, ex: &Executor) -> MsgResult<Self> {
-        let sock = ex
-            .async_from(&msg_socket.sock)
-            .map_err(MsgError::CreateAsync)?;
-        Ok(AsyncReceiver {
-            inner: msg_socket,
-            sock,
-        })
+impl<'a, I: MsgOnSocket, O: MsgOnSocket> AsyncReceiver<'a, I, O> {
+    fn new(msg_socket: &MsgSocket<I, O>) -> MsgResult<AsyncReceiver<I, O>> {
+        Ok(AsyncReceiver { inner: msg_socket })
     }
 
     pub async fn next(&mut self) -> MsgResult<O> {
-        self.sock.wait_readable().await.unwrap();
+        let p = cros_async::async_from(&self.inner.sock).unwrap();
+        p.wait_readable().await.unwrap();
         self.inner.recv()
     }
 }

@@ -53,14 +53,8 @@ impl MemoryMapping {
         self.0
             .write_from_memory(mem_offset, &wrap_descriptor(dst), count)
     }
-}
 
-pub trait Unix {
-    fn remove_range(&self, mem_offset: usize, count: usize) -> Result<()>;
-}
-
-impl Unix for MemoryMapping {
-    fn remove_range(&self, mem_offset: usize, count: usize) -> Result<()> {
+    pub fn remove_range(&self, mem_offset: usize, count: usize) -> Result<()> {
         self.0.remove_range(mem_offset, count)
     }
 }
@@ -128,7 +122,7 @@ impl<'a> MemoryMappingBuilder<'a> {
                 }
                 MemoryMappingBuilder::wrap(SysUtilMmap::new_protection(
                     self.size,
-                    self.protection.unwrap_or_else(Protection::read_write),
+                    self.protection.unwrap_or(Protection::read_write()),
                 ))
             }
             Some(descriptor) => {
@@ -136,7 +130,7 @@ impl<'a> MemoryMappingBuilder<'a> {
                     &wrap_descriptor(descriptor),
                     self.size,
                     self.offset.unwrap_or(0),
-                    self.protection.unwrap_or_else(Protection::read_write),
+                    self.protection.unwrap_or(Protection::read_write()),
                     self.populate,
                 ))
             }
@@ -161,7 +155,7 @@ impl<'a> MemoryMappingBuilder<'a> {
             None => MemoryMappingBuilder::wrap(SysUtilMmap::new_protection_fixed(
                 addr,
                 self.size,
-                self.protection.unwrap_or_else(Protection::read_write),
+                self.protection.unwrap_or(Protection::read_write()),
             )),
             Some(descriptor) => {
                 MemoryMappingBuilder::wrap(SysUtilMmap::from_fd_offset_protection_fixed(
@@ -169,14 +163,14 @@ impl<'a> MemoryMappingBuilder<'a> {
                     &wrap_descriptor(descriptor),
                     self.size,
                     self.offset.unwrap_or(0),
-                    self.protection.unwrap_or_else(Protection::read_write),
+                    self.protection.unwrap_or(Protection::read_write()),
                 ))
             }
         }
     }
 
     fn wrap(result: Result<SysUtilMmap>) -> Result<MemoryMapping> {
-        result.map(MemoryMapping)
+        result.map(|mmap| MemoryMapping(mmap))
     }
 }
 
