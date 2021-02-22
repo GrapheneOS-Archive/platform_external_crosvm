@@ -54,7 +54,6 @@ pub enum EncoderEvent {
     ProcessedOutputBuffer {
         id: OutputBufferId,
         bytesused: u32,
-        keyframe: bool,
         timestamp: u64,
     },
     FlushResponse {
@@ -72,7 +71,6 @@ pub struct SessionConfig {
     pub dst_profile: Profile,
     pub dst_bitrate: u32,
     pub dst_h264_level: Option<Level>,
-    pub frame_rate: u32,
 }
 
 #[derive(Debug)]
@@ -134,7 +132,6 @@ impl EncoderCapabilities {
         desired_format: Format,
         desired_width: u32,
         desired_height: u32,
-        mut stride: u32,
     ) -> Result<()> {
         let format_desc = self
             .input_format_descs
@@ -149,19 +146,15 @@ impl EncoderCapabilities {
         let (allowed_width, allowed_height) =
             find_closest_resolution(&format_desc.frame_formats, desired_width, desired_height);
 
-        if stride == 0 {
-            stride = allowed_width;
-        }
-
         let plane_formats = match format_desc.format {
             Format::NV12 => {
                 let y_plane = PlaneFormat {
-                    plane_size: stride * allowed_height,
-                    stride,
+                    plane_size: allowed_width * allowed_height,
+                    stride: allowed_width,
                 };
                 let crcb_plane = PlaneFormat {
                     plane_size: y_plane.plane_size / 2,
-                    stride,
+                    stride: allowed_width,
                 };
                 vec![y_plane, crcb_plane]
             }
@@ -180,8 +173,9 @@ impl EncoderCapabilities {
     pub fn populate_dst_params(
         &self,
         dst_params: &mut Params,
+        src_params: &Params,
         desired_format: Format,
-        buffer_size: u32,
+        frame_rate: u32,
     ) -> Result<()> {
         // TODO(alexlau): Should the first be the default?
         let format_desc = self
@@ -195,12 +189,14 @@ impl EncoderCapabilities {
             );
         dst_params.format = Some(format_desc.format.clone());
 
-        // The requested output buffer size might be adjusted by the encoder to match hardware
-        // requirements in RequireInputBuffers.
+        // TODO(alexlau): What values should be assigned here?
+        dst_params.frame_width = src_params.frame_width;
+        dst_params.frame_height = src_params.frame_height;
         dst_params.plane_formats = vec![PlaneFormat {
-            plane_size: buffer_size,
-            stride: 0,
+            plane_size: src_params.frame_width * dst_params.frame_height * 4,
+            stride: src_params.frame_width * 2,
         }];
+        dst_params.frame_rate = frame_rate;
         Ok(())
     }
 

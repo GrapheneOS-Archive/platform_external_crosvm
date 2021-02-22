@@ -230,10 +230,10 @@ impl AddressAllocator {
                 let end = address.checked_add(size).ok_or(Error::OutOfBounds)?;
                 match (range.contains(&address), range.contains(&end)) {
                     (true, true) => Ok(address),
-                    _ => Err(Error::OutOfBounds),
+                    _ => return Err(Error::OutOfBounds),
                 }
             }
-            None => Err(Error::InvalidAlloc(alloc)),
+            None => return Err(Error::InvalidAlloc(alloc)),
         }
     }
 }

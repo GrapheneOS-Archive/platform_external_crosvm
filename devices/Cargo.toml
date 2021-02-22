@@ -6,14 +6,13 @@ edition = "2018"
 
 [features]
 audio = []
-gpu = ["gpu_display","rutabaga_gfx"]
+gpu = ["gpu_buffer", "gpu_display", "gpu_renderer"]
 tpm = ["protos/trunks", "tpm2"]
 video-decoder = []
 video-encoder = []
-minigbm = ["rutabaga_gfx/minigbm"]
+wl-dmabuf = []
 x = ["gpu_display/x"]
-virgl_renderer = ["gpu", "rutabaga_gfx/virgl_renderer"]
-gfxstream = ["gpu", "rutabaga_gfx/gfxstream"]
+gfxstream = ["gpu", "gpu_renderer/gfxstream"]
 
 [dependencies]
 acpi_tables = {path = "../acpi_tables" }
@@ -24,8 +23,9 @@ data_model = { path = "../data_model" }
 disk = { path = "../disk" }
 enumn = { path = "../enumn" }
 fuse = {path = "../fuse" }
+gpu_buffer = { path = "../gpu_buffer", optional = true }
 gpu_display = { path = "../gpu_display", optional = true }
-rutabaga_gfx = { path = "../rutabaga_gfx", optional = true }
+gpu_renderer = { path = "../gpu_renderer", optional = true }
 hypervisor = { path = "../hypervisor" }
 kvm_sys = { path = "../kvm_sys" }
 libc = "*"
@@ -37,16 +37,13 @@ msg_socket = { path = "../msg_socket" }
 net_sys = { path = "../net_sys" }
 net_util = { path = "../net_util" }
 p9 = { path = "../../vm_tools/p9" }
-power_monitor = { path = "../power_monitor" }
 protos = { path = "../protos", optional = true }
 rand_ish = { path = "../rand_ish" }
 remain = "*"
 resources = { path = "../resources" }
 sync = { path = "../sync" }
-sys_util = { path = "../sys_util" }
 base = { path = "../base" }
 syscall_defines = { path = "../syscall_defines" }
-thiserror = "1.0.20"
 tpm2 = { path = "../tpm2", optional = true }
 usb_util = { path = "../usb_util" }
 vfio_sys = { path = "../vfio_sys" }
