@@ -14,8 +14,8 @@ use std::sync::Arc;
 use crate::guest_address::GuestAddress;
 use base::{pagesize, Error as SysError};
 use base::{
-    AsRawDescriptor, MappedRegion, MemfdSeals, MemoryMapping, MemoryMappingBuilder,
-    MemoryMappingUnix, MmapError, RawDescriptor, SharedMemory, SharedMemoryUnix,
+    AsRawDescriptor, MappedRegion, MemfdSeals, MemoryMapping, MemoryMappingBuilder, MmapError,
+    RawDescriptor, SharedMemory, SharedMemoryUnix,
 };
 use cros_async::{
     uring_mem::{self, BorrowedIoVec},
@@ -60,9 +60,9 @@ impl Display for Error {
             MemoryMappingFailed(e) => write!(f, "failed to map guest memory: {}", e),
             MemoryRegionOverlap => write!(f, "memory regions overlap"),
             MemoryRegionTooLarge(size) => write!(f, "memory region size {} is too large", size),
-            MemoryNotAligned => write!(f, "shm regions must be page aligned"),
-            MemoryCreationFailed(_) => write!(f, "failed to create shm region"),
-            MemoryAddSealsFailed(e) => write!(f, "failed to set seals on shm region: {}", e),
+            MemoryNotAligned => write!(f, "memfd regions must be page aligned"),
+            MemoryCreationFailed(_) => write!(f, "failed to create memfd region"),
+            MemoryAddSealsFailed(e) => write!(f, "failed to set seals on memfd region: {}", e),
             ShortWrite {
                 expected,
                 completed,
@@ -110,24 +110,24 @@ impl MemoryRegion {
 /// fd of the underlying memory regions.
 #[derive(Clone)]
 pub struct GuestMemory {
-    regions: Arc<[MemoryRegion]>,
-    shm: Arc<SharedMemory>,
+    regions: Arc<Vec<MemoryRegion>>,
+    memfd: Arc<SharedMemory>,
 }
 
 impl AsRawDescriptor for GuestMemory {
     fn as_raw_descriptor(&self) -> RawDescriptor {
-        self.shm.as_raw_descriptor()
+        self.memfd.as_raw_descriptor()
     }
 }
 
 impl AsRef<SharedMemory> for GuestMemory {
     fn as_ref(&self) -> &SharedMemory {
-        &self.shm
+        &self.memfd
     }
 }
 
 impl GuestMemory {
-    /// Creates backing shm for GuestMemory regions
+    /// Creates backing memfd for GuestMemory regions
     fn create_memfd(ranges: &[(GuestAddress, u64)]) -> Result<SharedMemory> {
         let mut aligned_size = 0;
         let pg_size = pagesize();
@@ -145,19 +145,21 @@ impl GuestMemory {
         seals.set_grow_seal();
         seals.set_seal_seal();
 
-        let mut shm = SharedMemory::named("crosvm_guest", aligned_size)
+        let mut memfd = SharedMemory::named("crosvm_guest", aligned_size)
             .map_err(Error::MemoryCreationFailed)?;
-        shm.add_seals(seals).map_err(Error::MemoryAddSealsFailed)?;
+        memfd
+            .add_seals(seals)
+            .map_err(Error::MemoryAddSealsFailed)?;
 
-        Ok(shm)
+        Ok(memfd)
     }
 
     /// Creates a container for guest memory regions.
     /// Valid memory regions are specified as a Vec of (Address, Size) tuples sorted by Address.
     pub fn new(ranges: &[(GuestAddress, u64)]) -> Result<GuestMemory> {
-        // Create shm
+        // Create memfd
 
-        let shm = GuestMemory::create_memfd(ranges)?;
+        let memfd = GuestMemory::create_memfd(ranges)?;
         // Create memory regions
         let mut regions = Vec::<MemoryRegion>::new();
         let mut offset = 0;
@@ -176,7 +178,7 @@ impl GuestMemory {
             let size =
                 usize::try_from(range.1).map_err(|_| Error::MemoryRegionTooLarge(range.1))?;
             let mapping = MemoryMappingBuilder::new(size)
-                .from_descriptor(&shm)
+                .from_descriptor(&memfd)
                 .offset(offset)
                 .build()
                 .map_err(Error::MemoryMappingFailed)?;
@@ -190,8 +192,8 @@ impl GuestMemory {
         }
 
         Ok(GuestMemory {
-            regions: Arc::from(regions),
-            shm: Arc::new(shm),
+            regions: Arc::new(regions),
+            memfd: Arc::new(memfd),
         })
     }
 
@@ -635,11 +637,11 @@ impl GuestMemory {
             })
     }
 
-    /// Convert a GuestAddress into an offset within self.shm.
+    /// Convert a GuestAddress into an offset within self.memfd.
     ///
     /// Due to potential gaps within GuestMemory, it is helpful to know the
-    /// offset within the shm where a given address is found. This offset
-    /// can then be passed to another process mapping the shm to read data
+    /// offset within the memfd where a given address is found. This offset
+    /// can then be passed to another process mapping the memfd to read data
     /// starting at that address.
     ///
     /// # Arguments
@@ -669,10 +671,10 @@ impl GuestMemory {
 
 // It is safe to implement BackingMemory because GuestMemory can be mutated any time already.
 unsafe impl BackingMemory for GuestMemory {
-    fn get_iovec(
-        &self,
+    fn get_iovec<'s>(
+        &'s self,
         mem_range: cros_async::MemRegion,
-    ) -> uring_mem::Result<uring_mem::BorrowedIoVec<'_>> {
+    ) -> uring_mem::Result<uring_mem::BorrowedIoVec<'s>> {
         let vs = self
             .get_slice_at_addr(GuestAddress(mem_range.offset as u64), mem_range.len)
             .map_err(|_| uring_mem::Error::InvalidOffset(mem_range.offset, mem_range.len))?;
