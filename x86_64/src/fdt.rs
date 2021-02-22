@@ -58,11 +58,10 @@ pub fn create_fdt(
         mem::size_of::<setup_data>(),
         mem::size_of::<setup_data_hdr>()
     );
-    let hdr = setup_data_hdr {
-        next: 0,
-        type_: SETUP_DTB,
-        len: fdt_data_size as u32,
-    };
+    let mut hdr: setup_data_hdr = Default::default();
+    hdr.next = 0;
+    hdr.type_ = SETUP_DTB;
+    hdr.len = fdt_data_size as u32;
 
     assert!(fdt_data_size as u64 <= X86_64_FDT_MAX_SIZE);
 

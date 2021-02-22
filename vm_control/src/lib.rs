@@ -15,8 +15,8 @@ pub mod gdb;
 
 use std::fmt::{self, Display};
 use std::fs::File;
+use std::io::{Seek, SeekFrom};
 use std::mem::ManuallyDrop;
-use std::os::raw::c_int;
 use std::result::Result as StdResult;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -24,29 +24,15 @@ use std::sync::Arc;
 use libc::{EINVAL, EIO, ENODEV};
 
 use base::{
-    error, AsRawDescriptor, Error as SysError, Event, ExternalMapping, Fd, FromRawDescriptor,
-    IntoRawDescriptor, MappedRegion, MemoryMappingArena, MemoryMappingBuilder, MmapError,
-    Protection, RawDescriptor, Result, SafeDescriptor,
+    error, AsRawDescriptor, Error as SysError, Event, ExternalMapping, FromRawDescriptor,
+    IntoRawDescriptor, MappedRegion, MemoryMappingBuilder, MmapError, RawDescriptor, Result,
+    SafeDescriptor,
 };
 use hypervisor::{IrqRoute, IrqSource, Vm};
 use msg_socket::{MsgError, MsgOnSocket, MsgReceiver, MsgResult, MsgSender, MsgSocket};
-use resources::{Alloc, MmioType, SystemAllocator};
-use rutabaga_gfx::{DrmFormat, ImageAllocationInfo, RutabagaGralloc, RutabagaGrallocFlags};
+use resources::{Alloc, GpuMemoryDesc, SystemAllocator};
 use sync::Mutex;
 use vm_memory::GuestAddress;
-
-/// Struct that describes the offset and stride of a plane located in GPU memory.
-#[derive(Clone, Copy, Debug, PartialEq, Default, MsgOnSocket)]
-pub struct GpuMemoryPlaneDesc {
-    pub stride: u32,
-    pub offset: u32,
-}
-
-/// Struct that describes a GPU memory allocation that consists of up to 3 planes.
-#[derive(Clone, Copy, Debug, Default, MsgOnSocket)]
-pub struct GpuMemoryDesc {
-    pub planes: [GpuMemoryPlaneDesc; 3],
-}
 
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 pub use crate::gdb::*;
@@ -354,7 +340,6 @@ impl VmMemoryRequest {
         vm: &mut impl Vm,
         sys_allocator: &mut SystemAllocator,
         map_request: Arc<Mutex<Option<ExternalMapping>>>,
-        gralloc: &mut RutabagaGralloc,
     ) -> VmMemoryResponse {
         use self::VmMemoryRequest::*;
         match *self {
@@ -378,7 +363,7 @@ impl VmMemoryRequest {
                 let mem = map_request
                     .lock()
                     .take()
-                    .ok_or_else(|| VmMemoryResponse::Err(SysError::new(EINVAL)))
+                    .ok_or(VmMemoryResponse::Err(SysError::new(EINVAL)))
                     .unwrap();
 
                 match register_memory_hva(vm, sys_allocator, Box::new(mem), (alloc, offset)) {
@@ -391,57 +376,25 @@ impl VmMemoryRequest {
                 height,
                 format,
             } => {
-                let img = ImageAllocationInfo {
-                    width,
-                    height,
-                    drm_format: DrmFormat::from(format),
-                    // Linear layout is a requirement as virtio wayland guest expects
-                    // this for CPU access to the buffer. Scanout and texturing are
-                    // optional as the consumer (wayland compositor) is expected to
-                    // fall-back to a less efficient meachnisms for presentation if
-                    // neccesary. In practice, linear buffers for commonly used formats
-                    // will also support scanout and texturing.
-                    flags: RutabagaGrallocFlags::empty().use_linear(true),
+                let (mut fd, desc) = match sys_allocator.gpu_memory_allocator() {
+                    Some(gpu_allocator) => match gpu_allocator.allocate(width, height, format) {
+                        Ok(v) => v,
+                        Err(e) => return VmMemoryResponse::Err(e),
+                    },
+                    None => return VmMemoryResponse::Err(SysError::new(ENODEV)),
                 };
-
-                let reqs = match gralloc.get_image_memory_requirements(img) {
-                    Ok(reqs) => reqs,
-                    Err(e) => {
-                        error!("gralloc failed to get image requirements: {}", e);
-                        return VmMemoryResponse::Err(SysError::new(EINVAL));
-                    }
+                // Determine size of buffer using 0 byte seek from end. This is preferred over
+                // `stride * height` as it's not limited to packed pixel formats.
+                let size = match fd.seek(SeekFrom::End(0)) {
+                    Ok(v) => v,
+                    Err(e) => return VmMemoryResponse::Err(SysError::from(e)),
                 };
-
-                let handle = match gralloc.allocate_memory(reqs) {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        error!("gralloc failed to allocate memory: {}", e);
-                        return VmMemoryResponse::Err(SysError::new(EINVAL));
-                    }
-                };
-
-                let mut desc = GpuMemoryDesc::default();
-                for i in 0..3 {
-                    desc.planes[i] = GpuMemoryPlaneDesc {
-                        stride: reqs.strides[i],
-                        offset: reqs.offsets[i],
-                    }
-                }
-
-                match register_memory(
-                    vm,
-                    sys_allocator,
-                    &handle.os_handle,
-                    reqs.size as usize,
-                    None,
-                ) {
+                match register_memory(vm, sys_allocator, &fd, size as usize, None) {
                     Ok((pfn, slot)) => VmMemoryResponse::AllocateAndRegisterGpuMemory {
                         // Safe because ownership is transferred to SafeDescriptor via
                         // into_raw_descriptor
                         descriptor: MaybeOwnedDescriptor::Owned(unsafe {
-                            SafeDescriptor::from_raw_descriptor(
-                                handle.os_handle.into_raw_descriptor(),
-                            )
+                            SafeDescriptor::from_raw_descriptor(fd.into_raw_descriptor())
                         }),
                         pfn,
                         slot,
@@ -813,112 +766,6 @@ pub struct BatControl {
     pub control_socket: BatControlRequestSocket,
 }
 
-#[derive(MsgOnSocket, Debug)]
-pub enum FsMappingRequest {
-    /// Create an anonymous memory mapping that spans the entire region described by `Alloc`.
-    AllocateSharedMemoryRegion(Alloc),
-    /// Create a memory mapping.
-    CreateMemoryMapping {
-        /// The slot for a MemoryMappingArena, previously returned by a response to an
-        /// `AllocateSharedMemoryRegion` request.
-        slot: u32,
-        /// The file descriptor that should be mapped.
-        fd: MaybeOwnedDescriptor,
-        /// The size of the mapping.
-        size: usize,
-        /// The offset into the file from where the mapping should start.
-        file_offset: u64,
-        /// The memory protection to be used for the mapping.  Protections other than readable and
-        /// writable will be silently dropped.
-        prot: u32,
-        /// The offset into the shared memory region where the mapping should be placed.
-        mem_offset: usize,
-    },
-    /// Remove a memory mapping.
-    RemoveMemoryMapping {
-        /// The slot for a MemoryMappingArena.
-        slot: u32,
-        /// The offset into the shared memory region.
-        offset: usize,
-        /// The size of the mapping.
-        size: usize,
-    },
-}
-
-impl FsMappingRequest {
-    pub fn execute(&self, vm: &mut dyn Vm, allocator: &mut SystemAllocator) -> VmResponse {
-        use self::FsMappingRequest::*;
-        match *self {
-            AllocateSharedMemoryRegion(Alloc::PciBar {
-                bus,
-                dev,
-                func,
-                bar,
-            }) => {
-                match allocator
-                    .mmio_allocator(MmioType::High)
-                    .get(&Alloc::PciBar {
-                        bus,
-                        dev,
-                        func,
-                        bar,
-                    }) {
-                    Some((addr, length, _)) => {
-                        let arena = match MemoryMappingArena::new(*length as usize) {
-                            Ok(a) => a,
-                            Err(MmapError::SystemCallFailed(e)) => return VmResponse::Err(e),
-                            _ => return VmResponse::Err(SysError::new(EINVAL)),
-                        };
-
-                        match vm.add_memory_region(
-                            GuestAddress(*addr),
-                            Box::new(arena),
-                            false,
-                            false,
-                        ) {
-                            Ok(slot) => VmResponse::RegisterMemory {
-                                pfn: addr >> 12,
-                                slot,
-                            },
-                            Err(e) => VmResponse::Err(e),
-                        }
-                    }
-                    None => VmResponse::Err(SysError::new(EINVAL)),
-                }
-            }
-            CreateMemoryMapping {
-                slot,
-                ref fd,
-                size,
-                file_offset,
-                prot,
-                mem_offset,
-            } => {
-                let raw_fd: Fd = Fd(fd.as_raw_descriptor());
-
-                match vm.add_fd_mapping(
-                    slot,
-                    mem_offset,
-                    size,
-                    &raw_fd,
-                    file_offset,
-                    Protection::from(prot as c_int & (libc::PROT_READ | libc::PROT_WRITE)),
-                ) {
-                    Ok(()) => VmResponse::Ok,
-                    Err(e) => VmResponse::Err(e),
-                }
-            }
-            RemoveMemoryMapping { slot, offset, size } => {
-                match vm.remove_mapping(slot, offset, size) {
-                    Ok(()) => VmResponse::Ok,
-                    Err(e) => VmResponse::Err(e),
-                }
-            }
-            _ => VmResponse::Err(SysError::new(EINVAL)),
-        }
-    }
-}
-
 pub type BalloonControlRequestSocket = MsgSocket<BalloonControlCommand, BalloonControlResult>;
 pub type BalloonControlResponseSocket = MsgSocket<BalloonControlResult, BalloonControlCommand>;
 
@@ -927,9 +774,6 @@ pub type BatControlResponseSocket = MsgSocket<BatControlResult, BatControlComman
 
 pub type DiskControlRequestSocket = MsgSocket<DiskControlCommand, DiskControlResult>;
 pub type DiskControlResponseSocket = MsgSocket<DiskControlResult, DiskControlCommand>;
-
-pub type FsMappingRequestSocket = MsgSocket<FsMappingRequest, VmResponse>;
-pub type FsMappingResponseSocket = MsgSocket<VmResponse, FsMappingRequest>;
 
 pub type UsbControlSocket = MsgSocket<UsbControlCommand, UsbControlResult>;
 

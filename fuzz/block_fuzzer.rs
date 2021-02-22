@@ -80,8 +80,7 @@ fuzz_target!(|bytes| {
     let features = base_features(false);
 
     let disk_file = tempfile::tempfile().unwrap();
-    let mut block =
-        Block::new(features, Box::new(disk_file), false, true, 512, None, None).unwrap();
+    let mut block = Block::new(features, Box::new(disk_file), false, true, 512, None).unwrap();
 
     block.activate(
         mem,

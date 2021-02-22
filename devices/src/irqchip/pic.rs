@@ -340,7 +340,11 @@ impl Pic {
     fn get_irq(&self, pic_type: PicSelect) -> Option<u8> {
         let pic = &self.pics[pic_type as usize];
         let mut irq_bitmap = pic.irr & !pic.imr;
-        let priority = Pic::get_priority(pic, irq_bitmap)?;
+        let priority = if let Some(p) = Pic::get_priority(pic, irq_bitmap) {
+            p
+        } else {
+            return None;
+        };
 
         // If the primary is in fully-nested mode, the IRQ coming from the secondary is not taken
         // into account for the priority computation below.
