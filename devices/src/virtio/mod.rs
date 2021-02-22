@@ -28,8 +28,6 @@ pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod resource_bridge;
-#[cfg(feature = "audio")]
-pub mod snd;
 pub mod vhost;
 
 pub use self::balloon::*;

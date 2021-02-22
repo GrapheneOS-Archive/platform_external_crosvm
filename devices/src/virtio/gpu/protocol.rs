@@ -19,15 +19,15 @@ use base::Error as SysError;
 use base::ExternalMappingError;
 use data_model::{DataInit, Le32, Le64};
 use gpu_display::GpuDisplayError;
+use gpu_renderer::Error as RendererError;
 use msg_socket::MsgError;
-use rutabaga_gfx::RutabagaError;
 
 pub const VIRTIO_GPU_F_VIRGL: u32 = 0;
 pub const VIRTIO_GPU_F_EDID: u32 = 1;
+/* The following capabilities are not upstreamed. */
 pub const VIRTIO_GPU_F_RESOURCE_UUID: u32 = 2;
 pub const VIRTIO_GPU_F_RESOURCE_BLOB: u32 = 3;
-/* The following capabilities are not upstreamed. */
-pub const VIRTIO_GPU_F_CONTEXT_INIT: u32 = 4;
+pub const VIRTIO_GPU_F_VULKAN: u32 = 4;
 
 pub const VIRTIO_GPU_UNDEFINED: u32 = 0x0;
 
@@ -44,6 +44,7 @@ pub const VIRTIO_GPU_CMD_GET_CAPSET_INFO: u32 = 0x108;
 pub const VIRTIO_GPU_CMD_GET_CAPSET: u32 = 0x109;
 pub const VIRTIO_GPU_CMD_GET_EDID: u32 = 0x10a;
 pub const VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID: u32 = 0x10b;
+/* The following hypercalls are not upstreamed. */
 pub const VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: u32 = 0x10c;
 pub const VIRTIO_GPU_CMD_SET_SCANOUT_BLOB: u32 = 0x10d;
 
@@ -81,14 +82,17 @@ pub const VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID: u32 = 0x1203;
 pub const VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID: u32 = 0x1204;
 pub const VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER: u32 = 0x1205;
 
+/* Blob mem (not upstreamed) */
 pub const VIRTIO_GPU_BLOB_MEM_GUEST: u32 = 0x0001;
 pub const VIRTIO_GPU_BLOB_MEM_HOST3D: u32 = 0x0002;
 pub const VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 
+/* Blob flags (not upstreamed) */
 pub const VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 pub const VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
 pub const VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE: u32 = 0x0004;
 
+/* Shared memory region IDs (not upstreamed) */
 pub const VIRTIO_GPU_SHM_ID_NONE: u8 = 0x0000;
 pub const VIRTIO_GPU_SHM_ID_HOST_VISIBLE: u8 = 0x0001;
 
@@ -141,8 +145,6 @@ pub fn virtio_gpu_cmd_str(cmd: u32) -> &'static str {
 }
 
 pub const VIRTIO_GPU_FLAG_FENCE: u32 = 1 << 0;
-/* Fence context index info flag not upstreamed. */
-pub const VIRTIO_GPU_FLAG_INFO_FENCE_CTX_IDX: u32 = 1 << 1;
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
@@ -151,7 +153,7 @@ pub struct virtio_gpu_ctrl_hdr {
     pub flags: Le32,
     pub fence_id: Le64,
     pub ctx_id: Le32,
-    pub info: Le32,
+    pub padding: Le32,
 }
 
 unsafe impl DataInit for virtio_gpu_ctrl_hdr {}
@@ -362,14 +364,13 @@ pub struct virtio_gpu_resource_create_3d {
 
 unsafe impl DataInit for virtio_gpu_resource_create_3d {}
 
-/* VIRTIO_GPU_CMD_CTX_CREATE (context_init not upstreamed) */
-pub const VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK: u32 = 1 << 0;
+/* VIRTIO_GPU_CMD_CTX_CREATE */
 #[derive(Copy)]
 #[repr(C)]
 pub struct virtio_gpu_ctx_create {
     pub hdr: virtio_gpu_ctrl_hdr,
     pub nlen: Le32,
-    pub context_init: Le32,
+    pub padding: Le32,
     pub debug_name: [u8; 64],
 }
 
@@ -431,10 +432,7 @@ unsafe impl DataInit for virtio_gpu_cmd_submit {}
 
 pub const VIRTIO_GPU_CAPSET_VIRGL: u32 = 1;
 pub const VIRTIO_GPU_CAPSET_VIRGL2: u32 = 2;
-/* New capset IDs (not upstreamed) */
-pub const VIRTIO_GPU_CAPSET_GFXSTREAM: u32 = 3;
-pub const VIRTIO_GPU_CAPSET_VENUS: u32 = 4;
-pub const VIRTIO_GPU_CAPSET_CROSS_DOMAIN: u32 = 5;
+pub const VIRTIO_GPU_CAPSET3: u32 = 3;
 
 /* VIRTIO_GPU_CMD_GET_CAPSET_INFO */
 #[derive(Copy, Clone, Debug, Default)]
@@ -784,7 +782,7 @@ pub enum GpuResponse {
     OkNoData,
     OkDisplayInfo(Vec<(u32, u32)>),
     OkCapsetInfo {
-        capset_id: u32,
+        id: u32,
         version: u32,
         size: u32,
     },
@@ -802,7 +800,7 @@ pub enum GpuResponse {
     ErrUnspec,
     ErrMsg(MsgError),
     ErrSys(SysError),
-    ErrRutabaga(RutabagaError),
+    ErrRenderer(RendererError),
     ErrDisplay(GpuDisplayError),
     ErrMapping(ExternalMappingError),
     ErrScanout {
@@ -821,9 +819,9 @@ impl From<MsgError> for GpuResponse {
     }
 }
 
-impl From<RutabagaError> for GpuResponse {
-    fn from(e: RutabagaError) -> GpuResponse {
-        GpuResponse::ErrRutabaga(e)
+impl From<RendererError> for GpuResponse {
+    fn from(e: RendererError) -> GpuResponse {
+        GpuResponse::ErrRenderer(e)
     }
 }
 
@@ -845,7 +843,7 @@ impl Display for GpuResponse {
         match self {
             ErrMsg(e) => write!(f, "msg-on-socket error: {}", e),
             ErrSys(e) => write!(f, "system error: {}", e),
-            ErrRutabaga(e) => write!(f, "renderer error: {}", e),
+            ErrRenderer(e) => write!(f, "renderer error: {}", e),
             ErrDisplay(e) => write!(f, "display error: {}", e),
             ErrScanout { num_scanouts } => write!(f, "non-zero scanout: {}", num_scanouts),
             _ => Ok(()),
@@ -904,7 +902,6 @@ impl GpuResponse {
         flags: u32,
         fence_id: u64,
         ctx_id: u32,
-        info: u32,
         resp: &mut Writer,
     ) -> Result<u32, GpuResponseEncodeError> {
         let hdr = virtio_gpu_ctrl_hdr {
@@ -912,7 +909,7 @@ impl GpuResponse {
             flags: Le32::from(flags),
             fence_id: Le64::from(fence_id),
             ctx_id: Le32::from(ctx_id),
-            info: Le32::from(info),
+            padding: Le32::from(0),
         };
         let len = match *self {
             GpuResponse::OkDisplayInfo(ref info) => {
@@ -931,14 +928,10 @@ impl GpuResponse {
                 resp.write_obj(disp_info)?;
                 size_of_val(&disp_info)
             }
-            GpuResponse::OkCapsetInfo {
-                capset_id,
-                version,
-                size,
-            } => {
+            GpuResponse::OkCapsetInfo { id, version, size } => {
                 resp.write_obj(virtio_gpu_resp_capset_info {
                     hdr,
-                    capset_id: Le32::from(capset_id),
+                    capset_id: Le32::from(id),
                     capset_max_version: Le32::from(version),
                     capset_max_size: Le32::from(size),
                     padding: Le32::from(0),
@@ -1021,7 +1014,7 @@ impl GpuResponse {
             GpuResponse::ErrUnspec => VIRTIO_GPU_RESP_ERR_UNSPEC,
             GpuResponse::ErrMsg(_) => VIRTIO_GPU_RESP_ERR_UNSPEC,
             GpuResponse::ErrSys(_) => VIRTIO_GPU_RESP_ERR_UNSPEC,
-            GpuResponse::ErrRutabaga(_) => VIRTIO_GPU_RESP_ERR_UNSPEC,
+            GpuResponse::ErrRenderer(_) => VIRTIO_GPU_RESP_ERR_UNSPEC,
             GpuResponse::ErrDisplay(_) => VIRTIO_GPU_RESP_ERR_UNSPEC,
             GpuResponse::ErrMapping(_) => VIRTIO_GPU_RESP_ERR_UNSPEC,
             GpuResponse::ErrScanout { num_scanouts: _ } => VIRTIO_GPU_RESP_ERR_UNSPEC,

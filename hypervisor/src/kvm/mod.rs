@@ -18,7 +18,6 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::convert::TryFrom;
 use std::mem::{size_of, ManuallyDrop};
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
-use std::os::unix::io::AsRawFd;
 use std::ptr::copy_nonoverlapping;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -30,8 +29,8 @@ use libc::{
 use base::{
     block_signal, errno_result, error, ioctl, ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val,
     pagesize, signal, unblock_signal, AsRawDescriptor, Error, Event, FromRawDescriptor,
-    MappedRegion, MemoryMapping, MemoryMappingBuilder, MmapError, Protection, RawDescriptor,
-    Result, SafeDescriptor,
+    MappedRegion, MemoryMapping, MemoryMappingBuilder, MmapError, RawDescriptor, Result,
+    SafeDescriptor,
 };
 use data_model::vec_with_array_field;
 use kvm_sys::*;
@@ -417,9 +416,7 @@ impl Vm for KvmVm {
         log_dirty_pages: bool,
     ) -> Result<MemSlot> {
         let size = mem.size() as u64;
-        let end_addr = guest_addr
-            .checked_add(size)
-            .ok_or_else(|| Error::new(EOVERFLOW))?;
+        let end_addr = guest_addr.checked_add(size).ok_or(Error::new(EOVERFLOW))?;
         if self.guest_mem.range_overlap(guest_addr, end_addr) {
             return Err(Error::new(ENOSPC));
         }
@@ -456,7 +453,7 @@ impl Vm for KvmVm {
 
     fn msync_memory_region(&mut self, slot: MemSlot, offset: usize, size: usize) -> Result<()> {
         let mut regions = self.mem_regions.lock();
-        let mem = regions.get_mut(&slot).ok_or_else(|| Error::new(ENOENT))?;
+        let mem = regions.get_mut(&slot).ok_or(Error::new(ENOENT))?;
 
         mem.msync(offset, size).map_err(|err| match err {
             MmapError::InvalidAddress => Error::new(EFAULT),
@@ -510,7 +507,7 @@ impl Vm for KvmVm {
 
     fn get_dirty_log(&self, slot: MemSlot, dirty_log: &mut [u8]) -> Result<()> {
         let regions = self.mem_regions.lock();
-        let mmap = regions.get(&slot).ok_or_else(|| Error::new(ENOENT))?;
+        let mmap = regions.get(&slot).ok_or(Error::new(ENOENT))?;
         // Ensures that there are as many bytes in dirty_log as there are pages in the mmap.
         if dirty_log_bitmap_size(mmap.size()) > dirty_log.len() {
             return Err(Error::new(EINVAL));
@@ -560,36 +557,6 @@ impl Vm for KvmVm {
 
     fn set_pvclock(&self, state: &ClockState) -> Result<()> {
         self.set_pvclock_arch(state)
-    }
-
-    fn add_fd_mapping(
-        &mut self,
-        slot: u32,
-        offset: usize,
-        size: usize,
-        fd: &dyn AsRawFd,
-        fd_offset: u64,
-        prot: Protection,
-    ) -> Result<()> {
-        let mut regions = self.mem_regions.lock();
-        let region = regions.get_mut(&slot).ok_or_else(|| Error::new(EINVAL))?;
-
-        match region.add_fd_mapping(offset, size, fd, fd_offset, prot) {
-            Ok(()) => Ok(()),
-            Err(MmapError::SystemCallFailed(e)) => Err(e),
-            Err(_) => Err(Error::new(EIO)),
-        }
-    }
-
-    fn remove_mapping(&mut self, slot: u32, offset: usize, size: usize) -> Result<()> {
-        let mut regions = self.mem_regions.lock();
-        let region = regions.get_mut(&slot).ok_or_else(|| Error::new(EINVAL))?;
-
-        match region.remove_mapping(offset, size) {
-            Ok(()) => Ok(()),
-            Err(MmapError::SystemCallFailed(e)) => Err(e),
-            Err(_) => Err(Error::new(EIO)),
-        }
     }
 }
 
@@ -792,7 +759,7 @@ impl Vcpu for KvmVcpu {
         // kvm_sigmask.len  = size_of::<sigset_t>() as u32;
         kvm_sigmask[0].len = 8;
         // Ensure the length is not too big.
-        const _ASSERT: usize = size_of::<sigset_t>() - 8usize;
+        const _ASSERT: usize = size_of::<sigset_t>() - 8 as usize;
 
         // Safe as we allocated exactly the needed space
         unsafe {

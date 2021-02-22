@@ -13,7 +13,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader};
 use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::string::String;
 use std::thread::sleep;
 use std::time::Duration;
@@ -30,7 +29,6 @@ use base::{
 use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
     platform, BindMount, Config, DiskOption, Executable, GidMap, SharedDir, TouchDeviceOption,
-    DISK_ID_LEN,
 };
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::{GpuMode, GpuParameters};
@@ -183,7 +181,7 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
                 }
                 #[cfg(feature = "gfxstream")]
                 "gfxstream" => {
-                    gpu_params.mode = GpuMode::ModeGfxstream;
+                    gpu_params.mode = GpuMode::ModeGfxStream;
                 }
                 // Preferred: Specifying --gpu,backend=<mode>
                 "backend" => match v {
@@ -195,7 +193,7 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
                     }
                     #[cfg(feature = "gfxstream")]
                     "gfxstream" => {
-                        gpu_params.mode = GpuMode::ModeGfxstream;
+                        gpu_params.mode = GpuMode::ModeGfxStream;
                     }
                     _ => {
                         return Err(argument::Error::InvalidValue {
@@ -359,7 +357,7 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
     {
         if vulkan_specified || syncfd_specified || angle_specified {
             match gpu_params.mode {
-                GpuMode::ModeGfxstream => {}
+                GpuMode::ModeGfxStream => {}
                 _ => {
                     return Err(argument::Error::UnknownArgument(
                         "gpu parameter vulkan and syncfd are only supported for gfxstream backend"
@@ -397,39 +395,10 @@ fn parse_ac97_options(s: &str) -> argument::Result<Ac97Parameters> {
                     argument::Error::Syntax(format!("invalid capture option: {}", e))
                 })?;
             }
-            #[cfg(target_os = "linux")]
-            "server" => {
-                ac97_params.vios_server_path =
-                    Some(
-                        PathBuf::from_str(v).map_err(|e| argument::Error::InvalidValue {
-                            value: v.to_string(),
-                            expected: e.to_string(),
-                        })?,
-                    );
-            }
             _ => {
                 return Err(argument::Error::UnknownArgument(format!(
                     "unknown ac97 parameter {}",
                     k
-                )));
-            }
-        }
-    }
-
-    // server is required for and exclusive to vios backend
-    #[cfg(target_os = "linux")]
-    match ac97_params.backend {
-        Ac97Backend::VIOS => {
-            if ac97_params.vios_server_path.is_none() {
-                return Err(argument::Error::ExpectedArgument(String::from(
-                    "server argument is required for VIOS backend",
-                )));
-            }
-        }
-        _ => {
-            if ac97_params.vios_server_path.is_some() {
-                return Err(argument::Error::UnexpectedValue(String::from(
-                    "server argument is exclusive to the VIOS backend",
                 )));
             }
         }
@@ -628,8 +597,8 @@ fn parse_battery_options(s: Option<&str>) -> argument::Result<BatteryType> {
 
     if let Some(s) = s {
         let opts = s
-            .split(',')
-            .map(|frag| frag.split('='))
+            .split(",")
+            .map(|frag| frag.split("="))
             .map(|mut kv| (kv.next().unwrap_or(""), kv.next().unwrap_or("")));
 
         for (k, v) in opts {
@@ -752,13 +721,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         #[cfg(feature = "audio")]
         "ac97" => {
             let ac97_params = parse_ac97_options(value.unwrap())?;
-            // Add kernel parameters related to the intel8x0 driver for ac97 devices once.
-            if cfg.ac97_parameters.is_empty() {
-                // Set `inside_vm=1` to save some register read ops in the driver.
-                cfg.params.push("snd_intel8x0.inside_vm=1".to_string());
-                // Set `ac97_clock=48000` to save intel8x0_measure_ac97_clock call in the driver.
-                cfg.params.push("snd_intel8x0.ac97_clock=48000".to_string());
-            }
             cfg.ac97_parameters.push(ac97_params);
         }
         "serial" => {
@@ -789,7 +751,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                     SerialHardware::Serial => {}
                     _ => {
                         return Err(argument::Error::InvalidValue {
-                            value: serial_params.hardware.to_string(),
+                            value: serial_params.hardware.to_string().to_owned(),
                             expected: String::from("earlycon not supported for hardware"),
                         });
                     }
@@ -861,7 +823,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 read_only,
                 sparse: true,
                 block_size: 512,
-                id: None,
             };
 
             for opt in components {
@@ -891,22 +852,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                             })?;
                         disk.block_size = block_size;
                     }
-                    "id" => {
-                        if value.len() > DISK_ID_LEN {
-                            return Err(argument::Error::InvalidValue {
-                                value: value.to_owned(),
-                                expected: format!(
-                                    "`id` must be {} or fewer characters",
-                                    DISK_ID_LEN
-                                ),
-                            });
-                        }
-                        let mut id = [0u8; DISK_ID_LEN];
-                        // Slicing id to value's length will never panic
-                        // because we checked that value will fit into id above.
-                        id[..value.len()].copy_from_slice(value.as_bytes());
-                        disk.id = Some(id);
-                    }
                     _ => {
                         return Err(argument::Error::InvalidValue {
                             value: kind.to_owned(),
@@ -932,7 +877,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 read_only: !name.starts_with("rw"),
                 sparse: false,
                 block_size: base::pagesize() as u32,
-                id: None,
             });
         }
         "pstore" => {
@@ -1217,7 +1161,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                         })?;
 
                         let dur = Duration::from_secs(seconds);
-                        shared_dir.fs_cfg.entry_timeout = dur;
+                        shared_dir.fs_cfg.entry_timeout = dur.clone();
                         shared_dir.fs_cfg.attr_timeout = dur;
                     }
                     "cache" => {
@@ -1387,24 +1331,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.virtio_single_touch = Some(single_touch_spec);
         }
-        "multi-touch" => {
-            if cfg.virtio_multi_touch.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`multi-touch` already given".to_owned(),
-                ));
-            }
-            let mut it = value.unwrap().split(':');
-
-            let mut multi_touch_spec =
-                TouchDeviceOption::new(PathBuf::from(it.next().unwrap().to_owned()));
-            if let Some(width) = it.next() {
-                multi_touch_spec.set_width(width.trim().parse().unwrap());
-            }
-            if let Some(height) = it.next() {
-                multi_touch_spec.set_height(height.trim().parse().unwrap());
-            }
-            cfg.virtio_multi_touch = Some(multi_touch_spec);
-        }
         "trackpad" => {
             if cfg.virtio_trackpad.is_some() {
                 return Err(argument::Error::TooManyArguments(
@@ -1523,18 +1449,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 })?;
             cfg.gdb = Some(port);
         }
-        "balloon_bias_mib" => {
-            cfg.balloon_bias =
-                value
-                    .unwrap()
-                    .parse::<i64>()
-                    .map_err(|_| argument::Error::InvalidValue {
-                        value: value.unwrap().to_owned(),
-                        expected: String::from("expected a valid ballon bias in MiB"),
-                    })?
-                    * 1024
-                    * 1024; // cfg.balloon_bias is in bytes.
-        }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
     }
@@ -1571,9 +1485,6 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
     {
         if let Some(gpu_parameters) = cfg.gpu_parameters.as_ref() {
             let (width, height) = (gpu_parameters.display_width, gpu_parameters.display_height);
-            if let Some(virtio_multi_touch) = cfg.virtio_multi_touch.as_mut() {
-                virtio_multi_touch.set_default_size(width, height);
-            }
             if let Some(virtio_single_touch) = cfg.virtio_single_touch.as_mut() {
                 virtio_single_touch.set_default_size(width, height);
             }
@@ -1620,8 +1531,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::short_value('d', "disk", "PATH[,key=value[,key=value[,...]]", "Path to a disk image followed by optional comma-separated options.
                               Valid keys:
                               sparse=BOOL - Indicates whether the disk should support the discard operation (default: true)
-                              block_size=BYTES - Set the reported block size of the disk (default: 512)
-                              id=STRING - Set the block device identifier to an ASCII string, up to 20 characters (default: no ID)"),
+                              block_size=BYTES - Set the reported block size of the disk (default: 512)"),
           Argument::value("rwdisk", "PATH[,key=value[,key=value[,...]]", "Path to a writable disk image followed by optional comma-separated options.
                               See --disk for valid options."),
           Argument::value("rw-pmem-device", "PATH", "Path to a writable disk image."),
@@ -1635,14 +1545,13 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::value("net-vq-pairs", "N", "virtio net virtual queue paris. (default: 1)"),
           #[cfg(feature = "audio")]
           Argument::value("ac97",
-                          "[backend=BACKEND,capture=true,capture_effect=EFFECT,shm-fd=FD,client-fd=FD,server-fd=FD]",
+                          "[backend=BACKEND,capture=true,capture_effect=EFFECT]",
                           "Comma separated key=value pairs for setting up Ac97 devices. Can be given more than once .
                           Possible key values:
-                          backend=(null, cras, vios) - Where to route the audio device. If not provided, backend will default to null.
-                          `null` for /dev/null, cras for CRAS server and vios for VioS server.
+                          backend=(null, cras) - Where to route the audio device. If not provided, backend will default to null.
+                          `null` for /dev/null, and  cras for CRAS server.
                           capture - Enable audio capture
-                          capture_effects - | separated effects to be enabled for recording. The only supported effect value now is EchoCancellation or aec.
-                          server - The to the VIOS server (unix socket)."),
+                          capture_effects - | separated effects to be enabled for recording. The only supported effect value now is EchoCancellation or aec."),
           Argument::value("serial",
                           "type=TYPE,[hardware=HW,num=NUM,path=PATH,input=PATH,console,earlycon,stdin]",
                           "Comma separated key=value pairs for setting up serial devices. Can be given more than once.
@@ -1717,7 +1626,6 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
           Argument::flag("software-tpm", "enable a software emulated trusted platform module device"),
           Argument::value("evdev", "PATH", "Path to an event device node. The device will be grabbed (unusable from the host) and made available to the guest with the same configuration it shows on the host"),
           Argument::value("single-touch", "PATH:WIDTH:HEIGHT", "Path to a socket from where to read single touch input events (such as those from a touchscreen) and write status updates to, optionally followed by width and height (defaults to 800x1280)."),
-          Argument::value("multi-touch", "PATH:WIDTH:HEIGHT", "Path to a socket from where to read multi touch input events (such as those from a touchscreen) and write status updates to, optionally followed by width and height (defaults to 800x1280)."),
           Argument::value("trackpad", "PATH:WIDTH:HEIGHT", "Path to a socket from where to read trackpad input events and write status updates to, optionally followed by screen width and height (defaults to 800x1280)."),
           Argument::value("mouse", "PATH", "Path to a socket from where to read mouse input events and write status updates to."),
           Argument::value("keyboard", "PATH", "Path to a socket from where to read keyboard input events and write status updates to."),
@@ -1738,7 +1646,6 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
                                   type=goldfish - type of battery emulation, defaults to goldfish
                                   "),
           Argument::value("gdb", "PORT", "(EXPERIMENTAL) gdb on the given port"),
-          Argument::value("balloon_bias_mib", "N", "Amount to bias balance of memory between host and guest as the balloon inflates, in MiB."),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -1767,7 +1674,7 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
                 Ok(())
             }
             Err(e) => {
-                error!("crosvm has exited with error: {}", e);
+                error!("{}", e);
                 Err(())
             }
         },
@@ -2430,13 +2337,6 @@ mod tests {
     #[test]
     fn parse_ac97_capture_vaild() {
         parse_ac97_options("backend=cras,capture=true").expect("parse should have succeded");
-    }
-
-    #[cfg(feature = "audio")]
-    #[test]
-    fn parse_ac97_vios_valid() {
-        parse_ac97_options("backend=vios,server=/path/to/server")
-            .expect("parse should have succeded");
     }
 
     #[test]
