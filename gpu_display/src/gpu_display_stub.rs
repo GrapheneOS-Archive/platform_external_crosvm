@@ -30,11 +30,11 @@ impl Buffer {
     }
 
     fn stride(&self) -> usize {
-        (self.bytes_per_pixel as usize) * (self.width as usize)
+        return (self.bytes_per_pixel as usize) * (self.width as usize);
     }
 
     fn bytes_per_pixel(&self) -> usize {
-        self.bytes_per_pixel as usize
+        return self.bytes_per_pixel as usize;
     }
 }
 

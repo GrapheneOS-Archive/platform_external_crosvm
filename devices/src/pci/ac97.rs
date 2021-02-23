@@ -5,7 +5,6 @@
 use std::default::Default;
 use std::error;
 use std::fmt::{self, Display};
-use std::path::PathBuf;
 use std::str::FromStr;
 
 use audio_streams::shm_streams::{NullShmStreamSource, ShmStreamSource};
@@ -21,11 +20,7 @@ use crate::pci::pci_configuration::{
     PciBarConfiguration, PciClassCode, PciConfiguration, PciHeaderType, PciMultimediaSubclass,
 };
 use crate::pci::pci_device::{self, PciDevice, Result};
-use crate::pci::{PciAddress, PciDeviceError, PciInterruptPin};
-#[cfg(not(target_os = "linux"))]
-use crate::virtio::snd::vios_backend::Error as VioSError;
-#[cfg(target_os = "linux")]
-use crate::virtio::snd::vios_backend::VioSShmStreamSource;
+use crate::pci::{PciAddress, PciInterruptPin};
 
 // Use 82801AA because it's what qemu does.
 const PCI_DEVICE_ID_INTEL_82801AA_5: u16 = 0x2415;
@@ -39,7 +34,6 @@ const PCI_DEVICE_ID_INTEL_82801AA_5: u16 = 0x2415;
 pub enum Ac97Backend {
     NULL,
     CRAS,
-    VIOS,
 }
 
 impl Default for Ac97Backend {
@@ -52,7 +46,6 @@ impl Default for Ac97Backend {
 #[derive(Debug)]
 pub enum Ac97Error {
     InvalidBackend,
-    MissingServerPath,
 }
 
 impl error::Error for Ac97Error {}
@@ -60,8 +53,7 @@ impl error::Error for Ac97Error {}
 impl Display for Ac97Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Ac97Error::InvalidBackend => write!(f, "Must be cras, vios or null"),
-            Ac97Error::MissingServerPath => write!(f, "server must be provided for vios backend"),
+            Ac97Error::InvalidBackend => write!(f, "Must be cras or null"),
         }
     }
 }
@@ -71,7 +63,6 @@ impl FromStr for Ac97Backend {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "cras" => Ok(Ac97Backend::CRAS),
-            "vios" => Ok(Ac97Backend::VIOS),
             "null" => Ok(Ac97Backend::NULL),
             _ => Err(Ac97Error::InvalidBackend),
         }
@@ -83,7 +74,6 @@ impl FromStr for Ac97Backend {
 pub struct Ac97Parameters {
     pub backend: Ac97Backend,
     pub capture: bool,
-    pub vios_server_path: Option<PathBuf>,
 }
 
 pub struct Ac97Dev {
@@ -139,7 +129,6 @@ impl Ac97Dev {
                 );
                 Self::create_null_audio_device(mem)
             }),
-            Ac97Backend::VIOS => Self::create_vios_audio_device(mem, param),
             Ac97Backend::NULL => Self::create_null_audio_device(mem),
         }
     }
@@ -148,7 +137,6 @@ impl Ac97Dev {
     pub fn minijail_policy(&self) -> &'static str {
         match self.backend {
             Ac97Backend::CRAS => "cras_audio_device",
-            Ac97Backend::VIOS => "vios_audio_device",
             Ac97Backend::NULL => "null_audio_device",
         }
     }
@@ -156,7 +144,7 @@ impl Ac97Dev {
     fn create_cras_audio_device(params: Ac97Parameters, mem: GuestMemory) -> Result<Self> {
         let mut server = Box::new(
             CrasClient::with_type(CrasSocketType::Unified)
-                .map_err(pci_device::Error::CreateCrasClientFailed)?,
+                .map_err(|e| pci_device::Error::CreateCrasClientFailed(e))?,
         );
         server.set_client_type(CrasClientType::CRAS_CLIENT_TYPE_CROSVM);
         if params.capture {
@@ -165,23 +153,6 @@ impl Ac97Dev {
 
         let cras_audio = Self::new(mem, Ac97Backend::CRAS, server);
         Ok(cras_audio)
-    }
-
-    fn create_vios_audio_device(mem: GuestMemory, param: Ac97Parameters) -> Result<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            let server = Box::new(
-                // The presence of vios_server_path is checked during argument parsing
-                VioSShmStreamSource::new(param.vios_server_path.expect("Missing server path"))
-                    .map_err(|e| pci_device::Error::CreateViosClientFailed(e))?,
-            );
-            let vios_audio = Self::new(mem, Ac97Backend::VIOS, server);
-            return Ok(vios_audio);
-        }
-        #[cfg(not(target_os = "linux"))]
-        Err(pci_device::Error::CreateViosClientFailed(
-            VioSError::PlatformNotSupported,
-        ))
     }
 
     fn create_null_audio_device(mem: GuestMemory) -> Result<Self> {
@@ -257,19 +228,8 @@ impl PciDevice for Ac97Dev {
         "AC97".to_owned()
     }
 
-    fn allocate_address(&mut self, resources: &mut SystemAllocator) -> Result<PciAddress> {
-        if self.pci_address.is_none() {
-            self.pci_address = match resources.allocate_pci(self.debug_label()) {
-                Some(Alloc::PciBar {
-                    bus,
-                    dev,
-                    func,
-                    bar: _,
-                }) => Some(PciAddress { bus, dev, func }),
-                _ => None,
-            }
-        }
-        self.pci_address.ok_or(PciDeviceError::PciAllocationFailed)
+    fn assign_address(&mut self, address: PciAddress) {
+        self.pci_address = Some(address);
     }
 
     fn assign_irq(
@@ -287,7 +247,7 @@ impl PciDevice for Ac97Dev {
     fn allocate_io_bars(&mut self, resources: &mut SystemAllocator) -> Result<Vec<(u64, u64)>> {
         let address = self
             .pci_address
-            .expect("allocate_address must be called prior to allocate_io_bars");
+            .expect("assign_address must be called prior to allocate_io_bars");
         let mut ranges = Vec::new();
         let mixer_regs_addr = resources
             .mmio_allocator(MmioType::Low)
@@ -399,9 +359,13 @@ mod tests {
             .add_io_addresses(0x1000_0000, 0x1000_0000)
             .add_low_mmio_addresses(0x2000_0000, 0x1000_0000)
             .add_high_mmio_addresses(0x3000_0000, 0x1000_0000)
-            .create_allocator(5)
+            .create_allocator(5, false)
             .unwrap();
-        assert!(ac97_dev.allocate_address(&mut allocator).is_ok());
+        ac97_dev.assign_address(PciAddress {
+            bus: 0,
+            dev: 0,
+            func: 0,
+        });
         assert!(ac97_dev.allocate_io_bars(&mut allocator).is_ok());
     }
 }

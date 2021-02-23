@@ -1,0 +1,15 @@
+[package]
+name = "gpu_renderer"
+version = "0.1.0"
+authors = ["The Chromium OS Authors"]
+edition = "2018"
+
+[features]
+virtio-gpu-next = []
+gfxstream = []
+
+[dependencies]
+data_model = { path = "../data_model" }
+libc = "*"
+base = { path = "../base" }
+vm_memory = { path = "../vm_memory" }

@@ -330,9 +330,7 @@ impl Vm {
         log_dirty_pages: bool,
     ) -> Result<u32> {
         let size = mem.size() as u64;
-        let end_addr = guest_addr
-            .checked_add(size)
-            .ok_or_else(|| Error::new(EOVERFLOW))?;
+        let end_addr = guest_addr.checked_add(size).ok_or(Error::new(EOVERFLOW))?;
         if self.guest_mem.range_overlap(guest_addr, end_addr) {
             return Err(Error::new(ENOSPC));
         }
@@ -494,10 +492,8 @@ impl Vm {
     /// Note that this call can only succeed after a call to `Vm::create_irq_chip`.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub fn get_pic_state(&self, id: PicId) -> Result<kvm_pic_state> {
-        let mut irqchip_state = kvm_irqchip {
-            chip_id: id as u32,
-            ..Default::default()
-        };
+        let mut irqchip_state = kvm_irqchip::default();
+        irqchip_state.chip_id = id as u32;
         let ret = unsafe {
             // Safe because we know our file is a VM fd, we know the kernel will only write
             // correct amount of memory to our pointer, and we verify the return result.
@@ -519,10 +515,8 @@ impl Vm {
     /// Note that this call can only succeed after a call to `Vm::create_irq_chip`.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub fn set_pic_state(&self, id: PicId, state: &kvm_pic_state) -> Result<()> {
-        let mut irqchip_state = kvm_irqchip {
-            chip_id: id as u32,
-            ..Default::default()
-        };
+        let mut irqchip_state = kvm_irqchip::default();
+        irqchip_state.chip_id = id as u32;
         irqchip_state.chip.pic = *state;
         // Safe because we know that our file is a VM fd, we know the kernel will only read
         // correct amount of memory from our pointer, and we verify the return result.
@@ -539,10 +533,8 @@ impl Vm {
     /// Note that this call can only succeed after a call to `Vm::create_irq_chip`.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub fn get_ioapic_state(&self) -> Result<kvm_ioapic_state> {
-        let mut irqchip_state = kvm_irqchip {
-            chip_id: 2,
-            ..Default::default()
-        };
+        let mut irqchip_state = kvm_irqchip::default();
+        irqchip_state.chip_id = 2;
         let ret = unsafe {
             // Safe because we know our file is a VM fd, we know the kernel will only write
             // correct amount of memory to our pointer, and we verify the return result.
@@ -564,10 +556,8 @@ impl Vm {
     /// Note that this call can only succeed after a call to `Vm::create_irq_chip`.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub fn set_ioapic_state(&self, state: &kvm_ioapic_state) -> Result<()> {
-        let mut irqchip_state = kvm_irqchip {
-            chip_id: 2,
-            ..Default::default()
-        };
+        let mut irqchip_state = kvm_irqchip::default();
+        irqchip_state.chip_id = 2;
         irqchip_state.chip.ioapic = *state;
         // Safe because we know that our file is a VM fd, we know the kernel will only read
         // correct amount of memory from our pointer, and we verify the return result.
@@ -1426,7 +1416,7 @@ impl Vcpu {
         // kvm_sigmask.len  = size_of::<sigset_t>() as u32;
         kvm_sigmask[0].len = 8;
         // Ensure the length is not too big.
-        const _ASSERT: usize = size_of::<sigset_t>() - 8usize;
+        const _ASSERT: usize = size_of::<sigset_t>() - 8 as usize;
 
         // Safe as we allocated exactly the needed space
         unsafe {

@@ -11,8 +11,8 @@
 //!     --with-derive-default            \
 //!     --no-layout-tests                \
 //!     --no-prepend-enum-name > protocol.rs
-//! $ sed -i "s/__u/u/g" protocol.rs
-//! $ sed -i "s/__le/Le/g" protocol.rs
+//! $ sed -i 's/u/u/g' protocol.rs
+//! $ sed -i 's/Le/Le/g' protocol.rs
 //! ```
 //!
 //! The main points of the manual modifications are as follows:
@@ -362,7 +362,6 @@ unsafe impl DataInit for virtio_video_set_params {}
 pub const VIRTIO_VIDEO_CONTROL_BITRATE: virtio_video_control_type = 1;
 pub const VIRTIO_VIDEO_CONTROL_PROFILE: virtio_video_control_type = 2;
 pub const VIRTIO_VIDEO_CONTROL_LEVEL: virtio_video_control_type = 3;
-pub const VIRTIO_VIDEO_CONTROL_FORCE_KEYFRAME: virtio_video_control_type = 4;
 pub type virtio_video_control_type = u32;
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
