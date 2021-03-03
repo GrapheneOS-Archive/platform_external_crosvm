@@ -4,10 +4,12 @@
 
 use crate::{BusAccessInfo, BusDevice};
 use acpi_tables::{aml, aml::Aml};
-use base::{error, warn, AsRawDescriptor, Descriptor, Event, PollContext, PollToken};
+use base::{
+    error, warn, AsRawDescriptor, Descriptor, Event, PollToken, RawDescriptor, WaitContext,
+};
 use msg_socket::{MsgReceiver, MsgSender};
+use power_monitor::{BatteryStatus, CreatePowerMonitorFn};
 use std::fmt::{self, Display};
-use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::thread;
 use sync::Mutex;
@@ -93,6 +95,7 @@ pub struct GoldfishBattery {
     monitor_thread: Option<thread::JoinHandle<()>>,
     kill_evt: Option<Event>,
     socket: Option<BatControlResponseSocket>,
+    create_power_monitor: Option<Box<dyn CreatePowerMonitorFn>>,
 }
 
 /// Goldfish Battery MMIO offset
@@ -118,21 +121,24 @@ const BATTERY_STATUS_CHANGED: u32 = 1 << 0;
 const AC_STATUS_CHANGED: u32 = 1 << 1;
 const BATTERY_INT_MASK: u32 = BATTERY_STATUS_CHANGED | AC_STATUS_CHANGED;
 
+/// Goldfish Battery status
+const BATTERY_STATUS_VAL_UNKNOWN: u32 = 0;
+const BATTERY_STATUS_VAL_CHARGING: u32 = 1;
+const BATTERY_STATUS_VAL_DISCHARGING: u32 = 2;
+const BATTERY_STATUS_VAL_NOT_CHARGING: u32 = 3;
+
+/// Goldfish Battery health
+const BATTERY_HEALTH_VAL_UNKNOWN: u32 = 0;
+
 fn command_monitor(
     socket: BatControlResponseSocket,
     irq_evt: Event,
     irq_resample_evt: Event,
     kill_evt: Event,
     state: Arc<Mutex<GoldfishBatteryState>>,
+    create_power_monitor: Option<Box<dyn CreatePowerMonitorFn>>,
 ) {
-    #[derive(PollToken)]
-    enum Token {
-        Commands,
-        Resample,
-        Kill,
-    }
-
-    let poll_ctx: PollContext<Token> = match PollContext::build_with(&[
+    let wait_ctx: WaitContext<Token> = match WaitContext::build_with(&[
         (&Descriptor(socket.as_raw_descriptor()), Token::Commands),
         (
             &Descriptor(irq_resample_evt.as_raw_descriptor()),
@@ -142,13 +148,38 @@ fn command_monitor(
     ]) {
         Ok(pc) => pc,
         Err(e) => {
-            error!("failed to build PollContext: {}", e);
+            error!("failed to build WaitContext: {}", e);
             return;
         }
     };
 
+    let mut power_monitor = match create_power_monitor {
+        Some(f) => match f() {
+            Ok(p) => match wait_ctx.add(&Descriptor(p.poll_fd()), Token::Monitor) {
+                Ok(()) => Some(p),
+                Err(e) => {
+                    error!("failed to add power monitor to poll context: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                error!("failed to create power monitor: {}", e);
+                None
+            }
+        },
+        None => None,
+    };
+
+    #[derive(PollToken)]
+    enum Token {
+        Commands,
+        Resample,
+        Kill,
+        Monitor,
+    }
+
     'poll: loop {
-        let events = match poll_ctx.wait() {
+        let events = match wait_ctx.wait() {
             Ok(v) => v,
             Err(e) => {
                 error!("error while polling for events: {}", e);
@@ -156,8 +187,8 @@ fn command_monitor(
             }
         };
 
-        for event in events.iter_readable() {
-            match event.token() {
+        for event in events.iter().filter(|e| e.is_readable) {
+            match event.token {
                 Token::Commands => {
                     let req = match socket.recv() {
                         Ok(req) => req,
@@ -193,12 +224,54 @@ fn command_monitor(
                         error!("failed to send response: {}", e);
                     }
                 }
+
+                Token::Monitor => {
+                    // Safe because power_monitor must be populated if Token::Monitor is triggered.
+                    let data = match power_monitor.as_mut().unwrap().read_message() {
+                        Ok(Some(d)) => d,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            error!("failed to read new power data: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let mut bat_state = state.lock();
+
+                    // Each set_* function called below returns true when interrupt bits
+                    // (*_STATUS_CHANGED) changed. If `inject_irq` is true after we attempt to
+                    // update each field, inject an interrupt.
+                    let mut inject_irq =
+                        bat_state.set_ac_online(if data.ac_online { 1 } else { 0 });
+
+                    match data.battery {
+                        Some(battery_data) => {
+                            inject_irq |= bat_state.set_capacity(battery_data.percent);
+                            let battery_status = match battery_data.status {
+                                BatteryStatus::Unknown => BATTERY_STATUS_VAL_UNKNOWN,
+                                BatteryStatus::Charging => BATTERY_STATUS_VAL_CHARGING,
+                                BatteryStatus::Discharging => BATTERY_STATUS_VAL_DISCHARGING,
+                                BatteryStatus::NotCharging => BATTERY_STATUS_VAL_NOT_CHARGING,
+                            };
+                            inject_irq |= bat_state.set_status(battery_status);
+                        }
+                        None => {
+                            inject_irq |= bat_state.set_present(0);
+                        }
+                    }
+
+                    if inject_irq {
+                        let _ = irq_evt.write(1);
+                    }
+                }
+
                 Token::Resample => {
                     let _ = irq_resample_evt.read();
                     if state.lock().int_status() != 0 {
                         let _ = irq_evt.write(1);
                     }
                 }
+
                 Token::Kill => break 'poll,
             }
         }
@@ -221,15 +294,16 @@ impl GoldfishBattery {
         irq_evt: Event,
         irq_resample_evt: Event,
         socket: BatControlResponseSocket,
+        create_power_monitor: Option<Box<dyn CreatePowerMonitorFn>>,
     ) -> Result<Self> {
         if mmio_base + GOLDFISHBAT_MMIO_LEN - 1 > u32::MAX as u64 {
             return Err(BatteryError::Non32BitMmioAddress);
         }
         let state = Arc::new(Mutex::new(GoldfishBatteryState {
             capacity: 50,
-            health: 1,
+            health: BATTERY_HEALTH_VAL_UNKNOWN,
             present: 1,
-            status: 1,
+            status: BATTERY_STATUS_VAL_UNKNOWN,
             ac_online: 1,
             int_enable: 0,
             int_status: 0,
@@ -245,21 +319,22 @@ impl GoldfishBattery {
             monitor_thread: None,
             kill_evt: None,
             socket: Some(socket),
+            create_power_monitor,
         })
     }
 
     /// return the fds used by this device
-    pub fn keep_fds(&self) -> Vec<RawFd> {
-        let mut fds = vec![
+    pub fn keep_rds(&self) -> Vec<RawDescriptor> {
+        let mut rds = vec![
             self.irq_evt.as_raw_descriptor(),
             self.irq_resample_evt.as_raw_descriptor(),
         ];
 
         if let Some(socket) = &self.socket {
-            fds.push(socket.as_raw_descriptor());
+            rds.push(socket.as_raw_descriptor());
         }
 
-        fds
+        rds
     }
 
     /// start a monitor thread to monitor the events from host
@@ -284,10 +359,19 @@ impl GoldfishBattery {
             let irq_evt = self.irq_evt.try_clone().unwrap();
             let irq_resample_evt = self.irq_resample_evt.try_clone().unwrap();
             let bat_state = self.state.clone();
+
+            let create_monitor_fn = self.create_power_monitor.take();
             let monitor_result = thread::Builder::new()
                 .name(self.debug_label())
                 .spawn(move || {
-                    command_monitor(socket, irq_evt, irq_resample_evt, kill_evt, bat_state);
+                    command_monitor(
+                        socket,
+                        irq_evt,
+                        irq_resample_evt,
+                        kill_evt,
+                        bat_state,
+                        create_monitor_fn,
+                    );
                 });
 
             self.monitor_thread = match monitor_result {
@@ -374,7 +458,7 @@ impl BusDevice for GoldfishBattery {
             return;
         }
 
-        let mut val_arr = u32::to_ne_bytes(0 as u32);
+        let mut val_arr = u32::to_ne_bytes(0u32);
         val_arr.copy_from_slice(data);
         let val = u32::from_ne_bytes(val_arr);
 

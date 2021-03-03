@@ -21,6 +21,7 @@ const VIRTQ_DESC_F_WRITE: u16 = 0x2;
 const VIRTQ_DESC_F_INDIRECT: u16 = 0x4;
 
 const VIRTQ_USED_F_NO_NOTIFY: u16 = 0x1;
+#[allow(dead_code)]
 const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 0x1;
 
 /// An iterator over a single descriptor chain.  Not to be confused with AvailIter,
@@ -91,15 +92,10 @@ impl DescriptorChain {
             return None;
         }
 
-        let desc_head = match mem.checked_offset(desc_table, (index as u64) * 16) {
-            Some(a) => a,
-            None => return None,
-        };
+        let desc_head = mem.checked_offset(desc_table, (index as u64) * 16)?;
         // These reads can't fail unless Guest memory is hopelessly broken.
         let addr = GuestAddress(mem.read_obj_from_addr::<u64>(desc_head).unwrap() as u64);
-        if mem.checked_offset(desc_head, 16).is_none() {
-            return None;
-        }
+        mem.checked_offset(desc_head, 16)?;
         let len: u32 = mem.read_obj_from_addr(desc_head.unchecked_add(8)).unwrap();
         let flags: u16 = mem.read_obj_from_addr(desc_head.unchecked_add(12)).unwrap();
         let next: u16 = mem.read_obj_from_addr(desc_head.unchecked_add(14)).unwrap();
@@ -122,7 +118,7 @@ impl DescriptorChain {
         }
     }
 
-    #[allow(clippy::if_same_then_else)]
+    #[allow(clippy::if_same_then_else, clippy::needless_bool)]
     fn is_valid(&self) -> bool {
         if self.len > 0
             && self
@@ -361,6 +357,7 @@ impl Queue {
     // Query the value of a single-bit flag in the available ring.
     //
     // Returns `true` if `flag` is currently set (by the driver) in the available ring flags.
+    #[allow(dead_code)]
     fn get_avail_flag(&self, mem: &GuestMemory, flag: u16) -> bool {
         let avail_flags: u16 = mem.read_obj_from_addr(self.avail_ring).unwrap();
         avail_flags & flag == flag
@@ -523,7 +520,13 @@ impl Queue {
             // so no need to inject new interrupt.
             self.next_used - used_event - Wrapping(1) < self.next_used - self.last_used
         } else {
-            !self.get_avail_flag(mem, VIRTQ_AVAIL_F_NO_INTERRUPT)
+            // TODO(b/172975852): This branch should check the flag that requests interrupt
+            // supression:
+            // ```
+            // !self.get_avail_flag(mem, VIRTQ_AVAIL_F_NO_INTERRUPT)
+            // ```
+            // Re-enable the flag check once the missing interrupt issue is debugged.
+            true
         }
     }
 
