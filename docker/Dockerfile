@@ -4,7 +4,7 @@
 
 FROM debian:buster
 LABEL description="Test crosvm using a command like the following: \
-docker run --privileged -v /dev/log:/dev/log -v <path to crosvm>:/platform/crosvm:ro <crosvm base image>"
+    docker run --privileged -v /dev/log:/dev/log -v <path to crosvm>:/platform/crosvm:ro <crosvm base image>"
 
 RUN apt-get update && apt-get install -y \
     autoconf \
@@ -84,9 +84,11 @@ RUN git clone https://gitlab.freedesktop.org/mesa/drm.git/ \
 
 # The gbm used by upstream linux distros is not compatible with crosvm, which must use Chrome OS's
 # minigbm.
+ARG MINIGBM_COMMIT=main
 RUN dpkg --force-depends -r libgbm1
 RUN git clone https://chromium.googlesource.com/chromiumos/platform/minigbm \
     && cd minigbm \
+    && git checkout $MINIGBM_COMMIT \
     && sed 's/-Wall/-Wno-maybe-uninitialized/g' -i Makefile \
     && make install -j$(nproc)
 
@@ -129,15 +131,25 @@ RUN git clone https://chromium.googlesource.com/chromiumos/platform2 $PLATFORM2_
     && git checkout $PLATFORM2_COMMIT
 
 # Set up sysroot from which system_api proto files are built.
-ENV SYSROOT=/sysroot
-RUN mkdir -p $SYSROOT/usr/include/chromeos/dbus/trunks \
+ENV PROTO_SYSROOT=/sysroot
+RUN mkdir -p $PROTO_SYSROOT/usr/include/chromeos/dbus/trunks \
     && cp $PLATFORM2_ROOT/trunks/interface.proto \
-        $SYSROOT/usr/include/chromeos/dbus/trunks
+    $PROTO_SYSROOT/usr/include/chromeos/dbus/trunks
 # Copy it under rustc's sysroot as well for cargo clippy.
 RUN export RUST_SYSROOT=$(rustc --print sysroot); echo $RUST_SYSROOT
 RUN mkdir -p $RUST_SYSROOT/usr/include/chromeos/dbus/trunks \
-  && cp $PLATFORM2_ROOT/trunks/interface.proto \
-        $RUST_SYSROOT/usr/include/chromeos/dbus/trunks
+    && cp $PLATFORM2_ROOT/trunks/interface.proto \
+    $RUST_SYSROOT/usr/include/chromeos/dbus/trunks
+
+# Copy power_supply_properties.proto from system_api, required for
+# power_monitor's powerd feature.
+RUN mkdir -p $PROTO_SYSROOT/usr/include/chromeos/dbus/power_manager \
+    && cp $PLATFORM2_ROOT/system_api/dbus/power_manager/power_supply_properties.proto \
+    $PROTO_SYSROOT/usr/include/chromeos/dbus/power_manager
+# Copy it under rustc's sysroot as well for cargo clippy.
+RUN mkdir -p $RUST_SYSROOT/usr/include/chromeos/dbus/power_manager \
+    && cp $PLATFORM2_ROOT/system_api/dbus/power_manager/power_supply_properties.proto \
+    $RUST_SYSROOT/usr/include/chromeos/dbus/power_manager
 
 # Inform pkg-config where libraries we install are placed.
 # Also, copy a dummy libvda.pc to compile crosvm with video features.

@@ -372,7 +372,7 @@ impl arch::LinuxArch for X8664arch {
     {
         let has_bios = matches!(components.vm_image, VmImage::Bios(_));
         let mem = Self::setup_memory(components.memory_size, has_bios)?;
-        let mut resources = Self::get_resource_allocator(&mem, components.wayland_dmabuf);
+        let mut resources = Self::get_resource_allocator(&mem);
 
         let vcpu_count = components.vcpu_count;
         let mut vm = create_vm(mem.clone()).map_err(|e| Error::CreateVm(Box::new(e)))?;
@@ -405,7 +405,7 @@ impl arch::LinuxArch for X8664arch {
         let mut io_bus = Self::setup_io_bus(
             irq_chip.pit_uses_speaker_port(),
             exit_evt.try_clone().map_err(Error::CloneEvent)?,
-            Some(pci_bus.clone()),
+            Some(pci_bus),
             components.memory_size,
         )?;
 
@@ -942,13 +942,13 @@ impl X8664arch {
     }
 
     /// Returns a system resource allocator.
-    fn get_resource_allocator(mem: &GuestMemory, gpu_allocation: bool) -> SystemAllocator {
+    fn get_resource_allocator(mem: &GuestMemory) -> SystemAllocator {
         let high_mmio_start = Self::get_high_mmio_base(mem);
         SystemAllocator::builder()
             .add_io_addresses(0xc000, 0x10000)
             .add_low_mmio_addresses(END_ADDR_BEFORE_32BITS, MMIO_SIZE)
             .add_high_mmio_addresses(high_mmio_start, u64::max_value() - high_mmio_start)
-            .create_allocator(X86_64_IRQ_BASE, gpu_allocation)
+            .create_allocator(X86_64_IRQ_BASE)
             .unwrap()
     }
 
@@ -1014,7 +1014,7 @@ impl X8664arch {
             io_bus.insert(pci_root, 0xcf8, 0x8).unwrap();
         } else {
             // ignore pci.
-            io_bus.insert(nul_device.clone(), 0xcf8, 0x8).unwrap();
+            io_bus.insert(nul_device, 0xcf8, 0x8).unwrap();
         }
 
         Ok(io_bus)
@@ -1141,6 +1141,9 @@ impl X8664arch {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod test_integration;
 
 #[cfg(test)]
 mod tests {
