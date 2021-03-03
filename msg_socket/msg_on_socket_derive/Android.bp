@@ -16,6 +16,7 @@ rust_proc_macro {
     srcs: ["msg_on_socket_derive.rs"],
     edition: "2018",
     rustlibs: [
+        "libbase_rust",
         "libproc_macro2",
         "libquote",
         "libsyn",
@@ -31,6 +32,7 @@ rust_test_host {
     auto_gen_config: true,
     edition: "2018",
     rustlibs: [
+        "libbase_rust",
         "libproc_macro2",
         "libquote",
         "libsyn",
@@ -40,6 +42,6 @@ rust_test_host {
 // dependent_library ["feature_list"]
 //   base-0.1.0
 //   proc-macro2-1.0.24 "default,proc-macro"
-//   quote-1.0.7 "default,proc-macro"
-//   syn-1.0.53 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   quote-1.0.8 "default,proc-macro"
+//   syn-1.0.60 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   unicode-xid-0.2.1 "default"
