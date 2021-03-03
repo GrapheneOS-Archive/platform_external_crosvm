@@ -5,8 +5,10 @@ authors = ["The Chromium OS Authors"]
 edition = "2018"
 
 [dependencies]
+data_model = { path = "../data_model" }
 libc = "*"
 syscall_defines = { path = "../syscall_defines" }
+sync = { path = "../sync" }
 sys_util = { path = "../sys_util" }
 
 [dev-dependencies]
