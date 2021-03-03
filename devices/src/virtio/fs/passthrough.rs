@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::cmp;
 use std::collections::btree_map;
 use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr, CString};
@@ -18,15 +19,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base::{
-    error, ioctl_ior_nr, ioctl_iow_nr, ioctl_with_mut_ptr, ioctl_with_ptr, warn, AsRawDescriptor,
-    FromRawDescriptor, RawDescriptor,
+    error, ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr, ioctl_with_mut_ptr, ioctl_with_ptr, warn,
+    AsRawDescriptor, FromRawDescriptor, RawDescriptor,
 };
 use data_model::DataInit;
 use fuse::filesystem::{
     Context, DirectoryIterator, Entry, FileSystem, FsOptions, GetxattrReply, IoctlFlags,
-    IoctlIovec, IoctlReply, ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader,
+    IoctlReply, ListxattrReply, OpenOptions, RemoveMappingOne, SetattrValid, ZeroCopyReader,
     ZeroCopyWriter, ROOT_ID,
 };
+use fuse::Mapper;
 use rand_ish::SimpleRng;
 use sync::Mutex;
 
@@ -43,9 +45,10 @@ const SECURITY_XATTR: &[u8] = b"security.";
 const SELINUX_XATTR: &[u8] = b"security.selinux";
 
 const FSCRYPT_KEY_DESCRIPTOR_SIZE: usize = 8;
+const FSCRYPT_KEY_IDENTIFIER_SIZE: usize = 16;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct fscrypt_policy_v1 {
     _version: u8,
     _contents_encryption_mode: u8,
@@ -55,8 +58,36 @@ struct fscrypt_policy_v1 {
 }
 unsafe impl DataInit for fscrypt_policy_v1 {}
 
-ioctl_ior_nr!(FS_IOC_SET_ENCRYPTION_POLICY, 0x66, 19, fscrypt_policy_v1);
-ioctl_iow_nr!(FS_IOC_GET_ENCRYPTION_POLICY, 0x66, 21, fscrypt_policy_v1);
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct fscrypt_policy_v2 {
+    _version: u8,
+    _contents_encryption_mode: u8,
+    _filenames_encryption_mode: u8,
+    _flags: u8,
+    __reserved: [u8; 4],
+    master_key_identifier: [u8; FSCRYPT_KEY_IDENTIFIER_SIZE],
+}
+unsafe impl DataInit for fscrypt_policy_v2 {}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+union fscrypt_policy {
+    _version: u8,
+    _v1: fscrypt_policy_v1,
+    _v2: fscrypt_policy_v2,
+}
+unsafe impl DataInit for fscrypt_policy {}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct fscrypt_get_policy_ex_arg {
+    policy_size: u64,       /* input/output */
+    policy: fscrypt_policy, /* output */
+}
+unsafe impl DataInit for fscrypt_get_policy_ex_arg {}
+
+ioctl_iowr_nr!(FS_IOC_GET_ENCRYPTION_POLICY_EX, 'f' as u32, 22, [u8; 9]);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -601,32 +632,8 @@ impl PassthroughFs {
         Err(io::Error::from_raw_os_error(libc::ENOENT))
     }
 
-    fn do_lookup(&self, parent: &InodeData, name: &CStr) -> io::Result<Entry> {
-        let raw_descriptor = {
-            // Safe because this doesn't modify any memory and we check the return value.
-            let raw_descriptor = unsafe {
-                libc::openat(
-                    parent.file.as_raw_descriptor(),
-                    name.as_ptr(),
-                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-
-            if raw_descriptor < 0 && self.cfg.ascii_casefold {
-                // Ignore any errors during casefold lookup.
-                self.ascii_casefold_lookup(parent, name.to_bytes())
-                    .unwrap_or(raw_descriptor)
-            } else {
-                raw_descriptor
-            }
-        };
-        if raw_descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we just opened this descriptor.
-        let f = unsafe { File::from_raw_descriptor(raw_descriptor) };
-
+    // Creates a new entry for `f` or increases the refcount of the existing entry for `f`.
+    fn add_entry(&self, f: File) -> io::Result<Entry> {
         let st = stat(&f)?;
 
         let altkey = InodeAltKey {
@@ -665,9 +672,38 @@ impl PassthroughFs {
             inode,
             generation: 0,
             attr: st,
-            attr_timeout: self.cfg.attr_timeout.clone(),
-            entry_timeout: self.cfg.entry_timeout.clone(),
+            attr_timeout: self.cfg.attr_timeout,
+            entry_timeout: self.cfg.entry_timeout,
         })
+    }
+
+    fn do_lookup(&self, parent: &InodeData, name: &CStr) -> io::Result<Entry> {
+        let fd = {
+            // Safe because this doesn't modify any memory and we check the return value.
+            let fd = unsafe {
+                libc::openat(
+                    parent.file.as_raw_descriptor(),
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+
+            if fd < 0 && self.cfg.ascii_casefold {
+                // Ignore any errors during casefold lookup.
+                self.ascii_casefold_lookup(parent, name.to_bytes())
+                    .unwrap_or(fd)
+            } else {
+                fd
+            }
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Safe because we just opened this fd.
+        let f = unsafe { File::from_raw_descriptor(fd) };
+
+        self.add_entry(f)
     }
 
     fn do_open(&self, inode: Inode, flags: u32) -> io::Result<(Option<Handle>, OpenOptions)> {
@@ -700,6 +736,68 @@ impl PassthroughFs {
         Ok((Some(handle), opts))
     }
 
+    fn do_tmpfile(
+        &self,
+        ctx: &Context,
+        dir: &InodeData,
+        flags: u32,
+        mut mode: u32,
+        umask: u32,
+    ) -> io::Result<File> {
+        // We don't want to use `O_EXCL` with `O_TMPFILE` as it has a different meaning when used in
+        // that combination.
+        let mut tmpflags = (flags as i32 | libc::O_TMPFILE | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            & !(libc::O_EXCL | libc::O_CREAT);
+
+        // O_TMPFILE requires that we use O_RDWR or O_WRONLY.
+        if flags as i32 & libc::O_ACCMODE == libc::O_RDONLY {
+            tmpflags &= !libc::O_ACCMODE;
+            tmpflags |= libc::O_RDWR;
+        }
+
+        // The presence of a default posix acl xattr in the parent directory completely changes the
+        // meaning of the mode parameter so only apply the umask if it doesn't have one.
+        if !self.has_default_posix_acl(&dir)? {
+            mode &= !umask;
+        }
+
+        // Safe because this is a valid c string.
+        let current_dir = unsafe { CStr::from_bytes_with_nul_unchecked(b".\0") };
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let fd = unsafe {
+            libc::openat(
+                dir.file.as_raw_descriptor(),
+                current_dir.as_ptr(),
+                tmpflags,
+                mode,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Safe because we just opened this fd.
+        let tmpfile = unsafe { File::from_raw_descriptor(fd) };
+
+        // We need to respect the setgid bit in the parent directory if it is set.
+        let st = stat(&dir.file)?;
+        let gid = if st.st_mode & libc::S_ISGID != 0 {
+            st.st_gid
+        } else {
+            ctx.gid
+        };
+
+        // Now set the uid and gid for the file. Safe because this doesn't modify any memory and we
+        // check the return value.
+        let ret = unsafe { libc::fchown(tmpfile.as_raw_descriptor(), ctx.uid, gid) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(tmpfile)
+    }
+
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
         let mut handles = self.handles.lock();
 
@@ -718,7 +816,7 @@ impl PassthroughFs {
     fn do_getattr(&self, inode: &InodeData) -> io::Result<(libc::stat64, Duration)> {
         let st = stat(&inode.file)?;
 
-        Ok((st, self.cfg.attr_timeout.clone()))
+        Ok((st, self.cfg.attr_timeout))
     }
 
     fn do_unlink(&self, parent: &InodeData, name: &CStr, flags: libc::c_int) -> io::Result<()> {
@@ -827,7 +925,11 @@ impl PassthroughFs {
         }
     }
 
-    fn get_encryption_policy(&self, handle: Handle) -> io::Result<IoctlReply> {
+    fn get_encryption_policy_ex<R: io::Read>(
+        &self,
+        handle: Handle,
+        mut r: R,
+    ) -> io::Result<IoctlReply> {
         let data = self
             .handles
             .lock()
@@ -835,37 +937,22 @@ impl PassthroughFs {
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
 
-        let mut buf = MaybeUninit::<fscrypt_policy_v1>::zeroed();
-        let file = data.file.lock();
+        // Safe because this only has integer fields.
+        let mut arg = unsafe { MaybeUninit::<fscrypt_get_policy_ex_arg>::zeroed().assume_init() };
+        r.read_exact(arg.policy_size.as_mut_slice())?;
 
-        // Safe because the kernel will only write to `buf` and we check the return value.
+        let policy_size = cmp::min(arg.policy_size, size_of::<fscrypt_policy>() as u64);
+        arg.policy_size = policy_size;
+
+        let file = data.file.lock();
+        // Safe because the kernel will only write to `arg` and we check the return value.
         let res =
-            unsafe { ioctl_with_mut_ptr(&*file, FS_IOC_GET_ENCRYPTION_POLICY(), buf.as_mut_ptr()) };
+            unsafe { ioctl_with_mut_ptr(&*file, FS_IOC_GET_ENCRYPTION_POLICY_EX(), &mut arg) };
         if res < 0 {
             Ok(IoctlReply::Done(Err(io::Error::last_os_error())))
         } else {
-            // Safe because the kernel guarantees that the policy is now initialized.
-            let policy = unsafe { buf.assume_init() };
-            Ok(IoctlReply::Done(Ok(policy.as_slice().to_vec())))
-        }
-    }
-
-    fn set_encryption_policy<R: io::Read>(&self, handle: Handle, r: R) -> io::Result<IoctlReply> {
-        let data = self
-            .handles
-            .lock()
-            .get(&handle)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
-
-        let policy = fscrypt_policy_v1::from_reader(r)?;
-        let file = data.file.lock();
-        // Safe because the kernel will only read from `policy` and we check the return value.
-        let res = unsafe { ioctl_with_ptr(&*file, FS_IOC_SET_ENCRYPTION_POLICY(), &policy) };
-        if res < 0 {
-            Ok(IoctlReply::Done(Err(io::Error::last_os_error())))
-        } else {
-            Ok(IoctlReply::Done(Ok(Vec::new())))
+            let len = size_of::<u64>() + arg.policy_size as usize;
+            Ok(IoctlReply::Done(Ok(arg.as_slice()[..len].to_vec())))
         }
     }
 
@@ -1355,8 +1442,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<Self::DirIter> {
         let data = self.find_handle(handle, inode)?;
 
-        let mut buf = Vec::with_capacity(size as usize);
-        buf.resize(size as usize, 0);
+        let buf = vec![0; size as usize];
 
         let dir = data.file.lock();
 
@@ -1385,12 +1471,32 @@ impl FileSystem for PassthroughFs {
         self.do_release(inode, handle)
     }
 
+    fn chromeos_tmpfile(
+        &self,
+        ctx: Context,
+        parent: Self::Inode,
+        mode: u32,
+        umask: u32,
+        security_ctx: Option<&CStr>,
+    ) -> io::Result<Entry> {
+        let data = self.find_inode(parent)?;
+
+        let _ctx = security_ctx
+            .filter(|ctx| ctx.to_bytes() != UNLABELED)
+            .map(|ctx| ScopedSecurityContext::new(&self.proc, ctx))
+            .transpose()?;
+
+        let tmpfile = self.do_tmpfile(&ctx, &data, 0, mode, umask)?;
+
+        self.add_entry(tmpfile)
+    }
+
     fn create(
         &self,
         ctx: Context,
         parent: Inode,
         name: &CStr,
-        mut mode: u32,
+        mode: u32,
         flags: u32,
         umask: u32,
         security_ctx: Option<&CStr>,
@@ -1412,56 +1518,7 @@ impl FileSystem for PassthroughFs {
             .map(|ctx| ScopedSecurityContext::new(&self.proc, ctx))
             .transpose()?;
 
-        // We don't want to use `O_EXCL` with `O_TMPFILE` as it has a different meaning when used in
-        // that combination.
-        let mut tmpflags = (flags as i32 | libc::O_TMPFILE | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            & !(libc::O_EXCL | libc::O_CREAT);
-
-        // O_TMPFILE requires that we use O_RDWR or O_WRONLY.
-        if flags as i32 & libc::O_ACCMODE == libc::O_RDONLY {
-            tmpflags &= !libc::O_ACCMODE;
-            tmpflags |= libc::O_RDWR;
-        }
-
-        // The presence of a default posix acl xattr in the parent directory completely changes the
-        // meaning of the mode parameter so only apply the umask if it doesn't have one.
-        if !self.has_default_posix_acl(&data)? {
-            mode &= !umask;
-        }
-
-        // Safe because this is a valid c string.
-        let current_dir = unsafe { CStr::from_bytes_with_nul_unchecked(b".\0") };
-
-        // Safe because this doesn't modify any memory and we check the return value.
-        let raw_descriptor = unsafe {
-            libc::openat(
-                data.file.as_raw_descriptor(),
-                current_dir.as_ptr(),
-                tmpflags,
-                mode,
-            )
-        };
-        if raw_descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we just opened this descriptor.
-        let tmpfile = unsafe { File::from_raw_descriptor(raw_descriptor) };
-
-        // We need to respect the setgid bit in the parent directory if it is set.
-        let st = stat(&data.file)?;
-        let gid = if st.st_mode & libc::S_ISGID != 0 {
-            st.st_gid
-        } else {
-            ctx.gid
-        };
-
-        // Now set the uid and gid for the file. Safe because this doesn't modify any memory and we
-        // check the return value.
-        let ret = unsafe { libc::fchown(tmpfile.as_raw_descriptor(), ctx.uid, gid) };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let tmpfile = self.do_tmpfile(&ctx, &data, flags, mode, umask)?;
 
         let proc_path = CString::new(format!("self/fd/{}", tmpfile.as_raw_descriptor()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1821,8 +1878,7 @@ impl FileSystem for PassthroughFs {
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
         let data = self.find_inode(inode)?;
 
-        let mut buf = Vec::with_capacity(libc::PATH_MAX as usize);
-        buf.resize(libc::PATH_MAX as usize, 0);
+        let mut buf = vec![0; libc::PATH_MAX as usize];
 
         // Safe because this is a constant value and a valid C string.
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
@@ -2164,13 +2220,12 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _flags: IoctlFlags,
         cmd: u32,
-        arg: u64,
+        _arg: u64,
         in_size: u32,
         out_size: u32,
         r: R,
     ) -> io::Result<IoctlReply> {
-        const GET_ENCRYPTION_POLICY: u32 = FS_IOC_GET_ENCRYPTION_POLICY() as u32;
-        const SET_ENCRYPTION_POLICY: u32 = FS_IOC_SET_ENCRYPTION_POLICY() as u32;
+        const GET_ENCRYPTION_POLICY_EX: u32 = FS_IOC_GET_ENCRYPTION_POLICY_EX() as u32;
         const GET_FSXATTR: u32 = FS_IOC_FSGETXATTR() as u32;
         const SET_FSXATTR: u32 = FS_IOC_FSSETXATTR() as u32;
         const GET_FLAGS32: u32 = FS_IOC32_GETFLAGS() as u32;
@@ -2178,34 +2233,8 @@ impl FileSystem for PassthroughFs {
         const GET_FLAGS64: u32 = FS_IOC64_GETFLAGS() as u32;
         const SET_FLAGS64: u32 = FS_IOC64_SETFLAGS() as u32;
 
-        // Normally, we wouldn't need to retry the FS_IOC_GET_ENCRYPTION_POLICY and
-        // FS_IOC_SET_ENCRYPTION_POLICY ioctls. Unfortunately, the I/O directions for both of them
-        // are encoded backwards so they can only be handled as unrestricted fuse ioctls.
         match cmd {
-            GET_ENCRYPTION_POLICY => {
-                if out_size < size_of::<fscrypt_policy_v1>() as u32 {
-                    let input = Vec::new();
-                    let output = vec![IoctlIovec {
-                        base: arg,
-                        len: size_of::<fscrypt_policy_v1>() as u64,
-                    }];
-                    Ok(IoctlReply::Retry { input, output })
-                } else {
-                    self.get_encryption_policy(handle)
-                }
-            }
-            SET_ENCRYPTION_POLICY => {
-                if in_size < size_of::<fscrypt_policy_v1>() as u32 {
-                    let input = vec![IoctlIovec {
-                        base: arg,
-                        len: size_of::<fscrypt_policy_v1>() as u64,
-                    }];
-                    let output = Vec::new();
-                    Ok(IoctlReply::Retry { input, output })
-                } else {
-                    self.set_encryption_policy(handle, r)
-                }
-            }
+            GET_ENCRYPTION_POLICY_EX => self.get_encryption_policy_ex(handle, r),
             GET_FSXATTR => {
                 if out_size < size_of::<fsxattr>() as u32 {
                     Err(io::Error::from_raw_os_error(libc::ENOMEM))
@@ -2277,6 +2306,40 @@ impl FileSystem for PassthroughFs {
             Err(io::Error::last_os_error())
         }
     }
+
+    fn set_up_mapping<M: Mapper>(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        file_offset: u64,
+        mem_offset: u64,
+        size: usize,
+        prot: u32,
+        mapper: M,
+    ) -> io::Result<()> {
+        let read = prot & libc::PROT_READ as u32 != 0;
+        let write = prot & libc::PROT_WRITE as u32 != 0;
+
+        let flags = match (read, write) {
+            (true, true) => libc::O_RDWR,
+            (true, false) => libc::O_RDONLY,
+            (false, true) => libc::O_WRONLY,
+            (false, false) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        };
+        let data = self.find_inode(inode)?;
+
+        let file = self.open_inode(&data, flags | libc::O_NONBLOCK)?;
+
+        mapper.map(mem_offset, size, &file, file_offset, prot)
+    }
+
+    fn remove_mapping<M: Mapper>(&self, msgs: &[RemoveMappingOne], mapper: M) -> io::Result<()> {
+        for RemoveMappingOne { moffset, len } in msgs {
+            mapper.unmap(*moffset, *len)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2285,7 +2348,6 @@ mod tests {
 
     use std::env;
     use std::os::unix::ffi::OsStringExt;
-    use std::path::PathBuf;
 
     #[test]
     fn create_temp_dir() {
@@ -2303,7 +2365,7 @@ mod tests {
         let t = TempDir::new(&parent, 0o755).expect("Failed to create temporary directory");
 
         let basename = t.basename().to_string_lossy();
-        let path = PathBuf::from(env::temp_dir()).join(&*basename);
+        let path = env::temp_dir().join(&*basename);
         assert!(path.exists());
         assert!(path.is_dir());
     }
@@ -2324,7 +2386,7 @@ mod tests {
         let t = TempDir::new(&parent, 0o755).expect("Failed to create temporary directory");
 
         let basename = t.basename().to_string_lossy();
-        let path = PathBuf::from(env::temp_dir()).join(&*basename);
+        let path = env::temp_dir().join(&*basename);
         mem::drop(t);
         assert!(!path.exists());
     }
@@ -2346,14 +2408,16 @@ mod tests {
 
         let (basename_cstr, _) = t.into_inner();
         let basename = basename_cstr.to_string_lossy();
-        let path = PathBuf::from(env::temp_dir()).join(&*basename);
+        let path = env::temp_dir().join(&*basename);
         assert!(path.exists());
     }
 
     #[test]
     fn rewrite_xattr_names() {
-        let mut cfg = Config::default();
-        cfg.rewrite_security_xattrs = true;
+        let cfg = Config {
+            rewrite_security_xattrs: true,
+            ..Default::default()
+        };
 
         let p = PassthroughFs::new(cfg).expect("Failed to create PassthroughFs");
 
