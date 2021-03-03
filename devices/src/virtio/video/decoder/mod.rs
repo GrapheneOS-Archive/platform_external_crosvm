@@ -11,7 +11,9 @@ use std::convert::TryInto;
 use backend::*;
 use base::{error, IntoRawDescriptor, WaitContext};
 
-use crate::virtio::resource_bridge::{self, ResourceInfo, ResourceRequestSocket};
+use crate::virtio::resource_bridge::{
+    self, BufferInfo, ResourceInfo, ResourceRequest, ResourceRequestSocket,
+};
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
 use crate::virtio::video::command::{QueueType, VideoCmd};
 use crate::virtio::video::control::{CtrlType, CtrlVal, QueryCtrlResponse, QueryCtrlType};
@@ -180,7 +182,7 @@ impl<S: DecoderSession> Context<S> {
             stream_id,
             in_params: Params {
                 format: Some(format),
-                min_buffers: 2,
+                min_buffers: 1,
                 max_buffers: 32,
                 plane_formats: vec![Default::default()],
                 ..Default::default()
@@ -198,7 +200,7 @@ impl<S: DecoderSession> Context<S> {
         queue_type: QueueType,
         res_bridge: &ResourceRequestSocket,
         resource_id: u32,
-    ) -> VideoResult<ResourceInfo> {
+    ) -> VideoResult<BufferInfo> {
         let res_id_to_res_handle = match queue_type {
             QueueType::Input => &self.in_res.res_id_to_res_handle,
             QueueType::Output => &self.out_res.res_id_to_res_handle,
@@ -210,8 +212,14 @@ impl<S: DecoderSession> Context<S> {
                 resource_id,
             },
         )?;
-        resource_bridge::get_resource_info(res_bridge, handle)
-            .map_err(VideoError::ResourceBridgeFailure)
+        match resource_bridge::get_resource_info(
+            res_bridge,
+            ResourceRequest::GetBuffer { id: handle },
+        ) {
+            Ok(ResourceInfo::Buffer(buffer_info)) => Ok(buffer_info),
+            Ok(_) => Err(VideoError::InvalidArgument),
+            Err(e) => Err(VideoError::ResourceBridgeFailure(e)),
+        }
     }
 
     fn register_buffer(&mut self, queue_type: QueueType, resource_id: u32, uuid: &u128) {

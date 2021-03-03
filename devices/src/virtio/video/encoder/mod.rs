@@ -14,7 +14,9 @@ pub use libvda_encoder::LibvdaEncoder;
 use base::{error, warn, WaitContext};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::virtio::resource_bridge::{self, ResourceRequestSocket};
+use crate::virtio::resource_bridge::{
+    self, BufferInfo, ResourceInfo, ResourceRequest, ResourceRequestSocket,
+};
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
 use crate::virtio::video::command::{QueueType, VideoCmd};
 use crate::virtio::video::control::*;
@@ -28,7 +30,7 @@ use crate::virtio::video::encoder::encoder::{
 };
 use crate::virtio::video::error::*;
 use crate::virtio::video::event::{EvtType, VideoEvt};
-use crate::virtio::video::format::{Format, Level, Profile};
+use crate::virtio::video::format::{Format, Level, PlaneFormat, Profile};
 use crate::virtio::video::params::Params;
 use crate::virtio::video::protocol;
 use crate::virtio::video::response::CmdResponse;
@@ -75,6 +77,8 @@ struct Stream<T: EncoderSession> {
     dst_bitrate: u32,
     dst_profile: Profile,
     dst_h264_level: Option<Level>,
+    frame_rate: u32,
+    force_keyframe: bool,
 
     encoder_session: Option<T>,
     received_input_buffers_event: bool,
@@ -95,11 +99,12 @@ impl<T: EncoderSession> Stream<T> {
         desired_format: Format,
         encoder: &EncoderDevice<E>,
     ) -> VideoResult<Self> {
-        const MIN_BUFFERS: u32 = 2;
+        const MIN_BUFFERS: u32 = 1;
         const MAX_BUFFERS: u32 = 342;
         const DEFAULT_WIDTH: u32 = 640;
         const DEFAULT_HEIGHT: u32 = 480;
         const DEFAULT_BITRATE: u32 = 6000;
+        const DEFAULT_BUFFER_SIZE: u32 = 2097152; // 2MB; chosen empirically for 1080p video
         const DEFAULT_FPS: u32 = 30;
 
         let mut src_params = Params {
@@ -111,7 +116,13 @@ impl<T: EncoderSession> Stream<T> {
         let cros_capabilities = &encoder.cros_capabilities;
 
         cros_capabilities
-            .populate_src_params(&mut src_params, Format::NV12, DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            .populate_src_params(
+                &mut src_params,
+                Format::NV12,
+                DEFAULT_WIDTH,
+                DEFAULT_HEIGHT,
+                0,
+            )
             .map_err(|_| VideoError::InvalidArgument)?;
 
         let mut dst_params = Default::default();
@@ -120,22 +131,15 @@ impl<T: EncoderSession> Stream<T> {
         // rate, because VEA's request_encoding_params_change requires both framerate and
         // bitrate to be specified.
         cros_capabilities
-            .populate_dst_params(
-                &mut dst_params,
-                &src_params,
-                desired_format,
-                /* fps= */ DEFAULT_FPS,
-            )
+            .populate_dst_params(&mut dst_params, desired_format, DEFAULT_BUFFER_SIZE)
             .map_err(|_| VideoError::InvalidArgument)?;
         // `format` is an Option since for the decoder, it is not populated until decoding has
         // started. for encoder, format should always be populated.
-        let dest_format = dst_params
-            .format
-            .ok_or_else(|| VideoError::InvalidArgument)?;
+        let dest_format = dst_params.format.ok_or(VideoError::InvalidArgument)?;
 
         let dst_profile = cros_capabilities
             .get_default_profile(&dest_format)
-            .ok_or_else(|| VideoError::InvalidArgument)?;
+            .ok_or(VideoError::InvalidArgument)?;
 
         let dst_h264_level = if dest_format == Format::H264 {
             Some(Level::H264_1_0)
@@ -150,6 +154,8 @@ impl<T: EncoderSession> Stream<T> {
             dst_bitrate: DEFAULT_BITRATE,
             dst_profile,
             dst_h264_level,
+            frame_rate: DEFAULT_FPS,
+            force_keyframe: false,
             encoder_session: None,
             received_input_buffers_event: false,
             src_resources: Default::default(),
@@ -185,6 +191,7 @@ impl<T: EncoderSession> Stream<T> {
                 dst_profile: self.dst_profile,
                 dst_bitrate: self.dst_bitrate,
                 dst_h264_level: self.dst_h264_level.clone(),
+                frame_rate: self.frame_rate,
             })
             .map_err(|_| VideoError::InvalidOperation)?;
 
@@ -334,6 +341,7 @@ impl<T: EncoderSession> Stream<T> {
         &mut self,
         output_buffer_id: OutputBufferId,
         bytesused: u32,
+        keyframe: bool,
         timestamp: u64,
     ) -> Option<Vec<VideoEvtResponseType>> {
         let resource_id = *match self.encoder_output_buffer_ids.get(&output_buffer_id) {
@@ -379,7 +387,11 @@ impl<T: EncoderSession> Stream<T> {
             // At the moment, a buffer is saved in `eos_notification_buffer`, and
             // the EOS flag is populated and returned after a flush() command.
             // TODO(b/149725148): Populate flags once libvda supports it.
-            flags: 0,
+            flags: if keyframe {
+                protocol::VIRTIO_VIDEO_BUFFER_FLAG_IFRAME
+            } else {
+                0
+            },
             size: bytesused,
         };
 
@@ -485,6 +497,17 @@ pub struct EncoderDevice<T: Encoder> {
     cros_capabilities: encoder::EncoderCapabilities,
     encoder: T,
     streams: BTreeMap<u32, Stream<T::Session>>,
+}
+
+fn get_resource_info(res_bridge: &ResourceRequestSocket, uuid: u128) -> VideoResult<BufferInfo> {
+    match resource_bridge::get_resource_info(
+        res_bridge,
+        ResourceRequest::GetBuffer { id: uuid as u32 },
+    ) {
+        Ok(ResourceInfo::Buffer(buffer_info)) => Ok(buffer_info),
+        Ok(_) => Err(VideoError::InvalidArgument),
+        Err(e) => Err(VideoError::ResourceBridgeFailure(e)),
+    }
 }
 
 impl<T: Encoder> EncoderDevice<T> {
@@ -604,9 +627,7 @@ impl<T: Encoder> EncoderDevice<T> {
                     warn!("Replacing source resource with id {}", resource_id);
                 }
 
-                let resource_info =
-                    resource_bridge::get_resource_info(resource_bridge, uuid as u32)
-                        .map_err(VideoError::ResourceBridgeFailure)?;
+                let resource_info = get_resource_info(resource_bridge, uuid)?;
 
                 let planes: Vec<VideoFramePlane> = resource_info.planes[0..num_planes]
                     .into_iter()
@@ -686,20 +707,16 @@ impl<T: Encoder> EncoderDevice<T> {
                     },
                 )?;
 
-                let resource_info = resource_bridge::get_resource_info(
-                    resource_bridge,
-                    src_resource.resource_handle as u32,
-                )
-                .map_err(VideoError::ResourceBridgeFailure)?;
+                let resource_info =
+                    get_resource_info(resource_bridge, src_resource.resource_handle)?;
 
-                // TODO(alexlau): Figure out what to do with force_keyframe.
-                // Perhaps by something in the protocol that allows the user
-                // to specify the VIRTIO_VIDEO_BUFFER_FLAG_[IPB]FRAME constants?
+                let force_keyframe = std::mem::replace(&mut stream.force_keyframe, false);
+
                 match encoder_session.encode(
                     resource_info.file,
                     &src_resource.planes,
                     timestamp,
-                    /* force_keyframe= */ false,
+                    force_keyframe,
                 ) {
                     Ok(input_buffer_id) => {
                         if let Some(last_resource_id) = stream
@@ -753,11 +770,8 @@ impl<T: Encoder> EncoderDevice<T> {
                     },
                 )?;
 
-                let resource_info = resource_bridge::get_resource_info(
-                    resource_bridge,
-                    dst_resource.resource_handle as u32,
-                )
-                .map_err(VideoError::ResourceBridgeFailure)?;
+                let resource_info =
+                    get_resource_info(resource_bridge, dst_resource.resource_handle)?;
 
                 let mut buffer_size = data_sizes[0];
 
@@ -931,6 +945,7 @@ impl<T: Encoder> EncoderDevice<T> {
         frame_width: u32,
         frame_height: u32,
         frame_rate: u32,
+        plane_formats: Vec<PlaneFormat>,
     ) -> VideoResult<VideoCmdResponseType> {
         let stream = self
             .streams
@@ -944,6 +959,11 @@ impl<T: Encoder> EncoderDevice<T> {
 
         match queue_type {
             QueueType::Input => {
+                // There should be at least a single plane.
+                if plane_formats.is_empty() {
+                    return Err(VideoError::InvalidArgument);
+                }
+
                 let desired_format = format.or(stream.src_params.format).unwrap_or(Format::NV12);
                 self.cros_capabilities
                     .populate_src_params(
@@ -951,32 +971,48 @@ impl<T: Encoder> EncoderDevice<T> {
                         desired_format,
                         frame_width,
                         frame_height,
+                        plane_formats[0].stride,
                     )
                     .map_err(VideoError::EncoderImpl)?;
+
+                // Following the V4L2 standard the framerate requested on the
+                // input queue should also be applied to the output queue.
+                if frame_rate > 0 {
+                    stream.frame_rate = frame_rate;
+                }
             }
             QueueType::Output => {
                 let desired_format = format.or(stream.dst_params.format).unwrap_or(Format::H264);
+
+                // There should be exactly one output buffer.
+                if plane_formats.len() != 1 {
+                    return Err(VideoError::InvalidArgument);
+                }
+
                 self.cros_capabilities
                     .populate_dst_params(
                         &mut stream.dst_params,
-                        &stream.src_params,
                         desired_format,
-                        frame_rate,
+                        plane_formats[0].plane_size,
                     )
                     .map_err(VideoError::EncoderImpl)?;
+
+                if frame_rate > 0 {
+                    stream.frame_rate = frame_rate;
+                }
 
                 // Format is always populated for encoder.
                 let new_format = stream
                     .dst_params
                     .format
-                    .ok_or_else(|| VideoError::InvalidArgument)?;
+                    .ok_or(VideoError::InvalidArgument)?;
 
                 // If the selected profile no longer corresponds to the selected coded format,
                 // reset it.
                 stream.dst_profile = self
                     .cros_capabilities
                     .get_default_profile(&new_format)
-                    .ok_or_else(|| VideoError::InvalidArgument)?;
+                    .ok_or(VideoError::InvalidArgument)?;
 
                 if new_format == Format::H264 {
                     stream.dst_h264_level = Some(Level::H264_1_0);
@@ -1020,10 +1056,23 @@ impl<T: Encoder> EncoderDevice<T> {
             },
             QueryCtrlType::Level(format) => {
                 match format {
-                    Format::H264 => {
-                        // TODO(alexlau): Figure out valid range of values.
-                        QueryCtrlResponse::Level(vec![Level::H264_1_0])
-                    }
+                    Format::H264 => QueryCtrlResponse::Level(vec![
+                        Level::H264_1_0,
+                        Level::H264_1_1,
+                        Level::H264_1_2,
+                        Level::H264_1_3,
+                        Level::H264_2_0,
+                        Level::H264_2_1,
+                        Level::H264_2_2,
+                        Level::H264_3_0,
+                        Level::H264_3_1,
+                        Level::H264_3_2,
+                        Level::H264_4_0,
+                        Level::H264_4_1,
+                        Level::H264_4_2,
+                        Level::H264_5_0,
+                        Level::H264_5_1,
+                    ]),
                     _ => {
                         // Levels are only supported for H264.
                         return Err(VideoError::UnsupportedControl(CtrlType::Level));
@@ -1053,7 +1102,7 @@ impl<T: Encoder> EncoderDevice<T> {
                 let format = stream
                     .dst_params
                     .format
-                    .ok_or_else(|| VideoError::InvalidArgument)?;
+                    .ok_or(VideoError::InvalidArgument)?;
                 match format {
                     Format::H264 => CtrlVal::Level(stream.dst_h264_level.ok_or_else(|| {
                         error!("H264 level not set");
@@ -1064,6 +1113,8 @@ impl<T: Encoder> EncoderDevice<T> {
                     }
                 }
             }
+            // Button controls should not be queried.
+            CtrlType::ForceKeyframe => return Err(VideoError::UnsupportedControl(ctrl_type)),
         };
         Ok(VideoCmdResponseType::Sync(CmdResponse::GetControl(
             ctrl_val,
@@ -1082,8 +1133,8 @@ impl<T: Encoder> EncoderDevice<T> {
         match ctrl_val {
             CtrlVal::Bitrate(bitrate) => {
                 if let Some(ref mut encoder_session) = stream.encoder_session {
-                    if let Err(e) = encoder_session
-                        .request_encoding_params_change(bitrate, stream.dst_params.frame_rate)
+                    if let Err(e) =
+                        encoder_session.request_encoding_params_change(bitrate, stream.frame_rate)
                     {
                         error!(
                             "failed to dynamically request encoding params change: {}",
@@ -1105,7 +1156,7 @@ impl<T: Encoder> EncoderDevice<T> {
                 let format = stream
                     .dst_params
                     .format
-                    .ok_or_else(|| VideoError::InvalidArgument)?;
+                    .ok_or(VideoError::InvalidArgument)?;
                 if format != profile.to_format() {
                     error!(
                         "specified profile does not correspond to the selected format ({})",
@@ -1126,7 +1177,7 @@ impl<T: Encoder> EncoderDevice<T> {
                 let format = stream
                     .dst_params
                     .format
-                    .ok_or_else(|| VideoError::InvalidArgument)?;
+                    .ok_or(VideoError::InvalidArgument)?;
                 if format != Format::H264 {
                     error!(
                         "set control called for level but format is not H264 ({})",
@@ -1135,6 +1186,9 @@ impl<T: Encoder> EncoderDevice<T> {
                     return Err(VideoError::InvalidOperation);
                 }
                 stream.dst_h264_level = Some(level);
+            }
+            CtrlVal::ForceKeyframe() => {
+                stream.force_keyframe = true;
             }
         }
         Ok(VideoCmdResponseType::Sync(CmdResponse::SetControl))
@@ -1203,6 +1257,7 @@ impl<T: Encoder> Device for EncoderDevice<T> {
                         frame_width,
                         frame_height,
                         frame_rate,
+                        plane_formats,
                         ..
                     },
             } => self.set_params(
@@ -1213,6 +1268,7 @@ impl<T: Encoder> Device for EncoderDevice<T> {
                 frame_width,
                 frame_height,
                 frame_rate,
+                plane_formats,
             ),
             VideoCmd::QueryControl { query_ctrl_type } => self.query_control(query_ctrl_type),
             VideoCmd::GetControl {
@@ -1277,8 +1333,9 @@ impl<T: Encoder> Device for EncoderDevice<T> {
             EncoderEvent::ProcessedOutputBuffer {
                 id: output_buffer_id,
                 bytesused,
+                keyframe,
                 timestamp,
-            } => stream.processed_output_buffer(output_buffer_id, bytesused, timestamp),
+            } => stream.processed_output_buffer(output_buffer_id, bytesused, keyframe, timestamp),
             EncoderEvent::FlushResponse { flush_done } => stream.flush_response(flush_done),
             EncoderEvent::NotifyError { error } => stream.notify_error(error),
         }
