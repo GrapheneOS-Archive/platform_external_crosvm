@@ -32,8 +32,6 @@ const INTEL_VENDOR_ID: u16 = 0x8086;
 const PCI_COMMAND: u32 = 0x4;
 const PCI_COMMAND_MEMORY: u8 = 0x2;
 const PCI_BASE_CLASS_CODE: u32 = 0x0B;
-const PCI_HEADER_TYPE: usize = 0x0E;
-const PCI_MULTI_FLAG: u32 = 0x0080_0000;
 
 const PCI_INTERRUPT_PIN: u32 = 0x3D;
 
@@ -167,14 +165,9 @@ impl VfioMsiCap {
             }
         };
 
-        if index >= self.offset as u64
+        index >= self.offset as u64
             && index + len as u64 <= (self.offset + msi_len) as u64
             && len as u32 <= msi_len
-        {
-            true
-        } else {
-            false
-        }
     }
 
     fn write_msi_reg(&mut self, index: u64, data: &[u8]) -> Option<VfioMsiChange> {
@@ -343,11 +336,7 @@ impl VfioMsixCap {
         let control_start = self.offset + PCI_MSIX_FLAGS;
         let control_end = control_start + 2;
 
-        if offset < control_end && offset + size > control_start {
-            true
-        } else {
-            false
-        }
+        offset < control_end && offset + size > control_start
     }
 
     fn read_msix_control(&self, data: &mut u32) {
@@ -372,14 +361,9 @@ impl VfioMsixCap {
 
     fn is_msix_table(&self, bar_index: u32, offset: u64) -> bool {
         let table_size: u64 = (self.table_size * (MSIX_TABLE_ENTRIES_MODULO as u16)).into();
-        if bar_index != self.table_pci_bar
-            || offset < self.table_offset
-            || offset >= self.table_offset + table_size
-        {
-            false
-        } else {
-            true
-        }
+        bar_index == self.table_pci_bar
+            && offset >= self.table_offset
+            && offset < self.table_offset + table_size
     }
 
     fn read_table(&self, offset: u64, data: &mut [u8]) {
@@ -396,14 +380,9 @@ impl VfioMsixCap {
         let pba_size: u64 = (((self.table_size + BITS_PER_PBA_ENTRY as u16 - 1)
             / BITS_PER_PBA_ENTRY as u16)
             * MSIX_PBA_ENTRIES_MODULO as u16) as u64;
-        if bar_index != self.pba_pci_bar
-            || offset < self.pba_offset
-            || offset >= self.pba_offset + pba_size
-        {
-            false
-        } else {
-            true
-        }
+        bar_index == self.pba_pci_bar
+            && offset >= self.pba_offset
+            && offset < self.pba_offset + pba_size
     }
 
     fn read_pba(&self, offset: u64, data: &mut [u8]) {
@@ -417,11 +396,7 @@ impl VfioMsixCap {
     }
 
     fn is_msix_bar(&self, bar_index: u32) -> bool {
-        if bar_index == self.table_pci_bar || bar_index == self.pba_pci_bar {
-            true
-        } else {
-            false
-        }
+        bar_index == self.table_pci_bar || bar_index == self.pba_pci_bar
     }
 
     fn get_msix_irqfds(&self) -> Option<Vec<&Event>> {
@@ -610,9 +585,8 @@ impl VfioPciDevice {
 
         // Above disable_msi() or disable_msix() will enable intx again.
         // so disable_intx here again.
-        match self.irq_type {
-            Some(VfioIrqType::Intx) => self.disable_intx(),
-            _ => (),
+        if let Some(VfioIrqType::Intx) = self.irq_type {
+            self.disable_intx();
         }
     }
 
@@ -770,11 +744,28 @@ impl VfioPciDevice {
 
 impl PciDevice for VfioPciDevice {
     fn debug_label(&self) -> String {
-        "vfio pci device".to_string()
+        format!("vfio {} device", self.device.device_name())
     }
 
-    fn assign_address(&mut self, address: PciAddress) {
-        self.pci_address = Some(address);
+    fn allocate_address(
+        &mut self,
+        resources: &mut SystemAllocator,
+    ) -> Result<PciAddress, PciDeviceError> {
+        if self.pci_address.is_none() {
+            let address = PciAddress::from_string(self.device.device_name());
+            if resources.reserve_pci(
+                Alloc::PciBar {
+                    bus: address.bus,
+                    dev: address.dev,
+                    func: address.func,
+                    bar: 0,
+                },
+                self.debug_label(),
+            ) {
+                self.pci_address = Some(address);
+            }
+        }
+        self.pci_address.ok_or(PciDeviceError::PciAllocationFailed)
     }
 
     fn keep_rds(&self) -> Vec<RawDescriptor> {
@@ -820,7 +811,7 @@ impl PciDevice for VfioPciDevice {
         let mut i = VFIO_PCI_BAR0_REGION_INDEX;
         let address = self
             .pci_address
-            .expect("assign_address must be called prior to allocate_io_bars");
+            .expect("allocate_address must be called prior to allocate_io_bars");
 
         while i <= VFIO_PCI_ROM_REGION_INDEX {
             let mut low: u32 = 0xffffffff;
@@ -919,7 +910,7 @@ impl PciDevice for VfioPciDevice {
         ) {
             let address = self
                 .pci_address
-                .expect("assign_address must be called prior to allocate_device_bars");
+                .expect("allocate_address must be called prior to allocate_device_bars");
             let bar_addr = resources
                 .mmio_allocator(MmioType::Low)
                 .allocate(
@@ -969,10 +960,6 @@ impl PciDevice for VfioPciDevice {
                     config = 0;
                 }
             }
-        } else if reg_idx == PCI_HEADER_TYPE / 4 {
-            // Clear multifunction flags as pci_root doesn't
-            // support multifunction.
-            config &= !PCI_MULTI_FLAG;
         } else if let Some(msix_cap) = &self.msix_cap {
             if msix_cap.is_msix_control_reg(reg, 4) {
                 msix_cap.read_msix_control(&mut config);
