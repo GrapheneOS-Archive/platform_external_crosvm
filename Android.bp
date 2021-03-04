@@ -61,6 +61,9 @@ rust_defaults {
         linux_bionic_arm64: {
             enabled: true,
         },
+        darwin: {
+            enabled: false,
+        },
     },
     apex_available: [
         "//apex_available:platform",
