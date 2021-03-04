@@ -19,6 +19,7 @@ rust_defaults {
     edition: "2018",
     features: [
         "gfxstream",
+        "virgl_renderer",
         "virtio-gpu-next",
     ],
     rustlibs: [
@@ -66,6 +67,7 @@ rust_library {
     edition: "2018",
     features: [
         "gfxstream",
+        "virgl_renderer",
         "virtio-gpu-next",
     ],
     rustlibs: [
