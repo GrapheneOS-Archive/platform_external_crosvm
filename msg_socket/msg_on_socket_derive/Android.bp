@@ -16,7 +16,6 @@ rust_proc_macro {
     srcs: ["msg_on_socket_derive.rs"],
     edition: "2018",
     rustlibs: [
-        "libbase_rust",
         "libproc_macro2",
         "libquote",
         "libsyn",
@@ -32,7 +31,6 @@ rust_test_host {
     auto_gen_config: true,
     edition: "2018",
     rustlibs: [
-        "libbase_rust",
         "libproc_macro2",
         "libquote",
         "libsyn",
