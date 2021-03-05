@@ -135,7 +135,7 @@ rust_binary {
         "libdata_model",
         "libdevices",
         "libdisk",
-	"librutabaga_gfx",
+        "librutabaga_gfx",
         "libhypervisor",
         "libkernel_cmdline",
         "libkernel_loader",
