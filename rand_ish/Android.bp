@@ -31,6 +31,9 @@ rust_defaults {
 rust_test_host {
     name: "rand_ish_host_test_src_lib",
     defaults: ["rand_ish_defaults"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
