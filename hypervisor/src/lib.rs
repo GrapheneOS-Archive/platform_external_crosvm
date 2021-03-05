@@ -47,16 +47,9 @@ pub trait Vm: Send {
     /// Checks if a particular `VmCap` is available.
     ///
     /// This is distinct from the `Hypervisor` version of this method because some extensions depend
-    /// on the particular `Vm` existence.  This method is encouraged because it more accurately
+    /// on the particular `Vm` instance. This method is encouraged because it more accurately
     /// reflects the usable capabilities.
     fn check_capability(&self, c: VmCap) -> bool;
-
-    /// Checks if a particular hypervisor-specific capability is available.
-    ///
-    /// # Arguments
-    ///
-    /// * `cap` - hypervisor-specific constant defined by the hypervisor API (e.g., kvm.h)
-    fn check_raw_capability(&self, cap: u32) -> bool;
 
     /// Gets the guest-mapped memory for the Vm.
     fn get_memory(&self) -> &GuestMemory;
@@ -267,17 +260,22 @@ pub trait Vcpu: downcast_rs::DowncastSync {
     fn set_data(&self, data: &[u8]) -> Result<()>;
 
     /// Signals to the hypervisor that this guest is being paused by userspace.  Only works on Vms
-    /// that support `VmCapability::PvClockSuspend`.
+    /// that support `VmCap::PvClockSuspend`.
     fn pvclock_ctrl(&self) -> Result<()>;
 
     /// Specifies set of signals that are blocked during execution of `RunnableVcpu::run`.  Signals
     /// that are not blocked will cause run to return with `VcpuExit::Intr`.  Only works on Vms that
-    /// support `VmCapability::SignalMask`.
+    /// support `VmCap::SignalMask`.
     fn set_signal_mask(&self, signals: &[c_int]) -> Result<()>;
 
     /// Enables a hypervisor-specific extension on this Vcpu.  `cap` is a constant defined by the
     /// hypervisor API (e.g., kvm.h).  `args` are the arguments for enabling the feature, if any.
-    fn enable_raw_capability(&self, cap: u32, args: &[u64; 4]) -> Result<()>;
+    ///
+    /// # Safety
+    /// This function is marked as unsafe because `args` may be interpreted as pointers for some
+    /// capabilities. The caller must ensure that any pointers passed in the `args` array are
+    /// allocated as the kernel expects, and that mutable pointers are owned.
+    unsafe fn enable_raw_capability(&self, cap: u32, args: &[u64; 4]) -> Result<()>;
 }
 
 downcast_rs::impl_downcast!(sync Vcpu);

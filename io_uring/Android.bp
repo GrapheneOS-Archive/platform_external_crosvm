@@ -30,6 +30,9 @@ rust_defaults {
 rust_test_host {
     name: "io_uring_host_test_src_lib",
     defaults: ["io_uring_defaults"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
@@ -61,8 +64,10 @@ rust_library {
 //   ../sys_util/src/lib.rs
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
-//   libc-0.2.86 "default,std"
+//   libc-0.2.87 "default,std"
 //   proc-macro2-1.0.24 "default,proc-macro"
-//   quote-1.0.8 "default,proc-macro"
-//   syn-1.0.60 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   quote-1.0.9 "default,proc-macro"
+//   serde-1.0.123 "default,derive,serde_derive,std"
+//   serde_derive-1.0.123 "default"
+//   syn-1.0.61 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   unicode-xid-0.2.1 "default"

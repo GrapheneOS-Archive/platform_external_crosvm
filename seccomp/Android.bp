@@ -337,56 +337,6 @@ prebuilt_etc {
 }
 
 genrule {
-    name: "vios_audio_device.policy_inline_x86_64",
-    defaults: ["crosvm_inline_seccomp_policy_x86_64"],
-    out: ["vios_audio_device.policy"],
-    srcs: ["x86_64/vios_audio_device.policy"],
-}
-
-prebuilt_usr_share_host {
-    name: "vios_audio_device.policy_x86_64",
-    filename: "vios_audio_device.policy",
-    relative_install_path: "crosvm/x86_64-linux-gnu/seccomp",
-    src: ":vios_audio_device.policy_inline_x86_64",
-}
-
-genrule {
-    name: "vios_audio_device.policy_inline_aarch64",
-    defaults: ["crosvm_inline_seccomp_policy_aarch64"],
-    out: ["vios_audio_device.policy"],
-    srcs: ["aarch64/vios_audio_device.policy"],
-}
-
-prebuilt_usr_share_host {
-    name: "vios_audio_device.policy_aarch64",
-    filename: "vios_audio_device.policy",
-    relative_install_path: "crosvm/aarch64-linux-gnu/seccomp",
-    src: ":vios_audio_device.policy_inline_aarch64",
-}
-
-prebuilt_etc {
-    name: "vios_audio_device.policy",
-    relative_install_path: "seccomp_policy/crosvm",
-    arch: {
-        x86_64: {
-            src: ":vios_audio_device.policy_inline_x86_64",
-        },
-        arm64: {
-            src: ":vios_audio_device.policy_inline_aarch64",
-        },
-    },
-    target: {
-        android_arm: {
-            enabled: false,
-        },
-        android_x86: {
-            enabled: false,
-        },
-    },
-}
-
-
-genrule {
     name: "vfio_device.policy_inline_x86_64",
     defaults: ["crosvm_inline_seccomp_policy_x86_64"],
     out: ["vfio_device.policy"],
@@ -507,6 +457,55 @@ prebuilt_etc {
         },
         arm64: {
             src: ":block_device.policy_inline_aarch64",
+        },
+    },
+    target: {
+        android_arm: {
+            enabled: false,
+        },
+        android_x86: {
+            enabled: false,
+        },
+    },
+}
+
+genrule {
+    name: "vios_audio_device.policy_inline_x86_64",
+    defaults: ["crosvm_inline_seccomp_policy_x86_64"],
+    out: ["vios_audio_device.policy"],
+    srcs: ["x86_64/vios_audio_device.policy"],
+}
+
+prebuilt_usr_share_host {
+    name: "vios_audio_device.policy_x86_64",
+    filename: "vios_audio_device.policy",
+    relative_install_path: "crosvm/x86_64-linux-gnu/seccomp",
+    src: ":vios_audio_device.policy_inline_x86_64",
+}
+
+genrule {
+    name: "vios_audio_device.policy_inline_aarch64",
+    defaults: ["crosvm_inline_seccomp_policy_aarch64"],
+    out: ["vios_audio_device.policy"],
+    srcs: ["aarch64/vios_audio_device.policy"],
+}
+
+prebuilt_usr_share_host {
+    name: "vios_audio_device.policy_aarch64",
+    filename: "vios_audio_device.policy",
+    relative_install_path: "crosvm/aarch64-linux-gnu/seccomp",
+    src: ":vios_audio_device.policy_inline_aarch64",
+}
+
+prebuilt_etc {
+    name: "vios_audio_device.policy",
+    relative_install_path: "seccomp_policy/crosvm",
+    arch: {
+        x86_64: {
+            src: ":vios_audio_device.policy_inline_x86_64",
+        },
+        arm64: {
+            src: ":vios_audio_device.policy_inline_aarch64",
         },
     },
     target: {
@@ -703,6 +702,55 @@ prebuilt_etc {
         },
         arm64: {
             src: ":null_audio_device.policy_inline_aarch64",
+        },
+    },
+    target: {
+        android_arm: {
+            enabled: false,
+        },
+        android_x86: {
+            enabled: false,
+        },
+    },
+}
+
+genrule {
+    name: "battery.policy_inline_x86_64",
+    defaults: ["crosvm_inline_seccomp_policy_x86_64"],
+    out: ["battery.policy"],
+    srcs: ["x86_64/battery.policy"],
+}
+
+prebuilt_usr_share_host {
+    name: "battery.policy_x86_64",
+    filename: "battery.policy",
+    relative_install_path: "crosvm/x86_64-linux-gnu/seccomp",
+    src: ":battery.policy_inline_x86_64",
+}
+
+genrule {
+    name: "battery.policy_inline_aarch64",
+    defaults: ["crosvm_inline_seccomp_policy_aarch64"],
+    out: ["battery.policy"],
+    srcs: ["aarch64/battery.policy"],
+}
+
+prebuilt_usr_share_host {
+    name: "battery.policy_aarch64",
+    filename: "battery.policy",
+    relative_install_path: "crosvm/aarch64-linux-gnu/seccomp",
+    src: ":battery.policy_inline_aarch64",
+}
+
+prebuilt_etc {
+    name: "battery.policy",
+    relative_install_path: "seccomp_policy/crosvm",
+    arch: {
+        x86_64: {
+            src: ":battery.policy_inline_x86_64",
+        },
+        arm64: {
+            src: ":battery.policy_inline_aarch64",
         },
     },
     target: {
@@ -994,3 +1042,4 @@ prebuilt_etc {
         },
     },
 }
+

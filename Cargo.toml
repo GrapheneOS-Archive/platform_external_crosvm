@@ -103,6 +103,7 @@ assertions = { path = "assertions" }
 audio_streams = { path = "../adhd/audio_streams" } # ignored by ebuild
 base = { path = "base" }
 data_model = { path = "data_model" }
+libchromeos = { path = "../libchromeos-rs" } # ignored by ebuild
 libcras = { path = "../adhd/cras/client/libcras" } # ignored by ebuild
 minijail = { path = "../minijail/rust/minijail" } # ignored by ebuild
 p9 = { path = "../vm_tools/p9" } # ignored by ebuild
