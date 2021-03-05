@@ -4,7 +4,7 @@
 
 #![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 
-use devices::IrqChipX86_64;
+use devices::{IrqChipX86_64, ProtectionType};
 use hypervisor::{HypervisorX86_64, VcpuExit, VcpuX86_64, VmX86_64};
 use vm_memory::{GuestAddress, GuestMemory};
 
@@ -100,7 +100,7 @@ where
     let write_addr = GuestAddress(0x4000);
 
     // guest mem is 400 pages
-    let guest_mem = X8664arch::setup_memory(memory_size, false).unwrap();
+    let guest_mem = X8664arch::setup_memory(memory_size, None).unwrap();
     // let guest_mem = GuestMemory::new(&[(GuestAddress(0), memory_size)]).unwrap();
     let mut resources = X8664arch::get_resource_allocator(&guest_mem);
 
@@ -158,8 +158,14 @@ where
 
     arch::set_default_serial_parameters(&mut serial_params);
 
-    X8664arch::setup_serial_devices(false, &mut irq_chip, &mut io_bus, &serial_params, None)
-        .unwrap();
+    X8664arch::setup_serial_devices(
+        ProtectionType::Unprotected,
+        &mut irq_chip,
+        &mut io_bus,
+        &serial_params,
+        None,
+    )
+    .unwrap();
 
     let param_args = "nokaslr";
 

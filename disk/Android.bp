@@ -35,6 +35,9 @@ rust_defaults {
 rust_test_host {
     name: "disk_host_test_src_disk",
     defaults: ["disk_defaults"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
@@ -82,31 +85,33 @@ rust_library {
 //   ../tempfile/src/lib.rs
 //   ../vm_memory/src/lib.rs
 //   async-task-4.0.3 "default,std"
-//   async-trait-0.1.42
+//   async-trait-0.1.45
 //   cfg-if-1.0.0
-//   futures-0.3.12 "alloc"
-//   futures-channel-0.3.12 "alloc,futures-sink,sink"
-//   futures-core-0.3.12 "alloc"
-//   futures-io-0.3.12
-//   futures-sink-0.3.12 "alloc"
-//   futures-task-0.3.12 "alloc"
-//   futures-util-0.3.12 "alloc,futures-sink,sink"
+//   futures-0.3.13 "alloc"
+//   futures-channel-0.3.13 "alloc,futures-sink,sink"
+//   futures-core-0.3.13 "alloc"
+//   futures-io-0.3.13
+//   futures-sink-0.3.13 "alloc"
+//   futures-task-0.3.13 "alloc"
+//   futures-util-0.3.13 "alloc,futures-sink,sink"
 //   getrandom-0.2.2 "std"
-//   libc-0.2.86 "default,std"
+//   libc-0.2.87 "default,std"
 //   paste-1.0.4
-//   pin-project-lite-0.2.4
+//   pin-project-lite-0.2.6
 //   pin-utils-0.1.0
 //   ppv-lite86-0.2.10 "simd,std"
 //   proc-macro2-1.0.24 "default,proc-macro"
-//   quote-1.0.8 "default,proc-macro"
+//   quote-1.0.9 "default,proc-macro"
 //   rand-0.8.3 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
 //   rand_chacha-0.3.0 "std"
-//   rand_core-0.6.1 "alloc,getrandom,std"
+//   rand_core-0.6.2 "alloc,getrandom,std"
 //   remain-0.2.2
 //   remove_dir_all-0.5.3
+//   serde-1.0.123 "default,derive,serde_derive,std"
+//   serde_derive-1.0.123 "default"
 //   slab-0.4.2
-//   syn-1.0.60 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.61 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   tempfile-3.2.0
-//   thiserror-1.0.23
-//   thiserror-impl-1.0.23
+//   thiserror-1.0.24
+//   thiserror-impl-1.0.24
 //   unicode-xid-0.2.1 "default"
