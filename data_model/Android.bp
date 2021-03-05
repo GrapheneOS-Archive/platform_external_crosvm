@@ -20,12 +20,16 @@ rust_defaults {
     rustlibs: [
         "libassertions",
         "liblibc",
+        "libserde",
     ],
 }
 
 rust_test_host {
     name: "data_model_host_test_src_lib",
     defaults: ["data_model_defaults"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
@@ -43,9 +47,16 @@ rust_library {
     rustlibs: [
         "libassertions",
         "liblibc",
+        "libserde",
     ],
 }
 
 // dependent_library ["feature_list"]
 //   ../assertions/src/lib.rs
-//   libc-0.2.86 "default,std"
+//   libc-0.2.87 "default,std"
+//   proc-macro2-1.0.24 "default,proc-macro"
+//   quote-1.0.9 "default,proc-macro"
+//   serde-1.0.123 "default,derive,serde_derive,std"
+//   serde_derive-1.0.123 "default"
+//   syn-1.0.61 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   unicode-xid-0.2.1 "default"

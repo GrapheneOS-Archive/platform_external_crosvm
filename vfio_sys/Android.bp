@@ -37,6 +37,9 @@ rust_defaults {
 rust_test_host {
     name: "vfio_sys_host_test_src_lib",
     defaults: ["vfio_sys_defaults"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
@@ -56,22 +59,24 @@ rust_test {
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
 //   async-task-4.0.3 "default,std"
-//   async-trait-0.1.42
-//   futures-0.3.12 "alloc"
-//   futures-channel-0.3.12 "alloc,futures-sink,sink"
-//   futures-core-0.3.12 "alloc"
-//   futures-io-0.3.12
-//   futures-sink-0.3.12 "alloc"
-//   futures-task-0.3.12 "alloc"
-//   futures-util-0.3.12 "alloc,futures-sink,sink"
-//   libc-0.2.86 "default,std"
+//   async-trait-0.1.45
+//   futures-0.3.13 "alloc"
+//   futures-channel-0.3.13 "alloc,futures-sink,sink"
+//   futures-core-0.3.13 "alloc"
+//   futures-io-0.3.13
+//   futures-sink-0.3.13 "alloc"
+//   futures-task-0.3.13 "alloc"
+//   futures-util-0.3.13 "alloc,futures-sink,sink"
+//   libc-0.2.87 "default,std"
 //   paste-1.0.4
-//   pin-project-lite-0.2.4
+//   pin-project-lite-0.2.6
 //   pin-utils-0.1.0
 //   proc-macro2-1.0.24 "default,proc-macro"
-//   quote-1.0.8 "default,proc-macro"
+//   quote-1.0.9 "default,proc-macro"
+//   serde-1.0.123 "default,derive,serde_derive,std"
+//   serde_derive-1.0.123 "default"
 //   slab-0.4.2
-//   syn-1.0.60 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
-//   thiserror-1.0.23
-//   thiserror-impl-1.0.23
+//   syn-1.0.61 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   thiserror-1.0.24
+//   thiserror-impl-1.0.24
 //   unicode-xid-0.2.1 "default"

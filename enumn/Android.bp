@@ -22,6 +22,9 @@ rust_test_host {
         "libquote",
         "libsyn",
     ],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_proc_macro {
@@ -39,6 +42,6 @@ rust_proc_macro {
 
 // dependent_library ["feature_list"]
 //   proc-macro2-1.0.24 "default,proc-macro"
-//   quote-1.0.8 "default,proc-macro"
-//   syn-1.0.60 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   quote-1.0.9 "default,proc-macro"
+//   syn-1.0.61 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   unicode-xid-0.2.1 "default"

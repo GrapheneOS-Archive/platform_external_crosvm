@@ -31,6 +31,9 @@ rust_defaults {
 rust_test_host {
     name: "syscall_defines_host_test_src_lib",
     defaults: ["syscall_defines_defaults"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {

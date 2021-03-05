@@ -17,6 +17,7 @@
 PRODUCT_PACKAGES += \
     9p_device.policy \
     balloon_device.policy \
+    battery.policy \
     block_device.policy \
     cras_audio_device.policy \
     fs_device.policy \
@@ -32,6 +33,7 @@ PRODUCT_PACKAGES += \
     vhost_net_device.policy \
     vhost_vsock_device.policy \
     video_device.policy \
+    vios_audio_device.policy \
     wl_device.policy \
     xhci.policy \
 
@@ -39,6 +41,7 @@ PRODUCT_PACKAGES += \
 PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += \
     system/etc/seccomp_policy/crosvm/9p_device.policy \
     system/etc/seccomp_policy/crosvm/balloon_device.policy \
+    system/etc/seccomp_policy/crosvm/battery.policy \
     system/etc/seccomp_policy/crosvm/block_device.policy \
     system/etc/seccomp_policy/crosvm/cras_audio_device.policy \
     system/etc/seccomp_policy/crosvm/fs_device.policy \
@@ -54,5 +57,6 @@ PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += \
     system/etc/seccomp_policy/crosvm/vhost_net_device.policy \
     system/etc/seccomp_policy/crosvm/vhost_vsock_device.policy \
     system/etc/seccomp_policy/crosvm/video_device.policy \
+    system/etc/seccomp_policy/crosvm/vios_audio_device.policy \
     system/etc/seccomp_policy/crosvm/wl_device.policy \
     system/etc/seccomp_policy/crosvm/xhci.policy \

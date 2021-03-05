@@ -32,6 +32,9 @@ rust_defaults {
 rust_test_host {
     name: "sync_host_test_src_lib",
     defaults: ["sync_defaults"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {

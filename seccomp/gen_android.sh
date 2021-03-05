@@ -183,28 +183,11 @@ function gen_crosvm_seccomp_policy_product_packages_mk_fragment() {
   done | sort
 }
 
-function gen_host_package_mk_arch_fragment() {
-  local arch="$1"
-  local arch_dir="$(get_arch_dir ${arch})"
-  local seccomp_dir="${arch}"
-  local host_share_subdir="crosvm/${arch_dir}/seccomp"
-  echo "crosvm_inline_seccomp_policy_${arch} := \\"
-  for i in $(scan_policy_name ${seccomp_dir}); do
-    local base_name="$(basename $i)"
-    echo "    usr/share/${host_share_subdir}/${base_name} \\"
-  done
-  echo
-}
-
 # main
 check_location
 gen_license >Android.bp
-gen_license \# >host_package.mk
 gen_license \# >crosvm_seccomp_policy_product_packages.mk
 gen_blueprint_boilerplate >>Android.bp
 gen_blueprint_arch_policy_files "${seccomp_archs[@]}" >>Android.bp
 gen_crosvm_seccomp_policy_product_packages_mk_fragment \
   "${seccomp_archs[@]}" >>crosvm_seccomp_policy_product_packages.mk
-for arch in ${seccomp_archs[@]}; do
-  gen_host_package_mk_arch_fragment ${arch} >>host_package.mk
-done

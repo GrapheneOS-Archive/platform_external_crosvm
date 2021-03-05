@@ -49,6 +49,9 @@ rust_defaults {
 rust_test_host {
     name: "msg_socket_host_test_src_lib",
     defaults: ["msg_socket_defaults"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
@@ -79,6 +82,9 @@ rust_test_host {
     name: "msg_socket_host_test_tests_enum",
     defaults: ["msg_socket_defaults_msg_socket"],
     srcs: ["tests/enum.rs"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
@@ -91,6 +97,9 @@ rust_test_host {
     name: "msg_socket_host_test_tests_struct",
     defaults: ["msg_socket_defaults_msg_socket"],
     srcs: ["tests/struct.rs"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
@@ -103,6 +112,9 @@ rust_test_host {
     name: "msg_socket_host_test_tests_tuple",
     defaults: ["msg_socket_defaults_msg_socket"],
     srcs: ["tests/tuple.rs"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
@@ -115,6 +127,9 @@ rust_test_host {
     name: "msg_socket_host_test_tests_unit",
     defaults: ["msg_socket_defaults_msg_socket"],
     srcs: ["tests/unit.rs"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
@@ -135,29 +150,30 @@ rust_test {
 //   ../syscall_defines/src/lib.rs
 //   ../tempfile/src/lib.rs
 //   async-task-4.0.3 "default,std"
-//   async-trait-0.1.42
+//   async-trait-0.1.45
 //   base-0.1.0
-//   futures-0.3.12 "alloc,async-await,default,executor,futures-executor,std"
-//   futures-channel-0.3.12 "alloc,futures-sink,sink,std"
-//   futures-core-0.3.12 "alloc,std"
-//   futures-executor-0.3.12 "std"
-//   futures-io-0.3.12 "std"
-//   futures-macro-0.3.12
-//   futures-sink-0.3.12 "alloc,std"
-//   futures-task-0.3.12 "alloc,once_cell,std"
-//   futures-util-0.3.12 "alloc,async-await,async-await-macro,channel,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,proc-macro-hack,proc-macro-nested,sink,slab,std"
-//   libc-0.2.86 "default,std"
+//   futures-0.3.13 "alloc,async-await,default,executor,futures-executor,std"
+//   futures-channel-0.3.13 "alloc,futures-sink,sink,std"
+//   futures-core-0.3.13 "alloc,std"
+//   futures-executor-0.3.13 "std"
+//   futures-io-0.3.13 "std"
+//   futures-macro-0.3.13
+//   futures-sink-0.3.13 "alloc,std"
+//   futures-task-0.3.13 "alloc,std"
+//   futures-util-0.3.13 "alloc,async-await,async-await-macro,channel,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,proc-macro-hack,proc-macro-nested,sink,slab,std"
+//   libc-0.2.87 "default,std"
 //   memchr-2.3.4 "default,std"
-//   once_cell-1.5.2 "alloc,std"
 //   paste-1.0.4
-//   pin-project-lite-0.2.4
+//   pin-project-lite-0.2.6
 //   pin-utils-0.1.0
 //   proc-macro-hack-0.5.19
 //   proc-macro-nested-0.1.7
 //   proc-macro2-1.0.24 "default,proc-macro"
-//   quote-1.0.8 "default,proc-macro"
+//   quote-1.0.9 "default,proc-macro"
+//   serde-1.0.123 "default,derive,serde_derive,std"
+//   serde_derive-1.0.123 "default"
 //   slab-0.4.2
-//   syn-1.0.60 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
-//   thiserror-1.0.23
-//   thiserror-impl-1.0.23
+//   syn-1.0.61 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   thiserror-1.0.24
+//   thiserror-impl-1.0.24
 //   unicode-xid-0.2.1 "default"
