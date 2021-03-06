@@ -73,8 +73,8 @@ use sync::Mutex;
 use sys_util::{warn, WatchingEvents};
 use thiserror::Error as ThisError;
 
+use crate::mem::{BackingMemory, MemRegion};
 use crate::queue::RunnableQueue;
-use crate::uring_mem::{BackingMemory, MemRegion};
 use crate::waker::{new_waker, WakerToken, WeakWake};
 
 #[derive(Debug, ThisError)]
@@ -331,6 +331,13 @@ impl RawExecutor {
         task
     }
 
+    fn runs_tasks_on_current_thread(&self) -> bool {
+        let executor_thread = self.thread_id.lock();
+        executor_thread
+            .map(|id| id == thread::current().id())
+            .unwrap_or(false)
+    }
+
     fn run<F: Future>(&self, cx: &mut Context, done: F) -> Result<F::Output> {
         let current_thread = thread::current().id();
         let mut thread_id = self.thread_id.lock();
@@ -394,9 +401,7 @@ impl RawExecutor {
                             waker.wake();
                         }
                     }
-                    OpStatus::Completed(_) => {
-                        panic!("uring operation completed more than once")
-                    }
+                    OpStatus::Completed(_) => panic!("uring operation completed more than once"),
                 }
             }
         }
@@ -557,7 +562,7 @@ impl RawExecutor {
     ) -> Result<WakerToken> {
         if addrs
             .iter()
-            .any(|&mem_range| mem.get_iovec(mem_range).is_err())
+            .any(|&mem_range| mem.get_volatile_slice(mem_range).is_err())
         {
             return Err(Error::InvalidOffset);
         }
@@ -577,7 +582,7 @@ impl RawExecutor {
         // validate their addresses before submitting.
         let iovecs = addrs
             .iter()
-            .map(|&mem_range| mem.get_iovec(mem_range).unwrap().iovec());
+            .map(|&mem_range| *mem.get_volatile_slice(mem_range).unwrap().as_iobuf());
 
         unsafe {
             // Safe because all the addresses are within the Memory that an Arc is kept for the
@@ -607,7 +612,7 @@ impl RawExecutor {
     ) -> Result<WakerToken> {
         if addrs
             .iter()
-            .any(|&mem_range| mem.get_iovec(mem_range).is_err())
+            .any(|&mem_range| mem.get_volatile_slice(mem_range).is_err())
         {
             return Err(Error::InvalidOffset);
         }
@@ -627,7 +632,7 @@ impl RawExecutor {
         // validate their addresses before submitting.
         let iovecs = addrs
             .iter()
-            .map(|&mem_range| mem.get_iovec(mem_range).unwrap().iovec());
+            .map(|&mem_range| *mem.get_volatile_slice(mem_range).unwrap().as_iobuf());
 
         unsafe {
             // Safe because all the addresses are within the Memory that an Arc is kept for the
@@ -790,8 +795,10 @@ impl Future for PendingOperation {
                 self.waker_token = None;
                 Poll::Ready(result.map_err(Error::Io))
             } else {
-                // If we haven't submitted the operation yet, do it now.
-                if !self.submitted {
+                // If we haven't submitted the operation yet, and the executor runs on a different
+                // thread then submit it now. Otherwise the executor will submit it automatically
+                // the next time it calls UringContext::wait.
+                if !self.submitted && !ex.runs_tasks_on_current_thread() {
                     match ex.ctx.submit() {
                         Ok(()) => self.submitted = true,
                         // If the kernel ring is full then wait until some ops are removed from the
@@ -830,7 +837,7 @@ mod tests {
     use futures::executor::block_on;
 
     use super::*;
-    use crate::uring_mem::{BackingMemory, MemRegion, VecIoWrapper};
+    use crate::mem::{BackingMemory, MemRegion, VecIoWrapper};
 
     // A future that returns ready when the uring queue is empty.
     struct UringQueueEmpty<'a> {

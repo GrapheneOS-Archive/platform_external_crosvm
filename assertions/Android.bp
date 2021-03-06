@@ -22,6 +22,9 @@ rust_defaults {
 rust_test_host {
     name: "assertions_host_test_src_lib",
     defaults: ["assertions_defaults"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {

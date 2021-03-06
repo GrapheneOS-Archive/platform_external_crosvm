@@ -37,6 +37,9 @@ rust_defaults {
 rust_test_host {
     name: "tempfile_host_test_src_lib",
     defaults: ["tempfile_defaults"],
+    test_options: {
+        unit_test: true,
+    },
 }
 
 rust_test {
@@ -45,4 +48,4 @@ rust_test {
 }
 
 // dependent_library ["feature_list"]
-//   libc-0.2.86 "default,std"
+//   libc-0.2.87 "default,std"
