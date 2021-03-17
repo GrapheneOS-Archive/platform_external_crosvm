@@ -93,7 +93,15 @@ rust_binary {
             relative_install_path: "aarch64-linux-bionic",
         },
         linux_glibc_x86_64: {
+            features: [
+                "gdb",
+                "gdbstub",
+            ],
             relative_install_path: "x86_64-linux-gnu",
+            rustlibs: [
+                "libgdbstub",
+                "libthiserror",
+            ],
         },
         darwin: {
             enabled: false,
@@ -172,6 +180,18 @@ rust_defaults {
         },
         arm64: {
             rustlibs: ["libaarch64"],
+        },
+    },
+    target: {
+        linux_glibc_x86_64: {
+            features: [
+                "gdb",
+                "gdbstub",
+            ],
+            rustlibs: [
+                "libgdbstub",
+                "libthiserror",
+            ],
         },
     },
     features: [
@@ -319,6 +339,16 @@ rust_library {
         linux_glibc: {
             features: [
                 "gfxstream",
+            ],
+        },
+        linux_glibc_x86_64: {
+            features: [
+                "gdb",
+                "gdbstub",
+            ],
+            rustlibs: [
+                "libgdbstub",
+                "libthiserror",
             ],
         },
     },
