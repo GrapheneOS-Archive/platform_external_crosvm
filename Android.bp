@@ -85,6 +85,7 @@ rust_binary {
     name: "crosvm",
     defaults: ["crosvm_defaults"],
     host_supported: true,
+    prefer_rlib: true,
     crate_name: "crosvm",
     srcs: ["src/main.rs"],
 
@@ -93,7 +94,15 @@ rust_binary {
             relative_install_path: "aarch64-linux-bionic",
         },
         linux_glibc_x86_64: {
+            features: [
+                "gdb",
+                "gdbstub",
+            ],
             relative_install_path: "x86_64-linux-gnu",
+            rustlibs: [
+                "libgdbstub",
+                "libthiserror",
+            ],
         },
         darwin: {
             enabled: false,
@@ -140,7 +149,6 @@ rust_binary {
         "liblibc",
         "liblibcras",
         "libminijail_rust",
-        "libmsg_socket",
         "libnet_util",
         "libp9",
         "librand_ish",
@@ -174,6 +182,18 @@ rust_defaults {
             rustlibs: ["libaarch64"],
         },
     },
+    target: {
+        linux_glibc_x86_64: {
+            features: [
+                "gdb",
+                "gdbstub",
+            ],
+            rustlibs: [
+                "libgdbstub",
+                "libthiserror",
+            ],
+        },
+    },
     features: [
         "default",
     ],
@@ -191,7 +211,6 @@ rust_defaults {
         "libkernel_loader",
         "liblibc",
         "libminijail_rust",
-        "libmsg_socket",
         "libnet_util",
         "libp9",
         "librand_ish",
@@ -270,7 +289,6 @@ rust_defaults {
         "libkernel_loader",
         "liblibc",
         "libminijail_rust",
-        "libmsg_socket",
         "libnet_util",
         "libp9",
         "librand_ish",
@@ -321,6 +339,16 @@ rust_library {
                 "gfxstream",
             ],
         },
+        linux_glibc_x86_64: {
+            features: [
+                "gdb",
+                "gdbstub",
+            ],
+            rustlibs: [
+                "libgdbstub",
+                "libthiserror",
+            ],
+        },
     },
     arch: {
         x86_64: {
@@ -351,7 +379,6 @@ rust_library {
         "liblibc",
         "liblibcras",
         "libminijail_rust",
-        "libmsg_socket",
         "libnet_util",
         "libp9",
         "librand_ish",
