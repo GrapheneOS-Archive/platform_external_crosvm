@@ -5,13 +5,13 @@
 //! rutabaga_utils: Utility enums, structs, and implementations needed by the rest of the crate.
 
 use std::fmt::{self, Display};
-use std::fs::File;
 use std::io::Error as IoError;
+use std::num::TryFromIntError;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::str::Utf8Error;
 
-use base::{Error as SysError, ExternalMappingError};
+use base::{Error as SysError, ExternalMappingError, SafeDescriptor};
 use data_model::VolatileMemoryError;
 
 #[cfg(feature = "vulkano")]
@@ -155,6 +155,8 @@ pub enum RutabagaError {
     SpecViolation,
     /// System error returned as a result of rutabaga library operation.
     SysError(SysError),
+    /// An attempted integer conversion failed.
+    TryFromIntError(TryFromIntError),
     /// The command is unsupported.
     Unsupported,
     /// Utf8 error.
@@ -210,6 +212,7 @@ impl Display for RutabagaError {
             ComponentError(ret) => write!(f, "rutabaga component failed with error {}", ret),
             SpecViolation => write!(f, "violation of the rutabaga spec"),
             SysError(e) => write!(f, "rutabaga received a system error: {}", e),
+            TryFromIntError(e) => write!(f, "int conversion failed: {}", e),
             Unsupported => write!(f, "feature or function unsupported"),
             Utf8Error(e) => write!(f, "an utf8 error occured: {}", e),
             VolatileMemoryError(e) => write!(f, "noticed a volatile memory error {}", e),
@@ -239,6 +242,12 @@ impl From<SysError> for RutabagaError {
     }
 }
 
+impl From<TryFromIntError> for RutabagaError {
+    fn from(e: TryFromIntError) -> RutabagaError {
+        RutabagaError::TryFromIntError(e)
+    }
+}
+
 impl From<Utf8Error> for RutabagaError {
     fn from(e: Utf8Error) -> RutabagaError {
         RutabagaError::Utf8Error(e)
@@ -262,6 +271,8 @@ const VIRGLRENDERER_USE_GLX: u32 = 1 << 2;
 const VIRGLRENDERER_USE_SURFACELESS: u32 = 1 << 3;
 const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
 const VIRGLRENDERER_USE_EXTERNAL_BLOB: u32 = 1 << 5;
+const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
 
 /// virglrenderer flag struct.
 #[derive(Copy, Clone)]
@@ -270,6 +281,8 @@ pub struct VirglRendererFlags(u32);
 impl Default for VirglRendererFlags {
     fn default() -> VirglRendererFlags {
         VirglRendererFlags::new()
+            .use_virgl(true)
+            .use_venus(false)
             .use_egl(true)
             .use_surfaceless(true)
             .use_gles(true)
@@ -294,6 +307,16 @@ impl VirglRendererFlags {
         } else {
             VirglRendererFlags(self.0 & (!bitmask))
         }
+    }
+
+    /// Enable virgl support
+    pub fn use_virgl(self, v: bool) -> VirglRendererFlags {
+        self.set_flag(VIRGLRENDERER_NO_VIRGL, !v)
+    }
+
+    /// Enable venus support
+    pub fn use_venus(self, v: bool) -> VirglRendererFlags {
+        self.set_flag(VIRGLRENDERER_VENUS, v)
     }
 
     /// Use EGL for context creation.
@@ -377,7 +400,7 @@ impl GfxstreamFlags {
     }
 
     /// Support using Vulkan.
-    pub fn support_vulkan(self, v: bool) -> GfxstreamFlags {
+    pub fn use_vulkan(self, v: bool) -> GfxstreamFlags {
         self.set_flag(GFXSTREAM_RENDERER_FLAGS_NO_VK_BIT, !v)
     }
 
@@ -463,7 +486,7 @@ pub const RUTABAGE_FENCE_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0006;
 
 /// Handle to OS-specific memory or synchronization objects.
 pub struct RutabagaHandle {
-    pub os_handle: File,
+    pub os_handle: SafeDescriptor,
     pub handle_type: u32,
 }
 

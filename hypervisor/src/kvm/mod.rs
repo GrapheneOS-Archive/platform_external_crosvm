@@ -16,9 +16,11 @@ use std::cell::RefCell;
 use std::cmp::{min, Reverse};
 use std::collections::{BTreeMap, BinaryHeap};
 use std::convert::TryFrom;
+use std::ffi::CString;
 use std::mem::{size_of, ManuallyDrop};
-use std::os::raw::{c_char, c_int, c_ulong, c_void};
-use std::os::unix::io::AsRawFd;
+use std::os::raw::{c_int, c_ulong, c_void};
+use std::os::unix::{io::AsRawFd, prelude::OsStrExt};
+use std::path::{Path, PathBuf};
 use std::ptr::copy_nonoverlapping;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -30,8 +32,8 @@ use libc::{
 use base::{
     block_signal, errno_result, error, ioctl, ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val,
     pagesize, signal, unblock_signal, AsRawDescriptor, Error, Event, FromRawDescriptor,
-    MappedRegion, MemoryMapping, MemoryMappingBuilder, MmapError, Protection, RawDescriptor,
-    Result, SafeDescriptor,
+    MappedRegion, MemoryMapping, MemoryMappingBuilder, MemoryMappingBuilderUnix, MmapError,
+    Protection, RawDescriptor, Result, SafeDescriptor,
 };
 use data_model::vec_with_array_field;
 use kvm_sys::*;
@@ -94,11 +96,10 @@ pub struct Kvm {
 type KvmCap = kvm::Cap;
 
 impl Kvm {
-    /// Opens `/dev/kvm/` and returns a Kvm object on success.
-    pub fn new() -> Result<Kvm> {
-        // Open calls are safe because we give a constant nul-terminated string and verify the
-        // result.
-        let ret = unsafe { open("/dev/kvm\0".as_ptr() as *const c_char, O_RDWR | O_CLOEXEC) };
+    pub fn new_with_path(device_path: &Path) -> Result<Kvm> {
+        // Open calls are safe because we give a nul-terminated string and verify the result.
+        let c_path = CString::new(device_path.as_os_str().as_bytes()).unwrap();
+        let ret = unsafe { open(c_path.as_ptr(), O_RDWR | O_CLOEXEC) };
         if ret < 0 {
             return errno_result();
         }
@@ -106,6 +107,11 @@ impl Kvm {
         Ok(Kvm {
             kvm: unsafe { SafeDescriptor::from_raw_descriptor(ret) },
         })
+    }
+
+    /// Opens `/dev/kvm/` and returns a Kvm object on success.
+    pub fn new() -> Result<Kvm> {
+        Kvm::new_with_path(&PathBuf::from("/dev/kvm"))
     }
 
     /// Gets the size of the mmap required to use vcpu's `kvm_run` structure.
@@ -166,7 +172,7 @@ impl KvmVm {
         }
         // Safe because we verify that ret is valid and we own the fd.
         let vm_descriptor = unsafe { SafeDescriptor::from_raw_descriptor(ret) };
-        guest_mem.with_regions(|index, guest_addr, size, host_addr, _| {
+        guest_mem.with_regions(|index, guest_addr, size, host_addr, _, _| {
             unsafe {
                 // Safe because the guest regions are guaranteed not to overlap.
                 set_user_memory_region(
@@ -448,7 +454,11 @@ impl Vm for KvmVm {
         read_only: bool,
         log_dirty_pages: bool,
     ) -> Result<MemSlot> {
-        let size = mem.size() as u64;
+        let pgsz = pagesize() as u64;
+        // KVM require to set the user memory region with page size aligned size. Safe to extend
+        // the mem.size() to be page size aligned because the mmap will round up the size to be
+        // page size aligned if it is not.
+        let size = (mem.size() as u64 + pgsz - 1) / pgsz * pgsz;
         let end_addr = guest_addr
             .checked_add(size)
             .ok_or_else(|| Error::new(EOVERFLOW))?;
@@ -691,11 +701,15 @@ impl Vcpu for KvmVcpu {
 
         // AcqRel ordering is sufficient to ensure only one thread gets to set its fingerprint to
         // this Vcpu and subsequent `run` calls will see the fingerprint.
-        if self.vcpu_run_handle_fingerprint.compare_and_swap(
-            0,
-            vcpu_run_handle.fingerprint().as_u64(),
-            std::sync::atomic::Ordering::AcqRel,
-        ) != 0
+        if self
+            .vcpu_run_handle_fingerprint
+            .compare_exchange(
+                0,
+                vcpu_run_handle.fingerprint().as_u64(),
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
         {
             return Err(Error::new(EBUSY));
         }
@@ -867,7 +881,7 @@ impl Vcpu for KvmVcpu {
     // The pointer is page aligned so casting to a different type is well defined, hence the clippy
     // allow attribute.
     fn run(&self, run_handle: &VcpuRunHandle) -> Result<VcpuExit> {
-        // Acquire is used to ensure this check is ordered after the `compare_and_swap` in `run`.
+        // Acquire is used to ensure this check is ordered after the `compare_exchange` in `run`.
         if self
             .vcpu_run_handle_fingerprint
             .load(std::sync::atomic::Ordering::Acquire)

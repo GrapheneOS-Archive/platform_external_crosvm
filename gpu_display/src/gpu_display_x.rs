@@ -243,7 +243,7 @@ impl Surface {
         visual: *mut xlib::Visual,
         width: u32,
         height: u32,
-    ) -> Result<Surface, GpuDisplayError> {
+    ) -> Surface {
         let keycode_translator = KeycodeTranslator::new(KeycodeTypes::XkbScancode);
         unsafe {
             let depth = xlib::XDefaultDepthOfScreen(screen.as_ptr()) as u32;
@@ -305,7 +305,7 @@ impl Surface {
             // Flush everything so that the window is visible immediately.
             display.flush();
 
-            Ok(Surface {
+            Surface {
                 display,
                 visual,
                 depth,
@@ -320,7 +320,7 @@ impl Surface {
                 buffer_completion_type,
                 delete_window_atom,
                 close_requested: false,
-            })
+            }
         }
     }
 
@@ -367,8 +367,8 @@ impl Surface {
                     // The touch event *must* be first per the Linux input subsystem's guidance.
                     let events = &[
                         virtio_input_event::touch(pressed),
-                        virtio_input_event::absolute_x(max(0, button_event.x) as u32),
-                        virtio_input_event::absolute_y(max(0, button_event.y) as u32),
+                        virtio_input_event::absolute_x(max(0, button_event.x)),
+                        virtio_input_event::absolute_y(max(0, button_event.y)),
                     ];
                     self.dispatch_to_event_devices(events, EventDeviceKind::Touchscreen);
                 }
@@ -377,8 +377,8 @@ impl Surface {
                 if motion.state & xlib::Button1Mask != 0 {
                     let events = &[
                         virtio_input_event::touch(true),
-                        virtio_input_event::absolute_x(max(0, motion.x) as u32),
-                        virtio_input_event::absolute_y(max(0, motion.y) as u32),
+                        virtio_input_event::absolute_x(max(0, motion.x)),
+                        virtio_input_event::absolute_y(max(0, motion.y)),
                     ];
                     self.dispatch_to_event_devices(events, EventDeviceKind::Touchscreen);
                 }
@@ -730,7 +730,7 @@ impl DisplayT for DisplayX {
             self.visual,
             width,
             height,
-        )?;
+        );
         let new_surface_id = self.next_id;
         self.surfaces.insert(new_surface_id, new_surface);
         self.next_id = ObjectId::new(self.next_id.get() + 1).unwrap();

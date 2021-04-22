@@ -9,7 +9,6 @@
 
 use std::cell::RefCell;
 use std::ffi::CString;
-use std::fs::File;
 use std::mem::{size_of, transmute};
 use std::os::raw::{c_char, c_void};
 use std::ptr::null_mut;
@@ -19,7 +18,7 @@ use std::sync::Arc;
 
 use base::{
     warn, Error as SysError, ExternalMapping, ExternalMappingError, ExternalMappingResult,
-    FromRawDescriptor,
+    FromRawDescriptor, SafeDescriptor,
 };
 
 use crate::generated::virgl_renderer_bindings::*;
@@ -181,7 +180,10 @@ impl VirglRenderer {
         // Initialize it only once and use the non-send/non-sync Renderer struct to keep things tied
         // to whichever thread called this function first.
         static INIT_ONCE: AtomicBool = AtomicBool::new(false);
-        if INIT_ONCE.compare_and_swap(false, true, Ordering::Acquire) {
+        if INIT_ONCE
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Acquire)
+            .is_err()
+        {
             return Err(RutabagaError::AlreadyInUse);
         }
 
@@ -266,7 +268,7 @@ impl VirglRenderer {
                 return Err(RutabagaError::Unsupported);
             }
 
-            let dmabuf = unsafe { File::from_raw_descriptor(fd) };
+            let dmabuf = unsafe { SafeDescriptor::from_raw_descriptor(fd) };
             Ok(Arc::new(RutabagaHandle {
                 os_handle: dmabuf,
                 handle_type: RUTABAGA_MEM_HANDLE_TYPE_DMABUF,
@@ -478,10 +480,17 @@ impl RutabagaComponent for VirglRenderer {
         ctx_id: u32,
         resource_id: u32,
         resource_create_blob: ResourceCreateBlob,
-        mut iovecs: Vec<RutabagaIovec>,
+        mut iovec_opt: Option<Vec<RutabagaIovec>>,
     ) -> RutabagaResult<RutabagaResource> {
         #[cfg(feature = "virgl_renderer_next")]
         {
+            let mut iovec_ptr = null_mut();
+            let mut num_iovecs = 0;
+            if let Some(ref mut iovecs) = iovec_opt {
+                iovec_ptr = iovecs.as_mut_ptr();
+                num_iovecs = iovecs.len();
+            }
+
             let resource_create_args = virgl_renderer_resource_create_blob_args {
                 res_handle: resource_id,
                 ctx_id,
@@ -489,16 +498,12 @@ impl RutabagaComponent for VirglRenderer {
                 blob_flags: resource_create_blob.blob_flags,
                 blob_id: resource_create_blob.blob_id,
                 size: resource_create_blob.size,
-                iovecs: iovecs.as_mut_ptr() as *const iovec,
-                num_iovs: iovecs.len() as u32,
+                iovecs: iovec_ptr as *const iovec,
+                num_iovs: num_iovecs as u32,
             };
+
             let ret = unsafe { virgl_renderer_resource_create_blob(&resource_create_args) };
             ret_to_res(ret)?;
-
-            let iovec_opt = match resource_create_blob.blob_mem {
-                RUTABAGA_BLOB_MEM_GUEST => Some(iovecs),
-                _ => None,
-            };
 
             Ok(RutabagaResource {
                 resource_id,
@@ -536,7 +541,7 @@ impl RutabagaComponent for VirglRenderer {
 
             // Safe because the FD was just returned by a successful virglrenderer call so it must
             // be valid and owned by us.
-            let fence = unsafe { File::from_raw_descriptor(fd) };
+            let fence = unsafe { SafeDescriptor::from_raw_descriptor(fd) };
             Ok(RutabagaHandle {
                 os_handle: fence,
                 handle_type: RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD,

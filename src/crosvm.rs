@@ -29,6 +29,9 @@ use devices::ProtectionType;
 use libc::{getegid, geteuid};
 use vm_control::BatteryType;
 
+static KVM_PATH: &str = "/dev/kvm";
+static VHOST_VSOCK_PATH: &str = "/dev/vhost-vsock";
+static VHOST_NET_PATH: &str = "/dev/vhost-net";
 static SECCOMP_POLICY_DIR: &str = "/usr/share/policy/crosvm";
 
 /// Indicates the location and kind of executable kernel for a VM.
@@ -55,6 +58,15 @@ pub struct DiskOption {
     pub id: Option<[u8; DISK_ID_LEN]>,
 }
 
+pub struct VhostUserOption {
+    pub socket: PathBuf,
+}
+
+pub struct VhostUserFsOption {
+    pub socket: PathBuf,
+    pub tag: String,
+}
+
 /// A bind mount for directories in the plugin process.
 pub struct BindMount {
     pub src: PathBuf,
@@ -67,6 +79,13 @@ pub struct GidMap {
     pub inner: libc::gid_t,
     pub outer: libc::gid_t,
     pub count: u32,
+}
+
+/// Direct IO forwarding options
+#[cfg(feature = "direct")]
+pub struct DirectIoOption {
+    pub path: PathBuf,
+    pub ranges: Vec<(u64, u64)>,
 }
 
 pub const DEFAULT_TOUCH_DEVICE_HEIGHT: u32 = 1024;
@@ -174,11 +193,16 @@ impl Default for SharedDir {
 
 /// Aggregate of all configurable options for a running VM.
 pub struct Config {
+    pub kvm_device_path: PathBuf,
+    pub vhost_vsock_device_path: PathBuf,
+    pub vhost_net_device_path: PathBuf,
     pub vcpu_count: Option<usize>,
     pub rt_cpus: Vec<usize>,
     pub vcpu_affinity: Option<VcpuAffinity>,
     pub no_smt: bool,
     pub memory: Option<u64>,
+    pub hugepages: bool,
+    pub memory_file: Option<PathBuf>,
     pub executable_path: Option<Executable>,
     pub android_fstab: Option<PathBuf>,
     pub initrd_path: Option<PathBuf>,
@@ -230,16 +254,31 @@ pub struct Config {
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     pub gdb: Option<u32>,
     pub balloon_bias: i64,
+    pub vhost_user_blk: Vec<VhostUserOption>,
+    pub vhost_user_fs: Vec<VhostUserFsOption>,
+    pub vhost_user_net: Vec<VhostUserOption>,
+    #[cfg(feature = "direct")]
+    pub direct_pmio: Option<DirectIoOption>,
+    #[cfg(feature = "direct")]
+    pub direct_level_irq: Vec<u32>,
+    #[cfg(feature = "direct")]
+    pub direct_edge_irq: Vec<u32>,
+    pub dmi_path: Option<PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Config {
         Config {
+            kvm_device_path: PathBuf::from(KVM_PATH),
+            vhost_vsock_device_path: PathBuf::from(VHOST_VSOCK_PATH),
+            vhost_net_device_path: PathBuf::from(VHOST_NET_PATH),
             vcpu_count: None,
             rt_cpus: Vec::new(),
             vcpu_affinity: None,
             no_smt: false,
             memory: None,
+            hugepages: false,
+            memory_file: None,
             executable_path: None,
             android_fstab: None,
             initrd_path: None,
@@ -291,6 +330,16 @@ impl Default for Config {
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             gdb: None,
             balloon_bias: 0,
+            vhost_user_blk: Vec::new(),
+            vhost_user_fs: Vec::new(),
+            vhost_user_net: Vec::new(),
+            #[cfg(feature = "direct")]
+            direct_pmio: None,
+            #[cfg(feature = "direct")]
+            direct_level_irq: Vec::new(),
+            #[cfg(feature = "direct")]
+            direct_edge_irq: Vec::new(),
+            dmi_path: None,
         }
     }
 }
