@@ -105,11 +105,11 @@ impl CmsgBuffer {
     }
 }
 
-fn raw_sendmsg<D: IntoIobuf>(fd: RawFd, out_data: &[D], out_fds: &[RawFd]) -> Result<usize> {
+fn raw_sendmsg<D: AsIobuf>(fd: RawFd, out_data: &[D], out_fds: &[RawFd]) -> Result<usize> {
     let cmsg_capacity = CMSG_SPACE!(size_of::<RawFd>() * out_fds.len());
     let mut cmsg_buffer = CmsgBuffer::with_capacity(cmsg_capacity);
 
-    let iovec = IntoIobuf::as_iobufs(out_data);
+    let iovec = AsIobuf::as_iobuf_slice(out_data);
 
     let mut msg = msghdr {
         msg_name: null_mut(),
@@ -155,19 +155,26 @@ fn raw_sendmsg<D: IntoIobuf>(fd: RawFd, out_data: &[D], out_fds: &[RawFd]) -> Re
 }
 
 fn raw_recvmsg(fd: RawFd, in_data: &mut [u8], in_fds: &mut [RawFd]) -> Result<(usize, usize)> {
-    let cmsg_capacity = CMSG_SPACE!(size_of::<RawFd>() * in_fds.len());
-    let mut cmsg_buffer = CmsgBuffer::with_capacity(cmsg_capacity);
-
-    let mut iovec = iovec {
+    let iovec = iovec {
         iov_base: in_data.as_mut_ptr() as *mut c_void,
         iov_len: in_data.len(),
     };
+    raw_recvmsg_iovecs(fd, &mut [iovec], in_fds)
+}
+
+fn raw_recvmsg_iovecs(
+    fd: RawFd,
+    iovecs: &mut [iovec],
+    in_fds: &mut [RawFd],
+) -> Result<(usize, usize)> {
+    let cmsg_capacity = CMSG_SPACE!(size_of::<RawFd>() * in_fds.len());
+    let mut cmsg_buffer = CmsgBuffer::with_capacity(cmsg_capacity);
 
     let mut msg = msghdr {
         msg_name: null_mut(),
         msg_namelen: 0,
-        msg_iov: &mut iovec as *mut iovec,
-        msg_iovlen: 1,
+        msg_iov: iovecs.as_mut_ptr() as *mut iovec,
+        msg_iovlen: iovecs.len(),
         msg_control: null_mut(),
         msg_controllen: 0,
         msg_flags: 0,
@@ -232,7 +239,7 @@ pub trait ScmSocket {
     ///
     /// * `buf` - A buffer of data to send on the `socket`.
     /// * `fd` - A file descriptors to be sent.
-    fn send_with_fd<D: IntoIobuf>(&self, buf: &[D], fd: RawFd) -> Result<usize> {
+    fn send_with_fd<D: AsIobuf>(&self, buf: &[D], fd: RawFd) -> Result<usize> {
         self.send_with_fds(buf, &[fd])
     }
 
@@ -244,8 +251,33 @@ pub trait ScmSocket {
     ///
     /// * `buf` - A buffer of data to send on the `socket`.
     /// * `fds` - A list of file descriptors to be sent.
-    fn send_with_fds<D: IntoIobuf>(&self, buf: &[D], fd: &[RawFd]) -> Result<usize> {
+    fn send_with_fds<D: AsIobuf>(&self, buf: &[D], fd: &[RawFd]) -> Result<usize> {
         raw_sendmsg(self.socket_fd(), buf, fd)
+    }
+
+    /// Sends the given data and file descriptor over the socket.
+    ///
+    /// On success, returns the number of bytes sent.
+    ///
+    /// # Arguments
+    ///
+    /// * `bufs` - A slice of slices of data to send on the `socket`.
+    /// * `fd` - A file descriptors to be sent.
+    fn send_bufs_with_fd(&self, bufs: &[&[u8]], fd: RawFd) -> Result<usize> {
+        self.send_bufs_with_fds(bufs, &[fd])
+    }
+
+    /// Sends the given data and file descriptors over the socket.
+    ///
+    /// On success, returns the number of bytes sent.
+    ///
+    /// # Arguments
+    ///
+    /// * `bufs` - A slice of slices of data to send on the `socket`.
+    /// * `fds` - A list of file descriptors to be sent.
+    fn send_bufs_with_fds(&self, bufs: &[&[u8]], fd: &[RawFd]) -> Result<usize> {
+        let slices: Vec<IoSlice> = bufs.iter().map(|&b| IoSlice::new(b)).collect();
+        raw_sendmsg(self.socket_fd(), &slices, fd)
     }
 
     /// Receives data and potentially a file descriptor from the socket.
@@ -284,6 +316,27 @@ pub trait ScmSocket {
     fn recv_with_fds(&self, buf: &mut [u8], fds: &mut [RawFd]) -> Result<(usize, usize)> {
         raw_recvmsg(self.socket_fd(), buf, fds)
     }
+
+    /// Receives data and file descriptors from the socket.
+    ///
+    /// On success, returns the number of bytes and file descriptors received as a tuple
+    /// `(bytes count, files count)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `ioves` - A slice of iovecs to store received data.
+    /// * `fds` - A slice of `RawFd`s to put the received file descriptors into. On success, the
+    ///           number of valid file descriptors is indicated by the second element of the
+    ///           returned tuple. The caller owns these file descriptors, but they will not be
+    ///           closed on drop like a `File`-like type would be. It is recommended that each valid
+    ///           file descriptor gets wrapped in a drop type that closes it after this returns.
+    fn recv_iovecs_with_fds(
+        &self,
+        iovecs: &mut [iovec],
+        fds: &mut [RawFd],
+    ) -> Result<(usize, usize)> {
+        raw_recvmsg_iovecs(self.socket_fd(), iovecs, fds)
+    }
 }
 
 impl ScmSocket for UnixDatagram {
@@ -309,25 +362,26 @@ impl ScmSocket for UnixSeqpacket {
 ///
 /// This trait is unsafe because interfaces that use this trait depend on the base pointer and size
 /// being accurate.
-pub unsafe trait IntoIobuf: Sized {
+pub unsafe trait AsIobuf: Sized {
     /// Returns a `iovec` that describes a contiguous region of memory.
-    fn into_iobuf(&self) -> iovec;
+    fn as_iobuf(&self) -> iovec;
 
     /// Returns a slice of `iovec`s that each describe a contiguous region of memory.
-    fn as_iobufs(bufs: &[Self]) -> &[iovec];
+    #[allow(clippy::wrong_self_convention)]
+    fn as_iobuf_slice(bufs: &[Self]) -> &[iovec];
 }
 
 // Safe because there are no other mutable references to the memory described by `IoSlice` and it is
 // guaranteed to be ABI-compatible with `iovec`.
-unsafe impl<'a> IntoIobuf for IoSlice<'a> {
-    fn into_iobuf(&self) -> iovec {
+unsafe impl<'a> AsIobuf for IoSlice<'a> {
+    fn as_iobuf(&self) -> iovec {
         iovec {
             iov_base: self.as_ptr() as *mut c_void,
             iov_len: self.len(),
         }
     }
 
-    fn as_iobufs(bufs: &[Self]) -> &[iovec] {
+    fn as_iobuf_slice(bufs: &[Self]) -> &[iovec] {
         // Safe because `IoSlice` is guaranteed to be ABI-compatible with `iovec`.
         unsafe { slice::from_raw_parts(bufs.as_ptr() as *const iovec, bufs.len()) }
     }
@@ -335,15 +389,15 @@ unsafe impl<'a> IntoIobuf for IoSlice<'a> {
 
 // Safe because there are no other references to the memory described by `IoSliceMut` and it is
 // guaranteed to be ABI-compatible with `iovec`.
-unsafe impl<'a> IntoIobuf for IoSliceMut<'a> {
-    fn into_iobuf(&self) -> iovec {
+unsafe impl<'a> AsIobuf for IoSliceMut<'a> {
+    fn as_iobuf(&self) -> iovec {
         iovec {
             iov_base: self.as_ptr() as *mut c_void,
             iov_len: self.len(),
         }
     }
 
-    fn as_iobufs(bufs: &[Self]) -> &[iovec] {
+    fn as_iobuf_slice(bufs: &[Self]) -> &[iovec] {
         // Safe because `IoSliceMut` is guaranteed to be ABI-compatible with `iovec`.
         unsafe { slice::from_raw_parts(bufs.as_ptr() as *const iovec, bufs.len()) }
     }
@@ -351,12 +405,12 @@ unsafe impl<'a> IntoIobuf for IoSliceMut<'a> {
 
 // Safe because volatile slices are only ever accessed with other volatile interfaces and the
 // pointer and size are guaranteed to be accurate.
-unsafe impl<'a> IntoIobuf for VolatileSlice<'a> {
-    fn into_iobuf(&self) -> iovec {
+unsafe impl<'a> AsIobuf for VolatileSlice<'a> {
+    fn as_iobuf(&self) -> iovec {
         *self.as_iobuf()
     }
 
-    fn as_iobufs(bufs: &[Self]) -> &[iovec] {
+    fn as_iobuf_slice(bufs: &[Self]) -> &[iovec] {
         VolatileSlice::as_iobufs(bufs)
     }
 }
@@ -416,7 +470,8 @@ mod tests {
     fn send_recv_no_fd() {
         let (s1, s2) = UnixDatagram::pair().expect("failed to create socket pair");
 
-        let ioslice = IoSlice::new([1u8, 1, 2, 21, 34, 55].as_ref());
+        let send_buf = [1u8, 1, 2, 21, 34, 55];
+        let ioslice = IoSlice::new(&send_buf);
         let write_count = s1
             .send_with_fds(&[ioslice], &[])
             .expect("failed to send data");
@@ -425,6 +480,19 @@ mod tests {
 
         let mut buf = [0; 6];
         let mut files = [0; 1];
+        let (read_count, file_count) = s2
+            .recv_with_fds(&mut buf[..], &mut files)
+            .expect("failed to recv data");
+
+        assert_eq!(read_count, 6);
+        assert_eq!(file_count, 0);
+        assert_eq!(buf, [1, 1, 2, 21, 34, 55]);
+
+        let write_count = s1
+            .send_bufs_with_fds(&[&send_buf[..]], &[])
+            .expect("failed to send data");
+
+        assert_eq!(write_count, 6);
         let (read_count, file_count) = s2
             .recv_with_fds(&mut buf[..], &mut files)
             .expect("failed to recv data");

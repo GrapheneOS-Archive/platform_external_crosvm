@@ -194,7 +194,7 @@ impl CompositeDiskFile {
         }
     }
 
-    fn disk_at_offset<'a>(&'a mut self, offset: u64) -> io::Result<&'a mut ComponentDiskPart> {
+    fn disk_at_offset(&mut self, offset: u64) -> io::Result<&mut ComponentDiskPart> {
         self.component_disks
             .iter_mut()
             .find(|disk| disk.range().contains(&offset))
@@ -342,13 +342,14 @@ impl AsRawDescriptors for CompositeDiskFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base::{AsRawDescriptor, SharedMemory};
+    use base::AsRawDescriptor;
     use data_model::VolatileMemory;
+    use tempfile::tempfile;
 
     #[test]
     fn block_duplicate_offset_disks() {
-        let file1: File = SharedMemory::new(None).unwrap().into();
-        let file2: File = SharedMemory::new(None).unwrap().into();
+        let file1 = tempfile().unwrap();
+        let file2 = tempfile().unwrap();
         let disk_part1 = ComponentDiskPart {
             file: Box::new(file1),
             offset: 0,
@@ -364,8 +365,8 @@ mod tests {
 
     #[test]
     fn get_len() {
-        let file1: File = SharedMemory::new(None).unwrap().into();
-        let file2: File = SharedMemory::new(None).unwrap().into();
+        let file1 = tempfile().unwrap();
+        let file2 = tempfile().unwrap();
         let disk_part1 = ComponentDiskPart {
             file: Box::new(file1),
             offset: 0,
@@ -383,7 +384,7 @@ mod tests {
 
     #[test]
     fn single_file_passthrough() {
-        let file: File = SharedMemory::new(None).unwrap().into();
+        let file = tempfile().unwrap();
         let disk_part = ComponentDiskPart {
             file: Box::new(file),
             offset: 0,
@@ -405,9 +406,9 @@ mod tests {
 
     #[test]
     fn triple_file_fds() {
-        let file1: File = SharedMemory::new(None).unwrap().into();
-        let file2: File = SharedMemory::new(None).unwrap().into();
-        let file3: File = SharedMemory::new(None).unwrap().into();
+        let file1 = tempfile().unwrap();
+        let file2 = tempfile().unwrap();
+        let file3 = tempfile().unwrap();
         let mut in_fds = vec![
             file1.as_raw_descriptor(),
             file2.as_raw_descriptor(),
@@ -437,9 +438,9 @@ mod tests {
 
     #[test]
     fn triple_file_passthrough() {
-        let file1: File = SharedMemory::new(None).unwrap().into();
-        let file2: File = SharedMemory::new(None).unwrap().into();
-        let file3: File = SharedMemory::new(None).unwrap().into();
+        let file1 = tempfile().unwrap();
+        let file2 = tempfile().unwrap();
+        let file3 = tempfile().unwrap();
         let disk_part1 = ComponentDiskPart {
             file: Box::new(file1),
             offset: 0,
@@ -467,14 +468,14 @@ mod tests {
         composite
             .read_exact_at_volatile(output_volatile_memory.get_slice(0, 200).unwrap(), 50)
             .unwrap();
-        assert!(input_memory.into_iter().eq(output_memory.into_iter()));
+        assert!(input_memory.iter().eq(output_memory.iter()));
     }
 
     #[test]
     fn triple_file_punch_hole() {
-        let file1: File = SharedMemory::new(None).unwrap().into();
-        let file2: File = SharedMemory::new(None).unwrap().into();
-        let file3: File = SharedMemory::new(None).unwrap().into();
+        let file1 = tempfile().unwrap();
+        let file2 = tempfile().unwrap();
+        let file3 = tempfile().unwrap();
         let disk_part1 = ComponentDiskPart {
             file: Box::new(file1),
             offset: 0,
@@ -507,14 +508,14 @@ mod tests {
         for i in 50..250 {
             input_memory[i] = 0;
         }
-        assert!(input_memory.into_iter().eq(output_memory.into_iter()));
+        assert!(input_memory.iter().eq(output_memory.iter()));
     }
 
     #[test]
     fn triple_file_write_zeroes() {
-        let file1: File = SharedMemory::new(None).unwrap().into();
-        let file2: File = SharedMemory::new(None).unwrap().into();
-        let file3: File = SharedMemory::new(None).unwrap().into();
+        let file1 = tempfile().unwrap();
+        let file2 = tempfile().unwrap();
+        let file3 = tempfile().unwrap();
         let disk_part1 = ComponentDiskPart {
             file: Box::new(file1),
             offset: 0,
@@ -558,6 +559,6 @@ mod tests {
                 i, input_memory[i], output_memory[i]
             );
         }
-        assert!(input_memory.into_iter().eq(output_memory.into_iter()));
+        assert!(input_memory.iter().eq(output_memory.iter()));
     }
 }
