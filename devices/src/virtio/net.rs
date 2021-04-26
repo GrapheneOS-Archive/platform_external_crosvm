@@ -23,7 +23,8 @@ use virtio_sys::virtio_net::{
 use vm_memory::GuestMemory;
 
 use super::{
-    copy_config, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer, TYPE_NET,
+    copy_config, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt, VirtioDevice,
+    Writer, TYPE_NET,
 };
 
 const QUEUE_SIZE: u16 = 256;
@@ -134,7 +135,7 @@ fn virtio_features_to_tap_offload(features: u64) -> c_uint {
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
-struct VirtioNetConfig {
+pub(crate) struct VirtioNetConfig {
     mac: [u8; 6],
     status: Le16,
     max_vq_pairs: Le16,
@@ -351,9 +352,11 @@ where
                 .add(ctrl_evt, Token::CtrlQueue)
                 .map_err(NetError::CreateWaitContext)?;
             // Let CtrlQueue's thread handle InterruptResample also.
-            wait_ctx
-                .add(self.interrupt.get_resample_evt(), Token::InterruptResample)
-                .map_err(NetError::CreateWaitContext)?;
+            if let Some(resample_evt) = self.interrupt.get_resample_evt() {
+                wait_ctx
+                    .add(resample_evt, Token::InterruptResample)
+                    .map_err(NetError::CreateWaitContext)?;
+            }
         }
 
         let mut tap_polling_enabled = true;
