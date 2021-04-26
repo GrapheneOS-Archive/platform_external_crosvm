@@ -14,12 +14,11 @@ rust_library {
     // has rustc warnings
     host_supported: true,
     crate_name: "protos",
-    srcs: [
-        "src/lib.rs",
-    ],
+    srcs: ["src/lib.rs"],
     features: [
         "composite-disk",
     ],
+        edition: "2018",
     rustlibs: [
         "libprotobuf",
         "libcdisk_spec_proto",
@@ -45,3 +44,21 @@ rust_protobuf {
     source_stem: "plugin",
     host_supported: true,
 }
+
+// dependent_library ["feature_list"]
+//   cfg-if-1.0.0
+//   either-1.6.1 "default,use_std"
+//   getrandom-0.2.2 "std"
+//   libc-0.2.93 "default,std"
+//   log-0.4.14
+//   ppv-lite86-0.2.10 "simd,std"
+//   protobuf-2.22.1
+//   protobuf-codegen-2.22.1
+//   protoc-2.22.1
+//   protoc-rust-2.22.1
+//   rand-0.8.3 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
+//   rand_chacha-0.3.0 "std"
+//   rand_core-0.6.2 "alloc,getrandom,std"
+//   remove_dir_all-0.5.3
+//   tempfile-3.2.0
+//   which-4.1.0
