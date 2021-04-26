@@ -5,7 +5,6 @@
 @include /usr/share/policy/crosvm/common_device.policy
 
 fallocate: 1
-fcntl: 1
 fdatasync: 1
 fstat: 1
 fsync: 1
@@ -18,3 +17,4 @@ statx: 1
 timerfd_create: 1
 timerfd_gettime: 1
 timerfd_settime: 1
+prctl: arg0 == PR_SET_NAME

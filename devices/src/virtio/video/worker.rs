@@ -6,11 +6,10 @@
 
 use std::collections::VecDeque;
 
-use base::{error, info, Event, WaitContext};
+use base::{error, info, Event, Tube, WaitContext};
 use vm_memory::GuestMemory;
 
 use crate::virtio::queue::{DescriptorChain, Queue};
-use crate::virtio::resource_bridge::ResourceRequestSocket;
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
 use crate::virtio::video::command::{QueueType, VideoCmd};
 use crate::virtio::video::device::{
@@ -19,7 +18,7 @@ use crate::virtio::video::device::{
 use crate::virtio::video::event::{self, EvtType, VideoEvt};
 use crate::virtio::video::response::{self, Response};
 use crate::virtio::video::{Error, Result};
-use crate::virtio::{Interrupt, Reader, Writer};
+use crate::virtio::{Interrupt, Reader, SignalableInterrupt, Writer};
 
 pub struct Worker {
     pub interrupt: Interrupt,
@@ -27,7 +26,7 @@ pub struct Worker {
     pub cmd_evt: Event,
     pub event_evt: Event,
     pub kill_evt: Event,
-    pub resource_bridge: ResourceRequestSocket,
+    pub resource_bridge: Tube,
 }
 
 /// Pair of a descriptor chain and a response to be written.
@@ -276,8 +275,13 @@ impl Worker {
             (&self.cmd_evt, Token::CmdQueue),
             (&self.event_evt, Token::EventQueue),
             (&self.kill_evt, Token::Kill),
-            (self.interrupt.get_resample_evt(), Token::InterruptResample),
         ])
+        .and_then(|wc| {
+            if let Some(resample_evt) = self.interrupt.get_resample_evt() {
+                wc.add(resample_evt, Token::InterruptResample)?;
+            }
+            Ok(wc)
+        })
         .map_err(Error::WaitContextCreationFailed)?;
 
         // Stores descriptors in which responses for asynchronous commands will be written.

@@ -53,7 +53,6 @@ dependencies = [
  "kernel_cmdline",
  "libc",
  "minijail",
- "msg_socket",
  "power_monitor",
  "resources",
  "sync",
@@ -93,6 +92,12 @@ dependencies = [
 
 [[package]]
 name = "autocfg"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d49d90015b3c36167a20fe2810c5cd875ad504b39cff3d4eae7977e6b7c1cb2"
+
+[[package]]
+name = "autocfg"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdb031dd78e28731d87d56cc8ffef4a8f36ca26c38fe2de700543e627f8a464a"
@@ -104,8 +109,12 @@ dependencies = [
  "cros_async",
  "data_model",
  "libc",
+ "serde",
+ "serde_json",
+ "smallvec",
  "sync",
  "sys_util",
+ "thiserror",
 ]
 
 [[package]]
@@ -143,6 +152,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4785bdd1c96b2a846b2bd7cc02e86b6b3dbf14e7e53446c4f54c92a361040822"
 
 [[package]]
+name = "cloudabi"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddfc5b9aa5d4507acaf872de71051dfd0e309860e88966e1051e462a077aac4f"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
 name = "cras-sys"
 version = "0.1.0"
 dependencies = [
@@ -158,6 +176,7 @@ dependencies = [
  "async-trait",
  "data_model",
  "futures",
+ "intrusive-collections",
  "io_uring",
  "libc",
  "paste",
@@ -165,8 +184,14 @@ dependencies = [
  "slab",
  "sync",
  "sys_util",
- "syscall_defines",
  "thiserror",
+]
+
+[[package]]
+name = "cros_fuzz"
+version = "0.1.0"
+dependencies = [
+ "rand_core 0.4.2",
 ]
 
 [[package]]
@@ -194,7 +219,6 @@ dependencies = [
  "libc",
  "libcras",
  "minijail",
- "msg_socket",
  "net_util",
  "p9",
  "protobuf",
@@ -210,6 +234,24 @@ dependencies = [
  "vm_control",
  "vm_memory",
  "x86_64",
+]
+
+[[package]]
+name = "crosvm-fuzz"
+version = "0.0.1"
+dependencies = [
+ "base",
+ "cros_fuzz",
+ "data_model",
+ "devices",
+ "disk",
+ "fuse",
+ "kernel_loader",
+ "libc",
+ "rand",
+ "tempfile",
+ "usb_util",
+ "vm_memory",
 ]
 
 [[package]]
@@ -261,13 +303,10 @@ dependencies = [
  "hypervisor",
  "kvm_sys",
  "libc",
- "libchromeos",
  "libcras",
  "libvda",
  "linux_input_sys",
  "minijail",
- "msg_on_socket_derive",
- "msg_socket",
  "net_sys",
  "net_util",
  "p9",
@@ -277,9 +316,10 @@ dependencies = [
  "remain",
  "resources",
  "rutabaga_gfx",
+ "serde",
+ "smallvec",
  "sync",
  "sys_util",
- "syscall_defines",
  "tempfile",
  "thiserror",
  "tpm2",
@@ -289,6 +329,7 @@ dependencies = [
  "virtio_sys",
  "vm_control",
  "vm_memory",
+ "vmm_vhost",
 ]
 
 [[package]]
@@ -324,6 +365,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuchsia-cprng"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06f77d526c1a601b7c4cdd98f54b5eaabffc14d5f2f0296febdc7f357c6d3ba"
+
+[[package]]
 name = "fuse"
 version = "0.1.0"
 dependencies = [
@@ -343,7 +390,6 @@ checksum = "b6f16056ecbb57525ff698bb955162d0cd03bee84e6241c27ff75c08d8ca5987"
 dependencies = [
  "futures-channel",
  "futures-core",
- "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -367,33 +413,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79564c427afefab1dfb3298535b21eda083ef7935b4f0ecbfcb121f0aec10866"
 
 [[package]]
-name = "futures-executor"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e274736563f686a837a0568b478bdabfeaec2dca794b5649b04e2fe1627c231"
-dependencies = [
- "futures-core",
- "futures-task",
- "futures-util",
-]
-
-[[package]]
 name = "futures-io"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e676577d229e70952ab25f3945795ba5b16d63ca794ca9d2c860e5595d20b5ff"
-
-[[package]]
-name = "futures-macro"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52e7c56c15537adb4f76d0b7a76ad131cb4d2f4f32d3b0bcabcbe1c7c5e87764"
-dependencies = [
- "proc-macro-hack",
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "futures-sink"
@@ -416,13 +439,10 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-io",
- "futures-macro",
  "futures-sink",
  "futures-task",
  "memchr",
  "pin-utils",
- "proc-macro-hack",
- "proc-macro-nested",
  "slab",
 ]
 
@@ -471,7 +491,7 @@ dependencies = [
  "kvm",
  "kvm_sys",
  "libc",
- "msg_socket",
+ "serde",
  "sync",
  "vm_memory",
 ]
@@ -505,8 +525,13 @@ dependencies = [
  "libc",
  "sync",
  "sys_util",
- "syscall_defines",
 ]
+
+[[package]]
+name = "itoa"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd25036021b0de88a0aff6b850051563c6516d0bf53f8638938edbb9de732736"
 
 [[package]]
 name = "kernel_cmdline"
@@ -533,7 +558,6 @@ dependencies = [
  "data_model",
  "kvm_sys",
  "libc",
- "msg_socket",
  "sync",
  "vm_memory",
 ]
@@ -549,9 +573,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.81"
+version = "0.2.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1482821306169ec4d07f6aca392a4681f66c75c9918aa49641a2595db64053cb"
+checksum = "9385f66bf6105b241aa65a61cb923ef20efc665cb9f9bb50ac2f0c4b7f378d41"
 
 [[package]]
 name = "libchromeos"
@@ -559,11 +583,12 @@ version = "0.1.0"
 dependencies = [
  "data_model",
  "futures",
- "intrusive-collections",
  "libc",
  "log",
  "protobuf",
+ "sys_util",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -575,6 +600,15 @@ dependencies = [
  "data_model",
  "libc",
  "sys_util",
+]
+
+[[package]]
+name = "libcrosvm_control"
+version = "0.1.0"
+dependencies = [
+ "base",
+ "libc",
+ "vm_control",
 ]
 
 [[package]]
@@ -631,7 +665,7 @@ version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "043175f069eda7b85febe4a74abbaeff828d9f8b448515d3151a14a3542811aa"
 dependencies = [
- "autocfg",
+ "autocfg 1.0.1",
 ]
 
 [[package]]
@@ -648,29 +682,6 @@ version = "0.0.11"
 dependencies = [
  "libc",
  "pkg-config",
-]
-
-[[package]]
-name = "msg_on_socket_derive"
-version = "0.1.0"
-dependencies = [
- "base",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "msg_socket"
-version = "0.1.0"
-dependencies = [
- "base",
- "cros_async",
- "data_model",
- "futures",
- "libc",
- "msg_on_socket_derive",
- "sync",
 ]
 
 [[package]]
@@ -696,7 +707,7 @@ version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac267bcc07f48ee5f8935ab0d24f316fb722d7a1292e2913f0cc196b29ffd611"
 dependencies = [
- "autocfg",
+ "autocfg 1.0.1",
 ]
 
 [[package]]
@@ -753,23 +764,6 @@ dependencies = [
  "protobuf",
  "protoc-rust",
 ]
-
-[[package]]
-name = "proc-macro-hack"
-version = "0.5.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecd45702f76d6d3c75a80564378ae228a85f0b59d2f3ed43c91b4a69eb2ebfc5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "proc-macro-nested"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "369a6ed065f249a159e06c45752c780bda2fb53c995718f9e484d08daa9eb42e"
 
 [[package]]
 name = "proc-macro2"
@@ -845,8 +839,123 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d71dacdc3c88c1fde3885a3be3fbab9f35724e6ce99467f7d9c5026132184ca"
+dependencies = [
+ "autocfg 0.1.7",
+ "libc",
+ "rand_chacha",
+ "rand_core 0.4.2",
+ "rand_hc",
+ "rand_isaac",
+ "rand_jitter",
+ "rand_os",
+ "rand_pcg",
+ "rand_xorshift",
+ "winapi",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "556d3a1ca6600bfcbab7c7c91ccb085ac7fbbcd70e008a98742e7847f4f7bcef"
+dependencies = [
+ "autocfg 0.1.7",
+ "rand_core 0.3.1",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a6fdeb83b075e8266dcc8762c22776f6877a63111121f5f8c7411e5be7eed4b"
+dependencies = [
+ "rand_core 0.4.2",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c33a3c44ca05fa6f1807d8e6743f3824e8509beca625669633be0acbdf509dc"
+
+[[package]]
+name = "rand_hc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b40677c7be09ae76218dc623efbf7b18e34bced3f38883af07bb75630a21bc4"
+dependencies = [
+ "rand_core 0.3.1",
+]
+
+[[package]]
+name = "rand_isaac"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ded997c9d5f13925be2a6fd7e66bf1872597f759fd9dd93513dd7e92e5a5ee08"
+dependencies = [
+ "rand_core 0.3.1",
+]
+
+[[package]]
 name = "rand_ish"
 version = "0.1.0"
+
+[[package]]
+name = "rand_jitter"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1166d5c91dc97b88d1decc3285bb0a99ed84b05cfd0bc2341bdf2d43fc41e39b"
+dependencies = [
+ "libc",
+ "rand_core 0.4.2",
+ "winapi",
+]
+
+[[package]]
+name = "rand_os"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b75f676a1e053fc562eafbb47838d67c84801e38fc1ba459e8f180deabd5071"
+dependencies = [
+ "cloudabi",
+ "fuchsia-cprng",
+ "libc",
+ "rand_core 0.4.2",
+ "rdrand",
+ "winapi",
+]
+
+[[package]]
+name = "rand_pcg"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abf9b09b01790cfe0364f52bf32995ea3c39f4d2dd011eac241d2914146d0b44"
+dependencies = [
+ "autocfg 0.1.7",
+ "rand_core 0.4.2",
+]
+
+[[package]]
+name = "rand_xorshift"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbf7e9e623549b0e21f6e97cf8ecf247c1a8fd2e8a992ae265314300b2455d5c"
+dependencies = [
+ "rand_core 0.3.1",
+]
+
+[[package]]
+name = "rdrand"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "678054eb77286b51581ba43620cc911abf02758c91f93f479767aed0f90458b2"
+dependencies = [
+ "rand_core 0.3.1",
+]
 
 [[package]]
 name = "remain"
@@ -865,7 +974,7 @@ version = "0.1.0"
 dependencies = [
  "base",
  "libc",
- "msg_socket",
+ "serde",
 ]
 
 [[package]]
@@ -877,6 +986,12 @@ dependencies = [
  "libc",
  "sync",
 ]
+
+[[package]]
+name = "ryu"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71d301d4193d031abdd79ff7e3dd721168a9572ef3fe51a1517aba235bd8f86e"
 
 [[package]]
 name = "serde"
@@ -899,10 +1014,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.64"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "799e97dc9fdae36a5c8b8f2cae9ce2ee9fdce2058c57a93e6099d919fd982f79"
+dependencies = [
+ "itoa",
+ "ryu",
+ "serde",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c111b5bd5695e56cffe5129854aa230b39c93a305372fdbb2668ca2394eea9f8"
+
+[[package]]
+name = "smallvec"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe0f37c9e8f3c5a4a66ad655a93c74daac4ad00c441533bf5c6e7990bb42604e"
 
 [[package]]
 name = "syn"
@@ -920,6 +1052,18 @@ name = "sync"
 version = "0.1.0"
 
 [[package]]
+name = "synstructure"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b834f2d66f734cb897113e34aaff2f1ab4719ca946f9a7358dba8f8064148701"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "unicode-xid",
+]
+
+[[package]]
 name = "sys_util"
 version = "0.1.0"
 dependencies = [
@@ -927,14 +1071,11 @@ dependencies = [
  "data_model",
  "libc",
  "poll_token_derive",
+ "serde",
+ "serde_json",
  "sync",
- "syscall_defines",
  "tempfile",
 ]
-
-[[package]]
-name = "syscall_defines"
-version = "0.1.0"
 
 [[package]]
 name = "tempfile"
@@ -1044,9 +1185,9 @@ dependencies = [
  "gdbstub",
  "hypervisor",
  "libc",
- "msg_socket",
  "resources",
  "rutabaga_gfx",
+ "serde",
  "sync",
  "vm_memory",
 ]
@@ -1056,11 +1197,43 @@ name = "vm_memory"
 version = "0.1.0"
 dependencies = [
  "base",
+ "bitflags",
  "cros_async",
  "data_model",
  "libc",
- "syscall_defines",
 ]
+
+[[package]]
+name = "vmm_vhost"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "libc",
+ "sys_util",
+ "tempfile",
+]
+
+[[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "wire_format_derive"
@@ -1087,10 +1260,30 @@ dependencies = [
  "kernel_loader",
  "libc",
  "minijail",
- "msg_socket",
  "remain",
  "resources",
  "sync",
  "vm_control",
  "vm_memory",
+]
+
+[[package]]
+name = "zeroize"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81a974bcdd357f0dca4d41677db03436324d45a4c9ed2d0b873a5a360ce41c36"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3f369ddb18862aba61aa49bf31e74d29f0f162dec753063200e1dc084345d16"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
 ]
