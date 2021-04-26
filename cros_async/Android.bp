@@ -22,6 +22,9 @@ rust_defaults {
         "libasync_task",
         "libdata_model",
         "libfutures",
+	"libfutures_executor",
+	"libfutures_util",
+	"libintrusive_collections",
         "libio_uring",
         "liblibc",
         "libpin_utils",
@@ -64,6 +67,7 @@ rust_library {
         "libasync_task",
         "libdata_model",
         "libfutures",
+	"libintrusive_collections",  // added manually
         "libio_uring",
         "liblibc",
         "libpin_utils",
