@@ -36,13 +36,14 @@ rust_defaults {
         "liblibcras",
         "liblinux_input_sys",
         "libminijail_rust",
-        "libmsg_socket",
         "libnet_sys",
         "libnet_util",
         "libp9",
         "libpower_monitor",
         "librand_ish",
         "libresources",
+	"libserde",
+	"libsmallvec",
         "libsync_rust",
         "libsys_util",
         "libsyscall_defines",
@@ -54,10 +55,10 @@ rust_defaults {
         "libvirtio_sys",
         "libvm_control",
         "libvm_memory",
+	"libvmm_vhost",
     ],
     proc_macros: [
         "libenumn",
-        "libmsg_on_socket_derive",
         "libremain",
     ],
 }
@@ -137,7 +138,6 @@ rust_library {
         "liblibcras",
         "liblinux_input_sys",
         "libminijail_rust",
-        "libmsg_socket",
         "libnet_sys",
         "libnet_util",
         "libp9",
@@ -145,6 +145,8 @@ rust_library {
         "librand_ish",
         "libresources",
         "librutabaga_gfx",  // added manually
+	"libserde",  // added manually
+	"libsmallvec",
         "libsync_rust",
         "libsys_util",
         "libsyscall_defines",
@@ -155,10 +157,10 @@ rust_library {
         "libvirtio_sys",
         "libvm_control",
         "libvm_memory",
+	"libvmm_vhost",  // added manually
     ],
     proc_macros: [
         "libenumn",
-        "libmsg_on_socket_derive",
         "libremain",
     ],
 }
@@ -187,8 +189,6 @@ rust_library {
 //   ../kvm/src/lib.rs
 //   ../kvm_sys/src/lib.rs
 //   ../linux_input_sys/src/lib.rs
-//   ../msg_socket/msg_on_socket_derive/msg_on_socket_derive.rs
-//   ../msg_socket/src/lib.rs
 //   ../net_sys/src/lib.rs
 //   ../net_util/src/lib.rs
 //   ../power_monitor/src/lib.rs
