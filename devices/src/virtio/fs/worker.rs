@@ -2,20 +2,19 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
-use base::{error, Event, PollToken, WaitContext};
+use base::{error, Event, PollToken, SafeDescriptor, Tube, WaitContext};
 use fuse::filesystem::{FileSystem, ZeroCopyReader, ZeroCopyWriter};
-use msg_socket::{MsgReceiver, MsgSender};
-use vm_control::{FsMappingRequest, FsMappingRequestSocket, MaybeOwnedDescriptor, VmResponse};
+use vm_control::{FsMappingRequest, VmResponse};
 use vm_memory::GuestMemory;
 
 use crate::virtio::fs::{Error, Result};
-use crate::virtio::{Interrupt, Queue, Reader, Writer};
+use crate::virtio::{Interrupt, Queue, Reader, SignalableInterrupt, Writer};
 
 impl fuse::Reader for Reader {}
 
@@ -46,27 +45,27 @@ impl ZeroCopyWriter for Writer {
 }
 
 struct Mapper {
-    socket: Arc<Mutex<FsMappingRequestSocket>>,
+    tube: Arc<Mutex<Tube>>,
     slot: u32,
 }
 
 impl Mapper {
-    fn new(socket: Arc<Mutex<FsMappingRequestSocket>>, slot: u32) -> Self {
-        Self { socket, slot }
+    fn new(tube: Arc<Mutex<Tube>>, slot: u32) -> Self {
+        Self { tube, slot }
     }
 
     fn process_request(&self, request: &FsMappingRequest) -> io::Result<()> {
-        let socket = self.socket.lock().map_err(|e| {
-            error!("failed to lock socket: {}", e);
+        let tube = self.tube.lock().map_err(|e| {
+            error!("failed to lock tube: {}", e);
             io::Error::from_raw_os_error(libc::EINVAL)
         })?;
 
-        socket.send(request).map_err(|e| {
+        tube.send(request).map_err(|e| {
             error!("failed to send request {:?}: {}", request, e);
             io::Error::from_raw_os_error(libc::EINVAL)
         })?;
 
-        match socket.recv() {
+        match tube.recv() {
             Ok(VmResponse::Ok) => Ok(()),
             Ok(VmResponse::Err(e)) => Err(e.into()),
             r => {
@@ -91,9 +90,11 @@ impl fuse::Mapper for Mapper {
             io::Error::from_raw_os_error(libc::EINVAL)
         })?;
 
+        let fd = SafeDescriptor::try_from(fd)?;
+
         let request = FsMappingRequest::CreateMemoryMapping {
             slot: self.slot,
-            fd: MaybeOwnedDescriptor::Borrowed(fd.as_raw_fd()),
+            fd,
             size,
             file_offset,
             prot,
@@ -128,7 +129,7 @@ pub struct Worker<F: FileSystem + Sync> {
     queue: Queue,
     server: Arc<fuse::Server<F>>,
     irq: Arc<Interrupt>,
-    socket: Arc<Mutex<FsMappingRequestSocket>>,
+    tube: Arc<Mutex<Tube>>,
     slot: u32,
 }
 
@@ -138,7 +139,7 @@ impl<F: FileSystem + Sync> Worker<F> {
         queue: Queue,
         server: Arc<fuse::Server<F>>,
         irq: Arc<Interrupt>,
-        socket: Arc<Mutex<FsMappingRequestSocket>>,
+        tube: Arc<Mutex<Tube>>,
         slot: u32,
     ) -> Worker<F> {
         Worker {
@@ -146,7 +147,7 @@ impl<F: FileSystem + Sync> Worker<F> {
             queue,
             server,
             irq,
-            socket,
+            tube,
             slot,
         }
     }
@@ -154,7 +155,7 @@ impl<F: FileSystem + Sync> Worker<F> {
     fn process_queue(&mut self) -> Result<()> {
         let mut needs_interrupt = false;
 
-        let mapper = Mapper::new(Arc::clone(&self.socket), self.slot);
+        let mapper = Mapper::new(Arc::clone(&self.tube), self.slot);
         while let Some(avail_desc) = self.queue.pop(&self.mem) {
             let reader = Reader::new(self.mem.clone(), avail_desc.clone())
                 .map_err(Error::InvalidDescriptorChain)?;
@@ -182,6 +183,29 @@ impl<F: FileSystem + Sync> Worker<F> {
         kill_evt: Event,
         watch_resample_event: bool,
     ) -> Result<()> {
+        // We need to set the no setuid fixup secure bit so that we don't drop capabilities when
+        // changing the thread uid/gid. Without this, creating new entries can fail in some corner
+        // cases.
+        const SECBIT_NO_SETUID_FIXUP: i32 = 1 << 2;
+
+        // TODO(crbug.com/1199487): Remove this once libc provides the wrapper for all targets.
+        #[cfg(target_os = "linux")]
+        {
+            // Safe because this doesn't modify any memory and we check the return value.
+            let mut securebits = unsafe { libc::prctl(libc::PR_GET_SECUREBITS) };
+            if securebits < 0 {
+                return Err(Error::GetSecurebits(io::Error::last_os_error()));
+            }
+
+            securebits |= SECBIT_NO_SETUID_FIXUP;
+
+            // Safe because this doesn't modify any memory and we check the return value.
+            let ret = unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits) };
+            if ret < 0 {
+                return Err(Error::SetSecurebits(io::Error::last_os_error()));
+            }
+        }
+
         #[derive(PollToken)]
         enum Token {
             // A request is ready on the queue.
@@ -197,9 +221,11 @@ impl<F: FileSystem + Sync> Worker<F> {
                 .map_err(Error::CreateWaitContext)?;
 
         if watch_resample_event {
-            wait_ctx
-                .add(self.irq.get_resample_evt(), Token::InterruptResample)
-                .map_err(Error::CreateWaitContext)?;
+            if let Some(resample_evt) = self.irq.get_resample_evt() {
+                wait_ctx
+                    .add(resample_evt, Token::InterruptResample)
+                    .map_err(Error::CreateWaitContext)?;
+            }
         }
 
         loop {

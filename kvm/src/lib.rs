@@ -9,10 +9,13 @@ mod cap;
 use std::cell::RefCell;
 use std::cmp::{min, Ordering};
 use std::collections::{BTreeMap, BinaryHeap};
+use std::ffi::CString;
 use std::fs::File;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::os::raw::*;
+use std::os::unix::prelude::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::ptr::copy_nonoverlapping;
 use std::sync::Arc;
 use sync::Mutex;
@@ -34,7 +37,6 @@ use base::{
     ioctl_with_val, pagesize, signal, unblock_signal, warn, Error, Event, IoctlNr, MappedRegion,
     MemoryMapping, MemoryMappingBuilder, MmapError, Result, SIGRTMIN,
 };
-use msg_socket::MsgOnSocket;
 use vm_memory::{GuestAddress, GuestMemory};
 
 pub use crate::cap::*;
@@ -94,9 +96,14 @@ pub struct Kvm {
 impl Kvm {
     /// Opens `/dev/kvm/` and returns a Kvm object on success.
     pub fn new() -> Result<Kvm> {
-        // Open calls are safe because we give a constant nul-terminated string and verify the
-        // result.
-        let ret = unsafe { open("/dev/kvm\0".as_ptr() as *const c_char, O_RDWR | O_CLOEXEC) };
+        Kvm::new_with_path(&PathBuf::from("/dev/kvm"))
+    }
+
+    /// Opens a KVM device at `device_path` and returns a Kvm object on success.
+    pub fn new_with_path(device_path: &Path) -> Result<Kvm> {
+        // Open calls are safe because we give a nul-terminated string and verify the result.
+        let c_path = CString::new(device_path.as_os_str().as_bytes()).unwrap();
+        let ret = unsafe { open(c_path.as_ptr(), O_RDWR | O_CLOEXEC) };
         if ret < 0 {
             return errno_result();
         }
@@ -200,7 +207,7 @@ impl AsRawDescriptor for Kvm {
 }
 
 /// An address either in programmable I/O space or in memory mapped I/O space.
-#[derive(Copy, Clone, Debug, MsgOnSocket)]
+#[derive(Copy, Clone, Debug)]
 pub enum IoeventAddress {
     Pio(u64),
     Mmio(u64),
@@ -271,7 +278,7 @@ impl Vm {
         if ret >= 0 {
             // Safe because we verify the value of ret and we are the owners of the fd.
             let vm_file = unsafe { File::from_raw_descriptor(ret) };
-            guest_mem.with_regions(|index, guest_addr, size, host_addr, _| {
+            guest_mem.with_regions(|index, guest_addr, size, host_addr, _, _| {
                 unsafe {
                     // Safe because the guest regions are guaranteed not to overlap.
                     set_user_memory_region(
@@ -962,7 +969,7 @@ impl Vcpu {
         let vcpu = unsafe { File::from_raw_descriptor(vcpu_fd) };
 
         let run_mmap = MemoryMappingBuilder::new(run_mmap_size)
-            .from_descriptor(&vcpu)
+            .from_file(&vcpu)
             .build()
             .map_err(|_| Error::new(ENOSPC))?;
 

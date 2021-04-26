@@ -174,7 +174,7 @@ impl VfioContainer {
 
         // Add all guest memory regions into vfio container's iommu table,
         // then vfio kernel driver could access guest memory from gfn
-        guest_mem.with_regions(|_index, guest_addr, size, host_addr, _fd_offset| {
+        guest_mem.with_regions(|_index, guest_addr, size, host_addr, _mmap, _fd_offset| {
             // Safe because the guest regions are guaranteed not to overlap
             unsafe { self.vfio_dma_map(guest_addr.0, size as u64, host_addr as u64) }
         })?;
@@ -391,21 +391,13 @@ impl VfioDevice {
     /// Enable vfio device's irq and associate Irqfd Event with device.
     /// When MSIx is enabled, multi vectors will be supported, so descriptors is vector and the vector
     /// length is the num of MSIx vectors
-    pub fn irq_enable(
-        &self,
-        descriptors: Vec<&Event>,
-        irq_type: VfioIrqType,
-    ) -> Result<(), VfioError> {
+    pub fn irq_enable(&self, descriptors: Vec<&Event>, index: u32) -> Result<(), VfioError> {
         let count = descriptors.len();
         let u32_size = mem::size_of::<u32>();
         let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(count);
         irq_set[0].argsz = (mem::size_of::<vfio_irq_set>() + count * u32_size) as u32;
         irq_set[0].flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
-        match irq_type {
-            VfioIrqType::Intx => irq_set[0].index = VFIO_PCI_INTX_IRQ_INDEX,
-            VfioIrqType::Msi => irq_set[0].index = VFIO_PCI_MSI_IRQ_INDEX,
-            VfioIrqType::Msix => irq_set[0].index = VFIO_PCI_MSIX_IRQ_INDEX,
-        }
+        irq_set[0].index = index;
         irq_set[0].start = 0;
         irq_set[0].count = count as u32;
 
@@ -421,7 +413,7 @@ impl VfioDevice {
         }
 
         // Safe as we are the owner of self and irq_set which are valid value
-        let ret = unsafe { ioctl_with_ref(self, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
+        let ret = unsafe { ioctl_with_ref(&self.dev, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
         if ret < 0 {
             Err(VfioError::VfioIrqEnable(get_error()))
         } else {
@@ -438,17 +430,17 @@ impl VfioDevice {
     /// This function enable resample irqfd and let vfio kernel could get EOI notification.
     ///
     /// descriptor: should be resample IrqFd.
-    pub fn resample_virq_enable(&self, descriptor: &Event) -> Result<(), VfioError> {
+    pub fn resample_virq_enable(&self, descriptor: &Event, index: u32) -> Result<(), VfioError> {
         let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(1);
         irq_set[0].argsz = (mem::size_of::<vfio_irq_set>() + mem::size_of::<u32>()) as u32;
         irq_set[0].flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_UNMASK;
-        irq_set[0].index = VFIO_PCI_INTX_IRQ_INDEX;
+        irq_set[0].index = index;
         irq_set[0].start = 0;
         irq_set[0].count = 1;
 
         {
-            // irq_set.data could be none, bool or descriptor according to flags, so irq_set.data
-            // is u8 default, here irq_set.data is descriptor as u32, so 4 default u8 are combined
+            // irq_set.data could be none, bool or descriptor according to flags, so irq_set.data is
+            // u8 default, here irq_set.data is descriptor as u32, so 4 default u8 are combined
             // together as u32. It is safe as enough space is reserved through
             // vec_with_array_field(u32)<1>.
             let descriptors = unsafe { irq_set[0].data.as_mut_slice(4) };
@@ -456,7 +448,7 @@ impl VfioDevice {
         }
 
         // Safe as we are the owner of self and irq_set which are valid value
-        let ret = unsafe { ioctl_with_ref(self, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
+        let ret = unsafe { ioctl_with_ref(&self.dev, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
         if ret < 0 {
             Err(VfioError::VfioIrqEnable(get_error()))
         } else {
@@ -465,20 +457,16 @@ impl VfioDevice {
     }
 
     /// disable vfio device's irq and disconnect Irqfd Event with device
-    pub fn irq_disable(&self, irq_type: VfioIrqType) -> Result<(), VfioError> {
+    pub fn irq_disable(&self, index: u32) -> Result<(), VfioError> {
         let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(0);
         irq_set[0].argsz = mem::size_of::<vfio_irq_set>() as u32;
         irq_set[0].flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER;
-        match irq_type {
-            VfioIrqType::Intx => irq_set[0].index = VFIO_PCI_INTX_IRQ_INDEX,
-            VfioIrqType::Msi => irq_set[0].index = VFIO_PCI_MSI_IRQ_INDEX,
-            VfioIrqType::Msix => irq_set[0].index = VFIO_PCI_MSIX_IRQ_INDEX,
-        }
+        irq_set[0].index = index;
         irq_set[0].start = 0;
         irq_set[0].count = 0;
 
         // Safe as we are the owner of self and irq_set which are valid value
-        let ret = unsafe { ioctl_with_ref(self, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
+        let ret = unsafe { ioctl_with_ref(&self.dev, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
         if ret < 0 {
             Err(VfioError::VfioIrqDisable(get_error()))
         } else {
@@ -487,20 +475,16 @@ impl VfioDevice {
     }
 
     /// Unmask vfio device irq
-    pub fn irq_unmask(&self, irq_type: VfioIrqType) -> Result<(), VfioError> {
+    pub fn irq_unmask(&self, index: u32) -> Result<(), VfioError> {
         let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(0);
         irq_set[0].argsz = mem::size_of::<vfio_irq_set>() as u32;
         irq_set[0].flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_UNMASK;
-        match irq_type {
-            VfioIrqType::Intx => irq_set[0].index = VFIO_PCI_INTX_IRQ_INDEX,
-            VfioIrqType::Msi => irq_set[0].index = VFIO_PCI_MSI_IRQ_INDEX,
-            VfioIrqType::Msix => irq_set[0].index = VFIO_PCI_MSIX_IRQ_INDEX,
-        }
+        irq_set[0].index = index;
         irq_set[0].start = 0;
         irq_set[0].count = 1;
 
         // Safe as we are the owner of self and irq_set which are valid value
-        let ret = unsafe { ioctl_with_ref(self, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
+        let ret = unsafe { ioctl_with_ref(&self.dev, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
         if ret < 0 {
             Err(VfioError::VfioIrqUnmask(get_error()))
         } else {
@@ -509,20 +493,16 @@ impl VfioDevice {
     }
 
     /// Mask vfio device irq
-    pub fn irq_mask(&self, irq_type: VfioIrqType) -> Result<(), VfioError> {
+    pub fn irq_mask(&self, index: u32) -> Result<(), VfioError> {
         let mut irq_set = vec_with_array_field::<vfio_irq_set, u32>(0);
         irq_set[0].argsz = mem::size_of::<vfio_irq_set>() as u32;
         irq_set[0].flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_MASK;
-        match irq_type {
-            VfioIrqType::Intx => irq_set[0].index = VFIO_PCI_INTX_IRQ_INDEX,
-            VfioIrqType::Msi => irq_set[0].index = VFIO_PCI_MSI_IRQ_INDEX,
-            VfioIrqType::Msix => irq_set[0].index = VFIO_PCI_MSIX_IRQ_INDEX,
-        }
+        irq_set[0].index = index;
         irq_set[0].start = 0;
         irq_set[0].count = 1;
 
         // Safe as we are the owner of self and irq_set which are valid value
-        let ret = unsafe { ioctl_with_ref(self, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
+        let ret = unsafe { ioctl_with_ref(&self.dev, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
         if ret < 0 {
             Err(VfioError::VfioIrqMask(get_error()))
         } else {
@@ -802,7 +782,7 @@ impl VfioDevice {
     /// get vfio device's descriptors which are passed into minijail process
     pub fn keep_rds(&self) -> Vec<RawDescriptor> {
         let mut rds = Vec::new();
-        rds.push(self.as_raw_descriptor());
+        rds.push(self.dev.as_raw_descriptor());
         rds.push(self.group_descriptor);
         rds.push(self.container.lock().as_raw_descriptor());
         rds
@@ -822,10 +802,9 @@ impl VfioDevice {
     pub fn vfio_dma_unmap(&self, iova: u64, size: u64) -> Result<(), VfioError> {
         self.container.lock().vfio_dma_unmap(iova, size)
     }
-}
 
-impl AsRawDescriptor for VfioDevice {
-    fn as_raw_descriptor(&self) -> RawDescriptor {
-        self.dev.as_raw_descriptor()
+    /// Gets the vfio device backing `File`.
+    pub fn device_file(&self) -> &File {
+        &self.dev
     }
 }

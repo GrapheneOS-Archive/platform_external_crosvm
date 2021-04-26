@@ -1338,15 +1338,7 @@ mod tests {
         }
         mem::drop(c);
 
-        // Now add NOPs to wake up any threads blocked on the syscall.
-        for i in 0..NUM_THREADS {
-            uring.add_nop((num_entries * 3 + i) as UserData).unwrap();
-        }
-        uring.submit().unwrap();
-
-        for t in threads {
-            t.join().unwrap();
-        }
+        // Let the OS clean up the still-waiting threads after the test run.
     }
 
     #[test]
@@ -1431,7 +1423,9 @@ mod tests {
         );
     }
 
+    // TODO(b/183722981): Fix and re-enable test
     #[test]
+    #[ignore]
     fn multi_thread_submit_and_complete() {
         const NUM_SUBMITTERS: usize = 7;
         const NUM_COMPLETERS: usize = 3;

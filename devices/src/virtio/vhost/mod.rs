@@ -6,13 +6,14 @@
 
 use std::fmt::{self, Display};
 
-use base::Error as SysError;
+use base::{Error as SysError, TubeError};
 use net_util::Error as TapError;
 use remain::sorted;
 use vhost::Error as VhostError;
 
 mod control_socket;
 mod net;
+pub mod user;
 mod vsock;
 mod worker;
 
@@ -27,6 +28,8 @@ pub enum Error {
     CloneKillEvent(SysError),
     /// Creating kill event failed.
     CreateKillEvent(SysError),
+    /// Creating tube failed.
+    CreateTube(TubeError),
     /// Creating wait context failed.
     CreateWaitContext(SysError),
     /// Enabling tap interface failed.
@@ -88,6 +91,7 @@ impl Display for Error {
         match self {
             CloneKillEvent(e) => write!(f, "failed to clone kill event: {}", e),
             CreateKillEvent(e) => write!(f, "failed to create kill event: {}", e),
+            CreateTube(e) => write!(f, "failed to create tube: {}", e),
             CreateWaitContext(e) => write!(f, "failed to create poll context: {}", e),
             TapEnable(e) => write!(f, "failed to enable tap interface: {}", e),
             TapOpen(e) => write!(f, "failed to open tap device: {}", e),

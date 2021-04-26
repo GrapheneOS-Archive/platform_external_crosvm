@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use acpi_tables::aml::Aml;
 use acpi_tables::sdt::SDT;
-use base::{syslog, AsRawDescriptor, Event};
+use base::{syslog, AsRawDescriptor, Event, Tube};
 use devices::virtio::VirtioDevice;
 use devices::{
     Bus, BusDevice, BusError, IrqChip, PciAddress, PciDevice, PciDeviceError, PciInterruptPin,
@@ -27,11 +27,7 @@ use hypervisor::{IoEventAddress, Vm};
 use minijail::Minijail;
 use resources::{MmioType, SystemAllocator};
 use sync::Mutex;
-#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
-use vm_control::VmControlRequestSocket;
-use vm_control::{
-    BatControl, BatControlCommand, BatControlRequestSocket, BatControlResult, BatteryType,
-};
+use vm_control::{BatControl, BatteryType};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
@@ -83,6 +79,7 @@ pub struct VmComponents {
     pub vcpu_count: usize,
     pub vcpu_affinity: Option<VcpuAffinity>,
     pub no_smt: bool,
+    pub hugepages: bool,
     pub vm_image: VmImage,
     pub android_fstab: Option<File>,
     pub pstore: Option<Pstore>,
@@ -93,7 +90,8 @@ pub struct VmComponents {
     pub rt_cpus: Vec<usize>,
     pub protected_vm: ProtectionType,
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
-    pub gdb: Option<(u32, VmControlRequestSocket)>, // port and control socket.
+    pub gdb: Option<(u32, Tube)>, // port and control tube.
+    pub dmi_path: Option<PathBuf>,
 }
 
 /// Holds the elements needed to run a Linux VM. Created by `build_vm`.
@@ -116,7 +114,7 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch, I: IrqChipArch> {
     pub rt_cpus: Vec<usize>,
     pub bat_control: Option<BatControl>,
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
-    pub gdb: Option<(u32, VmControlRequestSocket)>,
+    pub gdb: Option<(u32, Tube)>,
 }
 
 /// The device and optional jail.
@@ -130,6 +128,16 @@ pub struct VirtioDeviceStub {
 pub trait LinuxArch {
     type Error: StdError;
 
+    /// Returns a Vec of the valid memory addresses as pairs of address and length. These should be
+    /// used to configure the `GuestMemory` structure for the platform.
+    ///
+    /// # Arguments
+    ///
+    /// * `components` - Parts used to determine the memory layout.
+    fn guest_memory_layout(
+        components: &VmComponents,
+    ) -> std::result::Result<Vec<(GuestAddress, u64)>, Self::Error>;
+
     /// Takes `VmComponents` and generates a `RunnableLinuxVm`.
     ///
     /// # Arguments
@@ -138,15 +146,14 @@ pub trait LinuxArch {
     /// * `serial_parameters` - definitions for how the serial devices should be configured.
     /// * `battery` - defines what battery device will be created.
     /// * `create_devices` - Function to generate a list of devices.
-    /// * `create_vm` - Function to generate a VM.
     /// * `create_irq_chip` - Function to generate an IRQ chip.
-    fn build_vm<V, Vcpu, I, FD, FV, FI, E1, E2, E3>(
+    fn build_vm<V, Vcpu, I, FD, FI, E1, E2>(
         components: VmComponents,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
         battery: (&Option<BatteryType>, Option<Minijail>),
+        vm: V,
         create_devices: FD,
-        create_vm: FV,
         create_irq_chip: FI,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu, I>, Self::Error>
     where
@@ -159,11 +166,9 @@ pub trait LinuxArch {
             &mut SystemAllocator,
             &Event,
         ) -> std::result::Result<Vec<(Box<dyn PciDevice>, Option<Minijail>)>, E1>,
-        FV: FnOnce(GuestMemory) -> std::result::Result<V, E2>,
-        FI: FnOnce(&V, /* vcpu_count: */ usize) -> std::result::Result<I, E3>,
+        FI: FnOnce(&V, /* vcpu_count: */ usize) -> std::result::Result<I, E2>,
         E1: StdError + 'static,
-        E2: StdError + 'static,
-        E3: StdError + 'static;
+        E2: StdError + 'static;
 
     /// Configures the vcpu and should be called once per vcpu from the vcpu's thread.
     ///
@@ -240,8 +245,8 @@ pub enum DeviceRegistrationError {
     CreatePipe(base::Error),
     // Unable to create serial device from serial parameters
     CreateSerialDevice(serial::Error),
-    // Unable to create socket
-    CreateSocket(io::Error),
+    // Unable to create tube
+    CreateTube(base::TubeError),
     /// Could not clone an event.
     EventClone(base::Error),
     /// Could not create an event.
@@ -279,7 +284,7 @@ impl Display for DeviceRegistrationError {
             AllocateIrq => write!(f, "Allocating IRQ number"),
             CreatePipe(e) => write!(f, "failed to create pipe: {}", e),
             CreateSerialDevice(e) => write!(f, "failed to create serial device: {}", e),
-            CreateSocket(e) => write!(f, "failed to create socket: {}", e),
+            CreateTube(e) => write!(f, "failed to create tube: {}", e),
             Cmdline(e) => write!(f, "unable to add device to kernel command line: {}", e),
             EventClone(e) => write!(f, "failed to clone event: {}", e),
             EventCreate(e) => write!(f, "failed to create event: {}", e),
@@ -434,7 +439,7 @@ pub fn add_goldfish_battery(
     irq_chip: &mut impl IrqChip,
     irq_num: u32,
     resources: &mut SystemAllocator,
-) -> Result<BatControlRequestSocket, DeviceRegistrationError> {
+) -> Result<Tube, DeviceRegistrationError> {
     let alloc = resources.get_anon_alloc();
     let mmio_base = resources
         .mmio_allocator(MmioType::Low)
@@ -453,9 +458,8 @@ pub fn add_goldfish_battery(
         .register_irq_event(irq_num, &irq_evt, Some(&irq_resample_evt))
         .map_err(DeviceRegistrationError::RegisterIrqfd)?;
 
-    let (control_socket, response_socket) =
-        msg_socket::pair::<BatControlCommand, BatControlResult>()
-            .map_err(DeviceRegistrationError::CreateSocket)?;
+    let (control_tube, response_tube) =
+        Tube::pair().map_err(DeviceRegistrationError::CreateTube)?;
 
     #[cfg(feature = "power-monitor-powerd")]
     let create_monitor = Some(Box::new(power_monitor::powerd::DBusMonitor::connect)
@@ -469,7 +473,7 @@ pub fn add_goldfish_battery(
         irq_num,
         irq_evt,
         irq_resample_evt,
-        response_socket,
+        response_tube,
         create_monitor,
     )
     .map_err(DeviceRegistrationError::RegisterBattery)?;
@@ -501,7 +505,7 @@ pub fn add_goldfish_battery(
         }
     }
 
-    Ok(control_socket)
+    Ok(control_tube)
 }
 
 /// Errors for image loading.

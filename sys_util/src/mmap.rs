@@ -59,7 +59,7 @@ impl Display for Error {
                 "requested memory range spans past the end of the region: offset={} count={} region_size={}",
                 offset, count, region_size,
             ),
-            SystemCallFailed(e) => write!(f, "mmap system call failed: {}", e),
+            SystemCallFailed(e) => write!(f, "mmap related system call failed: {}", e),
             ReadToMemory(e) => write!(f, "failed to read from file to memory: {}", e),
             RemoveMappingIsUnsupported => write!(f, "`remove_mapping` is unsupported"),
             WriteFromMemory(e) => write!(f, "failed to write from memory to file: {}", e),
@@ -108,9 +108,9 @@ impl From<c_int> for Protection {
     }
 }
 
-impl Into<c_int> for Protection {
-    fn into(self) -> c_int {
-        self.0
+impl From<Protection> for c_int {
+    fn from(p: Protection) -> c_int {
+        p.0
     }
 }
 
@@ -409,6 +409,32 @@ impl MemoryMapping {
             addr: addr as *mut u8,
             size,
         })
+    }
+
+    /// Madvise the kernel to use Huge Pages for this mapping.
+    pub fn use_hugepages(&self) -> Result<()> {
+        const SZ_2M: usize = 2 * 1024 * 1024;
+
+        // THP uses 2M pages, so use THP only on mappings that are at least
+        // 2M in size.
+        if self.size() < SZ_2M {
+            return Ok(());
+        }
+
+        // This is safe because we call madvise with a valid address and size, and we check the
+        // return value.
+        let ret = unsafe {
+            libc::madvise(
+                self.as_ptr() as *mut libc::c_void,
+                self.size(),
+                libc::MADV_HUGEPAGE,
+            )
+        };
+        if ret == -1 {
+            Err(Error::SystemCallFailed(errno::Error::last()))
+        } else {
+            Ok(())
+        }
     }
 
     /// Calls msync with MS_SYNC on the mapping.
@@ -918,8 +944,9 @@ impl Drop for MemoryMappingArena {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Descriptor;
     use data_model::{VolatileMemory, VolatileMemoryError};
-    use std::os::unix::io::FromRawFd;
+    use tempfile::tempfile;
 
     #[test]
     fn basic_map() {
@@ -939,7 +966,7 @@ mod tests {
 
     #[test]
     fn map_invalid_fd() {
-        let fd = unsafe { std::fs::File::from_raw_fd(-1) };
+        let fd = Descriptor(-1);
         let res = MemoryMapping::from_fd(&fd, 1024).unwrap_err();
         if let Error::SystemCallFailed(e) = res {
             assert_eq!(e.errno(), libc::EBADF);
@@ -999,7 +1026,7 @@ mod tests {
 
     #[test]
     fn from_fd_offset_invalid() {
-        let fd = unsafe { std::fs::File::from_raw_fd(-1) };
+        let fd = tempfile().unwrap();
         let res = MemoryMapping::from_fd_offset(&fd, 4096, (libc::off_t::max_value() as u64) + 1)
             .unwrap_err();
         match res {

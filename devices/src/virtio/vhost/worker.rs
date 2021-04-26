@@ -4,14 +4,13 @@
 
 use std::os::raw::c_ulonglong;
 
-use base::{error, Error as SysError, Event, PollToken, WaitContext};
+use base::{error, Error as SysError, Event, PollToken, Tube, WaitContext};
 use vhost::Vhost;
 
-use super::control_socket::{VhostDevRequest, VhostDevResponse, VhostDevResponseSocket};
+use super::control_socket::{VhostDevRequest, VhostDevResponse};
 use super::{Error, Result};
-use crate::virtio::{Interrupt, Queue};
+use crate::virtio::{Interrupt, Queue, SignalableInterrupt};
 use libc::EIO;
-use msg_socket::{MsgReceiver, MsgSender};
 
 /// Worker that takes care of running the vhost device.
 pub struct Worker<T: Vhost> {
@@ -21,7 +20,7 @@ pub struct Worker<T: Vhost> {
     pub vhost_interrupt: Vec<Event>,
     acked_features: u64,
     pub kill_evt: Event,
-    pub response_socket: Option<VhostDevResponseSocket>,
+    pub response_tube: Option<Tube>,
 }
 
 impl<T: Vhost> Worker<T> {
@@ -32,7 +31,7 @@ impl<T: Vhost> Worker<T> {
         interrupt: Interrupt,
         acked_features: u64,
         kill_evt: Event,
-        response_socket: Option<VhostDevResponseSocket>,
+        response_tube: Option<Tube>,
     ) -> Worker<T> {
         Worker {
             interrupt,
@@ -41,7 +40,7 @@ impl<T: Vhost> Worker<T> {
             vhost_interrupt,
             acked_features,
             kill_evt,
-            response_socket,
+            response_tube,
         }
     }
 
@@ -106,20 +105,23 @@ impl<T: Vhost> Worker<T> {
             ControlNotify,
         }
 
-        let wait_ctx: WaitContext<Token> = WaitContext::build_with(&[
-            (self.interrupt.get_resample_evt(), Token::InterruptResample),
-            (&self.kill_evt, Token::Kill),
-        ])
-        .map_err(Error::CreateWaitContext)?;
+        let wait_ctx: WaitContext<Token> =
+            WaitContext::build_with(&[(&self.kill_evt, Token::Kill)])
+                .map_err(Error::CreateWaitContext)?;
 
         for (index, vhost_int) in self.vhost_interrupt.iter().enumerate() {
             wait_ctx
                 .add(vhost_int, Token::VhostIrqi { index })
                 .map_err(Error::CreateWaitContext)?;
         }
-        if let Some(socket) = &self.response_socket {
+        if let Some(socket) = &self.response_tube {
             wait_ctx
                 .add(socket, Token::ControlNotify)
+                .map_err(Error::CreateWaitContext)?;
+        }
+        if let Some(resample_evt) = self.interrupt.get_resample_evt() {
+            wait_ctx
+                .add(resample_evt, Token::InterruptResample)
                 .map_err(Error::CreateWaitContext)?;
         }
 
@@ -142,7 +144,7 @@ impl<T: Vhost> Worker<T> {
                         break 'wait;
                     }
                     Token::ControlNotify => {
-                        if let Some(socket) = &self.response_socket {
+                        if let Some(socket) = &self.response_tube {
                             match socket.recv() {
                                 Ok(VhostDevRequest::MsixEntryChanged(index)) => {
                                     let mut qindex = 0;
@@ -199,8 +201,8 @@ impl<T: Vhost> Worker<T> {
         // No response_socket means it doesn't have any control related
         // with the msix. Due to this, cannot use the direct irq fd but
         // should fall back to indirect irq fd.
-        if self.response_socket.is_some() {
-            if let Some(msix_config) = &self.interrupt.msix_config {
+        if self.response_tube.is_some() {
+            if let Some(msix_config) = self.interrupt.get_msix_config() {
                 let msix_config = msix_config.lock();
                 let msix_masked = msix_config.masked();
                 if msix_masked {
@@ -228,7 +230,7 @@ impl<T: Vhost> Worker<T> {
     }
 
     fn set_vring_calls(&self) -> Result<()> {
-        if let Some(msix_config) = &self.interrupt.msix_config {
+        if let Some(msix_config) = self.interrupt.get_msix_config() {
             let msix_config = msix_config.lock();
             if msix_config.masked() {
                 for (queue_index, _) in self.queues.iter().enumerate() {
