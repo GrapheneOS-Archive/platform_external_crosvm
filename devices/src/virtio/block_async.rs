@@ -15,23 +15,26 @@ use std::u32;
 
 use futures::pin_mut;
 use futures::stream::{FuturesUnordered, StreamExt};
-use libchromeos::sync::Mutex as AsyncMutex;
 use remain::sorted;
 use thiserror::Error as ThisError;
 
 use base::Error as SysError;
 use base::Result as SysResult;
-use base::{error, info, iov_max, warn, AsRawDescriptor, Event, RawDescriptor, Timer};
-use cros_async::{select5, AsyncError, EventAsync, Executor, SelectResult, TimerAsync};
+use base::{
+    error, info, iov_max, warn, AsRawDescriptor, AsyncTube, Event, RawDescriptor, Timer, Tube,
+    TubeError,
+};
+use cros_async::{
+    select5, sync::Mutex as AsyncMutex, AsyncError, EventAsync, Executor, SelectResult, TimerAsync,
+};
 use data_model::{DataInit, Le16, Le32, Le64};
 use disk::{AsyncDisk, ToAsyncDisk};
-use msg_socket::{MsgError, MsgSender};
-use vm_control::{DiskControlCommand, DiskControlResponseSocket, DiskControlResult};
+use vm_control::{DiskControlCommand, DiskControlResult};
 use vm_memory::GuestMemory;
 
 use super::{
-    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, VirtioDevice, Writer,
-    TYPE_BLOCK,
+    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt,
+    VirtioDevice, Writer, TYPE_BLOCK,
 };
 
 const QUEUE_SIZE: u16 = 256;
@@ -48,9 +51,17 @@ const MAX_WRITE_ZEROES_SEG: u32 = 32;
 // but this should probably be based on cluster size for qcow.
 const DISCARD_SECTOR_ALIGNMENT: u32 = 128;
 
+const ID_LEN: usize = 20;
+
+/// Virtio block device identifier.
+/// This is an ASCII string terminated by a \0, unless all 20 bytes are used,
+/// in which case the \0 terminator is omitted.
+pub type BlockId = [u8; ID_LEN];
+
 const VIRTIO_BLK_T_IN: u32 = 0;
 const VIRTIO_BLK_T_OUT: u32 = 1;
 const VIRTIO_BLK_T_FLUSH: u32 = 4;
+const VIRTIO_BLK_T_GET_ID: u32 = 8;
 const VIRTIO_BLK_T_DISCARD: u32 = 11;
 const VIRTIO_BLK_T_WRITE_ZEROES: u32 = 13;
 
@@ -91,7 +102,7 @@ unsafe impl DataInit for virtio_blk_topology {}
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
-struct virtio_blk_config {
+pub(crate) struct virtio_blk_config {
     capacity: Le64,
     size_max: Le32,
     seg_max: Le32,
@@ -100,7 +111,7 @@ struct virtio_blk_config {
     topology: virtio_blk_topology,
     writeback: u8,
     unused0: u8,
-    num_queues: Le16,
+    pub num_queues: Le16,
     max_discard_sectors: Le32,
     max_discard_seg: Le32,
     discard_sector_alignment: Le32,
@@ -140,8 +151,8 @@ unsafe impl DataInit for virtio_blk_discard_write_zeroes {}
 #[sorted]
 #[derive(ThisError, Debug)]
 enum ExecuteError {
-    #[error("couldn't create a message receiver: {0}")]
-    CreatingMessageReceiver(MsgError),
+    #[error("failed to copy ID string: {0}")]
+    CopyId(io::Error),
     #[error("virtio descriptor error: {0}")]
     Descriptor(DescriptorError),
     #[error("failed to perform discard or write zeroes; sector={sector} num_sectors={num_sectors} flags={flags}; {ioerr:?}")]
@@ -167,10 +178,10 @@ enum ExecuteError {
     },
     #[error("read only; request_type={request_type}")]
     ReadOnly { request_type: u32 },
-    #[error("failed to read command message: {0}")]
-    ReceivingCommand(MsgError),
+    #[error("failed to recieve command message: {0}")]
+    ReceivingCommand(TubeError),
     #[error("failed to send command response: {0}")]
-    SendingResponse(MsgError),
+    SendingResponse(TubeError),
     #[error("couldn't reset the timer: {0}")]
     TimerReset(base::Error),
     #[error("unsupported ({0})")]
@@ -188,7 +199,7 @@ enum ExecuteError {
 impl ExecuteError {
     fn status(&self) -> u8 {
         match self {
-            ExecuteError::CreatingMessageReceiver(_) => VIRTIO_BLK_S_IOERR,
+            ExecuteError::CopyId(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::Descriptor(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::DiscardWriteZeroes { .. } => VIRTIO_BLK_S_IOERR,
             ExecuteError::Flush(_) => VIRTIO_BLK_S_IOERR,
@@ -227,6 +238,7 @@ struct DiskState {
     disk_size: Arc<AtomicU64>,
     read_only: bool,
     sparse: bool,
+    id: Option<BlockId>,
 }
 
 async fn process_one_request(
@@ -294,7 +306,7 @@ async fn process_one_request_task(
 
     let mut queue = queue.borrow_mut();
     queue.add_used(&mem, descriptor_index, len as u32);
-    queue.trigger_interrupt(&mem, &interrupt.borrow());
+    queue.trigger_interrupt(&mem, &*interrupt.borrow());
     queue.update_int_required(&mem);
 }
 
@@ -335,19 +347,28 @@ async fn handle_irq_resample(
     ex: &Executor,
     interrupt: Rc<RefCell<Interrupt>>,
 ) -> result::Result<(), OtherError> {
-    let resample_evt = interrupt
-        .borrow_mut()
-        .get_resample_evt()
-        .try_clone()
-        .map_err(OtherError::CloneResampleEvent)?;
-    let resample_evt =
-        EventAsync::new(resample_evt.0, ex).map_err(OtherError::AsyncResampleCreate)?;
-    loop {
-        let _ = resample_evt
-            .next_val()
-            .await
-            .map_err(OtherError::ReadResampleEvent)?;
-        interrupt.borrow_mut().do_interrupt_resample();
+    let resample_evt = if let Some(resample_evt) = interrupt.borrow().get_resample_evt() {
+        let resample_evt = resample_evt
+            .try_clone()
+            .map_err(OtherError::CloneResampleEvent)?;
+        let resample_evt =
+            EventAsync::new(resample_evt.0, ex).map_err(OtherError::AsyncResampleCreate)?;
+        Some(resample_evt)
+    } else {
+        None
+    };
+    if let Some(resample_evt) = resample_evt {
+        loop {
+            let _ = resample_evt
+                .next_val()
+                .await
+                .map_err(OtherError::ReadResampleEvent)?;
+            interrupt.borrow().do_interrupt_resample();
+        }
+    } else {
+        // no resample event, park the future.
+        let () = futures::future::pending().await;
+        Ok(())
     }
 }
 
@@ -357,24 +378,20 @@ async fn wait_kill(kill_evt: EventAsync) {
     let _ = kill_evt.next_val().await;
 }
 
-async fn handle_command_socket(
-    ex: &Executor,
-    command_socket: &Option<DiskControlResponseSocket>,
+async fn handle_command_tube(
+    command_tube: &Option<AsyncTube>,
     interrupt: Rc<RefCell<Interrupt>>,
     disk_state: Rc<AsyncMutex<DiskState>>,
 ) -> Result<(), ExecuteError> {
-    let command_socket = match command_socket {
+    let command_tube = match command_tube {
         Some(c) => c,
         None => {
             let () = futures::future::pending().await;
             return Ok(());
         }
     };
-    let mut async_messages = command_socket
-        .async_receiver(ex)
-        .map_err(ExecuteError::CreatingMessageReceiver)?;
     loop {
-        match async_messages.next().await {
+        match command_tube.next().await {
             Ok(command) => {
                 let resp = match command {
                     DiskControlCommand::Resize { new_size } => {
@@ -382,7 +399,7 @@ async fn handle_command_socket(
                     }
                 };
 
-                command_socket
+                command_tube
                     .send(&resp)
                     .map_err(ExecuteError::SendingResponse)?;
                 if let DiskControlResult::Ok = resp {
@@ -462,7 +479,7 @@ fn run_worker(
     queues: Vec<Queue>,
     mem: GuestMemory,
     disk_state: &Rc<AsyncMutex<DiskState>>,
-    control_socket: &Option<DiskControlResponseSocket>,
+    control_tube: &Option<AsyncTube>,
     queue_evts: Vec<Event>,
     kill_evt: Event,
 ) -> Result<(), String> {
@@ -514,7 +531,7 @@ fn run_worker(
     pin_mut!(disk_flush);
 
     // Handles control requests.
-    let control = handle_command_socket(&ex, control_socket, interrupt.clone(), disk_state.clone());
+    let control = handle_command_tube(control_tube, interrupt.clone(), disk_state.clone());
     pin_mut!(control);
 
     // Process any requests to resample the irq value.
@@ -546,8 +563,7 @@ fn run_worker(
 /// Virtio device for exposing block level read/write operations on a host file.
 pub struct BlockAsync {
     kill_evt: Option<Event>,
-    worker_thread:
-        Option<thread::JoinHandle<(Box<dyn ToAsyncDisk>, Option<DiskControlResponseSocket>)>>,
+    worker_thread: Option<thread::JoinHandle<(Box<dyn ToAsyncDisk>, Option<Tube>)>>,
     disk_image: Option<Box<dyn ToAsyncDisk>>,
     disk_size: Arc<AtomicU64>,
     avail_features: u64,
@@ -555,7 +571,8 @@ pub struct BlockAsync {
     sparse: bool,
     seg_max: u32,
     block_size: u32,
-    control_socket: Option<DiskControlResponseSocket>,
+    id: Option<BlockId>,
+    control_tube: Option<Tube>,
 }
 
 fn build_config_space(disk_size: u64, seg_max: u32, block_size: u32) -> virtio_blk_config {
@@ -583,7 +600,8 @@ impl BlockAsync {
         read_only: bool,
         sparse: bool,
         block_size: u32,
-        control_socket: Option<DiskControlResponseSocket>,
+        id: Option<BlockId>,
+        control_tube: Option<Tube>,
     ) -> SysResult<BlockAsync> {
         if block_size % SECTOR_SIZE as u32 != 0 {
             error!(
@@ -632,7 +650,8 @@ impl BlockAsync {
             sparse,
             seg_max,
             block_size,
-            control_socket,
+            id,
+            control_tube,
         })
     }
 
@@ -655,7 +674,7 @@ impl BlockAsync {
         let req_type = req_header.req_type.to_native();
         let sector = req_header.sector.to_native();
 
-        if disk_state.read_only && req_type != VIRTIO_BLK_T_IN {
+        if disk_state.read_only && req_type != VIRTIO_BLK_T_IN && req_type != VIRTIO_BLK_T_GET_ID {
             return Err(ExecuteError::ReadOnly {
                 request_type: req_type,
             });
@@ -790,6 +809,13 @@ impl BlockAsync {
                     .await
                     .map_err(ExecuteError::Flush)?;
             }
+            VIRTIO_BLK_T_GET_ID => {
+                if let Some(id) = disk_state.id {
+                    writer.write_all(&id).map_err(ExecuteError::CopyId)?;
+                } else {
+                    return Err(ExecuteError::Unsupported(req_type));
+                }
+            }
             t => return Err(ExecuteError::Unsupported(t)),
         };
         Ok(())
@@ -817,8 +843,8 @@ impl VirtioDevice for BlockAsync {
             keep_rds.extend(disk_image.as_raw_descriptors());
         }
 
-        if let Some(control_socket) = &self.control_socket {
-            keep_rds.push(control_socket.as_raw_descriptor());
+        if let Some(control_tube) = &self.control_tube {
+            keep_rds.push(control_tube.as_raw_descriptor());
         }
 
         keep_rds
@@ -863,13 +889,16 @@ impl VirtioDevice for BlockAsync {
         let read_only = self.read_only;
         let sparse = self.sparse;
         let disk_size = self.disk_size.clone();
+        let id = self.id.take();
         if let Some(disk_image) = self.disk_image.take() {
-            let control_socket = self.control_socket.take();
+            let control_tube = self.control_tube.take();
             let worker_result =
                 thread::Builder::new()
                     .name("virtio_blk".to_string())
                     .spawn(move || {
                         let ex = Executor::new().expect("Failed to create an executor");
+                        let async_control = control_tube
+                            .map(|c| c.into_async_tube(&ex).expect("failed to create async tube"));
                         let async_image = match disk_image.to_async_disk(&ex) {
                             Ok(d) => d,
                             Err(e) => panic!("Failed to create async disk {}", e),
@@ -879,6 +908,7 @@ impl VirtioDevice for BlockAsync {
                             disk_size,
                             read_only,
                             sparse,
+                            id,
                         }));
                         if let Err(err_string) = run_worker(
                             ex,
@@ -886,7 +916,7 @@ impl VirtioDevice for BlockAsync {
                             queues,
                             mem,
                             &disk_state,
-                            &control_socket,
+                            &async_control,
                             queue_evts,
                             kill_evt,
                         ) {
@@ -897,7 +927,10 @@ impl VirtioDevice for BlockAsync {
                             Ok(d) => d.into_inner(),
                             Err(_) => panic!("too many refs to the disk"),
                         };
-                        (disk_state.disk_image.into_inner(), control_socket)
+                        (
+                            disk_state.disk_image.into_inner(),
+                            async_control.map(|c| c.into()),
+                        )
                     });
 
             match worker_result {
@@ -926,9 +959,9 @@ impl VirtioDevice for BlockAsync {
                     error!("{}: failed to get back resources", self.debug_label());
                     return false;
                 }
-                Ok((disk_image, control_socket)) => {
+                Ok((disk_image, control_tube)) => {
                     self.disk_image = Some(disk_image);
-                    self.control_socket = control_socket;
+                    self.control_tube = control_tube;
                     return true;
                 }
             }
@@ -962,7 +995,7 @@ mod tests {
         f.set_len(0x1000).unwrap();
 
         let features = base_features(ProtectionType::Unprotected);
-        let b = BlockAsync::new(features, Box::new(f), true, false, 512, None).unwrap();
+        let b = BlockAsync::new(features, Box::new(f), true, false, 512, None, None).unwrap();
         let mut num_sectors = [0u8; 4];
         b.read_config(0, &mut num_sectors);
         // size is 0x1000, so num_sectors is 8 (4096/512).
@@ -982,7 +1015,7 @@ mod tests {
         f.set_len(0x1000).unwrap();
 
         let features = base_features(ProtectionType::Unprotected);
-        let b = BlockAsync::new(features, Box::new(f), true, false, 4096, None).unwrap();
+        let b = BlockAsync::new(features, Box::new(f), true, false, 4096, None, None).unwrap();
         let mut blk_size = [0u8; 4];
         b.read_config(20, &mut blk_size);
         // blk_size should be 4096 (0x1000).
@@ -999,7 +1032,7 @@ mod tests {
         {
             let f = File::create(&path).unwrap();
             let features = base_features(ProtectionType::Unprotected);
-            let b = BlockAsync::new(features, Box::new(f), false, true, 512, None).unwrap();
+            let b = BlockAsync::new(features, Box::new(f), false, true, 512, None, None).unwrap();
             // writable device should set VIRTIO_BLK_F_FLUSH + VIRTIO_BLK_F_DISCARD
             // + VIRTIO_BLK_F_WRITE_ZEROES + VIRTIO_F_VERSION_1 + VIRTIO_BLK_F_BLK_SIZE
             // + VIRTIO_BLK_F_SEG_MAX + VIRTIO_BLK_F_MQ
@@ -1010,7 +1043,7 @@ mod tests {
         {
             let f = File::create(&path).unwrap();
             let features = base_features(ProtectionType::Unprotected);
-            let b = BlockAsync::new(features, Box::new(f), false, false, 512, None).unwrap();
+            let b = BlockAsync::new(features, Box::new(f), false, false, 512, None, None).unwrap();
             // read-only device should set VIRTIO_BLK_F_FLUSH and VIRTIO_BLK_F_RO
             // + VIRTIO_F_VERSION_1 + VIRTIO_BLK_F_BLK_SIZE + VIRTIO_BLK_F_SEG_MAX
             // + VIRTIO_BLK_F_MQ
@@ -1021,7 +1054,7 @@ mod tests {
         {
             let f = File::create(&path).unwrap();
             let features = base_features(ProtectionType::Unprotected);
-            let b = BlockAsync::new(features, Box::new(f), true, true, 512, None).unwrap();
+            let b = BlockAsync::new(features, Box::new(f), true, true, 512, None, None).unwrap();
             // read-only device should set VIRTIO_BLK_F_FLUSH and VIRTIO_BLK_F_RO
             // + VIRTIO_F_VERSION_1 + VIRTIO_BLK_F_BLK_SIZE + VIRTIO_BLK_F_SEG_MAX
             // + VIRTIO_BLK_F_MQ
@@ -1086,6 +1119,7 @@ mod tests {
             disk_size: Arc::new(AtomicU64::new(disk_size)),
             read_only: false,
             sparse: true,
+            id: None,
         }));
 
         let fut = process_one_request(avail_desc, disk_state, flush_timer, flush_timer_armed, &mem);
@@ -1154,6 +1188,7 @@ mod tests {
             disk_size: Arc::new(AtomicU64::new(disk_size)),
             read_only: false,
             sparse: true,
+            id: None,
         }));
 
         let fut = process_one_request(avail_desc, disk_state, flush_timer, flush_timer_armed, &mem);
@@ -1165,5 +1200,80 @@ mod tests {
         let status_offset = GuestAddress((0x1000 + size_of_val(&req_hdr) + 512 * 2) as u64);
         let status = mem.read_obj_from_addr::<u8>(status_offset).unwrap();
         assert_eq!(status, VIRTIO_BLK_S_IOERR);
+    }
+
+    #[test]
+    fn get_id() {
+        let ex = Executor::new().expect("creating an executor failed");
+
+        let tempdir = TempDir::new().unwrap();
+        let mut path = tempdir.path().to_owned();
+        path.push("disk_image");
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        let disk_size = 0x1000;
+        f.set_len(disk_size).unwrap();
+
+        let mem = GuestMemory::new(&[(GuestAddress(0u64), 4 * 1024 * 1024)])
+            .expect("Creating guest memory failed.");
+
+        let req_hdr = virtio_blk_req_header {
+            req_type: Le32::from(VIRTIO_BLK_T_GET_ID),
+            reserved: Le32::from(0),
+            sector: Le64::from(0),
+        };
+        mem.write_obj_at_addr(req_hdr, GuestAddress(0x1000))
+            .expect("writing req failed");
+
+        let avail_desc = create_descriptor_chain(
+            &mem,
+            GuestAddress(0x100),  // Place descriptor chain at 0x100.
+            GuestAddress(0x1000), // Describe buffer at 0x1000.
+            vec![
+                // Request header
+                (DescriptorType::Readable, size_of_val(&req_hdr) as u32),
+                // I/O buffer (20 bytes for serial)
+                (DescriptorType::Writable, 20),
+                // Request status
+                (DescriptorType::Writable, 1),
+            ],
+            0,
+        )
+        .expect("create_descriptor_chain failed");
+
+        let af = SingleFileDisk::new(f, &ex).expect("Failed to create SFD");
+        let timer = Timer::new().expect("Failed to create a timer");
+        let flush_timer = Rc::new(RefCell::new(
+            TimerAsync::new(timer.0, &ex).expect("Failed to create an async timer"),
+        ));
+        let flush_timer_armed = Rc::new(RefCell::new(false));
+
+        let id = b"a20-byteserialnumber";
+
+        let disk_state = Rc::new(AsyncMutex::new(DiskState {
+            disk_image: Box::new(af),
+            disk_size: Arc::new(AtomicU64::new(disk_size)),
+            read_only: false,
+            sparse: true,
+            id: Some(*id),
+        }));
+
+        let fut = process_one_request(avail_desc, disk_state, flush_timer, flush_timer_armed, &mem);
+
+        ex.run_until(fut)
+            .expect("running executor failed")
+            .expect("execute failed");
+
+        let status_offset = GuestAddress((0x1000 + size_of_val(&req_hdr) + 512) as u64);
+        let status = mem.read_obj_from_addr::<u8>(status_offset).unwrap();
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+
+        let id_offset = GuestAddress(0x1000 + size_of_val(&req_hdr) as u64);
+        let returned_id = mem.read_obj_from_addr::<[u8; 20]>(id_offset).unwrap();
+        assert_eq!(returned_id, *id);
     }
 }

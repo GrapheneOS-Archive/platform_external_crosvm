@@ -10,6 +10,7 @@ mod ioctl;
 mod mmap;
 mod shm;
 mod timer;
+mod tube;
 mod wait_context;
 
 pub use async_types::*;
@@ -18,7 +19,7 @@ pub use ioctl::{
     ioctl, ioctl_with_mut_ptr, ioctl_with_mut_ref, ioctl_with_ptr, ioctl_with_ref, ioctl_with_val,
 };
 pub use mmap::Unix as MemoryMappingUnix;
-pub use mmap::{MemoryMapping, MemoryMappingBuilder};
+pub use mmap::{MemoryMapping, MemoryMappingBuilder, MemoryMappingBuilderUnix};
 pub use shm::{SharedMemory, Unix as SharedMemoryUnix};
 pub use sys_util::ioctl::*;
 pub use sys_util::sched::*;
@@ -28,6 +29,7 @@ pub use sys_util::{
 };
 pub use sys_util::{SeekHole, WriteZeroesAt};
 pub use timer::{FakeTimer, Timer};
+pub use tube::{AsyncTube, Error as TubeError, Result as TubeResult, Tube};
 pub use wait_context::{EventToken, EventType, TriggeredEvent, WaitContext};
 
 /// Wraps an AsRawDescriptor in the simple Descriptor struct, which
