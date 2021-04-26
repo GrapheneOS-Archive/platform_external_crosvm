@@ -6,7 +6,6 @@ openat: 1
 
 @include /usr/share/policy/crosvm/common_device.policy
 
-fcntl: 1
 pread64: 1
 pwrite64: 1
 statx: 1
@@ -23,6 +22,8 @@ unlinkat: 1
 socket: arg0 == AF_UNIX
 utimensat: 1
 ftruncate: 1
-fchown: arg1 == 0xffffffff && arg2 == 0xffffffff
+fchmod: 1
+fchown: 1
 fstatfs: 1
 newfstatat: 1
+prctl: arg0 == PR_SET_NAME

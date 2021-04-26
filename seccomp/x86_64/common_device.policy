@@ -27,10 +27,10 @@ mprotect: arg2 in ~PROT_EXEC
 mremap: 1
 munmap: 1
 nanosleep: 1
+clock_nanosleep: 1
 pipe2: 1
 poll: 1
 ppoll: 1
-prctl: arg0 == PR_SET_NAME
 read: 1
 readv: 1
 recvfrom: 1
@@ -46,3 +46,4 @@ set_robust_list: 1
 sigaltstack: 1
 write: 1
 writev: 1
+fcntl: 1

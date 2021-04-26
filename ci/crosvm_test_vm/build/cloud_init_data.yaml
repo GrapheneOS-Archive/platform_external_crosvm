@@ -3,6 +3,7 @@ users:
   - name: crosvm
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: False
+    shell: /bin/bash
     # Hashed password is 'crosvm'
     passwd: $6$rounds=4096$os6Q9Ok4Y9a8hKvG$EwQ1bbS0qd4IJyRP.bnRbyjPbSS8BwxEJh18PfhsyD0w7a4GhTwakrmYZ6KuBoyP.cSjYYSW9wYwko4oCPoJr.
     # Pubkey for `../vm_key`
@@ -12,11 +13,7 @@ users:
         crosvm@localhost
     groups: kvm, disk, tty
 
-apt:
-  sources:
-    testing:
-      source: "deb $MIRROR bullseye main"
-  conf: APT::Default-Release "stable";
+hostname: testvm
 
 # Store working data on tmpfs to reduce unnecessary disk IO
 mounts:
@@ -37,17 +34,14 @@ packages:
   - rsync
 
 runcmd:
-  # Install testing (debian bullseye) versions of some libraries.
-  - [
-      apt-get,
-      install,
-      --yes,
-      -t,
-      testing,
-      --no-install-recommends,
-      libdrm2,
-      libepoxy0,
-    ]
+  # Prevent those annoying "host not found errors".
+  - echo 127.0.0.1 testvm >> /etc/hosts
+
+  # Make it easier to identify which VM we are in.
+  - echo "export PS1=\"testvm-$(arch):\\\\w# \"" >> /etc/bash.bashrc
+
+  # Enable core dumps for debugging crashes
+  - echo "* soft core unlimited" > /etc/security/limits.conf
 
   # Trim some fat
   - [apt-get, remove, --yes, vim-runtime, iso-codes, perl, grub-common]

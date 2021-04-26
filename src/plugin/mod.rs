@@ -34,7 +34,7 @@ use base::{
 use kvm::{Cap, Datamatch, IoeventAddress, Kvm, Vcpu, VcpuExit, Vm};
 use minijail::{self, Minijail};
 use net_util::{Error as TapError, Tap, TapT};
-use vm_memory::GuestMemory;
+use vm_memory::{GuestMemory, MemoryPolicy};
 
 use self::process::*;
 use self::vcpu::*;
@@ -418,7 +418,7 @@ pub fn run_vcpus(
 
     if use_kvm_signals {
         unsafe {
-            extern "C" fn handle_signal() {}
+            extern "C" fn handle_signal(_: c_int) {}
             // Our signal handler does nothing and is trivially async signal safe.
             // We need to install this signal handler even though we do block
             // the signal below, to ensure that this signal will interrupt
@@ -430,7 +430,7 @@ pub fn run_vcpus(
         block_signal(SIGRTMIN() + 0).expect("failed to block signal");
     } else {
         unsafe {
-            extern "C" fn handle_signal() {
+            extern "C" fn handle_signal(_: c_int) {
                 Vcpu::set_local_immediate_exit(true);
             }
             register_rt_signal_handler(SIGRTMIN() + 0, handle_signal)
@@ -691,7 +691,12 @@ pub fn run_config(cfg: Config) -> Result<()> {
     };
     let vcpu_count = cfg.vcpu_count.unwrap_or(1) as u32;
     let mem = GuestMemory::new(&[]).unwrap();
-    let kvm = Kvm::new().map_err(Error::CreateKvm)?;
+    let mut mem_policy = MemoryPolicy::empty();
+    if cfg.hugepages {
+        mem_policy |= MemoryPolicy::USE_HUGEPAGES;
+    }
+    mem.set_memory_policy(mem_policy);
+    let kvm = Kvm::new_with_path(&cfg.kvm_device_path).map_err(Error::CreateKvm)?;
     let mut vm = Vm::new(&kvm, mem).map_err(Error::CreateVm)?;
     vm.create_irq_chip().map_err(Error::CreateIrqChip)?;
     vm.create_pit().map_err(Error::CreatePIT)?;

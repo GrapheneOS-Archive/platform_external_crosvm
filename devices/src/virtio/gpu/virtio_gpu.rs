@@ -10,7 +10,7 @@ use std::result::Result;
 use std::sync::Arc;
 
 use crate::virtio::resource_bridge::{BufferInfo, PlaneInfo, ResourceInfo, ResourceResponse};
-use base::{error, AsRawDescriptor, ExternalMapping};
+use base::{error, AsRawDescriptor, ExternalMapping, Tube};
 
 use data_model::VolatileSlice;
 
@@ -20,21 +20,22 @@ use rutabaga_gfx::{
     RutabagaIovec, Transfer3D,
 };
 
-use msg_socket::{MsgReceiver, MsgSender};
-
 use libc::c_void;
 
 use resources::Alloc;
 
-use super::protocol::{GpuResponse::*, GpuResponsePlaneInfo, VirtioGpuResult};
+use super::protocol::{
+    GpuResponse::{self, *},
+    GpuResponsePlaneInfo, VirtioGpuResult, VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE,
+    VIRTIO_GPU_BLOB_MEM_HOST3D,
+};
+use super::udmabuf::UdmabufDriver;
 use super::VirtioScanoutBlobData;
 use sync::Mutex;
 
 use vm_memory::{GuestAddress, GuestMemory};
 
-use vm_control::{
-    MaybeOwnedDescriptor, MemSlot, VmMemoryControlRequestSocket, VmMemoryRequest, VmMemoryResponse,
-};
+use vm_control::{MemSlot, VmMemoryRequest, VmMemoryResponse};
 
 struct VirtioGpuResource {
     resource_id: u32,
@@ -78,12 +79,13 @@ pub struct VirtioGpu {
     cursor_surface_id: Option<u32>,
     // Maps event devices to scanout number.
     event_devices: Map<u32, u32>,
-    gpu_device_socket: VmMemoryControlRequestSocket,
+    gpu_device_tube: Tube,
     pci_bar: Alloc,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     rutabaga: Rutabaga,
     resources: Map<u32, VirtioGpuResource>,
     external_blob: bool,
+    udmabuf_driver: Option<UdmabufDriver>,
 }
 
 fn sglist_to_rutabaga_iovecs(
@@ -116,15 +118,26 @@ impl VirtioGpu {
         display_height: u32,
         rutabaga_builder: RutabagaBuilder,
         event_devices: Vec<EventDevice>,
-        gpu_device_socket: VmMemoryControlRequestSocket,
+        gpu_device_tube: Tube,
         pci_bar: Alloc,
         map_request: Arc<Mutex<Option<ExternalMapping>>>,
         external_blob: bool,
+        udmabuf: bool,
     ) -> Option<VirtioGpu> {
         let rutabaga = rutabaga_builder
             .build()
             .map_err(|e| error!("failed to build rutabaga {}", e))
             .ok()?;
+
+        let mut udmabuf_driver = None;
+        if udmabuf {
+            udmabuf_driver = Some(
+                UdmabufDriver::new()
+                    .map_err(|e| error!("failed to initialize udmabuf: {}", e))
+                    .ok()?,
+            );
+        }
+
         let mut virtio_gpu = VirtioGpu {
             display: Rc::new(RefCell::new(display)),
             display_width,
@@ -134,12 +147,13 @@ impl VirtioGpu {
             scanout_surface_id: None,
             cursor_resource_id: None,
             cursor_surface_id: None,
-            gpu_device_socket,
+            gpu_device_tube,
             pci_bar,
             map_request,
             rutabaga,
             resources: Default::default(),
             external_blob,
+            udmabuf_driver,
         };
 
         for event_device in event_devices {
@@ -424,7 +438,7 @@ impl VirtioGpu {
     /// If supported, export the resource with the given `resource_id` to a file.
     pub fn export_resource(&mut self, resource_id: u32) -> ResourceResponse {
         let file = match self.rutabaga.export_blob(resource_id) {
-            Ok(handle) => handle.os_handle,
+            Ok(handle) => handle.os_handle.into(),
             Err(_) => return ResourceResponse::Invalid,
         };
 
@@ -453,6 +467,7 @@ impl VirtioGpu {
                     stride: q.strides[3],
                 },
             ],
+            modifier: q.modifier,
         }))
     }
 
@@ -460,7 +475,7 @@ impl VirtioGpu {
     pub fn export_fence(&self, fence_id: u32) -> ResourceResponse {
         match self.rutabaga.export_fence(fence_id) {
             Ok(handle) => ResourceResponse::Resource(ResourceInfo::Fence {
-                file: handle.os_handle,
+                file: handle.os_handle.into(),
             }),
             Err(_) => ResourceResponse::Invalid,
         }
@@ -517,7 +532,7 @@ impl VirtioGpu {
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
-        self.result_from_query(resource_id)
+        Ok(self.result_from_query(resource_id))
     }
 
     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
@@ -588,19 +603,32 @@ impl VirtioGpu {
         vecs: Vec<(GuestAddress, usize)>,
         mem: &GuestMemory,
     ) -> VirtioGpuResult {
-        let rutabaga_iovecs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
+        let mut rutabaga_handle = None;
+        let mut rutabaga_iovecs = None;
+
+        if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
+            rutabaga_handle = match self.udmabuf_driver {
+                Some(ref driver) => Some(driver.create_udmabuf(mem, &vecs[..])?),
+                None => return Err(ErrUnspec),
+            }
+        } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
+            rutabaga_iovecs =
+                Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
+        }
+
         self.rutabaga.resource_create_blob(
             ctx_id,
             resource_id,
             resource_create_blob,
             rutabaga_iovecs,
+            rutabaga_handle,
         )?;
 
         let resource = VirtioGpuResource::new(resource_id, 0, 0, resource_create_blob.size);
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
-        self.result_from_query(resource_id)
+        Ok(self.result_from_query(resource_id))
     }
 
     /// Uses the hypervisor to map the rutabaga blob resource.
@@ -611,15 +639,28 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        let vulkan_info_opt = self.rutabaga.vulkan_info(resource_id).ok();
+
         let export = self.rutabaga.export_blob(resource_id);
 
         let request = match export {
-            Ok(ref export) => VmMemoryRequest::RegisterFdAtPciBarOffset(
-                self.pci_bar,
-                MaybeOwnedDescriptor::Borrowed(export.os_handle.as_raw_descriptor()),
-                resource.size as usize,
-                offset,
-            ),
+            Ok(export) => match vulkan_info_opt {
+                Some(vulkan_info) => VmMemoryRequest::RegisterVulkanMemoryAtPciBarOffset {
+                    alloc: self.pci_bar,
+                    descriptor: export.os_handle,
+                    handle_type: export.handle_type,
+                    memory_idx: vulkan_info.memory_idx,
+                    physical_device_idx: vulkan_info.physical_device_idx,
+                    offset,
+                    size: resource.size,
+                },
+                None => VmMemoryRequest::RegisterFdAtPciBarOffset(
+                    self.pci_bar,
+                    export.os_handle,
+                    resource.size as usize,
+                    offset,
+                ),
+            },
             Err(_) => {
                 if self.external_blob {
                     return Err(ErrUnspec);
@@ -638,8 +679,8 @@ impl VirtioGpu {
             }
         };
 
-        self.gpu_device_socket.send(&request)?;
-        let response = self.gpu_device_socket.recv()?;
+        self.gpu_device_tube.send(&request)?;
+        let response = self.gpu_device_tube.recv()?;
 
         match response {
             VmMemoryResponse::RegisterMemory { pfn: _, slot } => {
@@ -660,8 +701,8 @@ impl VirtioGpu {
 
         let slot = resource.slot.ok_or(ErrUnspec)?;
         let request = VmMemoryRequest::UnregisterMemory(slot);
-        self.gpu_device_socket.send(&request)?;
-        let response = self.gpu_device_socket.recv()?;
+        self.gpu_device_tube.send(&request)?;
+        let response = self.gpu_device_tube.recv()?;
 
         match response {
             VmMemoryResponse::Ok => {
@@ -704,7 +745,7 @@ impl VirtioGpu {
     }
 
     // Non-public function -- no doc comment needed!
-    fn result_from_query(&mut self, resource_id: u32) -> VirtioGpuResult {
+    fn result_from_query(&mut self, resource_id: u32) -> GpuResponse {
         match self.rutabaga.query(resource_id) {
             Ok(query) => {
                 let mut plane_info = Vec::with_capacity(4);
@@ -715,12 +756,12 @@ impl VirtioGpu {
                     });
                 }
                 let format_modifier = query.modifier;
-                Ok(OkResourcePlaneInfo {
+                OkResourcePlaneInfo {
                     format_modifier,
                     plane_info,
-                })
+                }
             }
-            Err(_) => Ok(OkNoData),
+            Err(_) => OkNoData,
         }
     }
 }

@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{Stderr, Stdin, Stdout};
 use std::mem;
@@ -9,6 +10,8 @@ use std::net::UdpSocket;
 use std::ops::Drop;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::{UnixDatagram, UnixStream};
+
+use serde::{Deserialize, Serialize};
 
 use crate::net::UnlinkUnixSeqpacketListener;
 use crate::{errno_result, PollToken, Result};
@@ -33,9 +36,24 @@ pub trait FromRawDescriptor {
     unsafe fn from_raw_descriptor(descriptor: RawDescriptor) -> Self;
 }
 
+/// Clones `fd`, returning a new file descriptor that refers to the same open file description as
+/// `fd`. The cloned fd will have the `FD_CLOEXEC` flag set but will not share any other file
+/// descriptor flags with `fd`.
+pub fn clone_fd(fd: &dyn AsRawFd) -> Result<RawFd> {
+    // Safe because this doesn't modify any memory and we check the return value.
+    let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if ret < 0 {
+        errno_result()
+    } else {
+        Ok(ret)
+    }
+}
+
 /// Wraps a RawDescriptor and safely closes it when self falls out of scope.
-#[derive(Debug, Eq)]
+#[derive(Serialize, Deserialize, Debug, Eq)]
+#[serde(transparent)]
 pub struct SafeDescriptor {
+    #[serde(with = "crate::with_raw_descriptor")]
     descriptor: RawDescriptor,
 }
 
@@ -98,18 +116,41 @@ impl AsRawFd for SafeDescriptor {
     }
 }
 
+impl TryFrom<&dyn AsRawFd> for SafeDescriptor {
+    type Error = std::io::Error;
+
+    fn try_from(fd: &dyn AsRawFd) -> std::result::Result<Self, Self::Error> {
+        Ok(SafeDescriptor {
+            descriptor: clone_fd(fd)?,
+        })
+    }
+}
+
 impl SafeDescriptor {
     /// Clones this descriptor, internally creating a new descriptor. The new SafeDescriptor will
     /// share the same underlying count within the kernel.
     pub fn try_clone(&self) -> Result<SafeDescriptor> {
-        // Safe because self.as_raw_descriptor() returns a valid value
-        let copy_fd = unsafe { libc::dup(self.as_raw_descriptor()) };
-        if copy_fd < 0 {
-            return errno_result();
+        // Safe because this doesn't modify any memory and we check the return value.
+        let descriptor = unsafe { libc::fcntl(self.descriptor, libc::F_DUPFD_CLOEXEC, 0) };
+        if descriptor < 0 {
+            errno_result()
+        } else {
+            Ok(SafeDescriptor { descriptor })
         }
-        // Safe becuase we just successfully duplicated and this object will uniquely
-        // own the raw descriptor.
-        Ok(unsafe { SafeDescriptor::from_raw_descriptor(copy_fd) })
+    }
+}
+
+impl From<SafeDescriptor> for File {
+    fn from(s: SafeDescriptor) -> File {
+        // Safe because we own the SafeDescriptor at this point.
+        unsafe { File::from_raw_fd(s.into_raw_descriptor()) }
+    }
+}
+
+impl From<File> for SafeDescriptor {
+    fn from(f: File) -> SafeDescriptor {
+        // Safe because we own the File at this point.
+        unsafe { SafeDescriptor::from_raw_descriptor(f.into_raw_descriptor()) }
     }
 }
 

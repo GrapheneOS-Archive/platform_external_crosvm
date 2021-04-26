@@ -11,12 +11,10 @@ mod libvda_encoder;
 pub use encoder::EncoderError;
 pub use libvda_encoder::LibvdaEncoder;
 
-use base::{error, warn, WaitContext};
+use base::{error, warn, Tube, WaitContext};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::virtio::resource_bridge::{
-    self, BufferInfo, ResourceInfo, ResourceRequest, ResourceRequestSocket,
-};
+use crate::virtio::resource_bridge::{self, BufferInfo, ResourceInfo, ResourceRequest};
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
 use crate::virtio::video::command::{QueueType, VideoCmd};
 use crate::virtio::video::control::*;
@@ -481,6 +479,7 @@ impl<T: EncoderSession> Stream<T> {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn notify_error(&self, error: EncoderError) -> Option<Vec<VideoEvtResponseType>> {
         error!(
             "Received encoder error event for stream {}: {}",
@@ -499,7 +498,7 @@ pub struct EncoderDevice<T: Encoder> {
     streams: BTreeMap<u32, Stream<T::Session>>,
 }
 
-fn get_resource_info(res_bridge: &ResourceRequestSocket, uuid: u128) -> VideoResult<BufferInfo> {
+fn get_resource_info(res_bridge: &Tube, uuid: u128) -> VideoResult<BufferInfo> {
     match resource_bridge::get_resource_info(
         res_bridge,
         ResourceRequest::GetBuffer { id: uuid as u32 },
@@ -519,6 +518,7 @@ impl<T: Encoder> EncoderDevice<T> {
         })
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn query_capabilities(&self, queue_type: QueueType) -> VideoResult<VideoCmdResponseType> {
         let descs = match queue_type {
             QueueType::Input => self.cros_capabilities.input_format_descs.clone(),
@@ -597,7 +597,7 @@ impl<T: Encoder> EncoderDevice<T> {
     fn resource_create(
         &mut self,
         wait_ctx: &WaitContext<Token>,
-        resource_bridge: &ResourceRequestSocket,
+        resource_bridge: &Tube,
         stream_id: u32,
         queue_type: QueueType,
         resource_id: u32,
@@ -672,7 +672,7 @@ impl<T: Encoder> EncoderDevice<T> {
 
     fn resource_queue(
         &mut self,
-        resource_bridge: &ResourceRequestSocket,
+        resource_bridge: &Tube,
         stream_id: u32,
         queue_type: QueueType,
         resource_id: u32,
@@ -1200,7 +1200,7 @@ impl<T: Encoder> Device for EncoderDevice<T> {
         &mut self,
         req: VideoCmd,
         wait_ctx: &WaitContext<Token>,
-        resource_bridge: &ResourceRequestSocket,
+        resource_bridge: &Tube,
     ) -> (
         VideoCmdResponseType,
         Option<(u32, Vec<VideoEvtResponseType>)>,
