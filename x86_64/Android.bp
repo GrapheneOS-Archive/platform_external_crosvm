@@ -23,11 +23,9 @@ rust_library {
             features: [
                 "gdb",
                 "gdbstub",
-                "msg_socket",
             ],
             rustlibs: [
                 "libgdbstub",
-                "libmsg_socket",
             ],
         },
     },
@@ -73,7 +71,6 @@ rust_defaults {
             features: [
                 "gdb",
                 "gdbstub",
-                "msg_socket",
             ],
             rustlibs: [
                 "libgdbstub",
@@ -92,7 +89,6 @@ rust_defaults {
         "libkernel_loader",
         "liblibc",
         "libminijail_rust",
-        "libmsg_socket",
         "libresources",
         "libsync_rust",
         "libvm_control",
@@ -151,8 +147,6 @@ rust_test {
 //   ../kvm/src/lib.rs
 //   ../kvm_sys/src/lib.rs
 //   ../linux_input_sys/src/lib.rs
-//   ../msg_socket/msg_on_socket_derive/msg_on_socket_derive.rs
-//   ../msg_socket/src/lib.rs
 //   ../net_sys/src/lib.rs
 //   ../net_util/src/lib.rs
 //   ../power_monitor/src/lib.rs

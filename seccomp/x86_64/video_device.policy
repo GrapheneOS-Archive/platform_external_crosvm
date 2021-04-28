@@ -7,8 +7,8 @@
 # Syscalls specific to video devices.
 clock_getres: 1
 connect: 1
-fcntl: arg1 == F_GETFL || arg1 == F_SETFL || arg1 == F_DUPFD_CLOEXEC || arg1 == F_GETFD || arg1 == F_SETFD
 getdents: 1
+getdents64: 1
 getegid: 1
 geteuid: 1
 getgid: 1
@@ -38,3 +38,5 @@ uname: 1
 
 # Required by mesa on AMD GPU
 sysinfo: 1
+
+prctl: arg0 == PR_SET_NAME

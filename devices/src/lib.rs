@@ -6,6 +6,10 @@
 
 mod bus;
 mod cmos;
+#[cfg(feature = "direct")]
+pub mod direct_io;
+#[cfg(feature = "direct")]
+pub mod direct_irq;
 mod i8042;
 pub mod irqchip;
 mod pci;
@@ -27,8 +31,12 @@ pub mod virtio;
 pub use self::acpi::ACPIPMResource;
 pub use self::bat::{BatteryError, GoldfishBattery};
 pub use self::bus::Error as BusError;
-pub use self::bus::{Bus, BusAccessInfo, BusDevice, BusRange, BusResumeDevice};
+pub use self::bus::{Bus, BusAccessInfo, BusDevice, BusDeviceSync, BusRange, BusResumeDevice};
 pub use self::cmos::Cmos;
+#[cfg(feature = "direct")]
+pub use self::direct_io::DirectIo;
+#[cfg(feature = "direct")]
+pub use self::direct_irq::{DirectIrq, DirectIrqError};
 pub use self::i8042::I8042Device;
 pub use self::irqchip::*;
 #[cfg(feature = "audio")]

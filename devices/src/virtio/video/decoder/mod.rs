@@ -9,11 +9,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::TryInto;
 
 use backend::*;
-use base::{error, IntoRawDescriptor, WaitContext};
+use base::{error, IntoRawDescriptor, Tube, WaitContext};
 
-use crate::virtio::resource_bridge::{
-    self, BufferInfo, ResourceInfo, ResourceRequest, ResourceRequestSocket,
-};
+use crate::virtio::resource_bridge::{self, BufferInfo, ResourceInfo, ResourceRequest};
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
 use crate::virtio::video::command::{QueueType, VideoCmd};
 use crate::virtio::video::control::{CtrlType, CtrlVal, QueryCtrlType};
@@ -179,9 +177,6 @@ struct Context<S: DecoderSession> {
     in_res: InputResources,
     out_res: OutputResources,
 
-    // Set the flag if we need to clear output resource when the output queue is cleared next time.
-    is_clear_out_res_needed: bool,
-
     // Set the flag when we ask the decoder reset, and unset when the reset is done.
     is_resetting: bool,
 
@@ -204,7 +199,6 @@ impl<S: DecoderSession> Context<S> {
             out_params: Default::default(),
             in_res: Default::default(),
             out_res: Default::default(),
-            is_clear_out_res_needed: false,
             is_resetting: false,
             pending_ready_pictures: Default::default(),
             session: None,
@@ -262,7 +256,7 @@ impl<S: DecoderSession> Context<S> {
     fn get_resource_info(
         &self,
         queue_type: QueueType,
-        res_bridge: &ResourceRequestSocket,
+        res_bridge: &Tube,
         resource_id: u32,
     ) -> VideoResult<BufferInfo> {
         let res_id_to_res_handle = match queue_type {
@@ -340,12 +334,6 @@ impl<S: DecoderSession> Context<S> {
             // No need to set `frame_rate`, as it's only for the encoder.
             ..Default::default()
         };
-
-        // That eos_resource_id has value means there are previous output resources.
-        // Clear the output resources when the output queue is cleared next time.
-        if self.out_res.eos_resource_id.is_some() {
-            self.is_clear_out_res_needed = true;
-        }
     }
 
     fn handle_notify_end_of_bitstream_buffer(&mut self, bitstream_id: i32) -> Option<ResourceId> {
@@ -540,7 +528,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
 
     fn queue_input_resource(
         &mut self,
-        resource_bridge: &ResourceRequestSocket,
+        resource_bridge: &Tube,
         stream_id: StreamId,
         resource_id: ResourceId,
         timestamp: u64,
@@ -604,7 +592,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
 
     fn queue_output_resource(
         &mut self,
-        resource_bridge: &ResourceRequestSocket,
+        resource_bridge: &Tube,
         stream_id: StreamId,
         resource_id: ResourceId,
     ) -> VideoResult<VideoCmdResponseType> {
@@ -661,7 +649,13 @@ impl<'a, D: DecoderBackend> Decoder<D> {
                 // Take ownership of this file by `into_raw_descriptor()` as this
                 // file will be closed by libvda.
                 let fd = resource_info.file.into_raw_descriptor();
-                session.use_output_buffer(buffer_id as i32, Format::NV12, fd, &planes)
+                session.use_output_buffer(
+                    buffer_id as i32,
+                    Format::NV12,
+                    fd,
+                    &planes,
+                    resource_info.modifier,
+                )
             }
         }?;
         Ok(VideoCmdResponseType::Async(AsyncCmdTag::Queue {
@@ -807,11 +801,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
                 }))
             }
             QueueType::Output => {
-                if std::mem::replace(&mut ctx.is_clear_out_res_needed, false) {
-                    ctx.out_res = Default::default();
-                } else {
-                    ctx.out_res.queued_res_ids.clear();
-                }
+                ctx.out_res.queued_res_ids.clear();
                 Ok(VideoCmdResponseType::Sync(CmdResponse::NoData))
             }
         }
@@ -823,7 +813,7 @@ impl<D: DecoderBackend> Device for Decoder<D> {
         &mut self,
         cmd: VideoCmd,
         wait_ctx: &WaitContext<Token>,
-        resource_bridge: &ResourceRequestSocket,
+        resource_bridge: &Tube,
     ) -> (
         VideoCmdResponseType,
         Option<(u32, Vec<VideoEvtResponseType>)>,

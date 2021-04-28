@@ -8,10 +8,8 @@ pub mod panic_hook;
 
 use std::collections::BTreeMap;
 use std::default::Default;
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader};
-use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::string::String;
@@ -22,15 +20,13 @@ use arch::{
     set_default_serial_parameters, Pstore, SerialHardware, SerialParameters, SerialType,
     VcpuAffinity,
 };
-use base::{
-    debug, error, getpid, info, kill_process_group, net::UnixSeqpacket, reap_child, syslog,
-    validate_raw_descriptor, warn, FromRawDescriptor, IntoRawDescriptor, RawDescriptor,
-    SafeDescriptor,
-};
+use base::{debug, error, getpid, info, kill_process_group, reap_child, syslog, warn};
+#[cfg(feature = "direct")]
+use crosvm::DirectIoOption;
 use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
     platform, BindMount, Config, DiskOption, Executable, GidMap, SharedDir, TouchDeviceOption,
-    DISK_ID_LEN,
+    VhostUserFsOption, VhostUserOption, DISK_ID_LEN,
 };
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::{GpuMode, GpuParameters};
@@ -38,11 +34,12 @@ use devices::ProtectionType;
 #[cfg(feature = "audio")]
 use devices::{Ac97Backend, Ac97Parameters};
 use disk::QcowFile;
-use msg_socket::{MsgReceiver, MsgSender, MsgSocket};
 use vm_control::{
-    BalloonControlCommand, BatControlCommand, BatControlResult, BatteryType, DiskControlCommand,
-    MaybeOwnedDescriptor, UsbControlCommand, UsbControlResult, VmControlRequestSocket, VmRequest,
-    VmResponse, USB_CONTROL_MAX_PORTS,
+    client::{
+        do_modify_battery, do_usb_attach, do_usb_detach, do_usb_list, handle_request, vms_request,
+        ModifyUsbError, ModifyUsbResult,
+    },
+    BalloonControlCommand, BatteryType, DiskControlCommand, UsbControlResult, VmRequest,
 };
 
 fn executable_is_plugin(executable: &Option<Executable>) -> bool {
@@ -175,12 +172,12 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
         for (k, v) in opts {
             match k {
                 // Deprecated: Specifying --gpu=<mode> Not great as the mode can be set multiple
-                // times if the user specifies several modes (--gpu=2d,3d,gfxstream)
+                // times if the user specifies several modes (--gpu=2d,virglrenderer,gfxstream)
                 "2d" | "2D" => {
                     gpu_params.mode = GpuMode::Mode2D;
                 }
-                "3d" | "3D" => {
-                    gpu_params.mode = GpuMode::Mode3D;
+                "3d" | "3D" | "virglrenderer" => {
+                    gpu_params.mode = GpuMode::ModeVirglRenderer;
                 }
                 #[cfg(feature = "gfxstream")]
                 "gfxstream" => {
@@ -191,8 +188,8 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
                     "2d" | "2D" => {
                         gpu_params.mode = GpuMode::Mode2D;
                     }
-                    "3d" | "3D" => {
-                        gpu_params.mode = GpuMode::Mode3D;
+                    "3d" | "3D" | "virglrenderer" => {
+                        gpu_params.mode = GpuMode::ModeVirglRenderer;
                     }
                     #[cfg(feature = "gfxstream")]
                     "gfxstream" => {
@@ -202,7 +199,7 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
                         return Err(argument::Error::InvalidValue {
                             value: v.to_string(),
                             expected: String::from(
-                                "gpu parameter 'backend' should be one of (2d|3d|gfxstream)",
+                                "gpu parameter 'backend' should be one of (2d|virglrenderer|gfxstream)",
                             ),
                         });
                     }
@@ -303,15 +300,17 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
                         }
                     }
                 }
-                #[cfg(feature = "gfxstream")]
                 "vulkan" => {
-                    vulkan_specified = true;
+                    #[cfg(feature = "gfxstream")]
+                    {
+                        vulkan_specified = true;
+                    }
                     match v {
                         "true" | "" => {
-                            gpu_params.gfxstream_support_vulkan = true;
+                            gpu_params.use_vulkan = true;
                         }
                         "false" => {
-                            gpu_params.gfxstream_support_vulkan = false;
+                            gpu_params.use_vulkan = false;
                         }
                         _ => {
                             return Err(argument::Error::InvalidValue {
@@ -345,6 +344,20 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
                 }
                 "cache-path" => gpu_params.cache_path = Some(v.to_string()),
                 "cache-size" => gpu_params.cache_size = Some(v.to_string()),
+                "udmabuf" => match v {
+                    "true" | "" => {
+                        gpu_params.udmabuf = true;
+                    }
+                    "false" => {
+                        gpu_params.udmabuf = false;
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: String::from("gpu parameter 'udmabuf' should be a boolean"),
+                        });
+                    }
+                },
                 "" => {}
                 _ => {
                     return Err(argument::Error::UnknownArgument(format!(
@@ -358,12 +371,16 @@ fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
 
     #[cfg(feature = "gfxstream")]
     {
-        if vulkan_specified || syncfd_specified || angle_specified {
+        if !vulkan_specified && gpu_params.mode == GpuMode::ModeGfxstream {
+            gpu_params.use_vulkan = true;
+        }
+
+        if syncfd_specified || angle_specified {
             match gpu_params.mode {
                 GpuMode::ModeGfxstream => {}
                 _ => {
                     return Err(argument::Error::UnknownArgument(
-                        "gpu parameter vulkan and syncfd are only supported for gfxstream backend"
+                        "gpu parameter syncfd and angle are only supported for gfxstream backend"
                             .to_string(),
                     ));
                 }
@@ -398,7 +415,15 @@ fn parse_ac97_options(s: &str) -> argument::Result<Ac97Parameters> {
                     argument::Error::Syntax(format!("invalid capture option: {}", e))
                 })?;
             }
-            #[cfg(target_os = "linux")]
+            "client_type" => {
+                ac97_params
+                    .set_client_type(v)
+                    .map_err(|e| argument::Error::InvalidValue {
+                        value: v.to_string(),
+                        expected: e.to_string(),
+                    })?;
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             "server" => {
                 ac97_params.vios_server_path =
                     Some(
@@ -418,7 +443,7 @@ fn parse_ac97_options(s: &str) -> argument::Result<Ac97Parameters> {
     }
 
     // server is required for and exclusive to vios backend
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     match ac97_params.backend {
         Ac97Backend::VIOS => {
             if ac97_params.vios_server_path.is_none() {
@@ -658,6 +683,64 @@ fn parse_battery_options(s: Option<&str>) -> argument::Result<BatteryType> {
     Ok(battery_type)
 }
 
+#[cfg(feature = "direct")]
+fn parse_direct_io_options(s: Option<&str>) -> argument::Result<DirectIoOption> {
+    let s = s.ok_or(argument::Error::ExpectedValue(String::from(
+        "expected path@range[,range] value",
+    )))?;
+    let parts: Vec<&str> = s.splitn(2, '@').collect();
+    if parts.len() != 2 {
+        return Err(argument::Error::InvalidValue {
+            value: s.to_string(),
+            expected: String::from("missing port range, use /path@X-Y,Z,.. syntax"),
+        });
+    }
+    let path = PathBuf::from(parts[0]);
+    if !path.exists() {
+        return Err(argument::Error::InvalidValue {
+            value: parts[0].to_owned(),
+            expected: String::from("the path does not exist"),
+        });
+    };
+    let ranges: argument::Result<Vec<(u64, u64)>> = parts[1]
+        .split(',')
+        .map(|frag| frag.split('-'))
+        .map(|mut range| {
+            let base = range
+                .next()
+                .map(|v| v.parse::<u64>())
+                .map_or(Ok(None), |r| r.map(Some));
+            let last = range
+                .next()
+                .map(|v| v.parse::<u64>())
+                .map_or(Ok(None), |r| r.map(Some));
+            (base, last)
+        })
+        .map(|range| match range {
+            (Ok(Some(base)), Ok(None)) => Ok((base, 1)),
+            (Ok(Some(base)), Ok(Some(last))) => {
+                Ok((base, last.saturating_sub(base).saturating_add(1)))
+            }
+            (Err(e), _) => Err(argument::Error::InvalidValue {
+                value: e.to_string(),
+                expected: String::from("invalid base range value"),
+            }),
+            (_, Err(e)) => Err(argument::Error::InvalidValue {
+                value: e.to_string(),
+                expected: String::from("invalid last range value"),
+            }),
+            _ => Err(argument::Error::InvalidValue {
+                value: s.to_owned(),
+                expected: String::from("invalid range format"),
+            }),
+        })
+        .collect();
+    Ok(DirectIoOption {
+        path,
+        ranges: ranges?,
+    })
+}
+
 fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::Result<()> {
     match name {
         "" => {
@@ -675,6 +758,39 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 });
             }
             cfg.executable_path = Some(Executable::Kernel(kernel_path));
+        }
+        "kvm-device" => {
+            let kvm_device_path = PathBuf::from(value.unwrap());
+            if !kvm_device_path.exists() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("this kvm device path does not exist"),
+                });
+            }
+
+            cfg.kvm_device_path = kvm_device_path;
+        }
+        "vhost-vsock-device" => {
+            let vhost_vsock_device_path = PathBuf::from(value.unwrap());
+            if !vhost_vsock_device_path.exists() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("this vhost-vsock device path does not exist"),
+                });
+            }
+
+            cfg.vhost_vsock_device_path = vhost_vsock_device_path;
+        }
+        "vhost-net-device" => {
+            let vhost_net_device_path = PathBuf::from(value.unwrap());
+            if !vhost_net_device_path.exists() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("this vhost-vsock device path does not exist"),
+                });
+            }
+
+            cfg.vhost_net_device_path = vhost_net_device_path;
         }
         "android-fstab" => {
             if cfg.android_fstab.is_some()
@@ -749,6 +865,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                             expected: String::from("this value for `mem` needs to be integer"),
                         })?,
                 )
+        }
+        "hugepages" => {
+            cfg.hugepages = true;
         }
         #[cfg(feature = "audio")]
         "ac97" => {
@@ -1544,6 +1663,94 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                     * 1024
                     * 1024; // cfg.balloon_bias is in bytes.
         }
+        "vhost-user-blk" => cfg.vhost_user_blk.push(VhostUserOption {
+            socket: PathBuf::from(value.unwrap()),
+        }),
+        "vhost-user-net" => cfg.vhost_user_net.push(VhostUserOption {
+            socket: PathBuf::from(value.unwrap()),
+        }),
+        "vhost-user-fs" => {
+            // (socket:tag)
+            let param = value.unwrap();
+            let mut components = param.split(':');
+            let socket =
+                PathBuf::from(
+                    components
+                        .next()
+                        .ok_or_else(|| argument::Error::InvalidValue {
+                            value: param.to_owned(),
+                            expected: String::from("missing socket path for `vhost-user-fs`"),
+                        })?,
+                );
+            let tag = components
+                .next()
+                .ok_or_else(|| argument::Error::InvalidValue {
+                    value: param.to_owned(),
+                    expected: String::from("missing tag for `vhost-user-fs`"),
+                })?
+                .to_owned();
+            cfg.vhost_user_fs.push(VhostUserFsOption { socket, tag });
+        }
+        #[cfg(feature = "direct")]
+        "direct-pmio" => {
+            if cfg.direct_pmio.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`direct_pmio` already given".to_owned(),
+                ));
+            }
+            cfg.direct_pmio = Some(parse_direct_io_options(value)?);
+        }
+        #[cfg(feature = "direct")]
+        "direct-level-irq" => {
+            cfg.direct_level_irq
+                .push(
+                    value
+                        .unwrap()
+                        .parse()
+                        .map_err(|_| argument::Error::InvalidValue {
+                            value: value.unwrap().to_owned(),
+                            expected: String::from(
+                                "this value for `direct-level-irq` must be an unsigned integer",
+                            ),
+                        })?,
+                );
+        }
+        #[cfg(feature = "direct")]
+        "direct-edge-irq" => {
+            cfg.direct_edge_irq
+                .push(
+                    value
+                        .unwrap()
+                        .parse()
+                        .map_err(|_| argument::Error::InvalidValue {
+                            value: value.unwrap().to_owned(),
+                            expected: String::from(
+                                "this value for `direct-edge-irq` must be an unsigned integer",
+                            ),
+                        })?,
+                );
+        }
+        "dmi" => {
+            if cfg.dmi_path.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`dmi` already given".to_owned(),
+                ));
+            }
+            let dmi_path = PathBuf::from(value.unwrap());
+            if !dmi_path.exists() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("the dmi path does not exist"),
+                });
+            }
+            if !dmi_path.is_dir() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("the dmi path should be directory"),
+                });
+            }
+            cfg.dmi_path = Some(dmi_path);
+        }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
     }
@@ -1603,6 +1810,9 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
 fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
     let arguments =
         &[Argument::positional("KERNEL", "bzImage of kernel to run"),
+          Argument::value("kvm-device", "PATH", "Path to the KVM device. (default /dev/kvm)"),
+          Argument::value("vhost-vsock-device", "PATH", "Path to the vhost-vsock device. (default /dev/vhost-vsock)"),
+          Argument::value("vhost-net-device", "PATH", "Path to the vhost-net device. (default /dev/vhost-net)"),
           Argument::value("android-fstab", "PATH", "Path to Android fstab"),
           Argument::short_value('i', "initrd", "PATH", "Initial ramdisk to load."),
           Argument::short_value('p',
@@ -1618,6 +1828,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                                 "mem",
                                 "N",
                                 "Amount of guest memory in MiB. (default: 256)"),
+          Argument::flag("hugepages", "Advise the kernel to use Huge Pages for guest memory mappings."),
           Argument::short_value('r',
                                 "root",
                                 "PATH[,key=value[,key=value[,...]]",
@@ -1644,13 +1855,14 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::value("net-vq-pairs", "N", "virtio net virtual queue paris. (default: 1)"),
           #[cfg(feature = "audio")]
           Argument::value("ac97",
-                          "[backend=BACKEND,capture=true,capture_effect=EFFECT,shm-fd=FD,client-fd=FD,server-fd=FD]",
+                          "[backend=BACKEND,capture=true,capture_effect=EFFECT,client_type=TYPE,shm-fd=FD,client-fd=FD,server-fd=FD]",
                           "Comma separated key=value pairs for setting up Ac97 devices. Can be given more than once .
                           Possible key values:
                           backend=(null, cras, vios) - Where to route the audio device. If not provided, backend will default to null.
                           `null` for /dev/null, cras for CRAS server and vios for VioS server.
                           capture - Enable audio capture
                           capture_effects - | separated effects to be enabled for recording. The only supported effect value now is EchoCancellation or aec.
+                          client_type - Set specific client type for cras backend.
                           server - The to the VIOS server (unix socket)."),
           Argument::value("serial",
                           "type=TYPE,[hardware=HW,num=NUM,path=PATH,input=PATH,console,earlycon,stdin]",
@@ -1712,15 +1924,15 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
                                   "[width=INT,height=INT]",
                                   "(EXPERIMENTAL) Comma separated key=value pairs for setting up a virtio-gpu device
                                   Possible key values:
-                                  backend=(2d|3d|gfxstream) - Which backend to use for virtio-gpu (determining rendering protocol)
+                                  backend=(2d|virglrenderer|gfxstream) - Which backend to use for virtio-gpu (determining rendering protocol)
                                   width=INT - The width of the virtual display connected to the virtio-gpu.
                                   height=INT - The height of the virtual display connected to the virtio-gpu.
-                                  egl[=true|=false] - If the virtio-gpu backend should use a EGL context for rendering.
-                                  glx[=true|=false] - If the virtio-gpu backend should use a GLX context for rendering.
-                                  surfaceless[=true|=false] - If the virtio-gpu backend should use a surfaceless context for rendering.
-                                  angle[=true|=false] - If the guest is using ANGLE (OpenGL on Vulkan) as its native OpenGL driver.
+                                  egl[=true|=false] - If the backend should use a EGL context for rendering.
+                                  glx[=true|=false] - If the backend should use a GLX context for rendering.
+                                  surfaceless[=true|=false] - If the backend should use a surfaceless context for rendering.
+                                  angle[=true|=false] - If the gfxstream backend should use ANGLE (OpenGL on Vulkan) as its native OpenGL driver.
                                   syncfd[=true|=false] - If the gfxstream backend should support EGL_ANDROID_native_fence_sync
-                                  vulkan[=true|=false] - If the gfxstream backend should support vulkan
+                                  vulkan[=true|=false] - If the backend should support vulkan
                                   "),
           #[cfg(feature = "tpm")]
           Argument::flag("software-tpm", "enable a software emulated trusted platform module device"),
@@ -1749,6 +1961,17 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
                                   "),
           Argument::value("gdb", "PORT", "(EXPERIMENTAL) gdb on the given port"),
           Argument::value("balloon_bias_mib", "N", "Amount to bias balance of memory between host and guest as the balloon inflates, in MiB."),
+          Argument::value("vhost-user-blk", "SOCKET_PATH", "Path to a socket for vhost-user block"),
+          Argument::value("vhost-user-net", "SOCKET_PATH", "Path to a socket for vhost-user net"),
+          Argument::value("vhost-user-fs", "SOCKET_PATH:TAG",
+                          "Path to a socket path for vhost-user fs, and tag for the shared dir"),
+          #[cfg(feature = "direct")]
+          Argument::value("direct-pmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct port I/O access"),
+          #[cfg(feature = "direct")]
+          Argument::value("direct-level-irq", "irq", "Enable interrupt passthrough"),
+          #[cfg(feature = "direct")]
+          Argument::value("direct-edge-irq", "irq", "Enable interrupt passthrough"),
+          Argument::value("dmi", "DIR", "Directory with smbios_entry_point/DMI files"),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -1792,76 +2015,37 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
     }
 }
 
-fn handle_request(
-    request: &VmRequest,
-    args: std::env::Args,
-) -> std::result::Result<VmResponse, ()> {
-    let mut return_result = Err(());
-    for socket_path in args {
-        match UnixSeqpacket::connect(&socket_path) {
-            Ok(s) => {
-                let socket: VmControlRequestSocket = MsgSocket::new(s);
-                if let Err(e) = socket.send(request) {
-                    error!(
-                        "failed to send request to socket at '{}': {}",
-                        socket_path, e
-                    );
-                    return_result = Err(());
-                    continue;
-                }
-                match socket.recv() {
-                    Ok(response) => return_result = Ok(response),
-                    Err(e) => {
-                        error!(
-                            "failed to send request to socket at2 '{}': {}",
-                            socket_path, e
-                        );
-                        return_result = Err(());
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                error!("failed to connect to socket at '{}': {}", socket_path, e);
-                return_result = Err(());
-            }
-        }
-    }
-
-    return_result
-}
-
-fn vms_request(request: &VmRequest, args: std::env::Args) -> std::result::Result<(), ()> {
-    let response = handle_request(request, args)?;
-    info!("request response was {}", response);
-    Ok(())
-}
-
-fn stop_vms(args: std::env::Args) -> std::result::Result<(), ()> {
+fn stop_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     if args.len() == 0 {
         print_help("crosvm stop", "VM_SOCKET...", &[]);
         println!("Stops the crosvm instance listening on each `VM_SOCKET` given.");
         return Err(());
     }
-    vms_request(&VmRequest::Exit, args)
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    vms_request(&VmRequest::Exit, socket_path)
 }
 
-fn suspend_vms(args: std::env::Args) -> std::result::Result<(), ()> {
+fn suspend_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     if args.len() == 0 {
         print_help("crosvm suspend", "VM_SOCKET...", &[]);
         println!("Suspends the crosvm instance listening on each `VM_SOCKET` given.");
         return Err(());
     }
-    vms_request(&VmRequest::Suspend, args)
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    vms_request(&VmRequest::Suspend, socket_path)
 }
 
-fn resume_vms(args: std::env::Args) -> std::result::Result<(), ()> {
+fn resume_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     if args.len() == 0 {
         print_help("crosvm resume", "VM_SOCKET...", &[]);
         println!("Resumes the crosvm instance listening on each `VM_SOCKET` given.");
         return Err(());
     }
-    vms_request(&VmRequest::Resume, args)
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    vms_request(&VmRequest::Resume, socket_path)
 }
 
 fn balloon_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
@@ -1879,10 +2063,12 @@ fn balloon_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     };
 
     let command = BalloonControlCommand::Adjust { num_bytes };
-    vms_request(&VmRequest::BalloonCommand(command), args)
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    vms_request(&VmRequest::BalloonCommand(command), socket_path)
 }
 
-fn balloon_stats(args: std::env::Args) -> std::result::Result<(), ()> {
+fn balloon_stats(mut args: std::env::Args) -> std::result::Result<(), ()> {
     if args.len() != 1 {
         print_help("crosvm balloon_stats", "VM_SOCKET", &[]);
         println!("Prints virtio balloon statistics for a `VM_SOCKET`.");
@@ -1890,7 +2076,9 @@ fn balloon_stats(args: std::env::Args) -> std::result::Result<(), ()> {
     }
     let command = BalloonControlCommand::Stats {};
     let request = &VmRequest::BalloonCommand(command);
-    let response = handle_request(request, args)?;
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    let response = handle_request(request, socket_path)?;
     println!("{}", response);
     Ok(())
 }
@@ -2013,46 +2201,10 @@ fn disk_cmd(mut args: std::env::Args) -> std::result::Result<(), ()> {
         }
     };
 
-    vms_request(&request, args)
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    vms_request(&request, socket_path)
 }
-
-enum ModifyUsbError {
-    ArgMissing(&'static str),
-    ArgParse(&'static str, String),
-    ArgParseInt(&'static str, String, ParseIntError),
-    FailedDescriptorValidate(base::Error),
-    PathDoesNotExist(PathBuf),
-    SocketFailed,
-    UnexpectedResponse(VmResponse),
-    UnknownCommand(String),
-    UsbControl(UsbControlResult),
-}
-
-impl fmt::Display for ModifyUsbError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::ModifyUsbError::*;
-
-        match self {
-            ArgMissing(a) => write!(f, "argument missing: {}", a),
-            ArgParse(name, value) => {
-                write!(f, "failed to parse argument {} value `{}`", name, value)
-            }
-            ArgParseInt(name, value, e) => write!(
-                f,
-                "failed to parse integer argument {} value `{}`: {}",
-                name, value, e
-            ),
-            FailedDescriptorValidate(e) => write!(f, "failed to validate file descriptor: {}", e),
-            PathDoesNotExist(p) => write!(f, "path `{}` does not exist", p.display()),
-            SocketFailed => write!(f, "socket failed"),
-            UnexpectedResponse(r) => write!(f, "unexpected response: {}", r),
-            UnknownCommand(c) => write!(f, "unknown command: `{}`", c),
-            UsbControl(e) => write!(f, "{}", e),
-        }
-    }
-}
-
-type ModifyUsbResult<T> = std::result::Result<T, ModifyUsbError>;
 
 fn parse_bus_id_addr(v: &str) -> ModifyUsbResult<(u8, u8, u16, u16)> {
     debug!("parse_bus_id_addr: {}", v);
@@ -2078,27 +2230,6 @@ fn parse_bus_id_addr(v: &str) -> ModifyUsbResult<(u8, u8, u16, u16)> {
     }
 }
 
-fn raw_descriptor_from_path(path: &Path) -> ModifyUsbResult<RawDescriptor> {
-    if !path.exists() {
-        return Err(ModifyUsbError::PathDoesNotExist(path.to_owned()));
-    }
-    let raw_descriptor = path
-        .file_name()
-        .and_then(|fd_osstr| fd_osstr.to_str())
-        .map_or(
-            Err(ModifyUsbError::ArgParse(
-                "USB_DEVICE_PATH",
-                path.to_string_lossy().into_owned(),
-            )),
-            |fd_str| {
-                fd_str.parse::<libc::c_int>().map_err(|e| {
-                    ModifyUsbError::ArgParseInt("USB_DEVICE_PATH", fd_str.to_owned(), e)
-                })
-            },
-        )?;
-    validate_raw_descriptor(raw_descriptor).map_err(ModifyUsbError::FailedDescriptorValidate)
-}
-
 fn usb_attach(mut args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
     let val = args
         .next()
@@ -2108,39 +2239,13 @@ fn usb_attach(mut args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
         args.next()
             .ok_or(ModifyUsbError::ArgMissing("usb device path"))?,
     );
-    let usb_file: Option<File> = if dev_path == Path::new("-") {
-        None
-    } else if dev_path.parent() == Some(Path::new("/proc/self/fd")) {
-        // Special case '/proc/self/fd/*' paths. The FD is already open, just use it.
-        // Safe because we will validate |raw_fd|.
-        Some(unsafe { File::from_raw_descriptor(raw_descriptor_from_path(&dev_path)?) })
-    } else {
-        Some(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&dev_path)
-                .map_err(|_| ModifyUsbError::UsbControl(UsbControlResult::FailedToOpenDevice))?,
-        )
-    };
 
-    let request = VmRequest::UsbCommand(UsbControlCommand::AttachDevice {
-        bus,
-        addr,
-        vid,
-        pid,
-        // Safe because we are transferring ownership to the rawdescriptor
-        descriptor: usb_file.map(|file| {
-            MaybeOwnedDescriptor::Owned(unsafe {
-                SafeDescriptor::from_raw_descriptor(file.into_raw_descriptor())
-            })
-        }),
-    });
-    let response = handle_request(&request, args).map_err(|_| ModifyUsbError::SocketFailed)?;
-    match response {
-        VmResponse::UsbResponse(usb_resp) => Ok(usb_resp),
-        r => Err(ModifyUsbError::UnexpectedResponse(r)),
-    }
+    let socket_path = args
+        .next()
+        .ok_or(ModifyUsbError::ArgMissing("control socket path"))?;
+    let socket_path = Path::new(&socket_path);
+
+    do_usb_attach(&socket_path, bus, addr, vid, pid, &dev_path)
 }
 
 fn usb_detach(mut args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
@@ -2150,25 +2255,19 @@ fn usb_detach(mut args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
             p.parse::<u8>()
                 .map_err(|e| ModifyUsbError::ArgParseInt("PORT", p.to_owned(), e))
         })?;
-    let request = VmRequest::UsbCommand(UsbControlCommand::DetachDevice { port });
-    let response = handle_request(&request, args).map_err(|_| ModifyUsbError::SocketFailed)?;
-    match response {
-        VmResponse::UsbResponse(usb_resp) => Ok(usb_resp),
-        r => Err(ModifyUsbError::UnexpectedResponse(r)),
-    }
+    let socket_path = args
+        .next()
+        .ok_or(ModifyUsbError::ArgMissing("control socket path"))?;
+    let socket_path = Path::new(&socket_path);
+    do_usb_detach(&socket_path, port)
 }
 
-fn usb_list(args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
-    let mut ports: [u8; USB_CONTROL_MAX_PORTS] = Default::default();
-    for (index, port) in ports.iter_mut().enumerate() {
-        *port = index as u8
-    }
-    let request = VmRequest::UsbCommand(UsbControlCommand::ListDevice { ports });
-    let response = handle_request(&request, args).map_err(|_| ModifyUsbError::SocketFailed)?;
-    match response {
-        VmResponse::UsbResponse(usb_resp) => Ok(usb_resp),
-        r => Err(ModifyUsbError::UnexpectedResponse(r)),
-    }
+fn usb_list(mut args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
+    let socket_path = args
+        .next()
+        .ok_or(ModifyUsbError::ArgMissing("control socket path"))?;
+    let socket_path = Path::new(&socket_path);
+    do_usb_list(&socket_path)
 }
 
 fn modify_usb(mut args: std::env::Args) -> std::result::Result<(), ()> {
@@ -2179,7 +2278,7 @@ fn modify_usb(mut args: std::env::Args) -> std::result::Result<(), ()> {
     }
 
     // This unwrap will not panic because of the above length check.
-    let command = args.next().unwrap();
+    let command = &args.next().unwrap();
     let result = match command.as_ref() {
         "attach" => usb_attach(args),
         "detach" => usb_detach(args),
@@ -2199,16 +2298,22 @@ fn modify_usb(mut args: std::env::Args) -> std::result::Result<(), ()> {
 }
 
 fn print_usage() {
-    print_help("crosvm", "[stop|run]", &[]);
+    print_help("crosvm", "[command]", &[]);
     println!("Commands:");
-    println!("    stop - Stops crosvm instances via their control sockets.");
-    println!("    run  - Start a new crosvm instance.");
+    println!("    balloon - Set balloon size of the crosvm instance.");
+    println!("    balloon_stats - Prints virtio balloon statistics.");
+    println!("    battery - Modify battery.");
     println!("    create_qcow2  - Create a new qcow2 disk image file.");
     println!("    disk - Manage attached virtual disk devices.");
+    println!("    resume - Resumes the crosvm instance.");
+    println!("    run - Start a new crosvm instance.");
+    println!("    stop - Stops crosvm instances via their control sockets.");
+    println!("    suspend - Suspends the crosvm instance.");
     println!("    usb - Manage attached virtual USB devices.");
     println!("    version - Show package version.");
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn pkg_version() -> std::result::Result<(), ()> {
     const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
     const PKG_VERSION: Option<&'static str> = option_env!("PKG_VERSION");
@@ -2219,20 +2324,6 @@ fn pkg_version() -> std::result::Result<(), ()> {
         None => println!(),
     }
     Ok(())
-}
-
-enum ModifyBatError {
-    BatControlErr(BatControlResult),
-}
-
-impl fmt::Display for ModifyBatError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::ModifyBatError::*;
-
-        match self {
-            BatControlErr(e) => write!(f, "{}", e),
-        }
-    }
 }
 
 fn modify_battery(mut args: std::env::Args) -> std::result::Result<(), ()> {
@@ -2247,27 +2338,10 @@ fn modify_battery(mut args: std::env::Args) -> std::result::Result<(), ()> {
     let property = args.next().unwrap();
     let target = args.next().unwrap();
 
-    let response = match battery_type.parse::<BatteryType>() {
-        Ok(type_) => match BatControlCommand::new(property, target) {
-            Ok(cmd) => {
-                let request = VmRequest::BatCommand(type_, cmd);
-                Ok(handle_request(&request, args)?)
-            }
-            Err(e) => Err(ModifyBatError::BatControlErr(e)),
-        },
-        Err(e) => Err(ModifyBatError::BatControlErr(e)),
-    };
+    let socket_path = args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
 
-    match response {
-        Ok(response) => {
-            println!("{}", response);
-            Ok(())
-        }
-        Err(e) => {
-            println!("error {}", e);
-            Err(())
-        }
-    }
+    do_modify_battery(&socket_path, &*battery_type, &*property, &*target)
 }
 
 fn crosvm_main() -> std::result::Result<(), ()> {
@@ -2440,6 +2514,17 @@ mod tests {
     #[test]
     fn parse_ac97_capture_vaild() {
         parse_ac97_options("backend=cras,capture=true").expect("parse should have succeded");
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn parse_ac97_client_type() {
+        parse_ac97_options("backend=cras,capture=true,client_type=crosvm")
+            .expect("parse should have succeded");
+        parse_ac97_options("backend=cras,capture=true,client_type=arcvm")
+            .expect("parse should have succeded");
+        parse_ac97_options("backend=cras,capture=true,client_type=none")
+            .expect_err("parse should have failed");
     }
 
     #[cfg(feature = "audio")]
@@ -2717,41 +2802,54 @@ mod tests {
         validate_arguments(&mut config).unwrap();
         assert_eq!(
             config.virtio_switches.unwrap(),
-            PathBuf::from("/dev/switches-test"));
+            PathBuf::from("/dev/switches-test")
+        );
     }
 
-    #[cfg(all(feature = "gpu", feature = "gfxstream"))]
+    #[cfg(feature = "gpu")]
     #[test]
-    fn parse_gpu_options_gfxstream_with_vulkan_specified() {
+    fn parse_gpu_options_default_vulkan_support() {
         assert!(
-            parse_gpu_options(Some("backend=gfxstream,vulkan=true"))
+            !parse_gpu_options(Some("backend=virglrenderer"))
                 .unwrap()
-                .gfxstream_support_vulkan
+                .use_vulkan
         );
+
+        #[cfg(feature = "gfxstream")]
         assert!(
-            parse_gpu_options(Some("vulkan=true,backend=gfxstream"))
+            parse_gpu_options(Some("backend=gfxstream"))
                 .unwrap()
-                .gfxstream_support_vulkan
+                .use_vulkan
         );
-        assert!(
-            !parse_gpu_options(Some("backend=gfxstream,vulkan=false"))
-                .unwrap()
-                .gfxstream_support_vulkan
-        );
-        assert!(
-            !parse_gpu_options(Some("vulkan=false,backend=gfxstream"))
-                .unwrap()
-                .gfxstream_support_vulkan
-        );
-        assert!(parse_gpu_options(Some("backend=gfxstream,vulkan=invalid_value")).is_err());
-        assert!(parse_gpu_options(Some("vulkan=invalid_value,backend=gfxstream")).is_err());
     }
 
-    #[cfg(all(feature = "gpu", feature = "gfxstream"))]
+    #[cfg(feature = "gpu")]
     #[test]
-    fn parse_gpu_options_not_gfxstream_with_vulkan_specified() {
-        assert!(parse_gpu_options(Some("backend=3d,vulkan=true")).is_err());
-        assert!(parse_gpu_options(Some("vulkan=true,backend=3d")).is_err());
+    fn parse_gpu_options_with_vulkan_specified() {
+        assert!(parse_gpu_options(Some("vulkan=true")).unwrap().use_vulkan);
+        assert!(
+            parse_gpu_options(Some("backend=virglrenderer,vulkan=true"))
+                .unwrap()
+                .use_vulkan
+        );
+        assert!(
+            parse_gpu_options(Some("vulkan=true,backend=virglrenderer"))
+                .unwrap()
+                .use_vulkan
+        );
+        assert!(!parse_gpu_options(Some("vulkan=false")).unwrap().use_vulkan);
+        assert!(
+            !parse_gpu_options(Some("backend=virglrenderer,vulkan=false"))
+                .unwrap()
+                .use_vulkan
+        );
+        assert!(
+            !parse_gpu_options(Some("vulkan=false,backend=virglrenderer"))
+                .unwrap()
+                .use_vulkan
+        );
+        assert!(parse_gpu_options(Some("backend=virglrenderer,vulkan=invalid_value")).is_err());
+        assert!(parse_gpu_options(Some("vulkan=invalid_value,backend=virglrenderer")).is_err());
     }
 
     #[cfg(all(feature = "gpu", feature = "gfxstream"))]
@@ -2784,8 +2882,8 @@ mod tests {
     #[cfg(all(feature = "gpu", feature = "gfxstream"))]
     #[test]
     fn parse_gpu_options_not_gfxstream_with_syncfd_specified() {
-        assert!(parse_gpu_options(Some("backend=3d,syncfd=true")).is_err());
-        assert!(parse_gpu_options(Some("syncfd=true,backend=3d")).is_err());
+        assert!(parse_gpu_options(Some("backend=virglrenderer,syncfd=true")).is_err());
+        assert!(parse_gpu_options(Some("syncfd=true,backend=virglrenderer")).is_err());
     }
 
     #[test]

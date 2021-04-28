@@ -5,19 +5,21 @@
 use std::ffi::{CStr, CString};
 use std::fs::{read_link, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 
 use libc::{
-    self, c_char, c_int, c_long, c_uint, close, fcntl, ftruncate64, off64_t, syscall, EINVAL,
-    F_ADD_SEALS, F_GET_SEALS, F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK, F_SEAL_WRITE,
-    MFD_ALLOW_SEALING,
+    self, c_char, c_int, c_long, c_uint, close, fcntl, ftruncate64, off64_t, syscall,
+    SYS_memfd_create, EINVAL, F_ADD_SEALS, F_GET_SEALS, F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK,
+    F_SEAL_WRITE, MFD_ALLOW_SEALING,
 };
-use syscall_defines::linux::LinuxSyscall::SYS_memfd_create;
+use serde::{Deserialize, Serialize};
 
 use crate::{errno, errno_result, Result};
 
 /// A shared memory file descriptor and its size.
+#[derive(Serialize, Deserialize)]
 pub struct SharedMemory {
+    #[serde(with = "crate::with_as_descriptor")]
     fd: File,
     size: u64,
 }
@@ -267,9 +269,15 @@ impl AsRawFd for &SharedMemory {
     }
 }
 
-impl Into<File> for SharedMemory {
-    fn into(self) -> File {
-        self.fd
+impl IntoRawFd for SharedMemory {
+    fn into_raw_fd(self) -> RawFd {
+        self.fd.into_raw_fd()
+    }
+}
+
+impl From<SharedMemory> for File {
+    fn from(s: SharedMemory) -> File {
+        s.fd
     }
 }
 

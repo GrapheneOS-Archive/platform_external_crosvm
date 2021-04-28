@@ -28,7 +28,9 @@ VERY_VERBOSE = False
 
 # Runs tests using the exec_file wrapper, which will run the test inside the
 # builders built-in VM.
-VM_TEST_RUNNER = "/workspace/vm/exec_file --no-sync"
+VM_TEST_RUNNER = (
+    os.path.abspath("./ci/vm_tools/exec_binary_in_vm") + " --no-sync"
+)
 
 # Runs tests using QEMU user-space emulation.
 QEMU_TEST_RUNNER = (
@@ -52,11 +54,20 @@ class Requirements(enum.Enum):
     # Test is disabled explicitly.
     DISABLED = "disabled"
 
-    # Test needs to be executed with expanded privileges for device access.
+    # Test needs to be executed with expanded privileges for device access and
+    # will be run inside a VM.
     PRIVILEGED = "privileged"
 
     # Test needs to run single-threaded
     SINGLE_THREADED = "single_threaded"
+
+    # Separate workspaces that have dev-dependencies cannot be built from the
+    # crosvm workspace and need to be built separately.
+    # Note: Separate workspaces are built with no features enabled.
+    SEPARATE_WORKSPACE = "separate_workspace"
+
+    # Build, but do not run.
+    DO_NOT_RUN = "do_not_run"
 
 
 BUILD_TIME_REQUIREMENTS = [
@@ -84,8 +95,13 @@ class CrateInfo(object):
         build_reqs = requirements.intersection(BUILD_TIME_REQUIREMENTS)
         self.can_build = all(req in capabilities for req in build_reqs)
 
-        self.can_run = self.can_build and (
-            not self.needs_privilege or Requirements.PRIVILEGED in capabilities
+        self.can_run = (
+            self.can_build
+            and (
+                not self.needs_privilege
+                or Requirements.PRIVILEGED in capabilities
+            )
+            and not Requirements.DO_NOT_RUN in self.requirements
         )
 
     def __repr__(self):
@@ -209,7 +225,7 @@ def results_summary(results: Union[RunResults, CrateResults]):
     num_pass = results.count(TestResult.PASS)
     num_skip = results.count(TestResult.SKIP)
     num_fail = results.count(TestResult.FAIL)
-    msg = []
+    msg: List[str] = []
     if num_pass:
         msg.append(f"{num_pass} passed")
     if num_skip:
@@ -219,9 +235,42 @@ def results_summary(results: Union[RunResults, CrateResults]):
     return ", ".join(msg)
 
 
+def cargo_build_process(
+    cwd: str = ".", crates: List[CrateInfo] = [], features: Set[str] = set()
+):
+    """Builds the main crosvm crate."""
+    cmd = [
+        "cargo",
+        "build",
+        "--color=never",
+        "--no-default-features",
+        "--features",
+        ",".join(features),
+    ]
+
+    for crate in sorted(crate.name for crate in crates):
+        cmd += ["-p", crate]
+
+    if VERY_VERBOSE:
+        print("CMD", " ".join(cmd))
+
+    process = subprocess.run(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if process.returncode != 0 or VERBOSE:
+        print()
+        print(process.stdout)
+    return process
+
+
 def cargo_test_process(
-    crates: List[CrateInfo],
-    features: Set[str],
+    cwd: str,
+    crates: List[CrateInfo] = [],
+    features: Set[str] = set(),
     run: bool = True,
     single_threaded: bool = False,
     use_vm: bool = False,
@@ -233,6 +282,11 @@ def cargo_test_process(
         cmd += ["--no-run"]
     if features:
         cmd += ["--no-default-features", "--features", ",".join(features)]
+
+    # Skip doc tests as these cannot be run in the VM.
+    if use_vm:
+        cmd += ["--bins", "--tests"]
+
     for crate in sorted(crate.name for crate in crates):
         cmd += ["-p", crate]
 
@@ -247,6 +301,7 @@ def cargo_test_process(
 
     process = subprocess.run(
         cmd,
+        cwd=cwd,
         env=env,
         timeout=timeout,
         stdout=subprocess.PIPE,
@@ -261,9 +316,41 @@ def cargo_test_process(
 
 def cargo_build_tests(crates: List[CrateInfo], features: Set[str]):
     """Runs cargo test --no-run to build all listed `crates`."""
-    print("Building: ", ", ".join(crate.name for crate in crates))
-    process = cargo_test_process(crates, features, run=False)
-    return process.returncode == 0
+    separate_workspace_crates = [
+        crate
+        for crate in crates
+        if Requirements.SEPARATE_WORKSPACE in crate.requirements
+    ]
+    workspace_crates = [
+        crate
+        for crate in crates
+        if Requirements.SEPARATE_WORKSPACE not in crate.requirements
+    ]
+
+    print(
+        "Building workspace: ",
+        ", ".join(crate.name for crate in workspace_crates),
+    )
+    build_process = cargo_build_process(
+        cwd=".", crates=workspace_crates, features=features
+    )
+    if build_process.returncode != 0:
+        return False
+    test_process = cargo_test_process(
+        cwd=".", crates=workspace_crates, features=features, run=False
+    )
+    if test_process.returncode != 0:
+        return False
+
+    for crate in separate_workspace_crates:
+        print("Building crate:", crate.name)
+        build_process = cargo_build_process(cwd=crate.name)
+        if build_process.returncode != 0:
+            return False
+        test_process = cargo_test_process(cwd=crate.name, run=False)
+        if test_process.returncode != 0:
+            return False
+    return True
 
 
 def cargo_test(
@@ -279,16 +366,29 @@ def cargo_test(
             msg.append("in vm")
         if single_threaded:
             msg.append("(single-threaded)")
+        if Requirements.SEPARATE_WORKSPACE in crate.requirements:
+            msg.append("(separate workspace)")
         sys.stdout.write(f"{' '.join(msg)}... ")
         sys.stdout.flush()
-        process = cargo_test_process(
-            [crate],
-            features,
-            run=True,
-            single_threaded=single_threaded,
-            use_vm=use_vm,
-            timeout=TEST_TIMEOUT_SECS,
-        )
+
+        if Requirements.SEPARATE_WORKSPACE in crate.requirements:
+            process = cargo_test_process(
+                cwd=crate.name,
+                run=True,
+                single_threaded=single_threaded,
+                use_vm=use_vm,
+                timeout=TEST_TIMEOUT_SECS,
+            )
+        else:
+            process = cargo_test_process(
+                cwd=".",
+                crates=[crate],
+                features=features,
+                run=True,
+                single_threaded=single_threaded,
+                use_vm=use_vm,
+                timeout=TEST_TIMEOUT_SECS,
+            )
         results = CrateResults(
             crate.name, process.returncode == 0, process.stdout
         )
@@ -318,7 +418,6 @@ def execute_batched_by_privilege(
     Non-privileged tests are run first. Privileged tests are executed in
     a VM if use_vm is set.
     """
-
     build_crates = [crate for crate in crates if crate.can_build]
     if not cargo_build_tests(build_crates, features):
         return []
@@ -335,7 +434,7 @@ def execute_batched_by_privilege(
     ]
     if privileged_crates:
         if use_vm:
-            subprocess.run("/workspace/vm/sync_so", check=True)
+            subprocess.run("./ci/vm_tools/sync_deps", check=True)
             yield from execute_batched_by_parallelism(
                 privileged_crates, features, use_vm=True
             )
@@ -491,8 +590,11 @@ def main(
         help="Path to file where to store junit xml results",
     )
     args = parser.parse_args()
+
+    global VERBOSE, VERY_VERBOSE
     VERBOSE = args.verbose or args.very_verbose  # type: ignore
     VERY_VERBOSE = args.very_verbose  # type: ignore
+
     use_vm = os.environ.get("CROSVM_USE_VM") != None or args.use_vm
     cros_build = os.environ.get("CROSVM_CROS_BUILD") != None or args.cros_build
 
