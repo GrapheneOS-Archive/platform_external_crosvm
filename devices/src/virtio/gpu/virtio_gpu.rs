@@ -215,14 +215,13 @@ impl VirtioGpu {
         scanout_data: Option<VirtioScanoutBlobData>,
     ) -> VirtioGpuResult {
         let mut display = self.display.borrow_mut();
-        if resource_id == 0 {
-            if let Some(surface_id) = self.scanout_surface_id.take() {
-                display.release_surface(surface_id);
-            }
-            self.scanout_resource_id = None;
-            return Ok(OkNoData);
-        }
-
+        /// b/186580833.
+        /// Remove the part of deleting surface when resource_id is 0.
+        /// This is a workaround to solve the issue of black display.
+        /// Observation is when Surfaceflinger falls back to client composition,
+        /// host receives set_scanout 0 0, and then set scanout 0 <some valid resid>.
+        /// The first 0 0 removes the surface, the second creates a new surface
+        /// with id++, which will be more than 0 and be ignorned in vnc or webrtc
         let resource = self
             .resources
             .get_mut(&resource_id)
