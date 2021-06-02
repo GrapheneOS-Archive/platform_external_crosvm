@@ -41,7 +41,7 @@ exclude = [
 ]
 
 [features]
-default = ["audio", "gpu"]
+default = ["audio", "gpu", "usb"]
 chromeos = ["base/chromeos"]
 default-no-sandbox = []
 direct = ["devices/direct"]
@@ -50,6 +50,7 @@ gpu = ["devices/gpu"]
 plugin = ["protos/plugin", "crosvm_plugin", "kvm", "kvm_sys", "protobuf"]
 power-monitor-powerd = ["arch/power-monitor-powerd"]
 tpm = ["devices/tpm"]
+usb = ["devices/usb"]
 video-decoder = ["devices/video-decoder"]
 video-encoder = ["devices/video-encoder"]
 wl-dmabuf = ["devices/minigbm"]
@@ -92,6 +93,7 @@ sync = { path = "sync" }
 tempfile = "*"
 thiserror = { version = "1.0.20", optional = true }
 vhost = { path = "vhost" }
+vhost_user_devices = { path = "vhost_user_devices" }
 vm_control = { path = "vm_control" }
 acpi_tables = { path = "acpi_tables" }
 vm_memory = { path = "vm_memory" }
