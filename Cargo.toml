@@ -23,7 +23,9 @@ overflow-checks = true
 
 [workspace]
 members = [
-    "fuzz",
+    # Disabled to support running cargo2android while cros-fuzz is not
+    # available in Android.
+    # "fuzz",
     "qcow_utils",
     "integration_tests",
     "libcrosvm_control",
@@ -111,7 +113,9 @@ base = "*"
 assertions = { path = "assertions" }
 audio_streams = { path = "../adhd/audio_streams" } # ignored by ebuild
 base = { path = "base" }
-cros_fuzz = { path = "../../platform2/cros-fuzz" } # ignored by ebuild
+# Disabled to support running cargo2android while cros-fuzz is not
+# available in Android.
+# cros_fuzz = { path = "../../platform2/cros-fuzz" } # ignored by ebuild
 data_model = { path = "data_model" }
 libchromeos = { path = "../libchromeos-rs" } # ignored by ebuild
 libcras = { path = "../adhd/cras/client/libcras" } # ignored by ebuild
@@ -121,4 +125,4 @@ sync = { path = "sync" }
 sys_util = { path = "sys_util" }
 tempfile = { path = "tempfile" }
 wire_format_derive = { path = "../vm_tools/p9/wire_format_derive" } # ignored by ebuild
-vmm_vhost = { path = "../rust/crates/vhost", features = ["vhost-user-master"] } # ignored by ebuild
+vmm_vhost = { path = "../rust/vmm_vhost", features = ["vhost-user-master"] } # ignored by ebuild

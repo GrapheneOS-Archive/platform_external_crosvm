@@ -23,7 +23,7 @@
 #include "aura-shell.h"
 #include "linux-dmabuf-unstable-v1.h"
 #include "viewporter.h"
-#include "xdg-shell.h"
+#include "xdg-shell-client-protocol.h"
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
 #include <wayland-client.h>
