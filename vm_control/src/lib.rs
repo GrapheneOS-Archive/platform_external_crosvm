@@ -57,7 +57,7 @@ pub use crate::gdb::*;
 pub use hypervisor::MemSlot;
 
 /// Control the state of a particular VM CPU.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum VcpuControl {
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     Debug(VcpuDebug),
@@ -233,6 +233,7 @@ pub enum UsbControlResult {
     NoSuchPort,
     FailedToOpenDevice,
     Devices([UsbControlAttachedDevice; USB_CONTROL_MAX_PORTS]),
+    FailedToInitHostDevice,
 }
 
 impl Display for UsbControlResult {
@@ -252,6 +253,7 @@ impl Display for UsbControlResult {
                 }
                 std::result::Result::Ok(())
             }
+            FailedToInitHostDevice => write!(f, "failed_to_init_host_device"),
         }
     }
 }
@@ -980,7 +982,7 @@ impl VmRequest {
         run_mode: &mut Option<VmRunMode>,
         balloon_host_tube: &Tube,
         disk_host_tubes: &[Tube],
-        usb_control_tube: &Tube,
+        usb_control_tube: Option<&Tube>,
         bat_control: &mut Option<BatControl>,
     ) -> VmResponse {
         match *self {
@@ -1044,6 +1046,13 @@ impl VmRequest {
                 }
             }
             VmRequest::UsbCommand(ref cmd) => {
+                let usb_control_tube = match usb_control_tube {
+                    Some(t) => t,
+                    None => {
+                        error!("attempted to execute USB request without control tube");
+                        return VmResponse::Err(SysError::new(ENODEV));
+                    }
+                };
                 let res = usb_control_tube.send(cmd);
                 if let Err(e) = res {
                     error!("fail to send command to usb control socket: {}", e);

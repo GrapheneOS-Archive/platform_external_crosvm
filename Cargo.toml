@@ -23,7 +23,9 @@ overflow-checks = true
 
 [workspace]
 members = [
-    "fuzz",
+    # Disabled to support running cargo2android while cros-fuzz is not
+    # available in Android.
+    # "fuzz",
     "qcow_utils",
     "integration_tests",
     "libcrosvm_control",
@@ -41,7 +43,7 @@ exclude = [
 ]
 
 [features]
-default = ["audio", "gpu"]
+default = ["audio", "gpu", "usb"]
 chromeos = ["base/chromeos"]
 default-no-sandbox = []
 direct = ["devices/direct"]
@@ -50,6 +52,7 @@ gpu = ["devices/gpu"]
 plugin = ["protos/plugin", "crosvm_plugin", "kvm", "kvm_sys", "protobuf"]
 power-monitor-powerd = ["arch/power-monitor-powerd"]
 tpm = ["devices/tpm"]
+usb = ["devices/usb"]
 video-decoder = ["devices/video-decoder"]
 video-encoder = ["devices/video-encoder"]
 wl-dmabuf = ["devices/minigbm"]
@@ -92,6 +95,7 @@ sync = { path = "sync" }
 tempfile = "*"
 thiserror = { version = "1.0.20", optional = true }
 vhost = { path = "vhost" }
+vhost_user_devices = { path = "vhost_user_devices" }
 vm_control = { path = "vm_control" }
 acpi_tables = { path = "acpi_tables" }
 vm_memory = { path = "vm_memory" }
@@ -109,7 +113,9 @@ base = "*"
 assertions = { path = "assertions" }
 audio_streams = { path = "../adhd/audio_streams" } # ignored by ebuild
 base = { path = "base" }
-cros_fuzz = { path = "../../platform2/cros-fuzz" } # ignored by ebuild
+# Disabled to support running cargo2android while cros-fuzz is not
+# available in Android.
+# cros_fuzz = { path = "../../platform2/cros-fuzz" } # ignored by ebuild
 data_model = { path = "data_model" }
 libchromeos = { path = "../libchromeos-rs" } # ignored by ebuild
 libcras = { path = "../adhd/cras/client/libcras" } # ignored by ebuild
@@ -119,4 +125,4 @@ sync = { path = "sync" }
 sys_util = { path = "sys_util" }
 tempfile = { path = "tempfile" }
 wire_format_derive = { path = "../vm_tools/p9/wire_format_derive" } # ignored by ebuild
-vmm_vhost = { path = "../rust/crates/vhost", features = ["vhost-user-master"] } # ignored by ebuild
+vmm_vhost = { path = "../rust/vmm_vhost", features = ["vhost-user-master"] } # ignored by ebuild

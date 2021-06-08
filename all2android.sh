@@ -7,7 +7,8 @@ set -e
 
 cargo2android() {
   cargo2android.py --run --device --tests --dependencies $@
-  rm -r cargo.out target.tmp
+  rm -r cargo.out
+  rm -rf target.tmp || /bin/true
 }
 
 # Run in the main crosvm directory.
