@@ -49,4 +49,4 @@ rust_test {
 }
 
 // dependent_library ["feature_list"]
-//   libc-0.2.93 "default,std"
+//   libc-0.2.95 "default,std"
