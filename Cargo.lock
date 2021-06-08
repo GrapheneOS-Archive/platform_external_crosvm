@@ -231,6 +231,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "vhost",
+ "vhost_user_devices",
  "vm_control",
  "vm_memory",
  "x86_64",
@@ -477,6 +478,7 @@ dependencies = [
  "data_model",
  "libc",
  "linux_input_sys",
+ "pkg-config",
 ]
 
 [[package]]
@@ -578,20 +580,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9385f66bf6105b241aa65a61cb923ef20efc665cb9f9bb50ac2f0c4b7f378d41"
 
 [[package]]
-name = "libchromeos"
-version = "0.1.0"
-dependencies = [
- "data_model",
- "futures",
- "libc",
- "log",
- "protobuf",
- "sys_util",
- "thiserror",
- "zeroize",
-]
-
-[[package]]
 name = "libcras"
 version = "0.1.0"
 dependencies = [
@@ -670,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "minijail"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libc",
  "minijail-sys",
@@ -678,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "minijail-sys"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "libc",
  "pkg-config",
@@ -696,9 +684,11 @@ name = "net_util"
 version = "0.1.0"
 dependencies = [
  "base",
+ "cros_async",
  "data_model",
  "libc",
  "net_sys",
+ "thiserror",
 ]
 
 [[package]]
@@ -720,11 +710,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "once_cell"
+version = "1.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af8b08b04175473088b46763e51ee54da5f9a164bc162f615b91bc179dbf15a3"
+
+[[package]]
 name = "p9"
 version = "0.1.0"
 dependencies = [
  "libc",
- "libchromeos",
+ "sys_util",
  "wire_format_derive",
 ]
 
@@ -1052,18 +1048,6 @@ name = "sync"
 version = "0.1.0"
 
 [[package]]
-name = "synstructure"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b834f2d66f734cb897113e34aaff2f1ab4719ca946f9a7358dba8f8064148701"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
- "unicode-xid",
-]
-
-[[package]]
 name = "sys_util"
 version = "0.1.0"
 dependencies = [
@@ -1075,6 +1059,7 @@ dependencies = [
  "serde_json",
  "sync",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -1167,6 +1152,29 @@ dependencies = [
  "net_util",
  "virtio_sys",
  "vm_memory",
+]
+
+[[package]]
+name = "vhost_user_devices"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base",
+ "cros_async",
+ "data_model",
+ "devices",
+ "futures",
+ "getopts",
+ "libc",
+ "net_util",
+ "once_cell",
+ "remain",
+ "sync",
+ "tempfile",
+ "thiserror",
+ "virtio_sys",
+ "vm_memory",
+ "vmm_vhost",
 ]
 
 [[package]]
@@ -1265,25 +1273,4 @@ dependencies = [
  "sync",
  "vm_control",
  "vm_memory",
-]
-
-[[package]]
-name = "zeroize"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81a974bcdd357f0dca4d41677db03436324d45a4c9ed2d0b873a5a360ce41c36"
-dependencies = [
- "zeroize_derive",
-]
-
-[[package]]
-name = "zeroize_derive"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3f369ddb18862aba61aa49bf31e74d29f0f162dec753063200e1dc084345d16"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
- "synstructure",
 ]
