@@ -1,0 +1,41 @@
+[package]
+name = "vhost_user_devices"
+version = "0.1.0"
+authors = ["The Chromium OS Authors"]
+edition = "2018"
+
+[features]
+net = ["data_model", "getopts", "net_util", "virtio_sys"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vhost-user-net-device"
+path = "src/net.rs"
+required-features = ["net"]
+
+[dependencies]
+anyhow = "*"
+base = { path = "../base" }
+cros_async = { path = "../cros_async" }
+data_model = { path = "../data_model", optional = true }
+devices = { path = "../devices" }
+getopts = { version = "0.2", optional = true }
+libc = "*"
+net_util = { path = "../net_util", optional = true }
+once_cell = "1.7.2"
+remain = "*"
+sync = { path = "../sync" }
+thiserror = "*"
+virtio_sys = { path = "../virtio_sys", optional = true }
+vm_memory = { path = "../vm_memory" }
+vmm_vhost = { path = "../../rust/vmm_vhost", version = "*", features = ["vhost-user-slave"] }
+
+[dependencies.futures]
+version = "*"
+default-features = false
+
+[dev-dependencies]
+data_model = { path = "../data_model" }
+tempfile = { path = "../tempfile" }

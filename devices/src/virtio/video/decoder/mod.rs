@@ -167,7 +167,6 @@ struct PictureReadyEvent {
 
 // Context is associated with one `DecoderSession`, which corresponds to one stream from the
 // virtio-video's point of view.
-#[derive(Default)]
 struct Context<S: DecoderSession> {
     stream_id: StreamId,
 
@@ -356,12 +355,6 @@ struct ContextMap<S: DecoderSession> {
 }
 
 impl<S: DecoderSession> ContextMap<S> {
-    fn new() -> Self {
-        ContextMap {
-            map: Default::default(),
-        }
-    }
-
     fn insert(&mut self, ctx: Context<S>) -> VideoResult<()> {
         match self.map.entry(ctx.stream_id) {
             Entry::Vacant(e) => {
@@ -390,6 +383,14 @@ impl<S: DecoderSession> ContextMap<S> {
     }
 }
 
+impl<S: DecoderSession> Default for ContextMap<S> {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+        }
+    }
+}
+
 /// Represents information of a decoder backed by a `DecoderBackend`.
 pub struct Decoder<D: DecoderBackend> {
     decoder: D,
@@ -398,14 +399,24 @@ pub struct Decoder<D: DecoderBackend> {
 }
 
 impl<'a, D: DecoderBackend> Decoder<D> {
+    /// Build a new decoder using the provided `backend`.
+    fn from_backend(backend: D) -> Self {
+        let capability = backend.get_capabilities();
+
+        Self {
+            decoder: backend,
+            capability,
+            contexts: Default::default(),
+        }
+    }
     /*
      * Functions processing virtio-video commands.
      */
 
     fn query_capabilities(&self, queue_type: QueueType) -> CmdResponse {
         let descs = match queue_type {
-            QueueType::Input => self.capability.in_fmts.clone(),
-            QueueType::Output => self.capability.out_fmts.clone(),
+            QueueType::Input => self.capability.input_formats().clone(),
+            QueueType::Output => self.capability.output_formats().clone(),
         };
 
         CmdResponse::QueryCapability(descs)
@@ -1085,17 +1096,5 @@ impl<D: DecoderBackend> Device for Decoder<D> {
         };
 
         Some(event_responses)
-    }
-}
-
-/// Create a new decoder instance using a Libvda decoder instance to perform
-/// the decoding.
-impl<'a> Decoder<&'a libvda::decode::VdaInstance> {
-    pub fn new(vda: &'a libvda::decode::VdaInstance) -> Self {
-        Decoder {
-            decoder: vda,
-            capability: Capability::new(vda.get_capabilities()),
-            contexts: ContextMap::new(),
-        }
     }
 }
