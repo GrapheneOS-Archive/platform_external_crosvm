@@ -686,7 +686,7 @@ impl VirtioGpu {
                 resource.slot = Some(slot);
                 Ok(OkMapInfo { map_info })
             }
-            VmMemoryResponse::Err(e) => Err(ErrSys(e)),
+            VmMemoryResponse::Err(e) => Err(ErrBase(e)),
             _ => Err(ErrUnspec),
         }
     }
@@ -708,7 +708,7 @@ impl VirtioGpu {
                 resource.slot = None;
                 Ok(OkNoData)
             }
-            VmMemoryResponse::Err(e) => Err(ErrSys(e)),
+            VmMemoryResponse::Err(e) => Err(ErrBase(e)),
             _ => Err(ErrUnspec),
         }
     }

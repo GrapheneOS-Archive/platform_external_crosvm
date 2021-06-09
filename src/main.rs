@@ -153,6 +153,37 @@ fn parse_cpu_affinity(s: &str) -> argument::Result<VcpuAffinity> {
     }
 }
 
+fn parse_cpu_capacity(s: &str, cpu_capacity: &mut BTreeMap<usize, u32>) -> argument::Result<()> {
+    for cpu_pair in s.split(',') {
+        let assignment: Vec<&str> = cpu_pair.split('=').collect();
+        if assignment.len() != 2 {
+            return Err(argument::Error::InvalidValue {
+                value: cpu_pair.to_owned(),
+                expected: String::from("invalid CPU capacity syntax"),
+            });
+        }
+        let cpu = assignment[0]
+            .parse()
+            .map_err(|_| argument::Error::InvalidValue {
+                value: assignment[0].to_owned(),
+                expected: String::from("CPU index must be a non-negative integer"),
+            })?;
+        let capacity = assignment[1]
+            .parse()
+            .map_err(|_| argument::Error::InvalidValue {
+                value: assignment[1].to_owned(),
+                expected: String::from("CPU capacity must be a non-negative integer"),
+            })?;
+        if cpu_capacity.insert(cpu, capacity).is_some() {
+            return Err(argument::Error::InvalidValue {
+                value: cpu_pair.to_owned(),
+                expected: String::from("CPU index must be unique"),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "gpu")]
 fn parse_gpu_options(s: Option<&str>) -> argument::Result<GpuParameters> {
     let mut gpu_params: GpuParameters = Default::default();
@@ -838,6 +869,12 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.vcpu_affinity = Some(parse_cpu_affinity(value.unwrap())?);
         }
+        "cpu-cluster" => {
+            cfg.cpu_clusters.push(parse_cpu_set(value.unwrap())?);
+        }
+        "cpu-capacity" => {
+            parse_cpu_capacity(value.unwrap(), &mut cfg.cpu_capacity)?;
+        }
         "no-smt" => {
             cfg.no_smt = true;
         }
@@ -1490,11 +1527,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.software_tpm = true;
         }
         "single-touch" => {
-            if cfg.virtio_single_touch.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`single-touch` already given".to_owned(),
-                ));
-            }
             let mut it = value.unwrap().split(':');
 
             let mut single_touch_spec =
@@ -1505,14 +1537,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             if let Some(height) = it.next() {
                 single_touch_spec.set_height(height.trim().parse().unwrap());
             }
-            cfg.virtio_single_touch = Some(single_touch_spec);
+            cfg.virtio_single_touch.push(single_touch_spec);
         }
         "multi-touch" => {
-            if cfg.virtio_multi_touch.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`multi-touch` already given".to_owned(),
-                ));
-            }
             let mut it = value.unwrap().split(':');
 
             let mut multi_touch_spec =
@@ -1523,14 +1550,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             if let Some(height) = it.next() {
                 multi_touch_spec.set_height(height.trim().parse().unwrap());
             }
-            cfg.virtio_multi_touch = Some(multi_touch_spec);
+            cfg.virtio_multi_touch.push(multi_touch_spec);
         }
         "trackpad" => {
-            if cfg.virtio_trackpad.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`trackpad` already given".to_owned(),
-                ));
-            }
             let mut it = value.unwrap().split(':');
 
             let mut trackpad_spec =
@@ -1541,31 +1563,19 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             if let Some(height) = it.next() {
                 trackpad_spec.set_height(height.trim().parse().unwrap());
             }
-            cfg.virtio_trackpad = Some(trackpad_spec);
+            cfg.virtio_trackpad.push(trackpad_spec);
         }
         "mouse" => {
-            if cfg.virtio_mouse.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`mouse` already given".to_owned(),
-                ));
-            }
-            cfg.virtio_mouse = Some(PathBuf::from(value.unwrap().to_owned()));
+            cfg.virtio_mice
+                .push(PathBuf::from(value.unwrap().to_owned()));
         }
         "keyboard" => {
-            if cfg.virtio_keyboard.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`keyboard` already given".to_owned(),
-                ));
-            }
-            cfg.virtio_keyboard = Some(PathBuf::from(value.unwrap().to_owned()));
+            cfg.virtio_keyboard
+                .push(PathBuf::from(value.unwrap().to_owned()));
         }
         "switches" => {
-            if cfg.virtio_switches.is_some() {
-                return Err(argument::Error::TooManyArguments(
-                    "`switches` already given".to_owned(),
-                ));
-            }
-            cfg.virtio_switches = Some(PathBuf::from(value.unwrap().to_owned()));
+            cfg.virtio_switches
+                .push(PathBuf::from(value.unwrap().to_owned()));
         }
         "evdev" => {
             let dev_path = PathBuf::from(value.unwrap());
@@ -1751,6 +1761,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.dmi_path = Some(dmi_path);
         }
+        "no-legacy" => {
+            cfg.no_legacy = true;
+        }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
     }
@@ -1787,10 +1800,10 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
     {
         if let Some(gpu_parameters) = cfg.gpu_parameters.as_ref() {
             let (width, height) = (gpu_parameters.display_width, gpu_parameters.display_height);
-            if let Some(virtio_multi_touch) = cfg.virtio_multi_touch.as_mut() {
+            if let Some(virtio_multi_touch) = cfg.virtio_multi_touch.first_mut() {
                 virtio_multi_touch.set_default_size(width, height);
             }
-            if let Some(virtio_single_touch) = cfg.virtio_single_touch.as_mut() {
+            if let Some(virtio_single_touch) = cfg.virtio_single_touch.first_mut() {
                 virtio_single_touch.set_default_size(width, height);
             }
         }
@@ -1822,6 +1835,8 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::short_value('c', "cpus", "N", "Number of VCPUs. (default: 1)"),
           Argument::value("cpu-affinity", "CPUSET", "Comma-separated list of CPUs or CPU ranges to run VCPUs on (e.g. 0,1-3,5)
                               or colon-separated list of assignments of guest to host CPU assignments (e.g. 0=0:1=1:2=2) (default: no mask)"),
+          Argument::value("cpu-cluster", "CPUSET", "Group the given CPUs into a cluster (default: no clusters)"),
+          Argument::value("cpu-capacity", "CPU=CAP[,CPU=CAP[,...]]", "Set the relative capacity of the given CPU (default: no capacity)"),
           Argument::flag("no-smt", "Don't use SMT in the guest"),
           Argument::value("rt-cpus", "CPUSET", "Comma-separated list of CPUs or CPU ranges to run VCPUs on. (e.g. 0,1-3,5) (default: none)"),
           Argument::short_value('m',
@@ -1972,6 +1987,7 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
           #[cfg(feature = "direct")]
           Argument::value("direct-edge-irq", "irq", "Enable interrupt passthrough"),
           Argument::value("dmi", "DIR", "Directory with smbios_entry_point/DMI files"),
+          Argument::flag("no-legacy", "Don't use legacy KBD/RTC devices emulation"),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -2696,11 +2712,11 @@ mod tests {
         set_argument(&mut config, "trackpad", Some("/dev/single-touch-test")).unwrap();
         validate_arguments(&mut config).unwrap();
         assert_eq!(
-            config.virtio_single_touch.unwrap().get_size(),
+            config.virtio_single_touch.first().unwrap().get_size(),
             (DEFAULT_TOUCH_DEVICE_WIDTH, DEFAULT_TOUCH_DEVICE_HEIGHT)
         );
         assert_eq!(
-            config.virtio_trackpad.unwrap().get_size(),
+            config.virtio_trackpad.first().unwrap().get_size(),
             (DEFAULT_TOUCH_DEVICE_WIDTH, DEFAULT_TOUCH_DEVICE_HEIGHT)
         );
     }
@@ -2723,7 +2739,7 @@ mod tests {
         .unwrap();
         validate_arguments(&mut config).unwrap();
         assert_eq!(
-            config.virtio_single_touch.unwrap().get_size(),
+            config.virtio_single_touch.first().unwrap().get_size(),
             (width, height)
         );
     }
@@ -2750,10 +2766,13 @@ mod tests {
         .unwrap();
         validate_arguments(&mut config).unwrap();
         assert_eq!(
-            config.virtio_single_touch.unwrap().get_size(),
+            config.virtio_single_touch.first().unwrap().get_size(),
             (width, height)
         );
-        assert_eq!(config.virtio_trackpad.unwrap().get_size(), (width, height));
+        assert_eq!(
+            config.virtio_trackpad.first().unwrap().get_size(),
+            (width, height)
+        );
     }
 
     #[cfg(feature = "gpu")]
@@ -2787,7 +2806,7 @@ mod tests {
         .unwrap();
         validate_arguments(&mut config).unwrap();
         assert_eq!(
-            config.virtio_single_touch.unwrap().get_size(),
+            config.virtio_single_touch.first().unwrap().get_size(),
             (touch_width, touch_height)
         );
     }
@@ -2801,7 +2820,7 @@ mod tests {
         set_argument(&mut config, "switches", Some("/dev/switches-test")).unwrap();
         validate_arguments(&mut config).unwrap();
         assert_eq!(
-            config.virtio_switches.unwrap(),
+            config.virtio_switches.pop().unwrap(),
             PathBuf::from("/dev/switches-test")
         );
     }
