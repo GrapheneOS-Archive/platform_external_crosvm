@@ -1,4 +1,4 @@
-// Copyright 2020 The Chromium OS Authors. All rights reserved.
+// Copyright 2021 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -10,8 +10,12 @@ use libvda::encode::{EncodeCapabilities, VeaImplType, VeaInstance};
 
 use base::{error, warn, IntoRawDescriptor};
 
-use crate::virtio::video::encoder::encoder::*;
+use super::*;
 use crate::virtio::video::format::{Format, FormatDesc, FormatRange, FrameFormat, Level, Profile};
+use crate::virtio::video::{
+    encoder::{encoder::*, EncoderDevice},
+    error::{VideoError, VideoResult},
+};
 
 pub struct LibvdaEncoder {
     instance: VeaInstance,
@@ -19,9 +23,8 @@ pub struct LibvdaEncoder {
 }
 
 impl LibvdaEncoder {
-    pub fn new() -> Result<Self> {
-        let instance = VeaInstance::new(VeaImplType::Gavea)
-            .map_err(|e| EncoderError::Implementation(Box::new(e)))?;
+    fn new() -> VideoResult<Self> {
+        let instance = VeaInstance::new(VeaImplType::Gavea)?;
 
         let EncodeCapabilities {
             input_formats,
@@ -30,7 +33,7 @@ impl LibvdaEncoder {
 
         if input_formats.len() == 0 || output_formats.len() == 0 {
             error!("No input or output formats.");
-            return Err(EncoderError::PlatformFailure);
+            return Err(VideoError::InvalidFormat);
         }
 
         let input_format_descs: Vec<FormatDesc> = input_formats
@@ -76,7 +79,7 @@ impl LibvdaEncoder {
         {
             // NV12 is currently the only supported pixel format for libvda.
             error!("libvda encoder does not support NV12.");
-            return Err(EncoderError::PlatformFailure);
+            return Err(VideoError::InvalidFormat);
         }
 
         struct ParsedFormat {
@@ -169,28 +172,28 @@ impl LibvdaEncoder {
     }
 }
 
-impl<'a> Encoder for &'a LibvdaEncoder {
-    type Session = LibvdaEncoderSession<'a>;
+impl Encoder for LibvdaEncoder {
+    type Session = LibvdaEncoderSession;
 
-    fn query_capabilities(&self) -> Result<EncoderCapabilities> {
+    fn query_capabilities(&self) -> VideoResult<EncoderCapabilities> {
         Ok(self.capabilities.clone())
     }
 
-    fn start_session(&mut self, config: SessionConfig) -> Result<LibvdaEncoderSession<'a>> {
+    fn start_session(&mut self, config: SessionConfig) -> VideoResult<LibvdaEncoderSession> {
         if config.dst_params.format.is_none() {
-            return Err(EncoderError::InvalidArgument);
+            return Err(VideoError::InvalidArgument);
         }
 
         let input_format = match config
             .src_params
             .format
-            .ok_or(EncoderError::InvalidArgument)?
+            .ok_or(VideoError::InvalidArgument)?
         {
             Format::NV12 => libvda::PixelFormat::NV12,
             Format::YUV420 => libvda::PixelFormat::YV12,
             unsupported_format => {
                 error!("Unsupported libvda format: {}", unsupported_format);
-                return Err(EncoderError::InvalidArgument);
+                return Err(VideoError::InvalidArgument);
             }
         };
 
@@ -198,7 +201,7 @@ impl<'a> Encoder for &'a LibvdaEncoder {
             Some(p) => p,
             None => {
                 error!("Unsupported libvda profile");
-                return Err(EncoderError::InvalidArgument);
+                return Err(VideoError::InvalidArgument);
             }
         };
 
@@ -235,10 +238,7 @@ impl<'a> Encoder for &'a LibvdaEncoder {
             }),
         };
 
-        let session = self
-            .instance
-            .open_session(config)
-            .map_err(|e| EncoderError::Implementation(Box::new(e)))?;
+        let session = self.instance.open_session(config)?;
 
         Ok(LibvdaEncoderSession {
             session,
@@ -247,26 +247,26 @@ impl<'a> Encoder for &'a LibvdaEncoder {
         })
     }
 
-    fn stop_session(&mut self, _session: LibvdaEncoderSession) -> Result<()> {
+    fn stop_session(&mut self, _session: LibvdaEncoderSession) -> VideoResult<()> {
         // Resources will be freed when `_session` is dropped.
         Ok(())
     }
 }
 
-pub struct LibvdaEncoderSession<'a> {
-    session: libvda::encode::Session<'a>,
+pub struct LibvdaEncoderSession {
+    session: libvda::encode::Session,
     next_input_buffer_id: InputBufferId,
     next_output_buffer_id: OutputBufferId,
 }
 
-impl<'a> EncoderSession for LibvdaEncoderSession<'a> {
+impl EncoderSession for LibvdaEncoderSession {
     fn encode(
         &mut self,
         resource: File,
         planes: &[VideoFramePlane],
         timestamp: u64,
         force_keyframe: bool,
-    ) -> Result<InputBufferId> {
+    ) -> VideoResult<InputBufferId> {
         let input_buffer_id = self.next_input_buffer_id;
 
         let libvda_planes = planes
@@ -277,58 +277,54 @@ impl<'a> EncoderSession for LibvdaEncoderSession<'a> {
             })
             .collect::<Vec<_>>();
 
-        self.session
-            .encode(
-                input_buffer_id as i32,
-                resource.into_raw_descriptor(),
-                &libvda_planes,
-                timestamp as i64,
-                force_keyframe,
-            )
-            .map_err(|e| EncoderError::Implementation(Box::new(e)))?;
+        self.session.encode(
+            input_buffer_id as i32,
+            resource.into_raw_descriptor(),
+            &libvda_planes,
+            timestamp as i64,
+            force_keyframe,
+        )?;
 
         self.next_input_buffer_id = self.next_input_buffer_id.wrapping_add(1);
 
         Ok(input_buffer_id)
     }
 
-    fn use_output_buffer(&mut self, file: File, offset: u32, size: u32) -> Result<OutputBufferId> {
+    fn use_output_buffer(
+        &mut self,
+        file: File,
+        offset: u32,
+        size: u32,
+    ) -> VideoResult<OutputBufferId> {
         let output_buffer_id = self.next_output_buffer_id;
         self.next_output_buffer_id = self.next_output_buffer_id.wrapping_add(1);
 
-        self.session
-            .use_output_buffer(
-                output_buffer_id as i32,
-                file.into_raw_descriptor(),
-                offset,
-                size,
-            )
-            .map_err(|e| EncoderError::Implementation(Box::new(e)))?;
+        self.session.use_output_buffer(
+            output_buffer_id as i32,
+            file.into_raw_descriptor(),
+            offset,
+            size,
+        )?;
 
         Ok(output_buffer_id)
     }
 
-    fn flush(&mut self) -> Result<()> {
-        self.session
-            .flush()
-            .map_err(|e| EncoderError::Implementation(Box::new(e)))
+    fn flush(&mut self) -> VideoResult<()> {
+        self.session.flush().map_err(VideoError::from)
     }
 
-    fn request_encoding_params_change(&mut self, bitrate: u32, framerate: u32) -> Result<()> {
+    fn request_encoding_params_change(&mut self, bitrate: u32, framerate: u32) -> VideoResult<()> {
         self.session
             .request_encoding_params_change(bitrate, framerate)
-            .map_err(|e| EncoderError::Implementation(Box::new(e)))
+            .map_err(VideoError::from)
     }
 
     fn event_pipe(&self) -> &File {
         self.session.pipe()
     }
 
-    fn read_event(&mut self) -> Result<EncoderEvent> {
-        let event = self
-            .session
-            .read_event()
-            .map_err(|e| EncoderError::Implementation(Box::new(e)))?;
+    fn read_event(&mut self) -> VideoResult<EncoderEvent> {
+        let event = self.session.read_event()?;
 
         use libvda::encode::Event::*;
         let encoder_event = match event {
@@ -358,10 +354,19 @@ impl<'a> EncoderSession for LibvdaEncoderSession<'a> {
             },
             FlushResponse { flush_done } => EncoderEvent::FlushResponse { flush_done },
             NotifyError(err) => EncoderEvent::NotifyError {
-                error: EncoderError::Implementation(Box::new(err)),
+                error: VideoError::BackendFailure(Box::new(err)),
             },
         };
 
         Ok(encoder_event)
+    }
+}
+
+/// Create a new encoder instance using a Libvda encoder instance to perform
+/// the encoding.
+impl EncoderDevice<LibvdaEncoder> {
+    pub fn new() -> VideoResult<Self> {
+        let vea = LibvdaEncoder::new()?;
+        EncoderDevice::from_backend(vea)
     }
 }

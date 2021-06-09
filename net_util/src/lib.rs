@@ -20,32 +20,28 @@ use base::{
     ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val, volatile_impl, AsRawDescriptor,
     FromRawDescriptor, IoctlNr, RawDescriptor,
 };
+use cros_async::IntoAsync;
+use thiserror::Error as ThisError;
 
-#[derive(Debug)]
+#[derive(ThisError, Debug)]
 pub enum Error {
     /// Failed to create a socket.
+    #[error("failed to create a socket: {0}")]
     CreateSocket(SysError),
     /// Couldn't open /dev/net/tun.
+    #[error("failed to open /dev/net/tun: {0}")]
     OpenTun(SysError),
     /// Unable to create tap interface.
+    #[error("failed to create tap interface: {0}")]
     CreateTap(SysError),
+    /// Unable to clone tap interface.
+    #[error("failed to clone tap interface: {0}")]
+    CloneTap(SysError),
     /// ioctl failed.
+    #[error("ioctl failed: {0}")]
     IoctlError(SysError),
 }
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            CreateSocket(e) => write!(f, "failed to create a socket: {}", e),
-            OpenTun(e) => write!(f, "failed to open /dev/net/tun: {}", e),
-            CreateTap(e) => write!(f, "failed to create tap interface: {}", e),
-            IoctlError(e) => write!(f, "ioctl failed: {}", e),
-        }
-    }
-}
 
 impl Error {
     pub fn sys_error(&self) -> SysError {
@@ -53,6 +49,7 @@ impl Error {
             Error::CreateSocket(e) => e,
             Error::OpenTun(e) => e,
             Error::CreateTap(e) => e,
+            Error::CloneTap(e) => e,
             Error::IoctlError(e) => e,
         }
     }
@@ -192,7 +189,7 @@ impl Tap {
         })
     }
 
-    fn create_tap_with_ifreq(ifreq: &mut net_sys::ifreq) -> Result<Tap> {
+    pub fn create_tap_with_ifreq(ifreq: &mut net_sys::ifreq) -> Result<Tap> {
         // Open calls are safe because we give a constant nul-terminated
         // string and verify the result.
         let fd = unsafe {
@@ -226,6 +223,18 @@ impl Tap {
             if_name: unsafe { ifreq.ifr_ifrn.ifrn_name },
             if_flags: unsafe { ifreq.ifr_ifru.ifru_flags },
         })
+    }
+
+    pub fn try_clone(&self) -> Result<Tap> {
+        self.tap_file
+            .try_clone()
+            .map(|tap_file| Tap {
+                tap_file,
+                if_name: self.if_name,
+                if_flags: self.if_flags,
+            })
+            .map_err(SysError::from)
+            .map_err(Error::CloneTap)
     }
 }
 
@@ -526,6 +535,8 @@ impl AsRawDescriptor for Tap {
         self.tap_file.as_raw_descriptor()
     }
 }
+
+impl IntoAsync for Tap {}
 
 volatile_impl!(Tap);
 
