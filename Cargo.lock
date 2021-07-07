@@ -227,6 +227,7 @@ dependencies = [
  "remain",
  "resources",
  "rutabaga_gfx",
+ "serde_json",
  "sync",
  "tempfile",
  "thiserror",
@@ -278,9 +279,9 @@ dependencies = [
 
 [[package]]
 name = "dbus"
-version = "0.6.5"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48b5f0f36f1eebe901b0e6bee369a77ed3396334bf3f09abd46454a576f71819"
+checksum = "5cd9e78c210146a1860f897db03412fd5091fd73100778e43ee255cca252cf32"
 dependencies = [
  "libc",
  "libdbus-sys",
@@ -347,6 +348,7 @@ dependencies = [
  "protos",
  "remain",
  "tempfile",
+ "thiserror",
  "vm_memory",
 ]
 
@@ -527,6 +529,7 @@ dependencies = [
  "libc",
  "sync",
  "sys_util",
+ "thiserror",
 ]
 
 [[package]]
@@ -1163,6 +1166,7 @@ dependencies = [
  "cros_async",
  "data_model",
  "devices",
+ "disk",
  "futures",
  "getopts",
  "libc",
@@ -1170,6 +1174,7 @@ dependencies = [
  "once_cell",
  "remain",
  "sync",
+ "sys_util",
  "tempfile",
  "thiserror",
  "virtio_sys",
@@ -1196,6 +1201,7 @@ dependencies = [
  "resources",
  "rutabaga_gfx",
  "serde",
+ "serde_json",
  "sync",
  "vm_memory",
 ]

@@ -5,7 +5,6 @@
 //! Implements virtio devices, queues, and transport mechanisms.
 
 mod balloon;
-mod block;
 mod console;
 mod descriptor_utils;
 mod input;
@@ -21,8 +20,9 @@ mod video;
 mod virtio_device;
 mod virtio_pci_common_config;
 mod virtio_pci_device;
-mod wl;
+pub mod wl;
 
+pub mod block;
 pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;

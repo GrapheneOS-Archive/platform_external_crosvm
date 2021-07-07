@@ -55,6 +55,8 @@ use base::{error, Event, FromRawDescriptor, SafeDescriptor, SharedMemory, Shared
 use cros_async::{AsyncError, AsyncWrapper, Executor};
 use devices::virtio::{Queue, SignalableInterrupt};
 use remain::sorted;
+use sync::Mutex;
+use sys_util::clear_fd_flags;
 use thiserror::Error as ThisError;
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 use vmm_vhost::vhost_user::message::{
@@ -148,7 +150,7 @@ where
         idx: usize,
         queue: Queue,
         mem: GuestMemory,
-        call_evt: CallEvent,
+        call_evt: Arc<Mutex<CallEvent>>,
         kick_evt: Event,
     ) -> std::result::Result<(), Self::Error>;
 
@@ -162,7 +164,7 @@ where
 /// A virtio ring entry.
 struct Vring {
     queue: Queue,
-    call_evt: Option<CallEvent>,
+    call_evt: Option<Arc<Mutex<CallEvent>>>,
     enabled: bool,
 }
 
@@ -460,6 +462,12 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
             return Err(VhostError::InvalidParam);
         }
 
+        let vring = &mut self.vrings[index as usize];
+        if vring.queue.ready {
+            error!("kick fd cannot replaced after queue is started");
+            return Err(VhostError::InvalidOperation);
+        }
+
         if let Some(fd) = fd {
             // TODO(b/186625058): The current code returns an error when `FD_CLOEXEC` is already
             // set, which is not harmful. Once we update the vhost crate's API to pass around `File`
@@ -468,6 +476,14 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
                 error!("invalid fd is given: {}", e);
                 VhostError::InvalidParam
             })?;
+
+            // Remove O_NONBLOCK from kick_fd. Otherwise, uring_executor will fails when we read
+            // values via `next_val()` later.
+            if let Err(e) = clear_fd_flags(rd, libc::O_NONBLOCK) {
+                error!("failed to remove O_NONBLOCK for kick fd: {}", e);
+                return Err(VhostError::InvalidParam);
+            }
+
             // Safe because the FD is now owned.
             let kick_evt = unsafe { Event::from_raw_descriptor(rd) };
 
@@ -475,17 +491,23 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
             vring.queue.ready = true;
 
             let queue = vring.queue.clone();
-            let call_evt = vring.call_evt.take().ok_or(VhostError::InvalidOperation)?;
+            let call_evt = vring
+                .call_evt
+                .as_ref()
+                .ok_or(VhostError::InvalidOperation)?;
             let mem = self
                 .mem
                 .as_ref()
                 .cloned()
                 .ok_or(VhostError::InvalidOperation)?;
 
-            if let Err(e) = self
-                .backend
-                .start_queue(index as usize, queue, mem, call_evt, kick_evt)
-            {
+            if let Err(e) = self.backend.start_queue(
+                index as usize,
+                queue,
+                mem,
+                Arc::clone(&call_evt),
+                kick_evt,
+            ) {
                 error!("Failed to start queue {}: {}", index, e);
                 return Err(VhostError::SlaveInternalError);
             }
@@ -504,8 +526,16 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
                 VhostError::InvalidParam
             })?;
             // Safe because the FD is now owned.
-            let call = unsafe { Event::from_raw_descriptor(rd) };
-            self.vrings[index as usize].call_evt = Some(CallEvent(call));
+            let call_evt = CallEvent(unsafe { Event::from_raw_descriptor(rd) });
+            match &self.vrings[index as usize].call_evt {
+                None => {
+                    self.vrings[index as usize].call_evt = Some(Arc::new(Mutex::new(call_evt)));
+                }
+                Some(cell) => {
+                    let mut evt = cell.lock();
+                    *evt = call_evt;
+                }
+            }
         }
 
         Ok(())
@@ -595,7 +625,6 @@ mod tests {
     use data_model::DataInit;
     use devices::virtio::vhost::user::VhostUserHandler;
     use tempfile::{Builder, TempDir};
-    use vmm_vhost::vhost_user::Master;
 
     #[derive(ThisError, Debug)]
     enum FakeError {
@@ -684,7 +713,7 @@ mod tests {
             _idx: usize,
             _queue: Queue,
             _mem: GuestMemory,
-            _call_evt: CallEvent,
+            _call_evt: Arc<Mutex<CallEvent>>,
             _kick_evt: Event,
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
@@ -722,7 +751,7 @@ mod tests {
             let allow_protocol_features = VhostUserProtocolFeatures::CONFIG;
             let mut vmm_handler = VhostUserHandler::new_from_path(
                 &path,
-                1,
+                QUEUES_NUM as u64,
                 allow_features,
                 init_features,
                 allow_protocol_features,
@@ -747,7 +776,7 @@ mod tests {
                 let irqfd = Event::new().unwrap();
 
                 vmm_handler
-                    .activate_vring(&mem, 0, &queue, &queue_evt, &irqfd)
+                    .activate_vring(&mem, idx, &queue, &queue_evt, &irqfd)
                     .unwrap();
             }
 

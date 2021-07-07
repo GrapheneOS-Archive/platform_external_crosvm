@@ -102,12 +102,12 @@ rust_library {
 //   futures-util-0.3.15 "alloc,async-await,async-await-macro,channel,default,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,proc-macro-hack,proc-macro-nested,sink,slab,std"
 //   intrusive-collections-0.9.1 "alloc,default"
 //   itoa-0.4.7
-//   libc-0.2.95 "default,std"
+//   libc-0.2.97 "default,std"
 //   memchr-2.4.0 "default,std"
 //   memoffset-0.5.6 "default"
 //   num_cpus-1.13.0
 //   paste-1.0.5
-//   pin-project-lite-0.2.6
+//   pin-project-lite-0.2.7
 //   pin-utils-0.1.0
 //   proc-macro-hack-0.5.19
 //   proc-macro-nested-0.1.7
@@ -118,7 +118,7 @@ rust_library {
 //   serde_derive-1.0.126 "default"
 //   serde_json-1.0.64 "default,std"
 //   slab-0.4.3 "default,std"
-//   syn-1.0.72 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.73 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   thiserror-1.0.25
 //   thiserror-impl-1.0.25
 //   unicode-xid-0.2.2 "default"

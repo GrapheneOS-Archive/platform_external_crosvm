@@ -155,6 +155,7 @@ rust_binary {
         "librand_ish",
         "libresources",
         "librutabaga_gfx",
+        "libserde_json",
         "libsync_rust",
         "libtempfile",
         "libvhost",
@@ -218,6 +219,7 @@ rust_defaults {
         "librand_ish",
         "libresources",
         "librutabaga_gfx",
+        "libserde_json",
         "libsync_rust",
         "libtempfile",
         "libvhost",
@@ -298,6 +300,7 @@ rust_defaults {
         "librand_ish",
         "libresources",
         "librutabaga_gfx",
+        "libserde_json",
         "libsync_rust",
         "libtempfile",
         "libvhost",
@@ -390,6 +393,7 @@ rust_library {
         "librand_ish",
         "libresources",
         "librutabaga_gfx",
+        "libserde_json",
         "libsync_rust",
         "libtempfile",
         "libvhost",
@@ -413,7 +417,7 @@ rust_library {
 //   ../rust/vmm_vhost/src/lib.rs "default,vhost-user,vhost-user-master,vhost-user-slave"
 //   ../vm_tools/p9/src/lib.rs
 //   ../vm_tools/p9/wire_format_derive/wire_format_derive.rs
-//   anyhow-1.0.40 "default,std"
+//   anyhow-1.0.41 "default,std"
 //   async-task-4.0.3 "default,std"
 //   async-trait-0.1.50
 //   autocfg-1.0.1
@@ -428,25 +432,26 @@ rust_library {
 //   futures-sink-0.3.15 "alloc,std"
 //   futures-task-0.3.15 "alloc,std"
 //   futures-util-0.3.15 "alloc,channel,futures-channel,futures-io,futures-sink,io,memchr,sink,slab,std"
+//   getopts-0.2.21
 //   getrandom-0.2.3 "std"
 //   intrusive-collections-0.9.1 "alloc,default"
 //   itoa-0.4.7
-//   libc-0.2.95 "default,std"
+//   libc-0.2.97 "default,std"
 //   log-0.4.14
 //   memchr-2.4.0 "default,std"
 //   memoffset-0.5.6 "default"
-//   once_cell-1.7.2 "alloc,default,race,std"
+//   once_cell-1.8.0 "alloc,default,race,std"
 //   paste-1.0.5
-//   pin-project-lite-0.2.6
+//   pin-project-lite-0.2.7
 //   pin-utils-0.1.0
 //   pkg-config-0.3.19
 //   ppv-lite86-0.2.10 "simd,std"
 //   proc-macro2-1.0.27 "default,proc-macro"
-//   protobuf-2.23.0
+//   protobuf-2.24.1
 //   quote-1.0.9 "default,proc-macro"
-//   rand-0.8.3 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
-//   rand_chacha-0.3.0 "std"
-//   rand_core-0.6.2 "alloc,getrandom,std"
+//   rand-0.8.4 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
+//   rand_chacha-0.3.1 "std"
+//   rand_core-0.6.3 "alloc,getrandom,std"
 //   remain-0.2.2
 //   remove_dir_all-0.5.3
 //   ryu-1.0.5
@@ -455,8 +460,9 @@ rust_library {
 //   serde_json-1.0.64 "default,std"
 //   slab-0.4.3 "default,std"
 //   smallvec-1.6.1
-//   syn-1.0.72 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.73 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   tempfile-3.2.0
 //   thiserror-1.0.25
 //   thiserror-impl-1.0.25
+//   unicode-width-0.1.8 "default"
 //   unicode-xid-0.2.2 "default"
