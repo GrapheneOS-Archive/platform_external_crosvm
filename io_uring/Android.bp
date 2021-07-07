@@ -24,6 +24,7 @@ rust_defaults {
         "libsync_rust",
         "libsys_util",
         "libtempfile",
+        "libthiserror",
     ],
 }
 
@@ -52,6 +53,7 @@ rust_library {
         "liblibc",
         "libsync_rust",
         "libsys_util",
+        "libthiserror",
     ],
 }
 
@@ -63,14 +65,14 @@ rust_library {
 //   ../sys_util/src/lib.rs
 //   ../tempfile/src/lib.rs
 //   itoa-0.4.7
-//   libc-0.2.95 "default,std"
+//   libc-0.2.97 "default,std"
 //   proc-macro2-1.0.27 "default,proc-macro"
 //   quote-1.0.9 "default,proc-macro"
 //   ryu-1.0.5
 //   serde-1.0.126 "default,derive,serde_derive,std"
 //   serde_derive-1.0.126 "default"
 //   serde_json-1.0.64 "default,std"
-//   syn-1.0.72 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   syn-1.0.73 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   thiserror-1.0.25
 //   thiserror-impl-1.0.25
 //   unicode-xid-0.2.2 "default"
