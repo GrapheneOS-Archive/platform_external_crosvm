@@ -110,16 +110,16 @@ rust_test {
 //   cfg-if-1.0.0
 //   either-1.6.1 "default,use_std"
 //   getrandom-0.2.3 "std"
-//   libc-0.2.95 "default,std"
+//   libc-0.2.97 "default,std"
 //   log-0.4.14
 //   ppv-lite86-0.2.10 "simd,std"
-//   protobuf-2.23.0
-//   protobuf-codegen-2.23.0
-//   protoc-2.23.0
-//   protoc-rust-2.23.0
-//   rand-0.8.3 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
-//   rand_chacha-0.3.0 "std"
-//   rand_core-0.6.2 "alloc,getrandom,std"
+//   protobuf-2.24.1
+//   protobuf-codegen-2.24.1
+//   protoc-2.24.1
+//   protoc-rust-2.24.1
+//   rand-0.8.4 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
+//   rand_chacha-0.3.1 "std"
+//   rand_core-0.6.3 "alloc,getrandom,std"
 //   remove_dir_all-0.5.3
 //   tempfile-3.2.0
 //   which-4.1.0

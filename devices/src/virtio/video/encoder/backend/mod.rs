@@ -6,11 +6,13 @@ pub mod vda;
 
 use std::fs::File;
 
+use base::AsRawDescriptor;
+
 use crate::virtio::video::error::VideoResult;
+use crate::virtio::video::format::FramePlane;
 
 use super::encoder::{
     EncoderCapabilities, EncoderEvent, InputBufferId, OutputBufferId, SessionConfig,
-    VideoFramePlane,
 };
 
 pub trait EncoderSession {
@@ -24,7 +26,7 @@ pub trait EncoderSession {
     fn encode(
         &mut self,
         resource: File,
-        planes: &[VideoFramePlane],
+        planes: &[FramePlane],
         timestamp: u64,
         force_keyframe: bool,
     ) -> VideoResult<InputBufferId>;
@@ -48,9 +50,9 @@ pub trait EncoderSession {
     /// Requests the encoder to use new encoding parameters provided by `bitrate` and `framerate`.
     fn request_encoding_params_change(&mut self, bitrate: u32, framerate: u32) -> VideoResult<()>;
 
-    /// Returns the event pipe as a pollable file descriptor. When the file descriptor is
-    /// readable, an event can be read by `read_event`.
-    fn event_pipe(&self) -> &File;
+    /// Returns the event pipe on which the availability of events will be signaled. Note that the
+    /// returned value is borrowed and only valid as long as the session is alive.
+    fn event_pipe(&self) -> &dyn AsRawDescriptor;
 
     /// Performs a blocking read for an encoder event. This function should only be called when
     /// the file descriptor returned by `event_pipe` is readable.

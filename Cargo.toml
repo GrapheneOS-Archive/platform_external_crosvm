@@ -91,6 +91,7 @@ protos = { path = "protos", optional = true }
 rand_ish = { path = "rand_ish" }
 remain = "*"
 resources = { path = "resources" }
+serde_json = "*"
 sync = { path = "sync" }
 tempfile = "*"
 thiserror = { version = "1.0.20", optional = true }
@@ -113,6 +114,7 @@ base = "*"
 assertions = { path = "assertions" }
 audio_streams = { path = "../adhd/audio_streams" } # ignored by ebuild
 base = { path = "base" }
+cras-sys = { path = "../adhd/cras/client/cras-sys" } # ignored by ebuild
 # Disabled to support running cargo2android while cros-fuzz is not
 # available in Android.
 # cros_fuzz = { path = "../../platform2/cros-fuzz" } # ignored by ebuild
