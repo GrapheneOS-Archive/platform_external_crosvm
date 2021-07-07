@@ -90,5 +90,5 @@ rust_library {
 // dependent_library ["feature_list"]
 //   proc-macro2-1.0.27 "default,proc-macro"
 //   quote-1.0.9 "default,proc-macro"
-//   syn-1.0.72 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
+//   syn-1.0.73 "clone-impls,default,derive,parsing,printing,proc-macro,quote"
 //   unicode-xid-0.2.2 "default"

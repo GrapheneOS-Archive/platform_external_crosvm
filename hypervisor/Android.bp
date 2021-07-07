@@ -100,10 +100,10 @@ rust_library {
 //   futures-util-0.3.15 "alloc,futures-sink,sink"
 //   intrusive-collections-0.9.1 "alloc,default"
 //   itoa-0.4.7
-//   libc-0.2.95 "default,std"
+//   libc-0.2.97 "default,std"
 //   memoffset-0.5.6 "default"
 //   paste-1.0.5
-//   pin-project-lite-0.2.6
+//   pin-project-lite-0.2.7
 //   pin-utils-0.1.0
 //   proc-macro2-1.0.27 "default,proc-macro"
 //   quote-1.0.9 "default,proc-macro"
@@ -113,7 +113,7 @@ rust_library {
 //   serde_json-1.0.64 "default,std"
 //   slab-0.4.3 "default,std"
 //   smallvec-1.6.1
-//   syn-1.0.72 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.73 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   thiserror-1.0.25
 //   thiserror-impl-1.0.25
 //   unicode-xid-0.2.2 "default"

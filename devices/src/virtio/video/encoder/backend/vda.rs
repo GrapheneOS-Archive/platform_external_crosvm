@@ -8,13 +8,16 @@ use std::fs::File;
 
 use libvda::encode::{EncodeCapabilities, VeaImplType, VeaInstance};
 
-use base::{error, warn, IntoRawDescriptor};
+use base::{error, warn, AsRawDescriptor, IntoRawDescriptor};
 
 use super::*;
-use crate::virtio::video::format::{Format, FormatDesc, FormatRange, FrameFormat, Level, Profile};
+use crate::virtio::video::format::{
+    Format, FormatDesc, FormatRange, FrameFormat, FramePlane, Level, Profile,
+};
 use crate::virtio::video::{
     encoder::{encoder::*, EncoderDevice},
     error::{VideoError, VideoResult},
+    Tube,
 };
 
 pub struct LibvdaEncoder {
@@ -263,7 +266,7 @@ impl EncoderSession for LibvdaEncoderSession {
     fn encode(
         &mut self,
         resource: File,
-        planes: &[VideoFramePlane],
+        planes: &[FramePlane],
         timestamp: u64,
         force_keyframe: bool,
     ) -> VideoResult<InputBufferId> {
@@ -297,7 +300,6 @@ impl EncoderSession for LibvdaEncoderSession {
         size: u32,
     ) -> VideoResult<OutputBufferId> {
         let output_buffer_id = self.next_output_buffer_id;
-        self.next_output_buffer_id = self.next_output_buffer_id.wrapping_add(1);
 
         self.session.use_output_buffer(
             output_buffer_id as i32,
@@ -305,6 +307,8 @@ impl EncoderSession for LibvdaEncoderSession {
             offset,
             size,
         )?;
+
+        self.next_output_buffer_id = self.next_output_buffer_id.wrapping_add(1);
 
         Ok(output_buffer_id)
     }
@@ -319,7 +323,7 @@ impl EncoderSession for LibvdaEncoderSession {
             .map_err(VideoError::from)
     }
 
-    fn event_pipe(&self) -> &File {
+    fn event_pipe(&self) -> &dyn AsRawDescriptor {
         self.session.pipe()
     }
 
@@ -365,8 +369,8 @@ impl EncoderSession for LibvdaEncoderSession {
 /// Create a new encoder instance using a Libvda encoder instance to perform
 /// the encoding.
 impl EncoderDevice<LibvdaEncoder> {
-    pub fn new() -> VideoResult<Self> {
+    pub fn new(resource_bridge: Tube) -> VideoResult<Self> {
         let vea = LibvdaEncoder::new()?;
-        EncoderDevice::from_backend(vea)
+        EncoderDevice::from_backend(vea, resource_bridge)
     }
 }
