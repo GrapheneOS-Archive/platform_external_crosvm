@@ -95,6 +95,7 @@ wayland_protocol_codegen {
         "protocol/aura-shell.xml",
         "protocol/linux-dmabuf-unstable-v1.xml",
         "protocol/viewporter.xml",
+        "protocol/virtio-gpu-metadata-v1.xml",
     ],
     tools: ["wayland_scanner"],
 }
@@ -107,8 +108,39 @@ wayland_protocol_codegen {
         "protocol/aura-shell.xml",
         "protocol/linux-dmabuf-unstable-v1.xml",
         "protocol/viewporter.xml",
+        "protocol/virtio-gpu-metadata-v1.xml",
     ],
     tools: ["wayland_scanner"],
+}
+
+wayland_protocol_codegen {
+    name: "gpu_display_server_protocol_headers",
+    cmd: "$(location wayland_scanner) server-header < $(in) > $(out)",
+    suffix: ".h",
+    srcs: [
+        "protocol/aura-shell.xml",
+        "protocol/linux-dmabuf-unstable-v1.xml",
+        "protocol/viewporter.xml",
+        "protocol/virtio-gpu-metadata-v1.xml",
+    ],
+    tools: ["wayland_scanner"],
+}
+
+cc_library_static {
+    name: "libwayland_crosvm_gpu_display_extension_server_protocols",
+    vendor_available: true,
+    host_supported: true,
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-g",
+        "-fvisibility=hidden",
+    ],
+    static_libs: ["libwayland_server"],
+    generated_sources: ["gpu_display_protocol_sources"],
+    generated_headers: ["gpu_display_server_protocol_headers"],
+    export_generated_headers: ["gpu_display_server_protocol_headers"],
 }
 
 // dependent_library ["feature_list"]
