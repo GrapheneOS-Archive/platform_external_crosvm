@@ -6,11 +6,6 @@ makes crosvm unique is a focus on safety within the programming language and a
 sandbox around the virtual devices to protect the kernel from attack in case of
 an exploit in the devices.
 
-## IRC
-
-The channel #crosvm on [freenode](https://webchat.freenode.net/#crosvm) is used
-for technical discussion related to crosvm development and integration.
-
 ## Getting started
 
 ### Building for CrOS
@@ -50,7 +45,7 @@ you can install `libcap-dev`.
 Handy Debian one-liner for all build and runtime deps, particularly if you're
 running Crostini:
 ```sh
-sudo apt install build-essential libcap-dev libgbm-dev libvirglrenderer-dev libwayland-bin libwayland-dev pkg-config protobuf-compiler python wayland-protocols bindgen
+sudo apt install build-essential clang libasound2-dev libcap-dev libgbm-dev libvirglrenderer-dev libwayland-bin libwayland-dev pkg-config protobuf-compiler python wayland-protocols bindgen
 ```
 
 Known issues:

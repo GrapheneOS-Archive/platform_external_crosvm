@@ -43,7 +43,7 @@ pub const VIRTIO_BLK_F_WRITE_ZEROES: u32 = 14;
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
-pub(crate) struct virtio_blk_geometry {
+pub struct virtio_blk_geometry {
     cylinders: Le16,
     heads: u8,
     sectors: u8,
@@ -54,7 +54,7 @@ unsafe impl DataInit for virtio_blk_geometry {}
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
-pub(crate) struct virtio_blk_topology {
+pub struct virtio_blk_topology {
     physical_block_exp: u8,
     alignment_offset: u8,
     min_io_size: Le16,
@@ -66,7 +66,7 @@ unsafe impl DataInit for virtio_blk_topology {}
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
-pub(crate) struct virtio_blk_config {
+pub struct virtio_blk_config {
     pub capacity: Le64,
     pub size_max: Le32,
     pub seg_max: Le32,
@@ -113,7 +113,7 @@ pub(crate) const VIRTIO_BLK_DISCARD_WRITE_ZEROES_FLAG_UNMAP: u32 = 1 << 0;
 unsafe impl DataInit for virtio_blk_discard_write_zeroes {}
 
 /// Builds and returns the config structure used to specify block features.
-pub(crate) fn build_config_space(
+pub fn build_config_space(
     disk_size: u64,
     seg_max: u32,
     block_size: u32,
@@ -133,4 +133,29 @@ pub(crate) fn build_config_space(
         max_write_zeroes_seg: Le32::from(MAX_WRITE_ZEROES_SEG),
         ..Default::default()
     }
+}
+
+/// Returns the feature flags given the specified attributes.
+pub fn build_avail_features(
+    base_features: u64,
+    read_only: bool,
+    sparse: bool,
+    multi_queue: bool,
+) -> u64 {
+    let mut avail_features = base_features;
+    avail_features |= 1 << VIRTIO_BLK_F_FLUSH;
+    if read_only {
+        avail_features |= 1 << VIRTIO_BLK_F_RO;
+    } else {
+        if sparse {
+            avail_features |= 1 << VIRTIO_BLK_F_DISCARD;
+        }
+        avail_features |= 1 << VIRTIO_BLK_F_WRITE_ZEROES;
+    }
+    avail_features |= 1 << VIRTIO_BLK_F_SEG_MAX;
+    avail_features |= 1 << VIRTIO_BLK_F_BLK_SIZE;
+    if multi_queue {
+        avail_features |= 1 << VIRTIO_BLK_F_MQ;
+    }
+    avail_features
 }
