@@ -26,6 +26,7 @@ rust_defaults {
         "libfutures",
         "liblibc",
         "libtempfile",
+        "libthiserror",
         "libvm_memory",
     ],
     proc_macros: [
@@ -67,6 +68,7 @@ rust_library {
         "libprotobuf",  // Added manually
         "libprotos",  // Added manually
         "libtempfile",
+        "libthiserror",
         "libvm_memory",
     ],
     proc_macros: [
@@ -101,17 +103,17 @@ rust_library {
 //   getrandom-0.2.3 "std"
 //   intrusive-collections-0.9.1 "alloc,default"
 //   itoa-0.4.7
-//   libc-0.2.95 "default,std"
+//   libc-0.2.97 "default,std"
 //   memoffset-0.5.6 "default"
 //   paste-1.0.5
-//   pin-project-lite-0.2.6
+//   pin-project-lite-0.2.7
 //   pin-utils-0.1.0
 //   ppv-lite86-0.2.10 "simd,std"
 //   proc-macro2-1.0.27 "default,proc-macro"
 //   quote-1.0.9 "default,proc-macro"
-//   rand-0.8.3 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
-//   rand_chacha-0.3.0 "std"
-//   rand_core-0.6.2 "alloc,getrandom,std"
+//   rand-0.8.4 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
+//   rand_chacha-0.3.1 "std"
+//   rand_core-0.6.3 "alloc,getrandom,std"
 //   remain-0.2.2
 //   remove_dir_all-0.5.3
 //   ryu-1.0.5
@@ -120,7 +122,7 @@ rust_library {
 //   serde_json-1.0.64 "default,std"
 //   slab-0.4.3 "default,std"
 //   smallvec-1.6.1
-//   syn-1.0.72 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.73 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   tempfile-3.2.0
 //   thiserror-1.0.25
 //   thiserror-impl-1.0.25

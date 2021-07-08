@@ -230,10 +230,17 @@ pub fn find_closest_resolution(
 }
 
 /// A rectangle used to describe portions of a frame.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Rect {
     pub left: i32,
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+
+/// Description of the layout for a single plane.
+#[derive(Debug, Clone)]
+pub struct FramePlane {
+    pub offset: usize,
+    pub stride: usize,
 }

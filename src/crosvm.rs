@@ -67,6 +67,11 @@ pub struct VhostUserFsOption {
     pub tag: String,
 }
 
+pub struct VhostUserWlOption {
+    pub socket: PathBuf,
+    pub vm_tube: PathBuf,
+}
+
 /// A bind mount for directories in the plugin process.
 pub struct BindMount {
     pub src: PathBuf,
@@ -257,8 +262,10 @@ pub struct Config {
     pub gdb: Option<u32>,
     pub balloon_bias: i64,
     pub vhost_user_blk: Vec<VhostUserOption>,
+    pub vhost_user_console: Vec<VhostUserOption>,
     pub vhost_user_fs: Vec<VhostUserFsOption>,
     pub vhost_user_net: Vec<VhostUserOption>,
+    pub vhost_user_wl: Vec<VhostUserWlOption>,
     #[cfg(feature = "direct")]
     pub direct_pmio: Option<DirectIoOption>,
     #[cfg(feature = "direct")]
@@ -336,8 +343,10 @@ impl Default for Config {
             gdb: None,
             balloon_bias: 0,
             vhost_user_blk: Vec::new(),
+            vhost_user_console: Vec::new(),
             vhost_user_fs: Vec::new(),
             vhost_user_net: Vec::new(),
+            vhost_user_wl: Vec::new(),
             #[cfg(feature = "direct")]
             direct_pmio: None,
             #[cfg(feature = "direct")]

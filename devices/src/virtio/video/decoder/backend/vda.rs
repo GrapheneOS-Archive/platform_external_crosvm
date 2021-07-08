@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use base::{error, warn, RawDescriptor};
+use base::{error, warn, AsRawDescriptor, RawDescriptor};
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
@@ -14,11 +14,22 @@ use crate::virtio::video::{
     decoder::{backend::*, Capability, Decoder},
     error::{VideoError, VideoResult},
     format::*,
+    Tube,
 };
 
 #[derive(Debug, ThisError)]
-#[error("VDA Failure: {0}")]
-struct VdaFailure(libvda::decode::Response);
+enum VdaBackendError {
+    #[error("VDA failure: {0}")]
+    VdaFailure(libvda::decode::Response),
+    #[error("set_output_parameters() must be called before use_output_buffer()")]
+    OutputParamsNotSet,
+}
+
+impl From<VdaBackendError> for VideoError {
+    fn from(e: VdaBackendError) -> Self {
+        VideoError::BackendFailure(Box::new(e))
+    }
+}
 
 impl TryFrom<Format> for libvda::Profile {
     type Error = VideoError;
@@ -53,8 +64,8 @@ impl TryFrom<Format> for libvda::PixelFormat {
 impl From<&FramePlane> for libvda::FramePlane {
     fn from(plane: &FramePlane) -> Self {
         libvda::FramePlane {
-            offset: plane.offset,
-            stride: plane.stride,
+            offset: plane.offset as i32,
+            stride: plane.stride as i32,
         }
     }
 }
@@ -66,7 +77,7 @@ impl From<libvda::decode::Event> for DecoderEvent {
         fn vda_response_to_result(resp: libvda::decode::Response) -> VideoResult<()> {
             match resp {
                 libvda::decode::Response::Success => Ok(()),
-                resp => Err(VideoError::BackendFailure(Box::new(VdaFailure(resp)))),
+                resp => Err(VdaBackendError::VdaFailure(resp).into()),
             }
         }
 
@@ -111,7 +122,7 @@ impl From<libvda::decode::Event> for DecoderEvent {
                 DecoderEvent::NotifyEndOfBitstreamBuffer(bitstream_id)
             }
             LibvdaEvent::NotifyError(resp) => {
-                DecoderEvent::NotifyError(VideoError::BackendFailure(Box::new(VdaFailure(resp))))
+                DecoderEvent::NotifyError(VdaBackendError::VdaFailure(resp).into())
             }
             LibvdaEvent::ResetResponse(resp) => {
                 DecoderEvent::ResetCompleted(vda_response_to_result(resp))
@@ -148,69 +159,82 @@ fn from_pixel_format(
     }
 }
 
-impl DecoderSession for libvda::decode::Session {
-    fn set_output_buffer_count(&self, count: usize) -> VideoResult<()> {
-        Ok(self.set_output_buffer_count(count)?)
+pub struct VdaDecoderSession {
+    vda_session: libvda::decode::Session,
+    format: Option<libvda::PixelFormat>,
+}
+
+impl DecoderSession for VdaDecoderSession {
+    fn set_output_parameters(&mut self, buffer_count: usize, format: Format) -> VideoResult<()> {
+        self.format = Some(libvda::PixelFormat::try_from(format)?);
+        Ok(self.vda_session.set_output_buffer_count(buffer_count)?)
     }
 
     fn decode(
-        &self,
+        &mut self,
         bitstream_id: i32,
         descriptor: RawDescriptor,
         offset: u32,
         bytes_used: u32,
     ) -> VideoResult<()> {
-        Ok(self.decode(bitstream_id, descriptor, offset, bytes_used)?)
+        Ok(self
+            .vda_session
+            .decode(bitstream_id, descriptor, offset, bytes_used)?)
     }
 
-    fn flush(&self) -> VideoResult<()> {
-        Ok(self.flush()?)
+    fn flush(&mut self) -> VideoResult<()> {
+        Ok(self.vda_session.flush()?)
     }
 
-    fn reset(&self) -> VideoResult<()> {
-        Ok(self.reset()?)
+    fn reset(&mut self) -> VideoResult<()> {
+        Ok(self.vda_session.reset()?)
     }
 
-    fn event_pipe(&self) -> &std::fs::File {
-        self.pipe()
+    fn event_pipe(&self) -> &dyn AsRawDescriptor {
+        self.vda_session.pipe()
     }
 
     fn use_output_buffer(
-        &self,
+        &mut self,
         picture_buffer_id: i32,
-        format: Format,
         output_buffer: RawDescriptor,
         planes: &[FramePlane],
         modifier: u64,
     ) -> VideoResult<()> {
         let vda_planes: Vec<libvda::FramePlane> = planes.iter().map(Into::into).collect();
-        Ok(self.use_output_buffer(
+        Ok(self.vda_session.use_output_buffer(
             picture_buffer_id,
-            libvda::PixelFormat::try_from(format)?,
+            self.format.ok_or(VdaBackendError::OutputParamsNotSet)?,
             output_buffer,
             &vda_planes,
             modifier,
         )?)
     }
 
-    fn reuse_output_buffer(&self, picture_buffer_id: i32) -> VideoResult<()> {
-        Ok(self.reuse_output_buffer(picture_buffer_id)?)
+    fn reuse_output_buffer(&mut self, picture_buffer_id: i32) -> VideoResult<()> {
+        Ok(self.vda_session.reuse_output_buffer(picture_buffer_id)?)
     }
 
     fn read_event(&mut self) -> VideoResult<DecoderEvent> {
-        self.read_event().map(Into::into).map_err(Into::into)
+        self.vda_session
+            .read_event()
+            .map(Into::into)
+            .map_err(Into::into)
     }
 }
 
 impl DecoderBackend for libvda::decode::VdaInstance {
-    type Session = libvda::decode::Session;
+    type Session = VdaDecoderSession;
 
-    fn new_session(&self, format: Format) -> VideoResult<Self::Session> {
+    fn new_session(&mut self, format: Format) -> VideoResult<Self::Session> {
         let profile = libvda::Profile::try_from(format)?;
 
-        self.open_session(profile).map_err(|e| {
-            error!("failed to open a session for {:?}: {}", format, e);
-            VideoError::InvalidOperation
+        Ok(VdaDecoderSession {
+            vda_session: self.open_session(profile).map_err(|e| {
+                error!("failed to open a session for {:?}: {}", format, e);
+                VideoError::InvalidOperation
+            })?,
+            format: None,
         })
     }
 
@@ -292,8 +316,8 @@ impl DecoderBackend for libvda::decode::VdaInstance {
 /// Create a new decoder instance using a Libvda decoder instance to perform
 /// the decoding.
 impl Decoder<libvda::decode::VdaInstance> {
-    pub fn new() -> VideoResult<Self> {
+    pub fn new(resource_bridge: Tube) -> VideoResult<Self> {
         let vda = libvda::decode::VdaInstance::new(libvda::decode::VdaImplType::Gavda)?;
-        Ok(Decoder::from_backend(vda))
+        Ok(Decoder::from_backend(vda, resource_bridge))
     }
 }
