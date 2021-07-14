@@ -67,6 +67,11 @@ pub struct VhostUserFsOption {
     pub tag: String,
 }
 
+pub struct VhostUserWlOption {
+    pub socket: PathBuf,
+    pub vm_tube: PathBuf,
+}
+
 /// A bind mount for directories in the plugin process.
 pub struct BindMount {
     pub src: PathBuf,
@@ -199,6 +204,8 @@ pub struct Config {
     pub vcpu_count: Option<usize>,
     pub rt_cpus: Vec<usize>,
     pub vcpu_affinity: Option<VcpuAffinity>,
+    pub cpu_clusters: Vec<Vec<usize>>,
+    pub cpu_capacity: BTreeMap<usize, u32>, // CPU index -> capacity
     pub no_smt: bool,
     pub memory: Option<u64>,
     pub hugepages: bool,
@@ -237,12 +244,12 @@ pub struct Config {
     pub ac97_parameters: Vec<Ac97Parameters>,
     pub serial_parameters: BTreeMap<(SerialHardware, u8), SerialParameters>,
     pub syslog_tag: Option<String>,
-    pub virtio_single_touch: Option<TouchDeviceOption>,
-    pub virtio_multi_touch: Option<TouchDeviceOption>,
-    pub virtio_trackpad: Option<TouchDeviceOption>,
-    pub virtio_mouse: Option<PathBuf>,
-    pub virtio_keyboard: Option<PathBuf>,
-    pub virtio_switches: Option<PathBuf>,
+    pub virtio_single_touch: Vec<TouchDeviceOption>,
+    pub virtio_multi_touch: Vec<TouchDeviceOption>,
+    pub virtio_trackpad: Vec<TouchDeviceOption>,
+    pub virtio_mice: Vec<PathBuf>,
+    pub virtio_keyboard: Vec<PathBuf>,
+    pub virtio_switches: Vec<PathBuf>,
     pub virtio_input_evdevs: Vec<PathBuf>,
     pub split_irqchip: bool,
     pub vfio: Vec<PathBuf>,
@@ -255,8 +262,10 @@ pub struct Config {
     pub gdb: Option<u32>,
     pub balloon_bias: i64,
     pub vhost_user_blk: Vec<VhostUserOption>,
+    pub vhost_user_console: Vec<VhostUserOption>,
     pub vhost_user_fs: Vec<VhostUserFsOption>,
     pub vhost_user_net: Vec<VhostUserOption>,
+    pub vhost_user_wl: Vec<VhostUserWlOption>,
     #[cfg(feature = "direct")]
     pub direct_pmio: Option<DirectIoOption>,
     #[cfg(feature = "direct")]
@@ -264,6 +273,7 @@ pub struct Config {
     #[cfg(feature = "direct")]
     pub direct_edge_irq: Vec<u32>,
     pub dmi_path: Option<PathBuf>,
+    pub no_legacy: bool,
 }
 
 impl Default for Config {
@@ -275,6 +285,8 @@ impl Default for Config {
             vcpu_count: None,
             rt_cpus: Vec::new(),
             vcpu_affinity: None,
+            cpu_clusters: Vec::new(),
+            cpu_capacity: BTreeMap::new(),
             no_smt: false,
             memory: None,
             hugepages: false,
@@ -313,12 +325,12 @@ impl Default for Config {
             ac97_parameters: Vec::new(),
             serial_parameters: BTreeMap::new(),
             syslog_tag: None,
-            virtio_single_touch: None,
-            virtio_multi_touch: None,
-            virtio_trackpad: None,
-            virtio_mouse: None,
-            virtio_keyboard: None,
-            virtio_switches: None,
+            virtio_single_touch: Vec::new(),
+            virtio_multi_touch: Vec::new(),
+            virtio_trackpad: Vec::new(),
+            virtio_mice: Vec::new(),
+            virtio_keyboard: Vec::new(),
+            virtio_switches: Vec::new(),
             virtio_input_evdevs: Vec::new(),
             split_irqchip: false,
             vfio: Vec::new(),
@@ -331,8 +343,10 @@ impl Default for Config {
             gdb: None,
             balloon_bias: 0,
             vhost_user_blk: Vec::new(),
+            vhost_user_console: Vec::new(),
             vhost_user_fs: Vec::new(),
             vhost_user_net: Vec::new(),
+            vhost_user_wl: Vec::new(),
             #[cfg(feature = "direct")]
             direct_pmio: None,
             #[cfg(feature = "direct")]
@@ -340,6 +354,7 @@ impl Default for Config {
             #[cfg(feature = "direct")]
             direct_edge_irq: Vec::new(),
             dmi_path: None,
+            no_legacy: false,
         }
     }
 }

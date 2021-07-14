@@ -6,9 +6,9 @@ use crate::virtio::snd::constants::*;
 use crate::virtio::snd::layout::*;
 
 use base::{
-    error, net::UnixSeqpacket, Error as BaseError, Event, FromRawDescriptor, IntoRawDescriptor,
-    MemoryMapping, MemoryMappingBuilder, MmapError, PollToken, SafeDescriptor, ScmSocket,
-    SharedMemory, WaitContext,
+    error, net::UnixSeqpacket, AsRawDescriptor, Error as BaseError, Event, FromRawDescriptor,
+    IntoRawDescriptor, MemoryMapping, MemoryMappingBuilder, MmapError, PollToken, SafeDescriptor,
+    ScmSocket, SharedMemory, WaitContext,
 };
 use data_model::{DataInit, VolatileMemory, VolatileMemoryError};
 
@@ -53,7 +53,7 @@ pub enum Error {
     NoStreamsAvailable,
     #[error("No stream with id {0}")]
     InvalidStreamId(u32),
-    #[error("Stream is unexpected state: {0:?}")]
+    #[error("Stream is in unexpected state: {0:?}")]
     UnexpectedState(StreamState),
     #[error("Invalid operation for stream direction: {0}")]
     WrongDirection(u8),
@@ -116,15 +116,14 @@ pub struct VioSClient {
 impl VioSClient {
     /// Create a new client given the path to the audio server's socket.
     pub fn try_new<P: AsRef<Path>>(server: P) -> Result<VioSClient> {
-        let client_socket =
-            UnixSeqpacket::connect(server).map_err(|e| Error::ServerConnectionError(e))?;
+        let client_socket = UnixSeqpacket::connect(server).map_err(Error::ServerConnectionError)?;
         let mut config: VioSConfig = Default::default();
         let mut fds: Vec<RawFd> = Vec::new();
         const NUM_FDS: usize = 5;
         fds.resize(NUM_FDS, 0);
         let (recv_size, fd_count) = client_socket
             .recv_with_fds(config.as_mut_slice(), &mut fds)
-            .map_err(|e| Error::ServerError(e))?;
+            .map_err(Error::ServerError)?;
 
         // Resize the vector to the actual number of file descriptors received and wrap them in
         // SafeDescriptors to prevent leaks
@@ -184,7 +183,7 @@ impl VioSClient {
         let rx_subscribers: Arc<Mutex<HashMap<usize, Sender<(u32, usize)>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let recv_running = Arc::new(Mutex::new(true));
-        let recv_event = Event::new().map_err(|e| Error::EventCreateError(e))?;
+        let recv_event = Event::new().map_err(Error::EventCreateError)?;
 
         let mut client = VioSClient {
             config,
@@ -210,13 +209,13 @@ impl VioSClient {
             .recv_event
             .lock()
             .try_clone()
-            .map_err(|e| Error::EventDupError(e))?;
+            .map_err(Error::EventDupError)?;
         let rx_socket = self
             .rx
             .lock()
             .socket
             .try_clone()
-            .map_err(|e| Error::UnixSeqpacketDupError(e))?;
+            .map_err(Error::UnixSeqpacketDupError)?;
         let mut opt = self.recv_thread.lock();
         // The lock on recv_thread was released above to avoid holding more than one lock at a time
         // while duplicating the fds. So we have to check again the condition.
@@ -353,6 +352,7 @@ impl VioSClient {
             let lock = self.rx.lock();
             (lock.socket.as_raw_fd(), lock.file.as_raw_fd())
         };
+        let recv_event = self.recv_event.lock().as_raw_descriptor();
         vec![
             control_fd,
             event_fd,
@@ -360,12 +360,13 @@ impl VioSClient {
             tx_shm_fd,
             rx_socket_fd,
             rx_shm_fd,
+            recv_event,
         ]
     }
 
     fn send_cmd<T: DataInit>(&self, data: T) -> Result<()> {
         let mut control_socket_lock = self.control_socket.lock();
-        seq_socket_send(&mut *control_socket_lock, data)?;
+        seq_socket_send(&*control_socket_lock, data)?;
         recv_cmd_status(&mut *control_socket_lock)
     }
 
@@ -427,7 +428,7 @@ impl VioSClient {
         let control_socket_lock = self.control_socket.lock();
         let info_vec = control_socket_lock
             .recv_as_vec()
-            .map_err(|e| Error::ServerIOError(e))?;
+            .map_err(Error::ServerIOError)?;
         if info_vec.len() != num_streams * info_size {
             return Err(Error::ProtocolError(
                 ProtocolErrorKind::UnexpectedMessageSize(num_streams * info_size, info_vec.len()),
@@ -485,16 +486,16 @@ fn spawn_recv_thread(
             (&rx_socket, Token::RxBufferMsg),
             (&event, Token::Notification),
         ])
-        .map_err(|e| Error::WaitContextCreateError(e))?;
+        .map_err(Error::WaitContextCreateError)?;
         while *running.lock() {
-            let events = wait_ctx.wait().map_err(|e| Error::WaitError(e))?;
+            let events = wait_ctx.wait().map_err(Error::WaitError)?;
             for evt in events {
                 match evt.token {
                     Token::RxBufferMsg => {
                         let mut msg: IoStatusMsg = Default::default();
                         let size = rx_socket
                             .recv(msg.as_mut_slice())
-                            .map_err(|e| Error::ServerIOError(e))?;
+                            .map_err(Error::ServerIOError)?;
                         if size != std::mem::size_of::<IoStatusMsg>() {
                             return Err(Error::ProtocolError(
                                 ProtocolErrorKind::UnexpectedMessageSize(
@@ -540,9 +541,7 @@ fn spawn_recv_thread(
 }
 
 fn await_status(promise: Receiver<(u32, usize)>) -> Result<usize> {
-    let (status, consumed_len) = promise
-        .recv()
-        .map_err(|e| Error::BufferStatusSenderLost(e))?;
+    let (status, consumed_len) = promise.recv().map_err(Error::BufferStatusSenderLost)?;
     if status == VIRTIO_SND_S_OK {
         Ok(consumed_len)
     } else {
@@ -560,14 +559,12 @@ struct IoBufferQueue {
 
 impl IoBufferQueue {
     fn new(socket: UnixSeqpacket, mut file: File) -> Result<IoBufferQueue> {
-        let size = file
-            .seek(SeekFrom::End(0))
-            .map_err(|e| Error::FileSizeError(e))? as usize;
+        let size = file.seek(SeekFrom::End(0)).map_err(Error::FileSizeError)? as usize;
 
         let mmap = MemoryMappingBuilder::new(size)
             .from_file(&file)
             .build()
-            .map_err(|e| Error::ServerMmapError(e))?;
+            .map_err(Error::ServerMmapError)?;
 
         Ok(IoBufferQueue {
             socket,
@@ -597,11 +594,11 @@ impl IoBufferQueue {
         let (src_mmap, mmap_offset) = mmap_buffer(src, offset, size)?;
         let src_slice = src_mmap
             .get_slice(mmap_offset, size)
-            .map_err(|e| Error::VolatileMemoryError(e))?;
+            .map_err(Error::VolatileMemoryError)?;
         let dst_slice = self
             .mmap
             .get_slice(shm_offset, size)
-            .map_err(|e| Error::VolatileMemoryError(e))?;
+            .map_err(Error::VolatileMemoryError)?;
         src_slice.copy_to_volatile_slice(dst_slice);
         Ok(shm_offset)
     }
@@ -616,11 +613,11 @@ impl IoBufferQueue {
         let (dst_mmap, mmap_offset) = mmap_buffer(dst, dst_offset, size)?;
         let dst_slice = dst_mmap
             .get_slice(mmap_offset, size)
-            .map_err(|e| Error::VolatileMemoryError(e))?;
+            .map_err(Error::VolatileMemoryError)?;
         let src_slice = self
             .mmap
             .get_slice(src_offset, size)
-            .map_err(|e| Error::VolatileMemoryError(e))?;
+            .map_err(Error::VolatileMemoryError)?;
         src_slice.copy_to_volatile_slice(dst_slice);
         Ok(())
     }
@@ -709,7 +706,7 @@ fn mmap_buffer(
         .offset(aligned_offset as u64)
         .from_shared_memory(src)
         .build()
-        .map_err(|e| Error::GuestMmapError(e))?;
+        .map_err(Error::GuestMmapError)?;
 
     Ok((mmap, offset_from_mapping_start))
 }
@@ -718,7 +715,7 @@ fn recv_cmd_status(control_socket: &mut UnixSeqpacket) -> Result<()> {
     let mut status: virtio_snd_hdr = Default::default();
     control_socket
         .recv(status.as_mut_slice())
-        .map_err(|e| Error::ServerIOError(e))?;
+        .map_err(Error::ServerIOError)?;
     if status.code.to_native() == VIRTIO_SND_S_OK {
         Ok(())
     } else {

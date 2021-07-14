@@ -11,7 +11,7 @@ use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::str::Utf8Error;
 
-use base::{Error as SysError, ExternalMappingError, SafeDescriptor};
+use base::{Error as BaseError, ExternalMappingError, SafeDescriptor};
 use data_model::VolatileMemoryError;
 
 #[cfg(feature = "vulkano")]
@@ -92,6 +92,7 @@ pub const RUTABAGA_FLAG_FENCE: u32 = 1 << 0;
 pub const RUTABAGA_FLAG_INFO_FENCE_CTX_IDX: u32 = 1 << 1;
 
 /// Convenience struct for Rutabaga fences
+#[derive(Copy, Clone)]
 pub struct RutabagaFenceData {
     pub flags: u32,
     pub fence_id: u64,
@@ -153,8 +154,8 @@ pub enum RutabagaError {
     ComponentError(i32),
     /// Violation of the Rutabaga spec occured.
     SpecViolation,
-    /// System error returned as a result of rutabaga library operation.
-    SysError(SysError),
+    /// Base error returned as a result of rutabaga library operation.
+    BaseError(BaseError),
     /// An attempted integer conversion failed.
     TryFromIntError(TryFromIntError),
     /// The command is unsupported.
@@ -211,7 +212,7 @@ impl Display for RutabagaError {
             MappingFailed(s) => write!(f, "The mapping failed for the following reason: {}", s),
             ComponentError(ret) => write!(f, "rutabaga component failed with error {}", ret),
             SpecViolation => write!(f, "violation of the rutabaga spec"),
-            SysError(e) => write!(f, "rutabaga received a system error: {}", e),
+            BaseError(e) => write!(f, "rutabaga received a base error: {}", e),
             TryFromIntError(e) => write!(f, "int conversion failed: {}", e),
             Unsupported => write!(f, "feature or function unsupported"),
             Utf8Error(e) => write!(f, "an utf8 error occured: {}", e),
@@ -236,9 +237,9 @@ impl From<IoError> for RutabagaError {
     }
 }
 
-impl From<SysError> for RutabagaError {
-    fn from(e: SysError) -> RutabagaError {
-        RutabagaError::SysError(e)
+impl From<BaseError> for RutabagaError {
+    fn from(e: BaseError) -> RutabagaError {
+        RutabagaError::BaseError(e)
     }
 }
 
@@ -265,7 +266,6 @@ pub type RutabagaResult<T> = std::result::Result<T, RutabagaError>;
 
 /// Flags for virglrenderer.  Copied from virglrenderer bindings.
 const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
-#[allow(dead_code)]
 const VIRGLRENDERER_THREAD_SYNC: u32 = 1 << 1;
 const VIRGLRENDERER_USE_GLX: u32 = 1 << 2;
 const VIRGLRENDERER_USE_SURFACELESS: u32 = 1 << 3;
@@ -273,6 +273,7 @@ const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
 const VIRGLRENDERER_USE_EXTERNAL_BLOB: u32 = 1 << 5;
 const VIRGLRENDERER_VENUS: u32 = 1 << 6;
 const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+const VIRGLRENDERER_USE_ASYNC_FENCE_CB: u32 = 1 << 8;
 
 /// virglrenderer flag struct.
 #[derive(Copy, Clone)]
@@ -324,6 +325,11 @@ impl VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_USE_EGL, v)
     }
 
+    /// Use a dedicated thread for fence synchronization.
+    pub fn use_thread_sync(self, v: bool) -> VirglRendererFlags {
+        self.set_flag(VIRGLRENDERER_THREAD_SYNC, v)
+    }
+
     /// Use GLX for context creation.
     pub fn use_glx(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_USE_GLX, v)
@@ -342,6 +348,11 @@ impl VirglRendererFlags {
     /// Use external memory when creating blob resources.
     pub fn use_external_blob(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_USE_EXTERNAL_BLOB, v)
+    }
+
+    /// Retire fence directly from sync thread.
+    pub fn use_async_fence_cb(self, v: bool) -> VirglRendererFlags {
+        self.set_flag(VIRGLRENDERER_USE_ASYNC_FENCE_CB, v)
     }
 }
 
@@ -501,5 +512,48 @@ impl RutabagaHandle {
             os_handle: clone,
             handle_type: self.handle_type,
         })
+    }
+}
+
+/// Trait for fence completion handlers
+pub trait RutabagaFenceCallback: Send {
+    fn call(&self, data: RutabagaFenceData);
+    fn clone_box(&self) -> RutabagaFenceHandler;
+}
+
+/// Wrapper type to allow cloning while respecting object-safety
+pub type RutabagaFenceHandler = Box<dyn RutabagaFenceCallback>;
+
+impl Clone for RutabagaFenceHandler {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
+/// Fence handler implementation that wraps a closure
+#[derive(Clone)]
+pub struct RutabagaFenceClosure<T> {
+    closure: T,
+}
+
+impl<T> RutabagaFenceClosure<T>
+where
+    T: Fn(RutabagaFenceData) + Clone + Send + 'static,
+{
+    pub fn new(closure: T) -> RutabagaFenceHandler {
+        Box::new(RutabagaFenceClosure { closure })
+    }
+}
+
+impl<T> RutabagaFenceCallback for RutabagaFenceClosure<T>
+where
+    T: Fn(RutabagaFenceData) + Clone + Send + 'static,
+{
+    fn call(&self, data: RutabagaFenceData) {
+        (self.closure)(data)
+    }
+
+    fn clone_box(&self) -> RutabagaFenceHandler {
+        Box::new(self.clone())
     }
 }

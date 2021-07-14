@@ -41,6 +41,7 @@ struct CrossDomainContext {
     requirements_blobs: Map<u64, ImageMemoryRequirements>,
     context_resources: Map<u32, CrossDomainResource>,
     last_fence_data: Option<RutabagaFenceData>,
+    fence_handler: RutabagaFenceHandler,
     blob_id: u64,
 }
 
@@ -211,28 +212,22 @@ impl RutabagaContext for CrossDomainContext {
     }
 
     fn attach(&mut self, resource: &mut RutabagaResource) {
-        match resource.blob_mem {
-            RUTABAGA_BLOB_MEM_GUEST => {
-                self.context_resources.insert(
-                    resource.resource_id,
-                    CrossDomainResource {
-                        handle: None,
-                        backing_iovecs: resource.backing_iovecs.take(),
-                    },
-                );
-            }
-            _ => match resource.handle {
-                Some(ref handle) => {
-                    self.context_resources.insert(
-                        resource.resource_id,
-                        CrossDomainResource {
-                            handle: Some(handle.clone()),
-                            backing_iovecs: None,
-                        },
-                    );
-                }
-                _ => (),
-            },
+        if resource.blob_mem == RUTABAGA_BLOB_MEM_GUEST {
+            self.context_resources.insert(
+                resource.resource_id,
+                CrossDomainResource {
+                    handle: None,
+                    backing_iovecs: resource.backing_iovecs.take(),
+                },
+            );
+        } else if let Some(ref handle) = resource.handle {
+            self.context_resources.insert(
+                resource.resource_id,
+                CrossDomainResource {
+                    handle: Some(handle.clone()),
+                    backing_iovecs: None,
+                },
+            );
         }
     }
 
@@ -241,6 +236,7 @@ impl RutabagaContext for CrossDomainContext {
     }
 
     fn context_create_fence(&mut self, fence_data: RutabagaFenceData) -> RutabagaResult<()> {
+        self.fence_handler.call(fence_data);
         self.last_fence_data = Some(fence_data);
         Ok(())
     }
@@ -256,19 +252,16 @@ impl RutabagaContext for CrossDomainContext {
 
 impl RutabagaComponent for CrossDomain {
     fn get_capset_info(&self, _capset_id: u32) -> (u32, u32) {
-        return (0u32, size_of::<CrossDomainCapabilities>() as u32);
+        (0u32, size_of::<CrossDomainCapabilities>() as u32)
     }
 
     fn get_capset(&self, _capset_id: u32, _version: u32) -> Vec<u8> {
         let mut caps: CrossDomainCapabilities = Default::default();
-        match self.channels {
-            Some(ref channels) => {
-                for channel in channels {
-                    caps.supported_channels = 1 << channel.channel_type;
-                }
+        if let Some(ref channels) = self.channels {
+            for channel in channels {
+                caps.supported_channels = 1 << channel.channel_type;
             }
-            None => (),
-        };
+        }
 
         if self.gralloc.lock().supports_dmabuf() {
             caps.supports_dmabuf = 1;
@@ -287,6 +280,7 @@ impl RutabagaComponent for CrossDomain {
         &self,
         _ctx_id: u32,
         _context_init: u32,
+        fence_handler: RutabagaFenceHandler,
     ) -> RutabagaResult<Box<dyn RutabagaContext>> {
         Ok(Box::new(CrossDomainContext {
             channels: self.channels.clone(),
@@ -296,6 +290,7 @@ impl RutabagaComponent for CrossDomain {
             requirements_blobs: Default::default(),
             context_resources: Default::default(),
             last_fence_data: None,
+            fence_handler,
             blob_id: 0,
         }))
     }

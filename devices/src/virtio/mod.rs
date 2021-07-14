@@ -5,13 +5,10 @@
 //! Implements virtio devices, queues, and transport mechanisms.
 
 mod balloon;
-mod block;
-mod block_async;
 mod console;
 mod descriptor_utils;
 mod input;
 mod interrupt;
-mod net;
 mod p9;
 mod pmem;
 mod queue;
@@ -23,11 +20,13 @@ mod video;
 mod virtio_device;
 mod virtio_pci_common_config;
 mod virtio_pci_device;
-mod wl;
+pub mod wl;
 
+pub mod block;
 pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod net;
 pub mod resource_bridge;
 #[cfg(feature = "audio")]
 pub mod snd;
@@ -35,7 +34,6 @@ pub mod vhost;
 
 pub use self::balloon::*;
 pub use self::block::*;
-pub use self::block_async::*;
 pub use self::console::*;
 pub use self::descriptor_utils::Error as DescriptorError;
 pub use self::descriptor_utils::*;

@@ -79,13 +79,13 @@ struct OutputResources {
     // destroyed.
     eos_resource_id: Option<OutputResourceId>,
 
-    // This is a flag that shows whether the device's set_output_buffer_count is called.
-    // This will be set to true when ResourceCreate for OutputBuffer is called for the first time.
+    // This is a flag that shows whether the device's set_output_parameters has called.
+    // This will be set to true when ResourceQueue for OutputBuffer is called for the first time.
     //
     // TODO(b/1518105): This field is added as a hack because the current virtio-video v3 spec
     // doesn't have a way to send a number of frame buffers the guest provides.
     // Once we have the way in the virtio-video protocol, we should remove this flag.
-    is_output_buffer_count_set: bool,
+    output_params_set: bool,
 
     // OutputResourceId -> ResourceHandle
     res_id_to_res_handle: BTreeMap<OutputResourceId, ResourceHandle>,
@@ -150,9 +150,9 @@ impl OutputResources {
         self.queued_res_ids.take(&self.eos_resource_id?)
     }
 
-    fn set_output_buffer_count(&mut self) -> bool {
-        if !self.is_output_buffer_count_set {
-            self.is_output_buffer_count_set = true;
+    fn output_params_set(&mut self) -> bool {
+        if !self.output_params_set {
+            self.output_params_set = true;
             return true;
         }
         false
@@ -167,7 +167,6 @@ struct PictureReadyEvent {
 
 // Context is associated with one `DecoderSession`, which corresponds to one stream from the
 // virtio-video's point of view.
-#[derive(Default)]
 struct Context<S: DecoderSession> {
     stream_id: StreamId,
 
@@ -356,12 +355,6 @@ struct ContextMap<S: DecoderSession> {
 }
 
 impl<S: DecoderSession> ContextMap<S> {
-    fn new() -> Self {
-        ContextMap {
-            map: Default::default(),
-        }
-    }
-
     fn insert(&mut self, ctx: Context<S>) -> VideoResult<()> {
         match self.map.entry(ctx.stream_id) {
             Entry::Vacant(e) => {
@@ -390,22 +383,42 @@ impl<S: DecoderSession> ContextMap<S> {
     }
 }
 
+impl<S: DecoderSession> Default for ContextMap<S> {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+        }
+    }
+}
+
 /// Represents information of a decoder backed by a `DecoderBackend`.
 pub struct Decoder<D: DecoderBackend> {
     decoder: D,
     capability: Capability,
     contexts: ContextMap<D::Session>,
+    resource_bridge: Tube,
 }
 
 impl<'a, D: DecoderBackend> Decoder<D> {
+    /// Build a new decoder using the provided `backend`.
+    fn from_backend(backend: D, resource_bridge: Tube) -> Self {
+        let capability = backend.get_capabilities();
+
+        Self {
+            decoder: backend,
+            capability,
+            contexts: Default::default(),
+            resource_bridge,
+        }
+    }
     /*
      * Functions processing virtio-video commands.
      */
 
     fn query_capabilities(&self, queue_type: QueueType) -> CmdResponse {
         let descs = match queue_type {
-            QueueType::Input => self.capability.in_fmts.clone(),
-            QueueType::Output => self.capability.out_fmts.clone(),
+            QueueType::Input => self.capability.input_formats().clone(),
+            QueueType::Output => self.capability.output_formats().clone(),
         };
 
         CmdResponse::QueryCapability(descs)
@@ -432,7 +445,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
     }
 
     fn create_session(
-        decoder: &D,
+        decoder: &mut D,
         wait_ctx: &WaitContext<Token>,
         ctx: &Context<D::Session>,
         stream_id: StreamId,
@@ -475,7 +488,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         // called here.
         if ctx.session.is_none() {
             ctx.session = Some(Self::create_session(
-                &self.decoder,
+                &mut self.decoder,
                 wait_ctx,
                 ctx,
                 stream_id,
@@ -528,14 +541,12 @@ impl<'a, D: DecoderBackend> Decoder<D> {
 
     fn queue_input_resource(
         &mut self,
-        resource_bridge: &Tube,
         stream_id: StreamId,
         resource_id: ResourceId,
         timestamp: u64,
         data_sizes: Vec<u32>,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
-        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         if data_sizes.len() != 1 {
             error!("num_data_sizes must be 1 but {}", data_sizes.len());
@@ -545,9 +556,11 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         // Take an ownership of this file by `into_raw_descriptor()` as this file will be closed
         // by the `DecoderBackend`.
         let fd = ctx
-            .get_resource_info(QueueType::Input, resource_bridge, resource_id)?
+            .get_resource_info(QueueType::Input, &self.resource_bridge, resource_id)?
             .file
             .into_raw_descriptor();
+
+        let session = ctx.session.as_mut().ok_or(VideoError::InvalidOperation)?;
 
         // Register a mapping of timestamp to resource_id
         if let Some(old_resource_id) = ctx
@@ -592,12 +605,10 @@ impl<'a, D: DecoderBackend> Decoder<D> {
 
     fn queue_output_resource(
         &mut self,
-        resource_bridge: &Tube,
         stream_id: StreamId,
         resource_id: ResourceId,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
-        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         // Check if the current pixel format is set to NV12.
         match ctx.out_params.format {
@@ -620,42 +631,42 @@ impl<'a, D: DecoderBackend> Decoder<D> {
                 // Don't enqueue this resource to the host.
                 Ok(())
             }
-            QueueOutputResourceResult::Reused(buffer_id) => session.reuse_output_buffer(buffer_id),
+            QueueOutputResourceResult::Reused(buffer_id) => ctx
+                .session
+                .as_mut()
+                .ok_or(VideoError::InvalidOperation)?
+                .reuse_output_buffer(buffer_id),
             QueueOutputResourceResult::Registered(buffer_id) => {
                 let resource_info =
-                    ctx.get_resource_info(QueueType::Output, resource_bridge, resource_id)?;
+                    ctx.get_resource_info(QueueType::Output, &self.resource_bridge, resource_id)?;
                 let planes = vec![
                     FramePlane {
-                        offset: resource_info.planes[0].offset as i32,
-                        stride: resource_info.planes[0].stride as i32,
+                        offset: resource_info.planes[0].offset as usize,
+                        stride: resource_info.planes[0].stride as usize,
                     },
                     FramePlane {
-                        offset: resource_info.planes[1].offset as i32,
-                        stride: resource_info.planes[1].stride as i32,
+                        offset: resource_info.planes[1].offset as usize,
+                        stride: resource_info.planes[1].stride as usize,
                     },
                 ];
 
+                let session = ctx.session.as_mut().ok_or(VideoError::InvalidOperation)?;
+
                 // Set output_buffer_count before passing the first output buffer.
-                if ctx.out_res.set_output_buffer_count() {
+                if ctx.out_res.output_params_set() {
                     const OUTPUT_BUFFER_COUNT: usize = 32;
 
                     // Set the buffer count to the maximum value.
                     // TODO(b/1518105): This is a hack due to the lack of way of telling a number of
                     // frame buffers explictly in virtio-video v3 RFC. Once we have the way,
                     // set_output_buffer_count should be called with a value passed by the guest.
-                    session.set_output_buffer_count(OUTPUT_BUFFER_COUNT)?;
+                    session.set_output_parameters(OUTPUT_BUFFER_COUNT, Format::NV12)?;
                 }
 
                 // Take ownership of this file by `into_raw_descriptor()` as this
                 // file will be closed by libvda.
                 let fd = resource_info.file.into_raw_descriptor();
-                session.use_output_buffer(
-                    buffer_id as i32,
-                    Format::NV12,
-                    fd,
-                    &planes,
-                    resource_info.modifier,
-                )
+                session.use_output_buffer(buffer_id as i32, fd, &planes, resource_info.modifier)
             }
         }?;
         Ok(VideoCmdResponseType::Async(AsyncCmdTag::Queue {
@@ -765,9 +776,9 @@ impl<'a, D: DecoderBackend> Decoder<D> {
 
     fn drain_stream(&mut self, stream_id: StreamId) -> VideoResult<VideoCmdResponseType> {
         self.contexts
-            .get(&stream_id)?
+            .get_mut(&stream_id)?
             .session
-            .as_ref()
+            .as_mut()
             .ok_or(VideoError::InvalidOperation)?
             .flush()?;
         Ok(VideoCmdResponseType::Async(AsyncCmdTag::Drain {
@@ -781,7 +792,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         queue_type: QueueType,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
-        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
+        let session = ctx.session.as_mut().ok_or(VideoError::InvalidOperation)?;
 
         // TODO(b/153406792): Though QUEUE_CLEAR is defined as a per-queue command in the
         // specification, the VDA's `Reset()` clears the input buffers and may (or may not) drop
@@ -813,7 +824,6 @@ impl<D: DecoderBackend> Device for Decoder<D> {
         &mut self,
         cmd: VideoCmd,
         wait_ctx: &WaitContext<Token>,
-        resource_bridge: &Tube,
     ) -> (
         VideoCmdResponseType,
         Option<(u32, Vec<VideoEvtResponseType>)>,
@@ -856,20 +866,14 @@ impl<D: DecoderBackend> Device for Decoder<D> {
                 resource_id,
                 timestamp,
                 data_sizes,
-            } => self.queue_input_resource(
-                resource_bridge,
-                stream_id,
-                resource_id,
-                timestamp,
-                data_sizes,
-            ),
+            } => self.queue_input_resource(stream_id, resource_id, timestamp, data_sizes),
             ResourceQueue {
                 stream_id,
                 queue_type: QueueType::Output,
                 resource_id,
                 ..
             } => {
-                let resp = self.queue_output_resource(resource_bridge, stream_id, resource_id);
+                let resp = self.queue_output_resource(stream_id, resource_id);
                 if resp.is_ok() {
                     if let Ok(ctx) = self.contexts.get_mut(&stream_id) {
                         event_ret = Some((stream_id, ctx.output_pending_pictures()));
@@ -1085,17 +1089,5 @@ impl<D: DecoderBackend> Device for Decoder<D> {
         };
 
         Some(event_responses)
-    }
-}
-
-/// Create a new decoder instance using a Libvda decoder instance to perform
-/// the decoding.
-impl<'a> Decoder<&'a libvda::decode::VdaInstance> {
-    pub fn new(vda: &'a libvda::decode::VdaInstance) -> Self {
-        Decoder {
-            decoder: vda,
-            capability: Capability::new(vda.get_capabilities()),
-            contexts: ContextMap::new(),
-        }
     }
 }

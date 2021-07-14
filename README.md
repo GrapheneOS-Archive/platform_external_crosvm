@@ -6,11 +6,6 @@ makes crosvm unique is a focus on safety within the programming language and a
 sandbox around the virtual devices to protect the kernel from attack in case of
 an exploit in the devices.
 
-## IRC
-
-The channel #crosvm on [freenode](https://webchat.freenode.net/#crosvm) is used
-for technical discussion related to crosvm development and integration.
-
 ## Getting started
 
 ### Building for CrOS
@@ -50,10 +45,19 @@ you can install `libcap-dev`.
 Handy Debian one-liner for all build and runtime deps, particularly if you're
 running Crostini:
 ```sh
-sudo apt install build-essential libcap-dev libgbm-dev libvirglrenderer-dev libwayland-bin libwayland-dev pkg-config protobuf-compiler python wayland-protocols
+sudo apt install build-essential clang libasound2-dev libcap-dev libgbm-dev libvirglrenderer-dev libwayland-bin libwayland-dev pkg-config protobuf-compiler python wayland-protocols bindgen
 ```
 
 Known issues:
+*   Even with the following points, jailed devices seem to crash for unclear
+    reasons. If you run into this, you can add `--disable-sandbox` to run
+    everything in a single process.
+*   If your Linux header files are too old, you may find minijail rejecting
+    seccomp filters for containing unknown syscalls. You can try removing the
+    offending lines from the filter file, or add `--seccomp-log-failures` to the
+    crosvm command line to turn these into warnings. Note that this option will
+    also stop minijail from killing processes that violate the seccomp rule,
+    making the sandboxing much less aggressive.
 *   Seccomp policy files have hardcoded absolute paths. You can either fix up
     the paths locally, or set up an awesome hacky symlink: `sudo mkdir
     /usr/share/policy && sudo ln -s /path/to/crosvm/seccomp/x86_64

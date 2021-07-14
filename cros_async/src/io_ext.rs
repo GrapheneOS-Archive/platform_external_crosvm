@@ -16,7 +16,9 @@
 //! `URingExecutor` documentation for an explaination of why.
 
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
+use std::io;
+use std::ops::{Deref, DerefMut};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,22 +31,20 @@ use crate::{BackingMemory, MemRegion};
 pub enum Error {
     /// An error with a polled(FD) source.
     #[error("An error with a poll source: {0}")]
-    Poll(crate::poll_source::Error),
+    Poll(#[from] crate::poll_source::Error),
     /// An error with a uring source.
     #[error("An error with a uring source: {0}")]
-    Uring(crate::uring_executor::Error),
+    Uring(#[from] crate::uring_executor::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-impl From<crate::uring_executor::Error> for Error {
-    fn from(err: crate::uring_executor::Error) -> Self {
-        Error::Uring(err)
-    }
-}
-
-impl From<crate::poll_source::Error> for Error {
-    fn from(err: crate::poll_source::Error) -> Self {
-        Error::Poll(err)
+impl From<Error> for io::Error {
+    fn from(e: Error) -> Self {
+        use Error::*;
+        match e {
+            Poll(e) => e.into(),
+            Uring(e) => e.into(),
+        }
     }
 }
 
@@ -118,6 +118,43 @@ pub trait IntoAsync: AsRawFd {}
 impl IntoAsync for File {}
 impl IntoAsync for UnixSeqpacket {}
 impl IntoAsync for &UnixSeqpacket {}
+
+/// Simple wrapper struct to implement IntoAsync on foreign types.
+pub struct AsyncWrapper<T>(T);
+
+impl<T> AsyncWrapper<T> {
+    /// Create a new `AsyncWrapper` that wraps `val`.
+    pub fn new(val: T) -> Self {
+        AsyncWrapper(val)
+    }
+
+    /// Consumes the `AsyncWrapper`, returning the inner struct.
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> Deref for AsyncWrapper<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for AsyncWrapper<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<T: AsRawFd> AsRawFd for AsyncWrapper<T> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl<T: AsRawFd> IntoAsync for AsyncWrapper<T> {}
 
 #[cfg(test)]
 mod tests {
