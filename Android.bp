@@ -408,18 +408,8 @@ rust_library {
 }
 
 // dependent_library ["feature_list"]
-//   ../adhd/audio_streams/src/audio_streams.rs
-//   ../adhd/cras/client/cras-sys/src/lib.rs
-//   ../adhd/cras/client/libcras/src/libcras.rs
-//   ../libchromeos-rs/src/lib.rs
 //   ../minijail/rust/minijail-sys/lib.rs
-//   ../minijail/rust/minijail/src/lib.rs
-//   ../rust/vmm_vhost/src/lib.rs "default,vhost-user,vhost-user-master,vhost-user-slave"
-//   ../vm_tools/p9/src/lib.rs
-//   ../vm_tools/p9/wire_format_derive/wire_format_derive.rs
-//   anyhow-1.0.41 "default,std"
 //   async-task-4.0.3 "default,std"
-//   async-trait-0.1.50
 //   autocfg-1.0.1
 //   bitflags-1.2.1 "default"
 //   cc-1.0.25
@@ -432,11 +422,10 @@ rust_library {
 //   futures-sink-0.3.15 "alloc,std"
 //   futures-task-0.3.15 "alloc,std"
 //   futures-util-0.3.15 "alloc,channel,futures-channel,futures-io,futures-sink,io,memchr,sink,slab,std"
-//   getopts-0.2.21
 //   getrandom-0.2.3 "std"
-//   intrusive-collections-0.9.1 "alloc,default"
+//   intrusive-collections-0.9.2 "alloc,default"
 //   itoa-0.4.7
-//   libc-0.2.97 "default,std"
+//   libc-0.2.98 "default,std"
 //   log-0.4.14
 //   memchr-2.4.0 "default,std"
 //   memoffset-0.5.6 "default"
@@ -449,20 +438,8 @@ rust_library {
 //   proc-macro2-1.0.27 "default,proc-macro"
 //   protobuf-2.24.1
 //   quote-1.0.9 "default,proc-macro"
-//   rand-0.8.4 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
-//   rand_chacha-0.3.1 "std"
-//   rand_core-0.6.3 "alloc,getrandom,std"
-//   remain-0.2.2
 //   remove_dir_all-0.5.3
 //   ryu-1.0.5
-//   serde-1.0.126 "default,derive,serde_derive,std"
-//   serde_derive-1.0.126 "default"
-//   serde_json-1.0.64 "default,std"
 //   slab-0.4.3 "default,std"
 //   smallvec-1.6.1
-//   syn-1.0.73 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
-//   tempfile-3.2.0
-//   thiserror-1.0.25
-//   thiserror-impl-1.0.25
-//   unicode-width-0.1.8 "default"
 //   unicode-xid-0.2.2 "default"
