@@ -21,7 +21,7 @@ rust_library {
 }
 
 rust_defaults {
-    name: "sync_defaults",
+    name: "sync_test_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "sync",
     srcs: ["src/lib.rs"],
@@ -32,7 +32,7 @@ rust_defaults {
 
 rust_test_host {
     name: "sync_host_test_src_lib",
-    defaults: ["sync_defaults"],
+    defaults: ["sync_test_defaults"],
     test_options: {
         unit_test: true,
     },
@@ -40,5 +40,5 @@ rust_test_host {
 
 rust_test {
     name: "sync_device_test_src_lib",
-    defaults: ["sync_defaults"],
+    defaults: ["sync_test_defaults"],
 }

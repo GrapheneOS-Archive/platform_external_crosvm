@@ -23,7 +23,7 @@ rust_library {
 }
 
 rust_defaults {
-    name: "tempfile_defaults",
+    name: "tempfile_test_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "tempfile",
     srcs: ["src/lib.rs"],
@@ -37,7 +37,7 @@ rust_defaults {
 
 rust_test_host {
     name: "tempfile_host_test_src_lib",
-    defaults: ["tempfile_defaults"],
+    defaults: ["tempfile_test_defaults"],
     test_options: {
         unit_test: true,
     },
@@ -45,8 +45,8 @@ rust_test_host {
 
 rust_test {
     name: "tempfile_device_test_src_lib",
-    defaults: ["tempfile_defaults"],
+    defaults: ["tempfile_test_defaults"],
 }
 
 // dependent_library ["feature_list"]
-//   libc-0.2.97 "default,std"
+//   libc-0.2.98 "default,std"

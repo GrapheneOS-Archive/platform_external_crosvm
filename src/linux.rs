@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cell::RefCell;
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 #[cfg(feature = "gpu")]
 use std::env;
@@ -16,7 +16,6 @@ use std::iter;
 use std::mem;
 use std::net::Ipv4Addr;
 use std::num::ParseIntError;
-use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -33,11 +32,13 @@ use acpi_tables::sdt::SDT;
 
 use base::net::{UnixSeqpacket, UnixSeqpacketListener, UnlinkUnixSeqpacketListener};
 use base::*;
+use devices::vfio::{VfioCommonSetup, VfioCommonTrait};
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::{DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH};
 use devices::virtio::vhost::user::{
     Block as VhostUserBlock, Console as VhostUserConsole, Error as VhostUserError,
-    Fs as VhostUserFs, Net as VhostUserNet, Wl as VhostUserWl,
+    Fs as VhostUserFs, Mac80211Hwsim as VhostUserMac80211Hwsim, Net as VhostUserNet,
+    Wl as VhostUserWl,
 };
 #[cfg(feature = "gpu")]
 use devices::virtio::EventDevice;
@@ -51,7 +52,7 @@ use devices::{
 #[cfg(feature = "usb")]
 use devices::{HostBackendDeviceProvider, XhciController};
 use hypervisor::kvm::{Kvm, KvmVcpu, KvmVm};
-use hypervisor::{HypervisorCap, Vcpu, VcpuExit, VcpuRunHandle, Vm, VmCap};
+use hypervisor::{DeviceKind, HypervisorCap, Vcpu, VcpuExit, VcpuRunHandle, Vm, VmCap};
 use minijail::{self, Minijail};
 use net_util::{Error as NetError, MacAddress, Tap};
 use remain::sorted;
@@ -97,7 +98,6 @@ pub enum Error {
     BalloonDeviceNew(virtio::BalloonError),
     BlockDeviceNew(base::Error),
     BlockSignal(base::signal::Error),
-    BorrowVfioContainer,
     BuildVm(<Arch as LinuxArch>::Error),
     ChownTpmStorage(base::Error),
     CloneEvent(base::Error),
@@ -124,6 +124,8 @@ pub enum Error {
     CreateUsbProvider(devices::usb::host_backend::error::Error),
     CreateVcpu(base::Error),
     CreateVfioDevice(devices::vfio::VfioError),
+    CreateVfioKvmDevice(base::Error),
+    CreateVirtioIommu(base::Error),
     CreateVm(base::Error),
     CreateWaitContext(base::Error),
     DeviceJail(minijail::Error),
@@ -146,8 +148,7 @@ pub enum Error {
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     HandleDebugCommand(<Arch as LinuxArch>::Error),
     InputDeviceNew(virtio::InputError),
-    InputEventsOpen(std::io::Error),
-    InvalidFdPath,
+    InputEventsOpen(io::Error),
     InvalidWaylandPath,
     IoJail(minijail::Error),
     LoadKernel(Box<dyn StdError>),
@@ -196,6 +197,7 @@ pub enum Error {
     VhostUserBlockDeviceNew(VhostUserError),
     VhostUserConsoleDeviceNew(VhostUserError),
     VhostUserFsDeviceNew(VhostUserError),
+    VhostUserMac80211HwsimNew(VhostUserError),
     VhostUserNetDeviceNew(VhostUserError),
     VhostUserNetWithNetArgs,
     VhostUserWlDeviceNew(VhostUserError),
@@ -224,7 +226,6 @@ impl Display for Error {
             BalloonDeviceNew(e) => write!(f, "failed to create balloon: {}", e),
             BlockDeviceNew(e) => write!(f, "failed to create block device: {}", e),
             BlockSignal(e) => write!(f, "failed to block signal: {}", e),
-            BorrowVfioContainer => write!(f, "failed to borrow global vfio container"),
             BuildVm(e) => write!(f, "The architecture failed to build the vm: {}", e),
             ChownTpmStorage(e) => write!(f, "failed to chown tpm storage: {}", e),
             CloneEvent(e) => write!(f, "failed to clone event: {}", e),
@@ -253,6 +254,8 @@ impl Display for Error {
             CreateUsbProvider(e) => write!(f, "failed to create usb provider: {}", e),
             CreateVcpu(e) => write!(f, "failed to create vcpu: {}", e),
             CreateVfioDevice(e) => write!(f, "Failed to create vfio device {}", e),
+            CreateVfioKvmDevice(e) => write!(f, "failed to create KVM vfio device: {}", e),
+            CreateVirtioIommu(e) => write!(f, "Failed to create IOMMU device {}", e),
             CreateVm(e) => write!(f, "failed to create vm: {}", e),
             CreateWaitContext(e) => write!(f, "failed to create wait context: {}", e),
             DeviceJail(e) => write!(f, "failed to jail device: {}", e),
@@ -276,7 +279,6 @@ impl Display for Error {
             HandleDebugCommand(e) => write!(f, "failed to handle a gdb command: {}", e),
             InputDeviceNew(e) => write!(f, "failed to set up input device: {}", e),
             InputEventsOpen(e) => write!(f, "failed to open event device: {}", e),
-            InvalidFdPath => write!(f, "failed parsing a /proc/self/fd/*"),
             InvalidWaylandPath => write!(f, "wayland socket path has no parent or file name"),
             IoJail(e) => write!(f, "{}", e),
             LoadKernel(e) => write!(f, "failed to load kernel: {}", e),
@@ -340,6 +342,9 @@ impl Display for Error {
                 write!(f, "failed to set up vhost-user console device: {}", e)
             }
             VhostUserFsDeviceNew(e) => write!(f, "failed to set up vhost-user fs device: {}", e),
+            VhostUserMac80211HwsimNew(e) => {
+                write!(f, "failed to set up vhost-user mac80211_hwsim device {}", e)
+            }
             VhostUserNetDeviceNew(e) => write!(f, "failed to set up vhost-user net device: {}", e),
             VhostUserNetWithNetArgs => write!(
                 f,
@@ -512,33 +517,9 @@ fn simple_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
 
 type DeviceResult<T = VirtioDeviceStub> = std::result::Result<T, Error>;
 
-/// Open the file with the given path, or if it is of the form `/proc/self/fd/N` then just use the
-/// file descriptor.
-///
-/// Note that this will not work properly if the same `/proc/self/fd/N` path is used twice in
-/// different places, as the metadata (including the offset) will be shared between both file
-/// descriptors.
-fn open_file<F>(path: &Path, read_only: bool, error_constructor: F) -> Result<File>
-where
-    F: FnOnce(PathBuf, io::Error) -> Error,
-{
-    // Special case '/proc/self/fd/*' paths. The FD is already open, just use it.
-    Ok(
-        if let Some(raw_descriptor) = raw_descriptor_from_path(path)? {
-            // Safe because we will validate |raw_fd|.
-            unsafe { File::from_raw_descriptor(raw_descriptor) }
-        } else {
-            OpenOptions::new()
-                .read(true)
-                .write(!read_only)
-                .open(path)
-                .map_err(|e| error_constructor(path.to_path_buf(), e))?
-        },
-    )
-}
-
 fn create_block_device(cfg: &Config, disk: &DiskOption, disk_device_tube: Tube) -> DeviceResult {
-    let raw_image: File = open_file(&disk.path, disk.read_only, Error::Disk)?;
+    let raw_image: File = open_file(&disk.path, disk.read_only)
+        .map_err(|e| Error::Disk(disk.path.clone(), e.into()))?;
     // Lock the disk image to prevent other crosvm instances from using it.
     let lock_op = if disk.read_only {
         FlockOperation::LockShared
@@ -612,6 +593,17 @@ fn create_vhost_user_fs_device(cfg: &Config, option: &VhostUserFsOption) -> Devi
         &option.tag,
     )
     .map_err(Error::VhostUserFsDeviceNew)?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        // no sandbox here because virtqueue handling is exported to a different process.
+        jail: None,
+    })
+}
+
+fn create_vhost_user_mac80211_hwsim_device(cfg: &Config, opt: &VhostUserOption) -> DeviceResult {
+    let dev = VhostUserMac80211Hwsim::new(virtio::base_features(cfg.protected_vm), &opt.socket)
+        .map_err(Error::VhostUserMac80211HwsimNew)?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
@@ -1325,7 +1317,8 @@ fn create_pmem_device(
     index: usize,
     pmem_device_tube: Tube,
 ) -> DeviceResult {
-    let fd = open_file(&disk.path, disk.read_only, Error::Disk)?;
+    let fd = open_file(&disk.path, disk.read_only)
+        .map_err(|e| Error::Disk(disk.path.clone(), e.into()))?;
 
     let arena_size = {
         let metadata =
@@ -1399,6 +1392,19 @@ fn create_pmem_device(
     Ok(VirtioDeviceStub {
         dev: Box::new(dev) as Box<dyn VirtioDevice>,
         jail: simple_jail(&cfg, "pmem_device")?,
+    })
+}
+
+fn create_iommu_device(
+    cfg: &Config,
+    endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
+) -> DeviceResult {
+    let dev = virtio::Iommu::new(virtio::base_features(cfg.protected_vm), endpoints)
+        .map_err(Error::CreateVirtioIommu)?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(&cfg, "iommu_device")?,
     })
 }
 
@@ -1725,33 +1731,28 @@ fn create_virtio_devices(
         devs.push(dev);
     }
 
+    if let Some(vhost_user_mac80211_hwsim) = &cfg.vhost_user_mac80211_hwsim {
+        devs.push(create_vhost_user_mac80211_hwsim_device(
+            cfg,
+            &vhost_user_mac80211_hwsim,
+        )?);
+    }
+
     Ok(devs)
 }
 
-thread_local!(static VFIO_CONTAINER: RefCell<Option<Arc<Mutex<VfioContainer>>>> = RefCell::new(None));
 fn create_vfio_device(
     cfg: &Config,
     vm: &impl Vm,
     resources: &mut SystemAllocator,
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
+    kvm_vfio_file: &SafeDescriptor,
+    endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
+    iommu_enabled: bool,
 ) -> DeviceResult<(Box<VfioPciDevice>, Option<Minijail>)> {
-    let vfio_container =
-        VFIO_CONTAINER.with::<_, DeviceResult<Arc<Mutex<VfioContainer>>>>(|v| {
-            if v.borrow().is_some() {
-                if let Some(container) = &(*v.borrow()) {
-                    Ok(container.clone())
-                } else {
-                    Err(Error::BorrowVfioContainer)
-                }
-            } else {
-                let container = Arc::new(Mutex::new(
-                    VfioContainer::new().map_err(Error::CreateVfioDevice)?,
-                ));
-                *v.borrow_mut() = Some(container.clone());
-                Ok(container)
-            }
-        })?;
+    let vfio_container = VfioCommonSetup::vfio_get_container(vfio_path, iommu_enabled)
+        .map_err(Error::CreateVfioDevice)?;
 
     // create MSI, MSI-X, and Mem request sockets for each vfio device
     let (vfio_host_tube_msi, vfio_device_tube_msi) = Tube::pair().map_err(Error::CreateTube)?;
@@ -1763,8 +1764,14 @@ fn create_vfio_device(
     let (vfio_host_tube_mem, vfio_device_tube_mem) = Tube::pair().map_err(Error::CreateTube)?;
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
-    let vfio_device = VfioDevice::new(vfio_path, vm, vm.get_memory(), vfio_container)
-        .map_err(Error::CreateVfioDevice)?;
+    let vfio_device = VfioDevice::new(
+        vfio_path,
+        vm.get_memory(),
+        &kvm_vfio_file,
+        vfio_container.clone(),
+        iommu_enabled,
+    )
+    .map_err(Error::CreateVfioDevice)?;
     let mut vfio_pci_device = Box::new(VfioPciDevice::new(
         vfio_device,
         vfio_device_tube_msi,
@@ -1772,11 +1779,16 @@ fn create_vfio_device(
         vfio_device_tube_mem,
     ));
     // early reservation for pass-through PCI devices.
-    if vfio_pci_device.allocate_address(resources).is_err() {
+    let endpoint_addr = vfio_pci_device.allocate_address(resources);
+    if endpoint_addr.is_err() {
         warn!(
             "address reservation failed for vfio {}",
             vfio_pci_device.debug_label()
         );
+    }
+
+    if iommu_enabled {
+        endpoints.insert(endpoint_addr.unwrap().to_u32(), vfio_container);
     }
 
     Ok((vfio_pci_device, simple_jail(cfg, "vfio_device")?))
@@ -1837,10 +1849,39 @@ fn create_devices(
         pci_devices.push((usb_controller, simple_jail(&cfg, "xhci")?));
     }
 
-    for vfio_path in &cfg.vfio {
-        let (vfio_pci_device, jail) =
-            create_vfio_device(cfg, vm, resources, control_tubes, vfio_path.as_path())?;
-        pci_devices.push((vfio_pci_device, jail));
+    if !cfg.vfio.is_empty() {
+        let kvm_vfio_file = vm
+            .create_device(DeviceKind::Vfio)
+            .map_err(Error::CreateVfioKvmDevice)?;
+
+        let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> =
+            BTreeMap::new();
+
+        for (vfio_path, enable_iommu) in cfg.vfio.iter() {
+            let (vfio_pci_device, jail) = create_vfio_device(
+                cfg,
+                vm,
+                resources,
+                control_tubes,
+                vfio_path.as_path(),
+                &kvm_vfio_file,
+                &mut iommu_attached_endpoints,
+                *enable_iommu,
+            )?;
+
+            pci_devices.push((vfio_pci_device, jail));
+        }
+
+        if !iommu_attached_endpoints.is_empty() {
+            let iommu_dev = create_iommu_device(cfg, iommu_attached_endpoints)?;
+
+            let (msi_host_tube, msi_device_tube) = Tube::pair().map_err(Error::CreateTube)?;
+            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+            let dev = VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
+                .map_err(Error::VirtioPciDev)?;
+            let dev = Box::new(dev) as Box<dyn PciDevice>;
+            pci_devices.push((dev, iommu_dev.jail));
+        }
     }
 
     Ok(pci_devices)
@@ -1887,32 +1928,16 @@ fn add_crosvm_user_to_jail(jail: &mut Minijail, feature: &str) -> Result<Ids> {
     })
 }
 
-/// If the given path is of the form /proc/self/fd/N for some N, returns `Ok(Some(N))`. Otherwise
-/// returns `Ok(None`).
-fn raw_descriptor_from_path(path: &Path) -> Result<Option<RawDescriptor>> {
-    if path.parent() == Some(Path::new("/proc/self/fd")) {
-        let raw_descriptor = path
-            .file_name()
-            .and_then(|fd_osstr| fd_osstr.to_str())
-            .and_then(|fd_str| fd_str.parse::<c_int>().ok())
-            .ok_or(Error::InvalidFdPath)?;
-        validate_raw_descriptor(raw_descriptor)
-            .map_err(Error::ValidateRawDescriptor)
-            .map(Some)
-    } else {
-        Ok(None)
-    }
-}
-
 trait IntoUnixStream {
     fn into_unix_stream(self) -> Result<UnixStream>;
 }
 
 impl<'a> IntoUnixStream for &'a Path {
     fn into_unix_stream(self) -> Result<UnixStream> {
-        if let Some(raw_descriptor) = raw_descriptor_from_path(self)? {
-            // Safe because we will validate |raw_fd|.
-            unsafe { Ok(UnixStream::from_raw_fd(raw_descriptor)) }
+        if let Some(fd) =
+            safe_descriptor_from_path(self).map_err(|e| Error::InputEventsOpen(e.into()))?
+        {
+            Ok(fd.into())
         } else {
             UnixStream::connect(self).map_err(Error::InputEventsOpen)
         }
@@ -2375,18 +2400,23 @@ where
 
 fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     let initrd_image = if let Some(initrd_path) = &cfg.initrd_path {
-        Some(open_file(initrd_path, true, Error::OpenInitrd)?)
+        Some(
+            open_file(initrd_path, true)
+                .map_err(|e| Error::OpenInitrd(initrd_path.to_owned(), e.into()))?,
+        )
     } else {
         None
     };
 
     let vm_image = match cfg.executable_path {
-        Some(Executable::Kernel(ref kernel_path)) => {
-            VmImage::Kernel(open_file(kernel_path, true, Error::OpenKernel)?)
-        }
-        Some(Executable::Bios(ref bios_path)) => {
-            VmImage::Bios(open_file(bios_path, true, Error::OpenBios)?)
-        }
+        Some(Executable::Kernel(ref kernel_path)) => VmImage::Kernel(
+            open_file(kernel_path, true)
+                .map_err(|e| Error::OpenKernel(kernel_path.to_owned(), e.into()))?,
+        ),
+        Some(Executable::Bios(ref bios_path)) => VmImage::Bios(
+            open_file(bios_path, true)
+                .map_err(|e| Error::OpenBios(bios_path.to_owned(), e.into()))?,
+        ),
         _ => panic!("Did not receive a bios or kernel, should be impossible."),
     };
 
@@ -2411,7 +2441,6 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         pstore: cfg.pstore.clone(),
         initrd_image,
         extra_kernel_params: cfg.params.clone(),
-        wayland_dmabuf: cfg.wayland_dmabuf,
         acpi_sdts: cfg
             .acpi_tables
             .iter()
@@ -3084,25 +3113,17 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             }
         }
 
-        for event in events.iter().filter(|e| e.is_hungup) {
-            match event.token {
-                Token::Exit => {}
-                Token::Suspend => {}
-                Token::ChildSignal => {}
-                Token::IrqFd { index: _ } => {}
-                Token::VmControlServer => {}
-                Token::VmControl { index } => {
-                    // It's possible more data is readable and buffered while the socket is hungup,
-                    // so don't delete the tube from the poll context until we're sure all the
-                    // data is read.
-                    if control_tubes
-                        .get(index)
-                        .map(|s| !s.as_ref().is_packet_ready())
-                        .unwrap_or(false)
-                    {
-                        vm_control_indices_to_remove.push(index);
-                    }
-                }
+        // It's possible more data is readable and buffered while the socket is hungup,
+        // so don't delete the tube from the poll context until we're sure all the
+        // data is read.
+        // Below case covers a condition where we have received a hungup event and the tube is not
+        // readable.
+        // In case of readable tube, once all data is read, any attempt to read more data on hungup
+        // tube should fail. On such failure, we get Disconnected error and index gets added to
+        // vm_control_indices_to_remove by the time we reach here.
+        for event in events.iter().filter(|e| e.is_hungup && !e.is_readable) {
+            if let Token::VmControl { index } = event.token {
+                vm_control_indices_to_remove.push(index);
             }
         }
 
