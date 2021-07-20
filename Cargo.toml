@@ -21,6 +21,11 @@ required-features = [ "direct" ]
 panic = 'abort'
 overflow-checks = true
 
+# We currently need to exclude some crates from the workspace to allow
+# these crates to be independently built by portage. These crates will
+# eventually be moved into separate repositories.
+# The only workspace members that need to be explicitly specified here are those
+# that are not dependencies of the crosvm root crate.
 [workspace]
 members = [
     # Disabled to support running cargo2android while cros-fuzz is not
@@ -29,6 +34,7 @@ members = [
     "qcow_utils",
     "integration_tests",
     "libcrosvm_control",
+    "vhost_user_devices",
 ]
 exclude = [
     "assertions",
@@ -43,11 +49,14 @@ exclude = [
 ]
 
 [features]
-default = ["audio", "gpu", "usb"]
+audio = ["devices/audio"]
 chromeos = ["base/chromeos"]
+composite-disk = ["protos/composite-disk", "protobuf", "disk/composite-disk"]
+default = ["audio", "gpu", "usb"]
 default-no-sandbox = []
 direct = ["devices/direct"]
-audio = ["devices/audio"]
+gdb = ["gdbstub", "thiserror",  "arch/gdb", "vm_control/gdb", "x86_64/gdb"]
+gfxstream = ["devices/gfxstream"]
 gpu = ["devices/gpu"]
 plugin = ["protos/plugin", "crosvm_plugin", "kvm", "kvm_sys", "protobuf"]
 power-monitor-powerd = ["arch/power-monitor-powerd"]
@@ -55,13 +64,10 @@ tpm = ["devices/tpm"]
 usb = ["devices/usb"]
 video-decoder = ["devices/video-decoder"]
 video-encoder = ["devices/video-encoder"]
+virgl_renderer = ["devices/virgl_renderer"]
+virgl_renderer_next = ["rutabaga_gfx/virgl_renderer_next"]
 wl-dmabuf = ["devices/minigbm"]
 x = ["devices/x"]
-virgl_renderer_next = ["rutabaga_gfx/virgl_renderer_next"]
-composite-disk = ["protos/composite-disk", "protobuf", "disk/composite-disk"]
-virgl_renderer = ["devices/virgl_renderer"]
-gfxstream = ["devices/gfxstream"]
-gdb = ["gdbstub", "thiserror",  "arch/gdb", "vm_control/gdb", "x86_64/gdb"]
 
 [dependencies]
 arch = { path = "arch" }
@@ -96,7 +102,6 @@ sync = { path = "sync" }
 tempfile = "*"
 thiserror = { version = "1.0.20", optional = true }
 vhost = { path = "vhost" }
-vhost_user_devices = { path = "vhost_user_devices" }
 vm_control = { path = "vm_control" }
 acpi_tables = { path = "acpi_tables" }
 vm_memory = { path = "vm_memory" }
@@ -119,7 +124,6 @@ cras-sys = { path = "../adhd/cras/client/cras-sys" } # ignored by ebuild
 # available in Android.
 # cros_fuzz = { path = "../../platform2/cros-fuzz" } # ignored by ebuild
 data_model = { path = "data_model" }
-libchromeos = { path = "../libchromeos-rs" } # ignored by ebuild
 libcras = { path = "../adhd/cras/client/libcras" } # ignored by ebuild
 minijail = { path = "../minijail/rust/minijail" } # ignored by ebuild
 p9 = { path = "../vm_tools/p9" } # ignored by ebuild

@@ -13,7 +13,6 @@ package {
 rust_library {
     name: "libprotos",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "protos",
     srcs: ["src/lib.rs"],
@@ -48,10 +47,9 @@ rust_protobuf {
 }
 
 rust_defaults {
-    name: "protos_defaults",
+    name: "protos_test_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "protos",
-    // has rustc warnings
     srcs: ["src/lib.rs"],
     features: [
         "composite-disk",
@@ -67,7 +65,7 @@ rust_defaults {
 
 rust_test_host {
     name: "protos_host_test_src_lib",
-    defaults: ["protos_defaults"],
+    defaults: ["protos_test_defaults"],
     test_options: {
         unit_test: true,
     },
@@ -75,14 +73,13 @@ rust_test_host {
 
 rust_test {
     name: "protos_device_test_src_lib",
-    defaults: ["protos_defaults"],
+    defaults: ["protos_test_defaults"],
 }
 
 rust_defaults {
-    name: "protos_defaults_trunks",
+    name: "protos_test_defaults_trunks",
     defaults: ["crosvm_defaults"],
     crate_name: "trunks",
-    // has rustc warnings
     srcs: ["tests/trunks.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
@@ -95,7 +92,7 @@ rust_defaults {
 
 rust_test_host {
     name: "protos_host_test_tests_trunks",
-    defaults: ["protos_defaults_trunks"],
+    defaults: ["protos_test_defaults_trunks"],
     test_options: {
         unit_test: true,
     },
@@ -103,14 +100,14 @@ rust_test_host {
 
 rust_test {
     name: "protos_device_test_tests_trunks",
-    defaults: ["protos_defaults_trunks"],
+    defaults: ["protos_test_defaults_trunks"],
 }
 
 // dependent_library ["feature_list"]
 //   cfg-if-1.0.0
 //   either-1.6.1 "default,use_std"
 //   getrandom-0.2.3 "std"
-//   libc-0.2.97 "default,std"
+//   libc-0.2.98 "default,std"
 //   log-0.4.14
 //   ppv-lite86-0.2.10 "simd,std"
 //   protobuf-2.24.1
