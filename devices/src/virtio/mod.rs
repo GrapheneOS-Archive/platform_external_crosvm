@@ -5,10 +5,10 @@
 //! Implements virtio devices, queues, and transport mechanisms.
 
 mod balloon;
-mod console;
 mod descriptor_utils;
 mod input;
 mod interrupt;
+mod iommu;
 mod p9;
 mod pmem;
 mod queue;
@@ -23,6 +23,7 @@ mod virtio_pci_device;
 pub mod wl;
 
 pub mod block;
+pub mod console;
 pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -41,6 +42,7 @@ pub use self::descriptor_utils::*;
 pub use self::gpu::*;
 pub use self::input::*;
 pub use self::interrupt::*;
+pub use self::iommu::*;
 pub use self::net::*;
 pub use self::p9::*;
 pub use self::pmem::*;
@@ -83,6 +85,7 @@ const TYPE_CRYPTO: u32 = 20;
 const TYPE_IOMMU: u32 = 23;
 const TYPE_FS: u32 = 26;
 const TYPE_PMEM: u32 = 27;
+const TYPE_MAC80211_HWSIM: u32 = 29;
 const TYPE_VIDEO_ENC: u32 = 30;
 const TYPE_VIDEO_DEC: u32 = 31;
 // Additional types invented by crosvm

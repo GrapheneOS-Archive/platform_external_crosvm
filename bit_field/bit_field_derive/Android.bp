@@ -11,7 +11,7 @@ package {
 }
 
 rust_defaults {
-    name: "bit_field_derive_defaults",
+    name: "bit_field_derive_test_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "bit_field_derive",
     srcs: ["bit_field_derive.rs"],
