@@ -32,8 +32,8 @@ rutabaga_gfx = { path = "../rutabaga_gfx", optional = true }
 hypervisor = { path = "../hypervisor" }
 kvm_sys = { path = "../kvm_sys" }
 libc = "*"
-libchromeos = { path = "../../libchromeos-rs" } # ignored by ebuild
 libcras = { path = "../../adhd/cras/client/libcras" } # ignored by ebuild
+libvda = { path = "../libvda", optional = true }
 linux_input_sys = { path = "../linux_input_sys" }
 minijail = { path = "../../minijail/rust/minijail" } # ignored by ebuild
 net_sys = { path = "../net_sys" }

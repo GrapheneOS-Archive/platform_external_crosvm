@@ -24,7 +24,7 @@ rust_proc_macro {
 }
 
 rust_defaults {
-    name: "poll_token_derive_defaults",
+    name: "poll_token_derive_test_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "poll_token_derive",
     srcs: ["poll_token_derive.rs"],
@@ -40,7 +40,7 @@ rust_defaults {
 
 //rust_test_host {
 //    name: "poll_token_derive_host_test_poll_token_derive",
-//    defaults: ["poll_token_derive_defaults"],
+//    defaults: ["poll_token_derive_test_defaults"],
 //    test_options: {
 //        unit_test: true,
 //    },
@@ -48,7 +48,7 @@ rust_defaults {
 
 //rust_test {
 //    name: "poll_token_derive_device_test_poll_token_derive",
-//    defaults: ["poll_token_derive_defaults"],
+//    defaults: ["poll_token_derive_test_defaults"],
 //}
 
 // dependent_library ["feature_list"]

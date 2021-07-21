@@ -36,6 +36,10 @@ use devices::ProtectionType;
 #[cfg(feature = "audio")]
 use devices::{Ac97Backend, Ac97Parameters};
 use disk::QcowFile;
+#[cfg(feature = "composite-disk")]
+use disk::{
+    create_composite_disk, create_disk_file, ImagePartitionType, PartitionFileInfo, PartitionInfo,
+};
 use vm_control::{
     client::{
         do_modify_battery, do_usb_attach, do_usb_detach, do_usb_list, handle_request, vms_request,
@@ -1333,7 +1337,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.wayland_socket_paths.insert(name.to_string(), path);
         }
         #[cfg(feature = "wl-dmabuf")]
-        "wayland-dmabuf" => cfg.wayland_dmabuf = true,
+        "wayland-dmabuf" => {}
         "x-display" => {
             if cfg.x_display.is_some() {
                 return Err(argument::Error::TooManyArguments(
@@ -1695,7 +1699,12 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.executable_path = Some(Executable::Bios(PathBuf::from(value.unwrap().to_owned())));
         }
         "vfio" => {
-            let vfio_path = PathBuf::from(value.unwrap());
+            let mut param = value.unwrap().split(',');
+            let vfio_path =
+                PathBuf::from(param.next().ok_or_else(|| argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("missing vfio path"),
+                })?);
             if !vfio_path.exists() {
                 return Err(argument::Error::InvalidValue {
                     value: value.unwrap().to_owned(),
@@ -1709,7 +1718,33 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 });
             }
 
-            cfg.vfio.push(vfio_path);
+            let mut enable_iommu = false;
+            if let Some(p) = param.next() {
+                let mut kv = p.splitn(2, '=');
+                if let (Some(kind), Some(value)) = (kv.next(), kv.next()) {
+                    match kind {
+                        "iommu" => (),
+                        _ => {
+                            return Err(argument::Error::InvalidValue {
+                                value: p.to_owned(),
+                                expected: String::from("option must be `iommu=on|off`"),
+                            })
+                        }
+                    }
+                    match value {
+                        "on" => enable_iommu = true,
+                        "off" => (),
+                        _ => {
+                            return Err(argument::Error::InvalidValue {
+                                value: p.to_owned(),
+                                expected: String::from("option must be `iommu=on|off`"),
+                            })
+                        }
+                    }
+                };
+            }
+
+            cfg.vfio.insert(vfio_path, enable_iommu);
         }
         "video-decoder" => {
             cfg.video_dec = true;
@@ -1771,6 +1806,11 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "vhost-user-console" => cfg.vhost_user_console.push(VhostUserOption {
             socket: PathBuf::from(value.unwrap()),
         }),
+        "vhost-user-mac80211-hwsim" => {
+            cfg.vhost_user_mac80211_hwsim = Some(VhostUserOption {
+                socket: PathBuf::from(value.unwrap()),
+            });
+        }
         "vhost-user-net" => cfg.vhost_user_net.push(VhostUserOption {
             socket: PathBuf::from(value.unwrap()),
         }),
@@ -2019,7 +2059,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::flag("display-window-mouse", "Capture keyboard input from the display window."),
           Argument::value("wayland-sock", "PATH[,name=NAME]", "Path to the Wayland socket to use. The unnamed one is used for displaying virtual screens. Named ones are only for IPC."),
           #[cfg(feature = "wl-dmabuf")]
-          Argument::flag("wayland-dmabuf", "Enable support for DMABufs in Wayland device."),
+          Argument::flag("wayland-dmabuf", "DEPRECATED: Enable support for DMABufs in Wayland device."),
           Argument::short_value('s',
                                 "socket",
                                 "PATH",
@@ -2090,7 +2130,8 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
           #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("split-irqchip", "(EXPERIMENTAL) enable split-irqchip support"),
           Argument::value("bios", "PATH", "Path to BIOS/firmware ROM"),
-          Argument::value("vfio", "PATH", "Path to sysfs of pass through or mdev device"),
+          Argument::value("vfio", "PATH[,iommu=on|off]", "Path to sysfs of pass through or mdev device.
+iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           #[cfg(feature = "video-decoder")]
           Argument::flag("video-decoder", "(EXPERIMENTAL) enable virtio-video decoder device"),
           #[cfg(feature = "video-encoder")]
@@ -2107,6 +2148,7 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
           Argument::value("balloon_bias_mib", "N", "Amount to bias balance of memory between host and guest as the balloon inflates, in MiB."),
           Argument::value("vhost-user-blk", "SOCKET_PATH", "Path to a socket for vhost-user block"),
           Argument::value("vhost-user-console", "SOCKET_PATH", "Path to a socket for vhost-user console"),
+          Argument::value("vhost-user-mac80211-hwsim", "SOCKET_PATH", "Path to a socket for vhost-user mac80211_hwsim"),
           Argument::value("vhost-user-net", "SOCKET_PATH", "Path to a socket for vhost-user net"),
           Argument::value("vhost-user-wl", "SOCKET_PATH:TUBE_PATH", "Paths to a vhost-user socket for wayland and a Tube socket for additional wayland-specific messages"),
           Argument::value("vhost-user-fs", "SOCKET_PATH:TAG",
@@ -2237,6 +2279,102 @@ fn balloon_stats(mut args: std::env::Args) -> std::result::Result<(), ()> {
         VmResponse::BalloonStats { .. } => Ok(()),
         _ => Err(()),
     }
+}
+
+#[cfg(feature = "composite-disk")]
+fn create_composite(mut args: std::env::Args) -> std::result::Result<(), ()> {
+    if args.len() < 1 {
+        print_help("crosvm create_composite", "PATH [LABEL:PARTITION]..", &[]);
+        println!("Creates a new composite disk image containing the given partition images");
+        return Err(());
+    }
+
+    let composite_image_path = args.next().unwrap();
+    let header_path = format!("{}.header", composite_image_path);
+    let footer_path = format!("{}.footer", composite_image_path);
+
+    let mut composite_image_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&composite_image_path)
+        .map_err(|e| {
+            error!(
+                "Failed opening composite disk image file at '{}': {}",
+                composite_image_path, e
+            );
+        })?;
+    let mut header_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&header_path)
+        .map_err(|e| {
+            error!(
+                "Failed opening header image file at '{}': {}",
+                header_path, e
+            );
+        })?;
+    let mut footer_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&footer_path)
+        .map_err(|e| {
+            error!(
+                "Failed opening footer image file at '{}': {}",
+                footer_path, e
+            );
+        })?;
+
+    let partitions = args
+        .into_iter()
+        .map(|partition_arg| {
+            if let [label, path] = partition_arg.split(":").collect::<Vec<_>>()[..] {
+                let partition_file = File::open(path)
+                    .map_err(|e| error!("Failed to open partition image: {}", e))?;
+                let size = create_disk_file(partition_file)
+                    .map_err(|e| error!("Failed to create DiskFile instance: {}", e))?
+                    .get_len()
+                    .map_err(|e| error!("Failed to get length of partition image: {}", e))?;
+                Ok(PartitionInfo {
+                    label: label.to_owned(),
+                    files: vec![PartitionFileInfo {
+                        path: Path::new(path).to_owned(),
+                        size,
+                    }],
+                    partition_type: ImagePartitionType::LinuxFilesystem,
+                    writable: false,
+                })
+            } else {
+                error!(
+                    "Must specify label and path for partition '{}', like LABEL:PATH",
+                    partition_arg
+                );
+                Err(())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    create_composite_disk(
+        &partitions,
+        &PathBuf::from(header_path),
+        &mut header_file,
+        &PathBuf::from(footer_path),
+        &mut footer_file,
+        &mut composite_image_file,
+    )
+    .map_err(|e| {
+        error!(
+            "Failed to create composite disk image at '{}': {}",
+            composite_image_path, e
+        );
+    })?;
+
+    Ok(())
 }
 
 fn create_qcow2(args: std::env::Args) -> std::result::Result<(), ()> {
@@ -2459,6 +2597,8 @@ fn print_usage() {
     println!("    balloon - Set balloon size of the crosvm instance.");
     println!("    balloon_stats - Prints virtio balloon statistics.");
     println!("    battery - Modify battery.");
+    #[cfg(feature = "composite-disk")]
+    println!("    create_composite  - Create a new composite disk image file.");
     println!("    create_qcow2  - Create a new qcow2 disk image file.");
     println!("    disk - Manage attached virtual disk devices.");
     println!("    resume - Resumes the crosvm instance.");
@@ -2526,6 +2666,8 @@ fn crosvm_main() -> std::result::Result<(), ()> {
         Some("run") => run_vm(args),
         Some("balloon") => balloon_vms(args),
         Some("balloon_stats") => balloon_stats(args),
+        #[cfg(feature = "composite-disk")]
+        Some("create_composite") => create_composite(args),
         Some("create_qcow2") => create_qcow2(args),
         Some("disk") => disk_cmd(args),
         Some("usb") => modify_usb(args),
