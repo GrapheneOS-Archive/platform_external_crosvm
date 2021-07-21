@@ -11,7 +11,7 @@ package {
 }
 
 rust_defaults {
-    name: "data_model_defaults",
+    name: "data_model_test_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "data_model",
     srcs: ["src/lib.rs"],
@@ -27,7 +27,7 @@ rust_defaults {
 
 rust_test_host {
     name: "data_model_host_test_src_lib",
-    defaults: ["data_model_defaults"],
+    defaults: ["data_model_test_defaults"],
     test_options: {
         unit_test: true,
     },
@@ -35,7 +35,7 @@ rust_test_host {
 
 rust_test {
     name: "data_model_device_test_src_lib",
-    defaults: ["data_model_defaults"],
+    defaults: ["data_model_test_defaults"],
 }
 
 rust_library {
@@ -54,7 +54,7 @@ rust_library {
 
 // dependent_library ["feature_list"]
 //   ../assertions/src/lib.rs
-//   libc-0.2.97 "default,std"
+//   libc-0.2.98 "default,std"
 //   proc-macro2-1.0.27 "default,proc-macro"
 //   quote-1.0.9 "default,proc-macro"
 //   serde-1.0.126 "default,derive,serde_derive,std"
