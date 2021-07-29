@@ -6,7 +6,7 @@
 set -e
 
 cargo2android() {
-  cargo2android.py --run --device --tests --dependencies $@
+  cargo2android.py --run --device --tests $@
   rm -r cargo.out
   rm -rf target.tmp || /bin/true
 }
