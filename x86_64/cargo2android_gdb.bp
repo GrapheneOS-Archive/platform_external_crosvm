@@ -1,0 +1,20 @@
+target: {
+    linux_glibc_x86_64: {
+        features: [
+            "gdb",
+            "gdbstub",
+        ],
+        rustlibs: [
+            "libgdbstub",
+        ],
+    },
+},
+// Exclude arm family manually
+arch: {
+    arm: {
+        enabled: false,
+    },
+    arm64: {
+        enabled: false,
+    },
+}
