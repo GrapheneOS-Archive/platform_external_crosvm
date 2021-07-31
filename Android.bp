@@ -50,9 +50,6 @@ rust_defaults {
     target: {
         linux_glibc_x86_64: {
             enabled: true,
-            flags: [
-                "-L device/google/cuttlefish_vmm/x86_64-linux-gnu/bin/",
-            ],
         },
         android64: {
             compile_multilib: "64",
