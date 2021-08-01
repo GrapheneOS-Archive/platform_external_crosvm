@@ -44,9 +44,6 @@ rust_defaults {
         "libvm_control",
         "libvm_memory",
     ],
-    shared_libs: [
-        "libfdt",  // added manually
-    ],
 }
 
 rust_test_host {
@@ -95,9 +92,6 @@ rust_library {
         "libvm_control",
         "libvm_memory",
     ],
-    shared_libs: [
-        "libfdt",  // added manually
-    ],
 }
 
 // dependent_library ["feature_list"]
@@ -145,18 +139,18 @@ rust_library {
 //   ../vm_control/src/lib.rs
 //   ../vm_memory/src/lib.rs
 //   async-task-4.0.3 "default,std"
-//   async-trait-0.1.50
+//   async-trait-0.1.51
 //   autocfg-1.0.1
 //   bitflags-1.2.1 "default"
 //   cfg-if-1.0.0
 //   downcast-rs-1.2.0 "default,std"
-//   futures-0.3.15 "alloc,std"
-//   futures-channel-0.3.15 "alloc,futures-sink,sink,std"
-//   futures-core-0.3.15 "alloc,std"
-//   futures-io-0.3.15 "std"
-//   futures-sink-0.3.15 "alloc,std"
-//   futures-task-0.3.15 "alloc,std"
-//   futures-util-0.3.15 "alloc,channel,futures-channel,futures-io,futures-sink,io,memchr,sink,slab,std"
+//   futures-0.3.16 "alloc,std"
+//   futures-channel-0.3.16 "alloc,futures-sink,sink,std"
+//   futures-core-0.3.16 "alloc,std"
+//   futures-io-0.3.16 "std"
+//   futures-sink-0.3.16 "alloc,std"
+//   futures-task-0.3.16 "alloc,std"
+//   futures-util-0.3.16 "alloc,channel,futures-channel,futures-io,futures-sink,io,memchr,sink,slab,std"
 //   getrandom-0.2.3 "std"
 //   intrusive-collections-0.9.2 "alloc,default"
 //   itoa-0.4.7
@@ -170,7 +164,7 @@ rust_library {
 //   pin-utils-0.1.0
 //   pkg-config-0.3.19
 //   ppv-lite86-0.2.10 "simd,std"
-//   proc-macro2-1.0.27 "default,proc-macro"
+//   proc-macro2-1.0.28 "default,proc-macro"
 //   protobuf-2.24.1
 //   quote-1.0.9 "default,proc-macro"
 //   rand-0.8.4 "alloc,default,getrandom,libc,rand_chacha,rand_hc,std,std_rng"
@@ -181,10 +175,10 @@ rust_library {
 //   ryu-1.0.5
 //   serde-1.0.126 "default,derive,serde_derive,std"
 //   serde_derive-1.0.126 "default"
-//   serde_json-1.0.64 "default,std"
+//   serde_json-1.0.65 "default,std"
 //   slab-0.4.3 "default,std"
 //   smallvec-1.6.1
-//   syn-1.0.73 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
+//   syn-1.0.74 "clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut"
 //   tempfile-3.2.0
 //   thiserror-1.0.26
 //   thiserror-impl-1.0.26
