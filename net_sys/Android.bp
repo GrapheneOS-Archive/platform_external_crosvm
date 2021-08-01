@@ -13,6 +13,7 @@ package {
 rust_library {
     name: "libnet_sys",
     defaults: ["crosvm_defaults"],
+    // has rustc warnings
     host_supported: true,
     crate_name: "net_sys",
     srcs: ["src/lib.rs"],
@@ -26,6 +27,7 @@ rust_defaults {
     name: "net_sys_test_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "net_sys",
+    // has rustc warnings
     srcs: ["src/lib.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
