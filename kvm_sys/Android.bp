@@ -14,6 +14,7 @@ rust_defaults {
     name: "kvm_sys_test_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "kvm_sys",
+    // has rustc warnings
     srcs: ["src/lib.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
@@ -42,6 +43,7 @@ rust_defaults {
     name: "kvm_sys_test_defaults_basic",
     defaults: ["crosvm_defaults"],
     crate_name: "basic",
+    // has rustc warnings
     srcs: ["tests/basic.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
@@ -70,6 +72,7 @@ rust_test {
 rust_library {
     name: "libkvm_sys",
     defaults: ["crosvm_defaults"],
+    // has rustc warnings
     host_supported: true,
     crate_name: "kvm_sys",
     srcs: ["src/lib.rs"],
