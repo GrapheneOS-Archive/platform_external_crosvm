@@ -24,6 +24,7 @@ rust_library {
         "libcros_async",
         "libdevices",
         "libfutures",
+        "libgetopts",
         "liblibc",
         "libonce_cell",
         "libsync_rust",
@@ -51,6 +52,7 @@ rust_defaults {
         "libdata_model",
         "libdevices",
         "libfutures",
+        "libgetopts",
         "liblibc",
         "libonce_cell",
         "libsync_rust",
@@ -76,3 +78,72 @@ rust_test {
     defaults: ["vhost_user_devices_test_defaults"],
 }
 
+rust_defaults {
+    name: "vhost_user_devices_test_defaults_vhost_user_wl_device",
+    defaults: ["crosvm_defaults"],
+    crate_name: "vhost_user_wl_device",
+    srcs: ["src/wl.rs"],
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+    edition: "2018",
+    rustlibs: [
+        "libanyhow",
+        "libarch",
+        "libbase_rust",
+        "libcros_async",
+        "libdata_model",
+        "libdevices",
+        "libfutures",
+        "libgetopts",
+        "liblibc",
+        "libonce_cell",
+        "libsync_rust",
+        "libsys_util",
+        "libtempfile",
+        "libthiserror",
+        "libvhost_user_devices",
+        "libvm_memory",
+        "libvmm_vhost",
+    ],
+    proc_macros: ["libremain"],
+}
+
+rust_test_host {
+    name: "vhost_user_devices_host_test_src_wl",
+    defaults: ["vhost_user_devices_test_defaults_vhost_user_wl_device"],
+    test_options: {
+        unit_test: true,
+    },
+}
+
+rust_test {
+    name: "vhost_user_devices_device_test_src_wl",
+    defaults: ["vhost_user_devices_test_defaults_vhost_user_wl_device"],
+}
+
+rust_binary {
+    name: "vhost_user_wl_device",
+    defaults: ["crosvm_defaults"],
+    host_supported: true,
+    crate_name: "vhost_user_wl_device",
+    srcs: ["src/wl.rs"],
+    edition: "2018",
+    rustlibs: [
+        "libanyhow",
+        "libarch",
+        "libbase_rust",
+        "libcros_async",
+        "libdevices",
+        "libfutures",
+        "libgetopts",
+        "liblibc",
+        "libonce_cell",
+        "libsync_rust",
+        "libsys_util",
+        "libthiserror",
+        "libvhost_user_devices",
+        "libvm_memory",
+        "libvmm_vhost",
+    ],
+    proc_macros: ["libremain"],
+}
