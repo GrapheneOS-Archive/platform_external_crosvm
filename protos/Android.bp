@@ -52,33 +52,6 @@ rust_test {
     defaults: ["protos_test_defaults"],
 }
 
-rust_defaults {
-    name: "protos_test_defaults_trunks",
-    defaults: ["crosvm_defaults"],
-    crate_name: "trunks",
-    srcs: ["tests/trunks.rs"],
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-    edition: "2018",
-    rustlibs: [
-        "libprotobuf",
-        "libprotos",
-    ],
-}
-
-rust_test_host {
-    name: "protos_host_test_tests_trunks",
-    defaults: ["protos_test_defaults_trunks"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
-rust_test {
-    name: "protos_device_test_tests_trunks",
-    defaults: ["protos_test_defaults_trunks"],
-}
-
 rust_protobuf {
     name: "libcdisk_spec_proto",
     crate_name: "cdisk_spec_proto",
