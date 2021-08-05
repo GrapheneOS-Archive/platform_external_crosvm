@@ -26,6 +26,7 @@ const NUM_QUEUES: usize = 2;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
 
 /// Virtio IOMMU features
+const VIRTIO_IOMMU_F_INPUT_RANGE: u32 = 0;
 const VIRTIO_IOMMU_F_MAP_UNMAP: u32 = 2;
 const VIRTIO_IOMMU_F_PROBE: u32 = 4;
 const VIRTIO_IOMMU_F_TOPOLOGY: u32 = 6;
@@ -361,6 +362,10 @@ impl Worker {
             return Ok(0);
         }
 
+        // The device MUST NOT allow writes to a range mapped
+        // without the VIRTIO_IOMMU_MAP_F_WRITE flag.
+        let write_en = req.flags & VIRTIO_IOMMU_MAP_F_WRITE != 0;
+
         if let Some(vfio_container) = self.domain_map.get(&domain) {
             let size = req.virt_end - req.virt_start + 1u64;
             let host_addr = self
@@ -371,10 +376,12 @@ impl Worker {
             // Safe because both guest and host address are guaranteed by
             // get_host_address_range() to be valid
             let vfio_map_result = unsafe {
-                vfio_container
-                    .1
-                    .lock()
-                    .vfio_dma_map(req.virt_start, size, host_addr as u64)
+                vfio_container.1.lock().vfio_dma_map(
+                    req.virt_start,
+                    size,
+                    host_addr as u64,
+                    write_en,
+                )
             };
 
             match vfio_map_result {
@@ -598,7 +605,7 @@ impl Worker {
                 }
             }
             if needs_interrupt {
-                self.interrupt.signal_used_queue(req_queue.vector);
+                req_queue.trigger_interrupt(&self.mem, &self.interrupt);
             }
         }
         Ok(())
@@ -620,6 +627,7 @@ impl Iommu {
     pub fn new(
         base_features: u64,
         endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
+        phys_max_addr: u64,
     ) -> SysResult<Iommu> {
         let mut topo_pci_ranges = Vec::new();
         for (endpoint, _) in endpoints.iter() {
@@ -651,8 +659,14 @@ impl Iommu {
             return Err(SysError::new(libc::EIO));
         }
 
+        let input_range = VirtioIommuRange64 {
+            start: 0_u64,
+            end: phys_max_addr,
+        };
+
         let config = VirtioIommuConfig {
             page_size_mask,
+            input_range,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             probe_size: IOMMU_PROBE_SIZE as u32,
             topo_config,
@@ -660,7 +674,9 @@ impl Iommu {
         };
 
         let mut avail_features: u64 = base_features;
-        avail_features |= 1 << VIRTIO_IOMMU_F_MAP_UNMAP | 1 << VIRTIO_IOMMU_F_TOPOLOGY;
+        avail_features |= 1 << VIRTIO_IOMMU_F_MAP_UNMAP
+            | 1 << VIRTIO_IOMMU_F_INPUT_RANGE
+            | 1 << VIRTIO_IOMMU_F_TOPOLOGY;
 
         if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
             avail_features |= 1 << VIRTIO_IOMMU_F_PROBE;
