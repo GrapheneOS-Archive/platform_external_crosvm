@@ -41,16 +41,17 @@ exclude = [
     "base",
     "cros_async",
     "data_model",
-    "rand_ish",
     "sync",
     "sys_util",
     "tempfile",
     "vm_memory",
+    "audio_streams",
 ]
 
 [features]
 audio = ["devices/audio"]
-chromeos = ["base/chromeos"]
+audio_cras = ["devices/audio_cras"]
+chromeos = ["base/chromeos", "audio_cras"]
 composite-disk = ["protos/composite-disk", "protobuf", "disk/composite-disk"]
 default = ["audio", "gpu", "usb"]
 default-no-sandbox = []
@@ -94,7 +95,6 @@ net_util = { path = "net_util" }
 p9 = { path = "../vm_tools/p9" }
 protobuf = { version = "2.3", optional = true }
 protos = { path = "protos", optional = true }
-rand_ish = { path = "rand_ish" }
 remain = "*"
 resources = { path = "resources" }
 serde_json = "*"
@@ -117,14 +117,13 @@ base = "*"
 
 [patch.crates-io]
 assertions = { path = "assertions" }
-audio_streams = { path = "../adhd/audio_streams" } # ignored by ebuild
+audio_streams = { path = "audio_streams" }
 base = { path = "base" }
-cras-sys = { path = "../adhd/cras/client/cras-sys" } # ignored by ebuild
 # Disabled to support running cargo2android while cros-fuzz is not
 # available in Android.
 # cros_fuzz = { path = "../../platform2/cros-fuzz" } # ignored by ebuild
 data_model = { path = "data_model" }
-libcras = { path = "../adhd/cras/client/libcras" } # ignored by ebuild
+libcras = { path = "libcras_stub" } # ignored by ebuild
 minijail = { path = "../minijail/rust/minijail" } # ignored by ebuild
 p9 = { path = "../vm_tools/p9" } # ignored by ebuild
 sync = { path = "sync" }
