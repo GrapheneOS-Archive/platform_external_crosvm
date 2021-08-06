@@ -6,6 +6,7 @@
 //! configs.
 
 pub mod argument;
+pub mod error;
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 pub mod gdb;
 #[path = "linux.rs"]
@@ -54,6 +55,7 @@ pub struct DiskOption {
     pub path: PathBuf,
     pub read_only: bool,
     pub sparse: bool,
+    pub o_direct: bool,
     pub block_size: u32,
     pub id: Option<[u8; DISK_ID_LEN]>,
 }
@@ -241,6 +243,8 @@ pub struct Config {
     pub display_window_mouse: bool,
     #[cfg(feature = "audio")]
     pub ac97_parameters: Vec<Ac97Parameters>,
+    #[cfg(feature = "audio")]
+    pub sound: Option<PathBuf>,
     pub serial_parameters: BTreeMap<(SerialHardware, u8), SerialParameters>,
     pub syslog_tag: Option<String>,
     pub virtio_single_touch: Vec<TouchDeviceOption>,
@@ -322,6 +326,8 @@ impl Default for Config {
             seccomp_log_failures: false,
             #[cfg(feature = "audio")]
             ac97_parameters: Vec::new(),
+            #[cfg(feature = "audio")]
+            sound: None,
             serial_parameters: BTreeMap::new(),
             syslog_tag: None,
             virtio_single_touch: Vec::new(),

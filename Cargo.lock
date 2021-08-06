@@ -86,6 +86,8 @@ dependencies = [
 name = "audio_streams"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "cros_async",
  "sync",
  "sys_util",
 ]
@@ -152,14 +154,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
-name = "cras-sys"
-version = "0.1.0"
-dependencies = [
- "audio_streams",
- "data_model",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -217,7 +211,6 @@ dependencies = [
  "p9",
  "protobuf",
  "protos",
- "rand_ish",
  "remain",
  "resources",
  "rutabaga_gfx",
@@ -289,7 +282,6 @@ dependencies = [
  "p9",
  "power_monitor",
  "protos",
- "rand_ish",
  "remain",
  "resources",
  "rutabaga_gfx",
@@ -589,13 +581,6 @@ dependencies = [
 [[package]]
 name = "libcras"
 version = "0.1.0"
-dependencies = [
- "audio_streams",
- "cras-sys",
- "data_model",
- "libc",
- "sys_util",
-]
 
 [[package]]
 name = "libcrosvm_control"
@@ -848,10 +833,6 @@ checksum = "c3d0b9745dc2debf507c8422de05d7226cc1f0644216dfdfead988f9b1ab32a7"
 dependencies = [
  "proc-macro2",
 ]
-
-[[package]]
-name = "rand_ish"
-version = "0.1.0"
 
 [[package]]
 name = "remain"
