@@ -30,7 +30,7 @@ use composite::{CompositeDiskFile, CDISK_MAGIC, CDISK_MAGIC_LEN};
 mod gpt;
 #[cfg(feature = "composite-disk")]
 pub use composite::{
-    create_composite_disk, Error as CompositeError, ImagePartitionType, PartitionFileInfo,
+    create_composite_disk, create_zero_filler, Error as CompositeError, ImagePartitionType,
     PartitionInfo,
 };
 #[cfg(feature = "composite-disk")]
@@ -271,7 +271,13 @@ pub fn detect_image_type(file: &File) -> Result<ImageType> {
 
     // Try to read the disk in a nicely-aligned block size unless the whole file is smaller.
     const MAGIC_BLOCK_SIZE: usize = 4096;
-    let mut magic = [0u8; MAGIC_BLOCK_SIZE];
+    #[repr(align(512))]
+    struct BlockAlignedBuffer {
+        data: [u8; MAGIC_BLOCK_SIZE],
+    }
+    let mut magic = BlockAlignedBuffer {
+        data: [0u8; MAGIC_BLOCK_SIZE],
+    };
     let magic_read_len = if disk_size > MAGIC_BLOCK_SIZE as u64 {
         MAGIC_BLOCK_SIZE
     } else {
@@ -280,19 +286,19 @@ pub fn detect_image_type(file: &File) -> Result<ImageType> {
         disk_size as usize
     };
 
-    f.read_exact(&mut magic[0..magic_read_len])
+    f.read_exact(&mut magic.data[0..magic_read_len])
         .map_err(Error::ReadingHeader)?;
     f.seek(SeekFrom::Start(orig_seek))
         .map_err(Error::SeekingFile)?;
 
     #[cfg(feature = "composite-disk")]
-    if let Some(cdisk_magic) = magic.get(0..CDISK_MAGIC_LEN) {
+    if let Some(cdisk_magic) = magic.data.get(0..CDISK_MAGIC_LEN) {
         if cdisk_magic == CDISK_MAGIC.as_bytes() {
             return Ok(ImageType::CompositeDisk);
         }
     }
 
-    if let Some(magic4) = magic.get(0..4) {
+    if let Some(magic4) = magic.data.get(0..4) {
         if magic4 == QCOW_MAGIC.to_be_bytes() {
             return Ok(ImageType::Qcow2);
         } else if magic4 == SPARSE_HEADER_MAGIC.to_le_bytes() {
@@ -429,7 +435,7 @@ impl AsyncDisk for SingleFileDisk {
         mem_offsets: &'a [cros_async::MemRegion],
     ) -> Result<usize> {
         self.inner
-            .read_to_mem(file_offset, mem, mem_offsets)
+            .read_to_mem(Some(file_offset), mem, mem_offsets)
             .await
             .map_err(Error::ReadToMem)
     }
@@ -441,7 +447,7 @@ impl AsyncDisk for SingleFileDisk {
         mem_offsets: &'a [cros_async::MemRegion],
     ) -> Result<usize> {
         self.inner
-            .write_from_mem(file_offset, mem, mem_offsets)
+            .write_from_mem(Some(file_offset), mem, mem_offsets)
             .await
             .map_err(Error::WriteFromMem)
     }
@@ -480,7 +486,7 @@ impl AsyncDisk for SingleFileDisk {
             let buf = vec![0u8; write_size];
             nwritten += self
                 .inner
-                .write_from_vec(file_offset + nwritten as u64, buf)
+                .write_from_vec(Some(file_offset + nwritten as u64), buf)
                 .await
                 .map(|(n, _)| n as u64)
                 .map_err(Error::WriteFromVec)?;
