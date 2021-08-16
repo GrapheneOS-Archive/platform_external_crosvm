@@ -33,10 +33,9 @@ rust_library {
         linux_glibc_x86_64: {
             features: [
                 "gdb",
-                "gdbstub",
             ],
             rustlibs: [
-                "libgdbstub",
+                "libgdbstub_arch",
             ],
         },
     },
@@ -74,10 +73,9 @@ rust_test_host {
         linux_glibc_x86_64: {
             features: [
                 "gdb",
-                "gdbstub",
             ],
             rustlibs: [
-                "libgdbstub",
+                "libgdbstub_arch",
             ],
         },
     },
@@ -90,10 +88,9 @@ rust_test {
         linux_glibc_x86_64: {
             features: [
                 "gdb",
-                "gdbstub",
             ],
             rustlibs: [
-                "libgdbstub",
+                "libgdbstub_arch",
             ],
         },
     },

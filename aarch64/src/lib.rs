@@ -439,6 +439,7 @@ impl arch::LinuxArch for AArch64 {
             irq_chip.get_vgic_version() == DeviceKind::ArmVgicV3,
             use_pmu,
             psci_version,
+            components.swiotlb,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -455,6 +456,7 @@ impl arch::LinuxArch for AArch64 {
             pid_debug_label_map,
             suspend_evt,
             rt_cpus: components.rt_cpus,
+            delay_rt: components.delay_rt,
             bat_control: None,
             resume_notify_devices: Vec::new(),
         })
