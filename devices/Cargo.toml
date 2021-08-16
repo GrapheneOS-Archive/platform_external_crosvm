@@ -39,7 +39,7 @@ linux_input_sys = { path = "../linux_input_sys" }
 minijail = { path = "../../minijail/rust/minijail" } # ignored by ebuild
 net_sys = { path = "../net_sys" }
 net_util = { path = "../net_util" }
-p9 = { path = "../../vm_tools/p9" }
+p9 = { path = "../common/p9" }
 power_monitor = { path = "../power_monitor" }
 protos = { path = "../protos", optional = true }
 remain = "*"

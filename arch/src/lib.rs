@@ -31,7 +31,7 @@ use vm_control::{BatControl, BatteryType};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
-use gdbstub::arch::x86::reg::X86_64CoreRegs as GdbStubRegs;
+use gdbstub_arch::x86::reg::X86_64CoreRegs as GdbStubRegs;
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 use {
@@ -76,6 +76,7 @@ pub enum VcpuAffinity {
 /// create a `RunnableLinuxVm`.
 pub struct VmComponents {
     pub memory_size: u64,
+    pub swiotlb: Option<u64>,
     pub vcpu_count: usize,
     pub vcpu_affinity: Option<VcpuAffinity>,
     pub cpu_clusters: Vec<Vec<usize>>,
@@ -89,6 +90,7 @@ pub struct VmComponents {
     pub extra_kernel_params: Vec<String>,
     pub acpi_sdts: Vec<SDT>,
     pub rt_cpus: Vec<usize>,
+    pub delay_rt: bool,
     pub protected_vm: ProtectionType,
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     pub gdb: Option<(u32, Tube)>, // port and control tube.
@@ -112,6 +114,7 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub pid_debug_label_map: BTreeMap<u32, String>,
     pub suspend_evt: Event,
     pub rt_cpus: Vec<usize>,
+    pub delay_rt: bool,
     pub bat_control: Option<BatControl>,
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     pub gdb: Option<(u32, Tube)>,

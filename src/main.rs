@@ -974,6 +974,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.rt_cpus = parse_cpu_set(value.unwrap())?;
         }
+        "delay-rt" => {
+            cfg.delay_rt = true;
+        }
         "mem" => {
             if cfg.memory.is_some() {
                 return Err(argument::Error::TooManyArguments(
@@ -988,6 +991,24 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                         .map_err(|_| argument::Error::InvalidValue {
                             value: value.unwrap().to_owned(),
                             expected: String::from("this value for `mem` needs to be integer"),
+                        })?,
+                )
+        }
+        #[cfg(target_arch = "aarch64")]
+        "swiotlb" => {
+            if cfg.swiotlb.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`swiotlb` already given".to_owned(),
+                ));
+            }
+            cfg.swiotlb =
+                Some(
+                    value
+                        .unwrap()
+                        .parse()
+                        .map_err(|_| argument::Error::InvalidValue {
+                            value: value.unwrap().to_owned(),
+                            expected: String::from("this value for `swiotlb` needs to be integer"),
                         })?,
                 )
         }
@@ -1787,7 +1808,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         "protected-vm" => {
             cfg.protected_vm = ProtectionType::Protected;
-            cfg.params.push("swiotlb=force".to_string());
         }
         "battery" => {
             let params = parse_battery_options(value)?;
@@ -2016,6 +2036,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::value("cpu-capacity", "CPU=CAP[,CPU=CAP[,...]]", "Set the relative capacity of the given CPU (default: no capacity)"),
           Argument::flag("no-smt", "Don't use SMT in the guest"),
           Argument::value("rt-cpus", "CPUSET", "Comma-separated list of CPUs or CPU ranges to run VCPUs on. (e.g. 0,1-3,5) (default: none)"),
+          Argument::flag("delay-rt", "Don't set VCPUs real-time until make-rt command is run"),
           Argument::short_value('m',
                                 "mem",
                                 "N",
@@ -2155,6 +2176,8 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::flag("video-encoder", "(EXPERIMENTAL) enable virtio-video encoder device"),
           Argument::value("acpi-table", "PATH", "Path to user provided ACPI table"),
           Argument::flag("protected-vm", "(EXPERIMENTAL) prevent host access to guest memory"),
+          #[cfg(target_arch = "aarch64")]
+          Argument::value("swiotlb", "N", "(EXPERIMENTAL) Size of virtio swiotlb buffer in MiB (default: 64 if `--protected-vm` is present)."),
           Argument::flag_or_value("battery",
                                   "[type=TYPE]",
                                   "Comma separated key=value pairs for setting up battery device
@@ -2251,6 +2274,17 @@ fn resume_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     let socket_path = &args.next().unwrap();
     let socket_path = Path::new(&socket_path);
     vms_request(&VmRequest::Resume, socket_path)
+}
+
+fn make_rt(mut args: std::env::Args) -> std::result::Result<(), ()> {
+    if args.len() == 0 {
+        print_help("crosvm make_rt", "VM_SOCKET...", &[]);
+        println!("Makes the crosvm instance listening on each `VM_SOCKET` given RT.");
+        return Err(());
+    }
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    vms_request(&VmRequest::MakeRT, socket_path)
 }
 
 fn balloon_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
@@ -2685,6 +2719,7 @@ fn crosvm_main() -> std::result::Result<(), ()> {
         Some("stop") => stop_vms(args),
         Some("suspend") => suspend_vms(args),
         Some("resume") => resume_vms(args),
+        Some("make_rt") => make_rt(args),
         Some("run") => run_vm(args),
         Some("balloon") => balloon_vms(args),
         Some("balloon_stats") => balloon_stats(args),

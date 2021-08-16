@@ -23,7 +23,7 @@ use std::time::Duration;
 use std::thread;
 use std::thread::JoinHandle;
 
-use libc::{self, c_int, gid_t, uid_t};
+use libc::{self, c_int, gid_t, uid_t, EINVAL};
 
 use acpi_tables::sdt::SDT;
 
@@ -42,6 +42,7 @@ use devices::virtio::EventDevice;
 use devices::virtio::{self, Console, VirtioDevice};
 #[cfg(feature = "audio")]
 use devices::Ac97Dev;
+use devices::ProtectionType;
 use devices::{
     self, IrqChip, IrqEventIndex, KvmKernelIrqChip, PciDevice, VcpuRunState, VfioContainer,
     VfioDevice, VfioPciDevice, VirtioPciDevice,
@@ -642,7 +643,6 @@ fn create_gpu_device(
     x_display: Option<String>,
     event_devices: Vec<EventDevice>,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
-    mem: &GuestMemory,
 ) -> DeviceResult {
     let mut display_backends = vec![
         virtio::DisplayBackend::X(x_display),
@@ -674,7 +674,6 @@ fn create_gpu_device(
         cfg.sandbox,
         virtio::base_features(cfg.protected_vm),
         cfg.wayland_socket_paths.clone(),
-        mem.clone(),
     );
 
     let jail = match simple_jail(&cfg, "gpu_device")? {
@@ -1396,7 +1395,6 @@ fn create_virtio_devices(
                 cfg.x_display.clone(),
                 event_devices,
                 map_request,
-                vm.get_memory(),
             )?);
         }
     }
@@ -1606,9 +1604,13 @@ fn create_devices(
 
             let (msi_host_tube, msi_device_tube) = Tube::pair().map_err(Error::CreateTube)?;
             control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
-            let dev = VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
-                .map_err(Error::VirtioPciDev)?;
-            let dev = Box::new(dev) as Box<dyn PciDevice>;
+            let mut dev =
+                VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
+                    .map_err(Error::VirtioPciDev)?;
+            // early reservation for viommu.
+            dev.allocate_address(resources)
+                .map_err(|_| Error::VirtioPciDev(base::Error::new(EINVAL)))?;
+            let dev = Box::new(dev);
             pci_devices.push((dev, iommu_dev.jail));
         }
     }
@@ -1869,6 +1871,7 @@ fn run_vcpu<V>(
     vcpu_count: usize,
     run_rt: bool,
     vcpu_affinity: Vec<usize>,
+    delay_rt: bool,
     no_smt: bool,
     start_barrier: Arc<Barrier>,
     has_bios: bool,
@@ -1900,7 +1903,7 @@ where
                 vm,
                 irq_chip.as_mut(),
                 vcpu_count,
-                run_rt,
+                run_rt && !delay_rt,
                 vcpu_affinity,
                 no_smt,
                 has_bios,
@@ -2001,6 +2004,21 @@ where
                                         }
                                     }
                                 }
+                                VcpuControl::MakeRT => {
+                                    if run_rt && delay_rt {
+                                        info!("Making vcpu {} RT\n", cpu_id);
+                                        const DEFAULT_VCPU_RT_LEVEL: u16 = 6;
+                                        if let Err(e) = set_rt_prio_limit(
+                                            u64::from(DEFAULT_VCPU_RT_LEVEL))
+                                            .and_then(|_|
+                                                set_rt_round_robin(
+                                                i32::from(DEFAULT_VCPU_RT_LEVEL)
+                                            ))
+                                        {
+                                            warn!("Failed to set vcpu to real time: {}", e);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2028,12 +2046,12 @@ where
                         Ok(VcpuExit::IoIn { port, mut size }) => {
                             let mut data = [0; 8];
                             if size > data.len() {
-                                error!("unsupported IoIn size of {} bytes", size);
+                                error!("unsupported IoIn size of {} bytes at port {:#x}", size, port);
                                 size = data.len();
                             }
                             io_bus.read(port as u64, &mut data[..size]);
                             if let Err(e) = vcpu.set_data(&data[..size]) {
-                                error!("failed to set return data for IoIn: {}", e);
+                                error!("failed to set return data for IoIn at port {:#x}: {}", port, e);
                             }
                         }
                         Ok(VcpuExit::IoOut {
@@ -2042,7 +2060,7 @@ where
                             data,
                         }) => {
                             if size > data.len() {
-                                error!("unsupported IoOut size of {} bytes", size);
+                                error!("unsupported IoOut size of {} bytes at port {:#x}", size, port);
                                 size = data.len();
                             }
                             io_bus.write(port as u64, &data[..size]);
@@ -2157,12 +2175,25 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         _ => panic!("Did not receive a bios or kernel, should be impossible."),
     };
 
+    let swiotlb = if let Some(size) = cfg.swiotlb {
+        Some(
+            size.checked_mul(1024 * 1024)
+                .ok_or(Error::SwiotlbTooLarge)?,
+        )
+    } else {
+        match cfg.protected_vm {
+            ProtectionType::Protected => Some(64 * 1024 * 1024),
+            ProtectionType::Unprotected => None,
+        }
+    };
+
     Ok(VmComponents {
         memory_size: cfg
             .memory
             .unwrap_or(256)
             .checked_mul(1024 * 1024)
             .ok_or(Error::MemoryTooLarge)?,
+        swiotlb,
         vcpu_count: cfg.vcpu_count.unwrap_or(1),
         vcpu_affinity: cfg.vcpu_affinity.clone(),
         cpu_clusters: cfg.cpu_clusters.clone(),
@@ -2184,6 +2215,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
             .map(|path| SDT::from_file(path).map_err(|e| Error::OpenAcpiTable(path.clone(), e)))
             .collect::<Result<Vec<SDT>>>()?,
         rt_cpus: cfg.rt_cpus.clone(),
+        delay_rt: cfg.delay_rt,
         protected_vm: cfg.protected_vm,
         #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
         gdb: None,
@@ -2383,7 +2415,7 @@ where
     let exit_evt = Event::new().map_err(Error::CreateEvent)?;
     let mut sys_allocator = Arch::create_system_allocator(vm.get_memory());
     let phys_max_addr = Arch::get_phys_max_addr();
-    let pci_devices = create_devices(
+    let mut pci_devices = create_devices(
         &cfg,
         &mut vm,
         &mut sys_allocator,
@@ -2400,6 +2432,18 @@ where
         usb_provider,
         Arc::clone(&map_request),
     )?;
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    for (device, _jail) in pci_devices.iter_mut() {
+        let sdts = device
+            .generate_acpi(components.acpi_sdts)
+            .or_else(|| {
+                error!("ACPI table generation error");
+                None
+            })
+            .ok_or(Error::GenerateAcpi)?;
+        components.acpi_sdts = sdts;
+    }
 
     #[cfg_attr(not(feature = "direct"), allow(unused_mut))]
     let mut linux = Arch::build_vm::<V, Vcpu>(
@@ -2596,6 +2640,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             linux.vcpu_count,
             linux.rt_cpus.contains(&cpu_id),
             vcpu_affinity,
+            linux.delay_rt,
             linux.no_smt,
             vcpu_thread_barrier.clone(),
             linux.has_bios,
@@ -2630,6 +2675,8 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     };
 
     vcpu_thread_barrier.wait();
+
+    let mut balloon_stats_id: u64 = 0;
 
     'wait: loop {
         let events = {
@@ -2709,12 +2756,14 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                     let response = request.execute(
                                         &mut run_mode_opt,
                                         &balloon_host_tube,
+                                        &mut balloon_stats_id,
                                         disk_host_tubes,
                                         #[cfg(feature = "usb")]
                                         Some(&usb_control_tube),
                                         #[cfg(not(feature = "usb"))]
                                         None,
                                         &mut linux.bat_control,
+                                        &vcpu_handles,
                                     );
                                     if let Err(e) = tube.send(&response) {
                                         error!("failed to send VmResponse: {}", e);
