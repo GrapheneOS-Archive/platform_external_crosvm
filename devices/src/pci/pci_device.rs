@@ -4,6 +4,8 @@
 
 use std::fmt::{self, Display};
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use acpi_tables::sdt::SDT;
 use base::{Event, RawDescriptor};
 use hypervisor::Datamatch;
 use resources::{Error as SystemAllocatorFaliure, SystemAllocator};
@@ -36,6 +38,12 @@ pub enum Error {
     PciAllocationFailed,
     /// PCI Address is not allocated.
     PciAddressMissing,
+    /// MSIX Allocator encounters size of zero
+    MsixAllocatorSizeZero,
+    /// MSIX Allocator encounters overflow
+    MsixAllocatorOverflow { base: u64, size: u64 },
+    /// MSIX Allocator encounters out-of-space
+    MsixAllocatorOutOfSpace,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -59,6 +67,13 @@ impl Display for Error {
             }
             PciAllocationFailed => write!(f, "failed to allocate PCI address"),
             PciAddressMissing => write!(f, "PCI address is not allocated"),
+            MsixAllocatorSizeZero => write!(f, "Size of zero detected in MSIX Allocator"),
+            MsixAllocatorOverflow { base, size } => write!(
+                f,
+                "base={} + size={} overflows in MSIX Allocator",
+                base, size
+            ),
+            MsixAllocatorOutOfSpace => write!(f, "Out-of-space detected in MSIX Allocator"),
         }
     }
 }
@@ -132,6 +147,11 @@ pub trait PciDevice: Send {
     fn write_bar(&mut self, addr: u64, data: &[u8]);
     /// Invoked when the device is sandboxed.
     fn on_device_sandboxed(&mut self) {}
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn generate_acpi(&mut self, sdts: Vec<SDT>) -> Option<Vec<SDT>> {
+        Some(sdts)
+    }
 }
 
 impl<T: PciDevice> BusDevice for T {
@@ -239,6 +259,11 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     /// Invoked when the device is sandboxed.
     fn on_device_sandboxed(&mut self) {
         (**self).on_device_sandboxed()
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn generate_acpi(&mut self, sdts: Vec<SDT>) -> Option<Vec<SDT>> {
+        (**self).generate_acpi(sdts)
     }
 }
 
