@@ -19,7 +19,8 @@ cargo2android() {
 # Run in the main crosvm directory.
 cargo2android --no-subdir
 
-for dir in */src
+initial_dir=`pwd`
+for dir in */src common/*/src
 do
   base=`dirname $dir`
   echo "$base"
@@ -42,5 +43,5 @@ do
     cargo2android --global_defaults=crosvm_defaults --add_workspace
   fi
 
-  cd ..
+  cd "$initial_dir"
 done
