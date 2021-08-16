@@ -98,6 +98,7 @@ rust_binary {
             relative_install_path: "x86_64-linux-gnu",
             rustlibs: [
                 "libgdbstub",
+                "libgdbstub_arch",
                 "libthiserror",
             ],
         },
@@ -189,6 +190,7 @@ rust_defaults {
             ],
             rustlibs: [
                 "libgdbstub",
+                "libgdbstub_arch",
                 "libthiserror",
             ],
         },
@@ -348,6 +350,7 @@ rust_library {
             ],
             rustlibs: [
                 "libgdbstub",
+                "libgdbstub_arch",
                 "libthiserror",
             ],
         },
