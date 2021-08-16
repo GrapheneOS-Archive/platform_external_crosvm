@@ -28,9 +28,7 @@ overflow-checks = true
 # that are not dependencies of the crosvm root crate.
 [workspace]
 members = [
-    # Disabled to support running cargo2android while cros-fuzz is not
-    # available in Android.
-    # "fuzz",
+    "fuzz",
     "qcow_utils",
     "integration_tests",
     "libcrosvm_control",
@@ -56,7 +54,7 @@ composite-disk = ["protos/composite-disk", "protobuf", "disk/composite-disk"]
 default = ["audio", "gpu", "usb"]
 default-no-sandbox = []
 direct = ["devices/direct"]
-gdb = ["gdbstub", "thiserror",  "arch/gdb", "vm_control/gdb", "x86_64/gdb"]
+gdb = ["gdbstub", "gdbstub_arch", "thiserror",  "arch/gdb", "vm_control/gdb", "x86_64/gdb"]
 gfxstream = ["devices/gfxstream"]
 gpu = ["devices/gpu"]
 plugin = ["protos/plugin", "crosvm_plugin", "kvm", "kvm_sys", "protobuf"]
@@ -81,7 +79,8 @@ data_model = "*"
 devices = { path = "devices" }
 disk = { path = "disk" }
 enumn = { path = "enumn" }
-gdbstub = { version = "0.4.0", optional = true }
+gdbstub = { version = "0.5.0", optional = true }
+gdbstub_arch = { version = "0.1.0", optional = true }
 rutabaga_gfx = { path = "rutabaga_gfx"}
 hypervisor = { path = "hypervisor" }
 kernel_cmdline = { path = "kernel_cmdline" }
@@ -92,7 +91,7 @@ libc = "0.2.93"
 libcras = "*"
 minijail = "*" # provided by ebuild
 net_util = { path = "net_util" }
-p9 = { path = "../vm_tools/p9" }
+p9 = "*"
 protobuf = { version = "2.3", optional = true }
 protos = { path = "protos", optional = true }
 remain = "*"
@@ -119,15 +118,13 @@ base = "*"
 assertions = { path = "assertions" }
 audio_streams = { path = "audio_streams" }
 base = { path = "base" }
-# Disabled to support running cargo2android while cros-fuzz is not
-# available in Android.
-# cros_fuzz = { path = "../../platform2/cros-fuzz" } # ignored by ebuild
+cros_fuzz = { path = "common/cros-fuzz" } # ignored by ebuild
 data_model = { path = "data_model" }
 libcras = { path = "libcras_stub" } # ignored by ebuild
-minijail = { path = "../minijail/rust/minijail" } # ignored by ebuild
-p9 = { path = "../vm_tools/p9" } # ignored by ebuild
+p9 = { path = "common/p9" } # ignored by ebuild
 sync = { path = "sync" }
 sys_util = { path = "sys_util" }
 tempfile = { path = "tempfile" }
-wire_format_derive = { path = "../vm_tools/p9/wire_format_derive" } # ignored by ebuild
-vmm_vhost = { path = "../rust/vmm_vhost", features = ["vhost-user-master"] } # ignored by ebuild
+wire_format_derive = { path = "common/p9/wire_format_derive" } # ignored by ebuild
+minijail = { path = "../minijail/rust/minijail" } # ignored by ebuild
+vmm_vhost = { path = "../rust/vmm_vhost", features = ["vhost-user-master", "vhost-user-slave"] } # ignored by ebuild
