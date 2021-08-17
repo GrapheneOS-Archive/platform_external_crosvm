@@ -940,7 +940,7 @@ impl<T: Encoder> EncoderDevice<T> {
                 if !resources_queued {
                     create_session = true;
                 } else if let Err(e) = encoder_session
-                    .request_encoding_params_change(stream.dst_bitrate.target(), stream.frame_rate)
+                    .request_encoding_params_change(stream.dst_bitrate, stream.frame_rate)
                 {
                     error!("failed to dynamically request framerate change: {}", e);
                     return Err(VideoError::InvalidOperation);
@@ -1128,6 +1128,9 @@ impl<T: Encoder> EncoderDevice<T> {
             }
             // Button controls should not be queried.
             CtrlType::ForceKeyframe => return Err(VideoError::UnsupportedControl(ctrl_type)),
+            // Prepending SPS and PPS to IDR is always enabled in the libvda backend.
+            // TODO (b/161495502): account for other backends
+            CtrlType::PrependSpsPpsToIdr => CtrlVal::PrependSpsPpsToIdr(true),
         };
         Ok(VideoCmdResponseType::Sync(CmdResponse::GetControl(
             ctrl_val,
@@ -1166,36 +1169,39 @@ impl<T: Encoder> EncoderDevice<T> {
                 }
             }
             CtrlVal::Bitrate(bitrate) => {
+                let mut new_bitrate = stream.dst_bitrate;
+                match &mut new_bitrate {
+                    Bitrate::CBR { target } | Bitrate::VBR { target, .. } => *target = bitrate,
+                }
                 if let Some(ref mut encoder_session) = stream.encoder_session {
-                    if let Err(e) =
-                        encoder_session.request_encoding_params_change(bitrate, stream.frame_rate)
+                    if let Err(e) = encoder_session
+                        .request_encoding_params_change(new_bitrate, stream.frame_rate)
                     {
-                        error!(
-                            "failed to dynamically request encoding params change: {}",
-                            e
-                        );
+                        error!("failed to dynamically request target bitrate change: {}", e);
                         return Err(VideoError::InvalidOperation);
                     }
                 }
-                match &mut stream.dst_bitrate {
-                    Bitrate::CBR { target } => *target = bitrate,
-                    Bitrate::VBR { target, .. } => *target = bitrate,
-                }
+                stream.dst_bitrate = new_bitrate;
             }
             CtrlVal::BitratePeak(bitrate) => {
-                // TODO(b/190336806): Dynamic peak bitrate changes not supported yet.
-                if stream.encoder_session.is_some() {
-                    warn!(
-                        "set control called for peak bitrate but encoder session already exists."
-                    );
-                    return Err(VideoError::InvalidOperation);
-                }
-                match &mut stream.dst_bitrate {
-                    // Trying to set the peak bitrate while in constant mode. This is not an error,
-                    // just ignored.
-                    Bitrate::CBR { .. } => (),
+                let mut new_bitrate = stream.dst_bitrate;
+                match &mut new_bitrate {
+                    Bitrate::CBR { .. } => {
+                        // Trying to set the peak bitrate while in constant mode. This is not an
+                        // error, just ignored.
+                        return Ok(VideoCmdResponseType::Sync(CmdResponse::SetControl));
+                    }
                     Bitrate::VBR { peak, .. } => *peak = bitrate,
                 }
+                if let Some(ref mut encoder_session) = stream.encoder_session {
+                    if let Err(e) = encoder_session
+                        .request_encoding_params_change(new_bitrate, stream.frame_rate)
+                    {
+                        error!("failed to dynamically request peak bitrate change: {}", e);
+                        return Err(VideoError::InvalidOperation);
+                    }
+                }
+                stream.dst_bitrate = new_bitrate;
             }
             CtrlVal::Profile(profile) => {
                 if stream.encoder_session.is_some() {
@@ -1239,8 +1245,16 @@ impl<T: Encoder> EncoderDevice<T> {
                 }
                 stream.dst_h264_level = Some(level);
             }
-            CtrlVal::ForceKeyframe() => {
+            CtrlVal::ForceKeyframe => {
                 stream.force_keyframe = true;
+            }
+            CtrlVal::PrependSpsPpsToIdr(prepend_sps_pps_to_idr) => {
+                // Prepending SPS and PPS to IDR is always enabled in the libvda backend,
+                // disabling it will always fail.
+                // TODO (b/161495502): account for other backends
+                if !prepend_sps_pps_to_idr {
+                    return Err(VideoError::InvalidOperation);
+                }
             }
         }
         Ok(VideoCmdResponseType::Sync(CmdResponse::SetControl))
