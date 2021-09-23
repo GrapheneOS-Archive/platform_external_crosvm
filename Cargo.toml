@@ -37,6 +37,7 @@ members = [
 exclude = [
     "assertions",
     "base",
+    "common",
     "cros_async",
     "data_model",
     "sync",
