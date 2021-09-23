@@ -28,7 +28,11 @@
 #include "aura-shell.h"
 #include "linux-dmabuf-unstable-v1.h"
 #include "viewporter.h"
+#ifdef ANDROID
 #include "xdg-shell-client-protocol.h"
+#else
+#include "xdg-shell.h"
+#endif
 #include "virtio-gpu-metadata-v1.h"
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
