@@ -69,7 +69,7 @@ use vmm_vhost::vhost_user::message::{
     VhostUserVringState,
 };
 use vmm_vhost::vhost_user::{
-    Error as VhostError, Listener, Result as VhostResult, SlaveFsCacheReq, SlaveListener,
+    Error as VhostError, Listener, Result as VhostResult, SlaveListener,
     VhostUserSlaveReqHandlerMut,
 };
 
@@ -571,7 +571,7 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
         Ok(())
     }
 
-    fn set_slave_req_fd(&mut self, _vu_req: SlaveFsCacheReq) {
+    fn set_slave_req_fd(&mut self, _vu_req: File) {
         // TODO
     }
 
