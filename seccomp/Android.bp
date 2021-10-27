@@ -568,6 +568,41 @@ prebuilt_etc {
 }
 
 genrule {
+    name: "iommu_device.policy_inline_x86_64",
+    defaults: ["crosvm_inline_seccomp_policy_x86_64"],
+    out: ["iommu_device.policy"],
+    srcs: ["x86_64/iommu_device.policy"],
+}
+
+prebuilt_usr_share_host {
+    name: "iommu_device.policy_x86_64",
+    filename: "iommu_device.policy",
+    relative_install_path: "crosvm/x86_64-linux-gnu/seccomp",
+    src: ":iommu_device.policy_inline_x86_64",
+}
+
+prebuilt_etc {
+    name: "iommu_device.policy",
+    relative_install_path: "seccomp_policy/crosvm",
+    arch: {
+        x86_64: {
+            src: ":iommu_device.policy_inline_x86_64",
+        },
+    },
+    target: {
+        android_arm64: {
+            enabled: false,
+        },
+        android_arm: {
+            enabled: false,
+        },
+        android_x86: {
+            enabled: false,
+        },
+    },
+}
+
+genrule {
     name: "rng_device.policy_inline_x86_64",
     defaults: ["crosvm_inline_seccomp_policy_x86_64"],
     out: ["rng_device.policy"],
