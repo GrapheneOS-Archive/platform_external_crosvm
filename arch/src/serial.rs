@@ -14,7 +14,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use base::{error, info, read_raw_stdin, syslog, AsRawDescriptor, Event, RawDescriptor};
+use base::{
+    error, info, read_raw_stdin, safe_descriptor_from_path, syslog, AsRawDescriptor, Event,
+    RawDescriptor,
+};
 use devices::{Bus, ProtectionType, ProxyDevice, Serial, SerialDevice};
 use minijail::Minijail;
 use sync::Mutex;
@@ -218,7 +221,14 @@ impl SerialParameters {
         let evt = evt.try_clone().map_err(Error::CloneEvent)?;
         keep_rds.push(evt.as_raw_descriptor());
         let input: Option<Box<dyn io::Read + Send>> = if let Some(input_path) = &self.input {
-            let input_file = File::open(input_path.as_path()).map_err(Error::FileError)?;
+            let input_path = input_path.as_path();
+            let input_file = if let Some(fd) =
+                safe_descriptor_from_path(input_path).map_err(|e| Error::FileError(e.into()))?
+            {
+                fd.into()
+            } else {
+                File::open(input_path).map_err(Error::FileError)?
+            };
             keep_rds.push(input_file.as_raw_descriptor());
             Some(Box::new(input_file))
         } else if self.stdin {
@@ -250,11 +260,18 @@ impl SerialParameters {
             }
             SerialType::File => match &self.path {
                 Some(path) => {
-                    let file = OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(path.as_path())
-                        .map_err(Error::FileError)?;
+                    let path = path.as_path();
+                    let file = if let Some(fd) = safe_descriptor_from_path(path).map_err(|e| {
+                        Error::FileError(std::io::Error::from_raw_os_error(e.errno()))
+                    })? {
+                        fd.into()
+                    } else {
+                        OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(path)
+                            .map_err(Error::FileError)?
+                    };
                     keep_rds.push(file.as_raw_descriptor());
                     Some(Box::new(file))
                 }
