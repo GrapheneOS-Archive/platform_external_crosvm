@@ -23,6 +23,7 @@ PRODUCT_PACKAGES += \
     fs_device.policy \
     gpu_device.policy \
     input_device.policy \
+    iommu_device.policy \
     net_device.policy \
     null_audio_device.policy \
     pmem_device.policy \
@@ -47,6 +48,7 @@ PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += \
     system/etc/seccomp_policy/crosvm/fs_device.policy \
     system/etc/seccomp_policy/crosvm/gpu_device.policy \
     system/etc/seccomp_policy/crosvm/input_device.policy \
+    system/etc/seccomp_policy/crosvm/iommu_device.policy \
     system/etc/seccomp_policy/crosvm/net_device.policy \
     system/etc/seccomp_policy/crosvm/null_audio_device.policy \
     system/etc/seccomp_policy/crosvm/pmem_device.policy \
