@@ -16,6 +16,8 @@ rust_library {
     // has rustc warnings
     host_supported: true,
     crate_name: "net_sys",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
     srcs: ["src/lib.rs"],
     edition: "2018",
     rustlibs: [
@@ -29,6 +31,8 @@ rust_defaults {
     crate_name: "net_sys",
     // has rustc warnings
     srcs: ["src/lib.rs"],
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
     test_suites: ["general-tests"],
     auto_gen_config: true,
     edition: "2018",
