@@ -6,66 +6,44 @@
 //! mmap object leaves scope.
 
 use std::cmp::min;
-use std::fmt::{self, Display};
 use std::io;
 use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::ptr::{copy_nonoverlapping, null_mut, read_unaligned, write_unaligned};
 
 use libc::{self, c_int, c_void, read, write};
+use remain::sorted;
 
 use data_model::volatile_memory::*;
 use data_model::DataInit;
 
 use crate::{errno, pagesize};
 
-#[derive(Debug)]
+#[sorted]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// `add_fd_mapping` is not supported.
+    #[error("`add_fd_mapping` is unsupported")]
     AddFdMappingIsUnsupported,
-    /// Requested memory out of range.
+    #[error("requested memory out of range")]
     InvalidAddress,
-    /// Invalid argument provided when building mmap.
+    #[error("invalid argument provided when creating mapping")]
     InvalidArgument,
-    /// Requested offset is out of range of `libc::off_t`.
+    #[error("requested offset is out of range of off_t")]
     InvalidOffset,
-    /// Requested mapping is not page aligned
-    NotPageAligned,
-    /// Requested memory range spans past the end of the region.
+    #[error("requested memory range spans past the end of the region: offset={0} count={1} region_size={2}")]
     InvalidRange(usize, usize, usize),
-    /// `mmap` returned the given error.
-    SystemCallFailed(errno::Error),
-    /// Writing to memory failed
-    ReadToMemory(io::Error),
-    /// `remove_mapping` is not supported
+    #[error("requested memory is not page aligned")]
+    NotPageAligned,
+    #[error("failed to read from file to memory: {0}")]
+    ReadToMemory(#[source] io::Error),
+    #[error("`remove_mapping` is unsupported")]
     RemoveMappingIsUnsupported,
-    /// Reading from memory failed
-    WriteFromMemory(io::Error),
+    #[error("mmap related system call failed: {0}")]
+    SystemCallFailed(#[source] errno::Error),
+    #[error("failed to write from memory to file: {0}")]
+    WriteFromMemory(#[source] io::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            AddFdMappingIsUnsupported => write!(f, "`add_fd_mapping` is unsupported"),
-            InvalidAddress => write!(f, "requested memory out of range"),
-            InvalidArgument => write!(f, "invalid argument provided when creating mapping"),
-            InvalidOffset => write!(f, "requested offset is out of range of off_t"),
-            NotPageAligned => write!(f, "requested memory is not page aligned"),
-            InvalidRange(offset, count, region_size) => write!(
-                f,
-                "requested memory range spans past the end of the region: offset={} count={} region_size={}",
-                offset, count, region_size,
-            ),
-            SystemCallFailed(e) => write!(f, "mmap related system call failed: {}", e),
-            ReadToMemory(e) => write!(f, "failed to read from file to memory: {}", e),
-            RemoveMappingIsUnsupported => write!(f, "`remove_mapping` is unsupported"),
-            WriteFromMemory(e) => write!(f, "failed to write from memory to file: {}", e),
-        }
-    }
-}
 
 /// Memory access type for anonymous shared memory mapping.
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -786,15 +764,30 @@ impl MemoryMappingArena {
         MemoryMapping::new_protection(size, Protection::none().set_read()).map(From::from)
     }
 
+    /// Anonymously maps `size` bytes at `offset` bytes from the start of the arena
+    /// with `prot` protections. `offset` must be page aligned.
+    ///
+    /// # Arguments
+    /// * `offset` - Page aligned offset into the arena in bytes.
+    /// * `size` - Size of memory region in bytes.
+    /// * `prot` - Protection (e.g. readable/writable) of the memory region.
+    pub fn add_anon_protection(
+        &mut self,
+        offset: usize,
+        size: usize,
+        prot: Protection,
+    ) -> Result<()> {
+        self.try_add(offset, size, prot, None)
+    }
+
     /// Anonymously maps `size` bytes at `offset` bytes from the start of the arena.
     /// `offset` must be page aligned.
     ///
     /// # Arguments
     /// * `offset` - Page aligned offset into the arena in bytes.
     /// * `size` - Size of memory region in bytes.
-    /// * `fd` - File descriptor to mmap from.
     pub fn add_anon(&mut self, offset: usize, size: usize) -> Result<()> {
-        self.try_add(offset, size, Protection::read_write(), None)
+        self.add_anon_protection(offset, size, Protection::read_write())
     }
 
     /// Maps `size` bytes from the start of the given `fd` at `offset` bytes from
@@ -1139,10 +1132,10 @@ mod tests {
         let size = 0x40000;
         let m = MemoryMappingArena::new(size).unwrap();
         let ps = pagesize();
-        MappedRegion::msync(&m, 0, ps).unwrap();
-        MappedRegion::msync(&m, 0, size).unwrap();
-        MappedRegion::msync(&m, ps, size - ps).unwrap();
-        let res = MappedRegion::msync(&m, ps, size).unwrap_err();
+        <dyn MappedRegion>::msync(&m, 0, ps).unwrap();
+        <dyn MappedRegion>::msync(&m, 0, size).unwrap();
+        <dyn MappedRegion>::msync(&m, ps, size - ps).unwrap();
+        let res = <dyn MappedRegion>::msync(&m, ps, size).unwrap_err();
         match res {
             Error::InvalidAddress => {}
             e => panic!("unexpected error: {}", e),
