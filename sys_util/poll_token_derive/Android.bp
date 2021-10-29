@@ -14,6 +14,8 @@ rust_proc_macro {
     name: "libpoll_token_derive",
     defaults: ["crosvm_defaults"],
     crate_name: "poll_token_derive",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
     srcs: ["poll_token_derive.rs"],
     edition: "2018",
     rustlibs: [

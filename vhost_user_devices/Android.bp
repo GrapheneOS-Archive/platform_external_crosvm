@@ -15,6 +15,8 @@ rust_library {
     defaults: ["crosvm_defaults"],
     host_supported: true,
     crate_name: "vhost_user_devices",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
     srcs: ["src/lib.rs"],
     edition: "2018",
     rustlibs: [
@@ -105,100 +107,10 @@ rust_binary {
 rust_defaults {
     name: "vhost_user_devices_test_defaults",
     defaults: ["crosvm_defaults"],
-    crate_name: "vhost_user_block_device",
-    srcs: ["src/block.rs"],
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-    edition: "2018",
-    rustlibs: [
-        "libanyhow",
-        "libarch",
-        "libbase_rust",
-        "libcros_async",
-        "libdata_model",
-        "libdevices",
-        "libdisk",
-        "libfutures",
-        "libgetopts",
-        "liblibc",
-        "libnet_util",
-        "libonce_cell",
-        "libsync_rust",
-        "libsys_util",
-        "libtempfile",
-        "libthiserror",
-        "libvhost_user_devices",
-        "libvirtio_sys",
-        "libvm_memory",
-        "libvmm_vhost",
-    ],
-    proc_macros: ["libremain"],
-}
-
-rust_test_host {
-    name: "vhost_user_devices_host_test_src_block",
-    defaults: ["vhost_user_devices_test_defaults"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
-rust_test {
-    name: "vhost_user_devices_device_test_src_block",
-    defaults: ["vhost_user_devices_test_defaults"],
-}
-
-rust_defaults {
-    name: "vhost_user_devices_test_defaults_vhost_user_console_device",
-    defaults: ["crosvm_defaults"],
-    crate_name: "vhost_user_console_device",
-    srcs: ["src/console.rs"],
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-    edition: "2018",
-    rustlibs: [
-        "libanyhow",
-        "libarch",
-        "libbase_rust",
-        "libcros_async",
-        "libdata_model",
-        "libdevices",
-        "libdisk",
-        "libfutures",
-        "libgetopts",
-        "liblibc",
-        "libnet_util",
-        "libonce_cell",
-        "libsync_rust",
-        "libsys_util",
-        "libtempfile",
-        "libthiserror",
-        "libvhost_user_devices",
-        "libvirtio_sys",
-        "libvm_memory",
-        "libvmm_vhost",
-    ],
-    proc_macros: ["libremain"],
-}
-
-rust_test_host {
-    name: "vhost_user_devices_host_test_src_console",
-    defaults: ["vhost_user_devices_test_defaults_vhost_user_console_device"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
-rust_test {
-    name: "vhost_user_devices_device_test_src_console",
-    defaults: ["vhost_user_devices_test_defaults_vhost_user_console_device"],
-}
-
-rust_defaults {
-    name: "vhost_user_devices_test_defaults_vhost_user_devices",
-    defaults: ["crosvm_defaults"],
     crate_name: "vhost_user_devices",
     srcs: ["src/lib.rs"],
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
     test_suites: ["general-tests"],
     auto_gen_config: true,
     edition: "2018",
@@ -228,7 +140,7 @@ rust_defaults {
 
 rust_test_host {
     name: "vhost_user_devices_host_test_src_lib",
-    defaults: ["vhost_user_devices_test_defaults_vhost_user_devices"],
+    defaults: ["vhost_user_devices_test_defaults"],
     test_options: {
         unit_test: true,
     },
@@ -236,99 +148,7 @@ rust_test_host {
 
 rust_test {
     name: "vhost_user_devices_device_test_src_lib",
-    defaults: ["vhost_user_devices_test_defaults_vhost_user_devices"],
-}
-
-rust_defaults {
-    name: "vhost_user_devices_test_defaults_vhost_user_net_device",
-    defaults: ["crosvm_defaults"],
-    crate_name: "vhost_user_net_device",
-    srcs: ["src/net.rs"],
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-    edition: "2018",
-    rustlibs: [
-        "libanyhow",
-        "libarch",
-        "libbase_rust",
-        "libcros_async",
-        "libdata_model",
-        "libdevices",
-        "libdisk",
-        "libfutures",
-        "libgetopts",
-        "liblibc",
-        "libnet_util",
-        "libonce_cell",
-        "libsync_rust",
-        "libsys_util",
-        "libtempfile",
-        "libthiserror",
-        "libvhost_user_devices",
-        "libvirtio_sys",
-        "libvm_memory",
-        "libvmm_vhost",
-    ],
-    proc_macros: ["libremain"],
-}
-
-rust_test_host {
-    name: "vhost_user_devices_host_test_src_net",
-    defaults: ["vhost_user_devices_test_defaults_vhost_user_net_device"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
-rust_test {
-    name: "vhost_user_devices_device_test_src_net",
-    defaults: ["vhost_user_devices_test_defaults_vhost_user_net_device"],
-}
-
-rust_defaults {
-    name: "vhost_user_devices_test_defaults_vhost_user_wl_device",
-    defaults: ["crosvm_defaults"],
-    crate_name: "vhost_user_wl_device",
-    srcs: ["src/wl.rs"],
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-    edition: "2018",
-    rustlibs: [
-        "libanyhow",
-        "libarch",
-        "libbase_rust",
-        "libcros_async",
-        "libdata_model",
-        "libdevices",
-        "libdisk",
-        "libfutures",
-        "libgetopts",
-        "liblibc",
-        "libnet_util",
-        "libonce_cell",
-        "libsync_rust",
-        "libsys_util",
-        "libtempfile",
-        "libthiserror",
-        "libvhost_user_devices",
-        "libvirtio_sys",
-        "libvm_memory",
-        "libvmm_vhost",
-    ],
-    proc_macros: ["libremain"],
-}
-
-rust_test_host {
-    name: "vhost_user_devices_host_test_src_wl",
-    defaults: ["vhost_user_devices_test_defaults_vhost_user_wl_device"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
-rust_test {
-    name: "vhost_user_devices_device_test_src_wl",
-    defaults: ["vhost_user_devices_test_defaults_vhost_user_wl_device"],
+    defaults: ["vhost_user_devices_test_defaults"],
 }
 
 rust_binary {

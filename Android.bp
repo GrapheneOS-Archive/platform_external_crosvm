@@ -39,7 +39,6 @@ rust_binary {
     prefer_rlib: true,
     crate_name: "crosvm",
     cargo_env_compat: true,
-    cargo_pkg_version: "",
     srcs: ["src/main.rs"],
     edition: "2018",
     features: [
@@ -120,6 +119,7 @@ rust_defaults {
     defaults: ["crosvm_defaults"],
     crate_name: "crosvm",
     srcs: ["src/crosvm.rs"],
+    cargo_env_compat: true,
     test_suites: ["general-tests"],
     auto_gen_config: true,
     edition: "2018",
@@ -231,6 +231,7 @@ rust_defaults {
     defaults: ["crosvm_defaults"],
     crate_name: "crosvm",
     srcs: ["src/main.rs"],
+    cargo_env_compat: true,
     test_suites: ["general-tests"],
     auto_gen_config: true,
     edition: "2018",
@@ -344,7 +345,6 @@ rust_library {
     host_supported: true,
     crate_name: "crosvm",
     cargo_env_compat: true,
-    cargo_pkg_version: "",
     srcs: ["src/crosvm.rs"],
     edition: "2018",
     features: [
