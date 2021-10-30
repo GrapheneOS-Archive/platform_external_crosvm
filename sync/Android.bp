@@ -16,29 +16,8 @@ rust_library {
     stem: "libsync",
     host_supported: true,
     crate_name: "sync",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
     srcs: ["src/lib.rs"],
     edition: "2018",
-}
-
-rust_defaults {
-    name: "sync_test_defaults",
-    defaults: ["crosvm_defaults"],
-    crate_name: "sync",
-    srcs: ["src/lib.rs"],
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-    edition: "2018",
-}
-
-rust_test_host {
-    name: "sync_host_test_src_lib",
-    defaults: ["sync_test_defaults"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
-rust_test {
-    name: "sync_device_test_src_lib",
-    defaults: ["sync_test_defaults"],
 }

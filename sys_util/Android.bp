@@ -15,6 +15,8 @@ rust_library {
     defaults: ["crosvm_defaults"],
     host_supported: true,
     crate_name: "sys_util",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
     srcs: ["src/lib.rs"],
     edition: "2018",
     rustlibs: [
