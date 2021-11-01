@@ -12,13 +12,30 @@ use base::{error, warn, AsRawDescriptor, IntoRawDescriptor};
 
 use super::*;
 use crate::virtio::video::format::{
-    Format, FormatDesc, FormatRange, FrameFormat, FramePlane, Level, Profile,
+    Bitrate, Format, FormatDesc, FormatRange, FrameFormat, FramePlane, Level, Profile,
 };
 use crate::virtio::video::{
     encoder::{encoder::*, EncoderDevice},
     error::{VideoError, VideoResult},
     Tube,
 };
+
+impl From<Bitrate> for libvda::encode::Bitrate {
+    fn from(bitrate: Bitrate) -> Self {
+        libvda::encode::Bitrate {
+            mode: match bitrate {
+                Bitrate::VBR { .. } => libvda::encode::BitrateMode::VBR,
+                Bitrate::CBR { .. } => libvda::encode::BitrateMode::CBR,
+            },
+            target: bitrate.target(),
+            peak: match &bitrate {
+                // No need to specify peak if mode is CBR.
+                Bitrate::CBR { .. } => 0,
+                Bitrate::VBR { peak, .. } => *peak,
+            },
+        }
+    }
+}
 
 pub struct LibvdaEncoder {
     instance: VeaInstance,
@@ -213,7 +230,7 @@ impl Encoder for LibvdaEncoder {
             input_visible_width: config.src_params.frame_width,
             input_visible_height: config.src_params.frame_height,
             output_profile,
-            initial_bitrate: config.dst_bitrate,
+            bitrate: config.dst_bitrate.into(),
             initial_framerate: if config.frame_rate == 0 {
                 None
             } else {
@@ -317,9 +334,13 @@ impl EncoderSession for LibvdaEncoderSession {
         self.session.flush().map_err(VideoError::from)
     }
 
-    fn request_encoding_params_change(&mut self, bitrate: u32, framerate: u32) -> VideoResult<()> {
+    fn request_encoding_params_change(
+        &mut self,
+        bitrate: Bitrate,
+        framerate: u32,
+    ) -> VideoResult<()> {
         self.session
-            .request_encoding_params_change(bitrate, framerate)
+            .request_encoding_params_change(bitrate.into(), framerate)
             .map_err(VideoError::from)
     }
 

@@ -36,6 +36,10 @@ use devices::ProtectionType;
 #[cfg(feature = "audio")]
 use devices::{Ac97Backend, Ac97Parameters};
 use disk::QcowFile;
+#[cfg(feature = "composite-disk")]
+use disk::{
+    create_composite_disk, create_disk_file, create_zero_filler, ImagePartitionType, PartitionInfo,
+};
 use vm_control::{
     client::{
         do_modify_battery, do_usb_attach, do_usb_detach, do_usb_list, handle_request, vms_request,
@@ -529,6 +533,7 @@ fn parse_ac97_options(s: &str) -> argument::Result<Ac97Parameters> {
                     argument::Error::Syntax(format!("invalid capture option: {}", e))
                 })?;
             }
+            #[cfg(feature = "audio_cras")]
             "client_type" => {
                 ac97_params
                     .set_client_type(v)
@@ -969,6 +974,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.rt_cpus = parse_cpu_set(value.unwrap())?;
         }
+        "delay-rt" => {
+            cfg.delay_rt = true;
+        }
         "mem" => {
             if cfg.memory.is_some() {
                 return Err(argument::Error::TooManyArguments(
@@ -986,6 +994,24 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                         })?,
                 )
         }
+        #[cfg(target_arch = "aarch64")]
+        "swiotlb" => {
+            if cfg.swiotlb.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`swiotlb` already given".to_owned(),
+                ));
+            }
+            cfg.swiotlb =
+                Some(
+                    value
+                        .unwrap()
+                        .parse()
+                        .map_err(|_| argument::Error::InvalidValue {
+                            value: value.unwrap().to_owned(),
+                            expected: String::from("this value for `swiotlb` needs to be integer"),
+                        })?,
+                )
+        }
         "hugepages" => {
             cfg.hugepages = true;
         }
@@ -1000,6 +1026,11 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 cfg.params.push("snd_intel8x0.ac97_clock=48000".to_string());
             }
             cfg.ac97_parameters.push(ac97_params);
+        }
+        #[cfg(feature = "audio")]
+        "sound" => {
+            let client_path = PathBuf::from(value.unwrap());
+            cfg.sound = Some(client_path);
         }
         "serial" => {
             let serial_params = parse_serial_options(value.unwrap())?;
@@ -1099,6 +1130,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             let mut disk = DiskOption {
                 path: disk_path,
                 read_only,
+                o_direct: false,
                 sparse: true,
                 block_size: 512,
                 id: None,
@@ -1122,6 +1154,14 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                             expected: String::from("`sparse` must be a boolean"),
                         })?;
                         disk.sparse = sparse;
+                    }
+                    "o_direct" => {
+                        let o_direct =
+                            value.parse().map_err(|_| argument::Error::InvalidValue {
+                                value: value.to_owned(),
+                                expected: String::from("`o_direct` must be a boolean"),
+                            })?;
+                        disk.o_direct = o_direct;
                     }
                     "block_size" => {
                         let block_size =
@@ -1171,6 +1211,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 path: disk_path,
                 read_only: !name.starts_with("rw"),
                 sparse: false,
+                o_direct: false,
                 block_size: base::pagesize() as u32,
                 id: None,
             });
@@ -1333,7 +1374,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.wayland_socket_paths.insert(name.to_string(), path);
         }
         #[cfg(feature = "wl-dmabuf")]
-        "wayland-dmabuf" => cfg.wayland_dmabuf = true,
+        "wayland-dmabuf" => {}
         "x-display" => {
             if cfg.x_display.is_some() {
                 return Err(argument::Error::TooManyArguments(
@@ -1695,7 +1736,12 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.executable_path = Some(Executable::Bios(PathBuf::from(value.unwrap().to_owned())));
         }
         "vfio" => {
-            let vfio_path = PathBuf::from(value.unwrap());
+            let mut param = value.unwrap().split(',');
+            let vfio_path =
+                PathBuf::from(param.next().ok_or_else(|| argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("missing vfio path"),
+                })?);
             if !vfio_path.exists() {
                 return Err(argument::Error::InvalidValue {
                     value: value.unwrap().to_owned(),
@@ -1709,7 +1755,33 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 });
             }
 
-            cfg.vfio.push(vfio_path);
+            let mut enable_iommu = false;
+            if let Some(p) = param.next() {
+                let mut kv = p.splitn(2, '=');
+                if let (Some(kind), Some(value)) = (kv.next(), kv.next()) {
+                    match kind {
+                        "iommu" => (),
+                        _ => {
+                            return Err(argument::Error::InvalidValue {
+                                value: p.to_owned(),
+                                expected: String::from("option must be `iommu=on|off`"),
+                            })
+                        }
+                    }
+                    match value {
+                        "on" => enable_iommu = true,
+                        "off" => (),
+                        _ => {
+                            return Err(argument::Error::InvalidValue {
+                                value: p.to_owned(),
+                                expected: String::from("option must be `iommu=on|off`"),
+                            })
+                        }
+                    }
+                };
+            }
+
+            cfg.vfio.insert(vfio_path, enable_iommu);
         }
         "video-decoder" => {
             cfg.video_dec = true;
@@ -1736,7 +1808,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         "protected-vm" => {
             cfg.protected_vm = ProtectionType::Protected;
-            cfg.params.push("swiotlb=force".to_string());
         }
         "battery" => {
             let params = parse_battery_options(value)?;
@@ -1771,6 +1842,11 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "vhost-user-console" => cfg.vhost_user_console.push(VhostUserOption {
             socket: PathBuf::from(value.unwrap()),
         }),
+        "vhost-user-mac80211-hwsim" => {
+            cfg.vhost_user_mac80211_hwsim = Some(VhostUserOption {
+                socket: PathBuf::from(value.unwrap()),
+            });
+        }
         "vhost-user-net" => cfg.vhost_user_net.push(VhostUserOption {
             socket: PathBuf::from(value.unwrap()),
         }),
@@ -1960,6 +2036,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::value("cpu-capacity", "CPU=CAP[,CPU=CAP[,...]]", "Set the relative capacity of the given CPU (default: no capacity)"),
           Argument::flag("no-smt", "Don't use SMT in the guest"),
           Argument::value("rt-cpus", "CPUSET", "Comma-separated list of CPUs or CPU ranges to run VCPUs on. (e.g. 0,1-3,5) (default: none)"),
+          Argument::flag("delay-rt", "Don't set VCPUs real-time until make-rt command is run"),
           Argument::short_value('m',
                                 "mem",
                                 "N",
@@ -1977,7 +2054,8 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                               Valid keys:
                               sparse=BOOL - Indicates whether the disk should support the discard operation (default: true)
                               block_size=BYTES - Set the reported block size of the disk (default: 512)
-                              id=STRING - Set the block device identifier to an ASCII string, up to 20 characters (default: no ID)"),
+                              id=STRING - Set the block device identifier to an ASCII string, up to 20 characters (default: no ID)
+                              o_direct=BOOL - Use O_DIRECT mode to bypass page cache"),
           Argument::value("rwdisk", "PATH[,key=value[,key=value[,...]]", "Path to a writable disk image followed by optional comma-separated options.
                               See --disk for valid options."),
           Argument::value("rw-pmem-device", "PATH", "Path to a writable disk image."),
@@ -1993,33 +2071,35 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::value("ac97",
                           "[backend=BACKEND,capture=true,capture_effect=EFFECT,client_type=TYPE,shm-fd=FD,client-fd=FD,server-fd=FD]",
                           "Comma separated key=value pairs for setting up Ac97 devices. Can be given more than once .
-                          Possible key values:
-                          backend=(null, cras, vios) - Where to route the audio device. If not provided, backend will default to null.
-                          `null` for /dev/null, cras for CRAS server and vios for VioS server.
-                          capture - Enable audio capture
-                          capture_effects - | separated effects to be enabled for recording. The only supported effect value now is EchoCancellation or aec.
-                          client_type - Set specific client type for cras backend.
-                          server - The to the VIOS server (unix socket)."),
+                              Possible key values:
+                              backend=(null, cras, vios) - Where to route the audio device. If not provided, backend will default to null.
+                              `null` for /dev/null, cras for CRAS server and vios for VioS server.
+                              capture - Enable audio capture
+                              capture_effects - | separated effects to be enabled for recording. The only supported effect value now is EchoCancellation or aec.
+                              client_type - Set specific client type for cras backend.
+                              server - The to the VIOS server (unix socket)."),
+          #[cfg(feature = "audio")]
+          Argument::value("sound", "[PATH]", "Path to the VioS server socket for setting up virtio-snd devices."),
           Argument::value("serial",
                           "type=TYPE,[hardware=HW,num=NUM,path=PATH,input=PATH,console,earlycon,stdin]",
                           "Comma separated key=value pairs for setting up serial devices. Can be given more than once.
-                          Possible key values:
-                          type=(stdout,syslog,sink,file) - Where to route the serial device
-                          hardware=(serial,virtio-console) - Which type of serial hardware to emulate. Defaults to 8250 UART (serial).
-                          num=(1,2,3,4) - Serial Device Number. If not provided, num will default to 1.
-                          path=PATH - The path to the file to write to when type=file
-                          input=PATH - The path to the file to read from when not stdin
-                          console - Use this serial device as the guest console. Can only be given once. Will default to first serial port if not provided.
-                          earlycon - Use this serial device as the early console. Can only be given once.
-                          stdin - Direct standard input to this serial device. Can only be given once. Will default to first serial port if not provided.
-                          "),
+                              Possible key values:
+                              type=(stdout,syslog,sink,file) - Where to route the serial device
+                              hardware=(serial,virtio-console) - Which type of serial hardware to emulate. Defaults to 8250 UART (serial).
+                              num=(1,2,3,4) - Serial Device Number. If not provided, num will default to 1.
+                              path=PATH - The path to the file to write to when type=file
+                              input=PATH - The path to the file to read from when not stdin
+                              console - Use this serial device as the guest console. Can only be given once. Will default to first serial port if not provided.
+                              earlycon - Use this serial device as the early console. Can only be given once.
+                              stdin - Direct standard input to this serial device. Can only be given once. Will default to first serial port if not provided.
+                              "),
           Argument::value("syslog-tag", "TAG", "When logging to syslog, use the provided tag."),
           Argument::value("x-display", "DISPLAY", "X11 display name to use."),
           Argument::flag("display-window-keyboard", "Capture keyboard input from the display window."),
           Argument::flag("display-window-mouse", "Capture keyboard input from the display window."),
           Argument::value("wayland-sock", "PATH[,name=NAME]", "Path to the Wayland socket to use. The unnamed one is used for displaying virtual screens. Named ones are only for IPC."),
           #[cfg(feature = "wl-dmabuf")]
-          Argument::flag("wayland-dmabuf", "Enable support for DMABufs in Wayland device."),
+          Argument::flag("wayland-dmabuf", "DEPRECATED: Enable support for DMABufs in Wayland device."),
           Argument::short_value('s',
                                 "socket",
                                 "PATH",
@@ -2028,14 +2108,14 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           Argument::value("cid", "CID", "Context ID for virtual sockets."),
           Argument::value("shared-dir", "PATH:TAG[:type=TYPE:writeback=BOOL:timeout=SECONDS:uidmap=UIDMAP:gidmap=GIDMAP:cache=CACHE]",
                           "Colon-separated options for configuring a directory to be shared with the VM.
-The first field is the directory to be shared and the second field is the tag that the VM can use to identify the device.
-The remaining fields are key=value pairs that may appear in any order.  Valid keys are:
-type=(p9, fs) - Indicates whether the directory should be shared via virtio-9p or virtio-fs (default: p9).
-uidmap=UIDMAP - The uid map to use for the device's jail in the format \"inner outer count[,inner outer count]\" (default: 0 <current euid> 1).
-gidmap=GIDMAP - The gid map to use for the device's jail in the format \"inner outer count[,inner outer count]\" (default: 0 <current egid> 1).
-cache=(never, auto, always) - Indicates whether the VM can cache the contents of the shared directory (default: auto).  When set to \"auto\" and the type is \"fs\", the VM will use close-to-open consistency for file contents.
-timeout=SECONDS - How long the VM should consider file attributes and directory entries to be valid (default: 5).  If the VM has exclusive access to the directory, then this should be a large value.  If the directory can be modified by other processes, then this should be 0.
-writeback=BOOL - Indicates whether the VM can use writeback caching (default: false).  This is only safe to do when the VM has exclusive access to the files in a directory.  Additionally, the server should have read permission for all files as the VM may issue read requests even for files that are opened write-only.
+                              The first field is the directory to be shared and the second field is the tag that the VM can use to identify the device.
+                              The remaining fields are key=value pairs that may appear in any order.  Valid keys are:
+                              type=(p9, fs) - Indicates whether the directory should be shared via virtio-9p or virtio-fs (default: p9).
+                              uidmap=UIDMAP - The uid map to use for the device's jail in the format \"inner outer count[,inner outer count]\" (default: 0 <current euid> 1).
+                              gidmap=GIDMAP - The gid map to use for the device's jail in the format \"inner outer count[,inner outer count]\" (default: 0 <current egid> 1).
+                              cache=(never, auto, always) - Indicates whether the VM can cache the contents of the shared directory (default: auto).  When set to \"auto\" and the type is \"fs\", the VM will use close-to-open consistency for file contents.
+                              timeout=SECONDS - How long the VM should consider file attributes and directory entries to be valid (default: 5).  If the VM has exclusive access to the directory, then this should be a large value.  If the directory can be modified by other processes, then this should be 0.
+                              writeback=BOOL - Indicates whether the VM can use writeback caching (default: false).  This is only safe to do when the VM has exclusive access to the files in a directory.  Additionally, the server should have read permission for all files as the VM may issue read requests even for files that are opened write-only.
 "),
           Argument::value("seccomp-policy-dir", "PATH", "Path to seccomp .policy files."),
           Argument::flag("seccomp-log-failures", "Instead of seccomp filter failures being fatal, they will be logged instead."),
@@ -2059,25 +2139,23 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
           Argument::flag_or_value("gpu",
                                   "[width=INT,height=INT]",
                                   "(EXPERIMENTAL) Comma separated key=value pairs for setting up a virtio-gpu device
-                                  Possible key values:
-                                  backend=(2d|virglrenderer|gfxstream) - Which backend to use for virtio-gpu (determining rendering protocol)
-                                  width=INT - The width of the virtual display connected to the virtio-gpu.
-                                  height=INT - The height of the virtual display connected to the virtio-gpu.
-                                  egl[=true|=false] - If the backend should use a EGL context for rendering.
-                                  glx[=true|=false] - If the backend should use a GLX context for rendering.
-                                  surfaceless[=true|=false] - If the backend should use a surfaceless context for rendering.
-                                  angle[=true|=false] - If the gfxstream backend should use ANGLE (OpenGL on Vulkan) as its native OpenGL driver.
-                                  syncfd[=true|=false] - If the gfxstream backend should support EGL_ANDROID_native_fence_sync
-                                  vulkan[=true|=false] - If the backend should support vulkan
-                                  "),
+                              Possible key values:
+                              backend=(2d|virglrenderer|gfxstream) - Which backend to use for virtio-gpu (determining rendering protocol)
+                              width=INT - The width of the virtual display connected to the virtio-gpu.
+                              height=INT - The height of the virtual display connected to the virtio-gpu.
+                              egl[=true|=false] - If the backend should use a EGL context for rendering.
+                              glx[=true|=false] - If the backend should use a GLX context for rendering.
+                              surfaceless[=true|=false] - If the backend should use a surfaceless context for rendering.
+                              angle[=true|=false] - If the gfxstream backend should use ANGLE (OpenGL on Vulkan) as its native OpenGL driver.
+                              syncfd[=true|=false] - If the gfxstream backend should support EGL_ANDROID_native_fence_sync
+                              vulkan[=true|=false] - If the backend should support vulkan"),
           #[cfg(feature = "gpu")]
           Argument::flag_or_value("gpu-display",
                                   "[width=INT,height=INT]",
                                   "(EXPERIMENTAL) Comma separated key=value pairs for setting up a display on the virtio-gpu device
-                                  Possible key values:
-                                  width=INT - The width of the virtual display connected to the virtio-gpu.
-                                  height=INT - The height of the virtual display connected to the virtio-gpu.
-                                  "),
+                              Possible key values:
+                              width=INT - The width of the virtual display connected to the virtio-gpu.
+                              height=INT - The height of the virtual display connected to the virtio-gpu."),
           #[cfg(feature = "tpm")]
           Argument::flag("software-tpm", "enable a software emulated trusted platform module device"),
           Argument::value("evdev", "PATH", "Path to an event device node. The device will be grabbed (unusable from the host) and made available to the guest with the same configuration it shows on the host"),
@@ -2090,23 +2168,26 @@ writeback=BOOL - Indicates whether the VM can use writeback caching (default: fa
           #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("split-irqchip", "(EXPERIMENTAL) enable split-irqchip support"),
           Argument::value("bios", "PATH", "Path to BIOS/firmware ROM"),
-          Argument::value("vfio", "PATH", "Path to sysfs of pass through or mdev device"),
+          Argument::value("vfio", "PATH[,iommu=on|off]", "Path to sysfs of pass through or mdev device.
+iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           #[cfg(feature = "video-decoder")]
           Argument::flag("video-decoder", "(EXPERIMENTAL) enable virtio-video decoder device"),
           #[cfg(feature = "video-encoder")]
           Argument::flag("video-encoder", "(EXPERIMENTAL) enable virtio-video encoder device"),
           Argument::value("acpi-table", "PATH", "Path to user provided ACPI table"),
           Argument::flag("protected-vm", "(EXPERIMENTAL) prevent host access to guest memory"),
+          #[cfg(target_arch = "aarch64")]
+          Argument::value("swiotlb", "N", "(EXPERIMENTAL) Size of virtio swiotlb buffer in MiB (default: 64 if `--protected-vm` is present)."),
           Argument::flag_or_value("battery",
                                   "[type=TYPE]",
                                   "Comma separated key=value pairs for setting up battery device
-                                  Possible key values:
-                                  type=goldfish - type of battery emulation, defaults to goldfish
-                                  "),
+                              Possible key values:
+                              type=goldfish - type of battery emulation, defaults to goldfish"),
           Argument::value("gdb", "PORT", "(EXPERIMENTAL) gdb on the given port"),
           Argument::value("balloon_bias_mib", "N", "Amount to bias balance of memory between host and guest as the balloon inflates, in MiB."),
           Argument::value("vhost-user-blk", "SOCKET_PATH", "Path to a socket for vhost-user block"),
           Argument::value("vhost-user-console", "SOCKET_PATH", "Path to a socket for vhost-user console"),
+          Argument::value("vhost-user-mac80211-hwsim", "SOCKET_PATH", "Path to a socket for vhost-user mac80211_hwsim"),
           Argument::value("vhost-user-net", "SOCKET_PATH", "Path to a socket for vhost-user net"),
           Argument::value("vhost-user-wl", "SOCKET_PATH:TUBE_PATH", "Paths to a vhost-user socket for wayland and a Tube socket for additional wayland-specific messages"),
           Argument::value("vhost-user-fs", "SOCKET_PATH:TAG",
@@ -2195,6 +2276,17 @@ fn resume_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     vms_request(&VmRequest::Resume, socket_path)
 }
 
+fn make_rt(mut args: std::env::Args) -> std::result::Result<(), ()> {
+    if args.len() == 0 {
+        print_help("crosvm make_rt", "VM_SOCKET...", &[]);
+        println!("Makes the crosvm instance listening on each `VM_SOCKET` given RT.");
+        return Err(());
+    }
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    vms_request(&VmRequest::MakeRT, socket_path)
+}
+
 fn balloon_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     if args.len() < 2 {
         print_help("crosvm balloon", "SIZE VM_SOCKET...", &[]);
@@ -2237,6 +2329,108 @@ fn balloon_stats(mut args: std::env::Args) -> std::result::Result<(), ()> {
         VmResponse::BalloonStats { .. } => Ok(()),
         _ => Err(()),
     }
+}
+
+#[cfg(feature = "composite-disk")]
+fn create_composite(mut args: std::env::Args) -> std::result::Result<(), ()> {
+    if args.len() < 1 {
+        print_help("crosvm create_composite", "PATH [LABEL:PARTITION]..", &[]);
+        println!("Creates a new composite disk image containing the given partition images");
+        return Err(());
+    }
+
+    let composite_image_path = args.next().unwrap();
+    let zero_filler_path = format!("{}.filler", composite_image_path);
+    let header_path = format!("{}.header", composite_image_path);
+    let footer_path = format!("{}.footer", composite_image_path);
+
+    let mut composite_image_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&composite_image_path)
+        .map_err(|e| {
+            error!(
+                "Failed opening composite disk image file at '{}': {}",
+                composite_image_path, e
+            );
+        })?;
+    create_zero_filler(&zero_filler_path).map_err(|e| {
+        error!(
+            "Failed to create zero filler file at '{}': {}",
+            &zero_filler_path, e
+        );
+    })?;
+    let mut header_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&header_path)
+        .map_err(|e| {
+            error!(
+                "Failed opening header image file at '{}': {}",
+                header_path, e
+            );
+        })?;
+    let mut footer_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&footer_path)
+        .map_err(|e| {
+            error!(
+                "Failed opening footer image file at '{}': {}",
+                footer_path, e
+            );
+        })?;
+
+    let partitions = args
+        .into_iter()
+        .map(|partition_arg| {
+            if let [label, path] = partition_arg.split(":").collect::<Vec<_>>()[..] {
+                let partition_file = File::open(path)
+                    .map_err(|e| error!("Failed to open partition image: {}", e))?;
+                let size = create_disk_file(partition_file)
+                    .map_err(|e| error!("Failed to create DiskFile instance: {}", e))?
+                    .get_len()
+                    .map_err(|e| error!("Failed to get length of partition image: {}", e))?;
+                Ok(PartitionInfo {
+                    label: label.to_owned(),
+                    path: Path::new(path).to_owned(),
+                    partition_type: ImagePartitionType::LinuxFilesystem,
+                    writable: false,
+                    size,
+                })
+            } else {
+                error!(
+                    "Must specify label and path for partition '{}', like LABEL:PATH",
+                    partition_arg
+                );
+                Err(())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    create_composite_disk(
+        &partitions,
+        &PathBuf::from(zero_filler_path),
+        &PathBuf::from(header_path),
+        &mut header_file,
+        &PathBuf::from(footer_path),
+        &mut footer_file,
+        &mut composite_image_file,
+    )
+    .map_err(|e| {
+        error!(
+            "Failed to create composite disk image at '{}': {}",
+            composite_image_path, e
+        );
+    })?;
+
+    Ok(())
 }
 
 fn create_qcow2(args: std::env::Args) -> std::result::Result<(), ()> {
@@ -2459,6 +2653,8 @@ fn print_usage() {
     println!("    balloon - Set balloon size of the crosvm instance.");
     println!("    balloon_stats - Prints virtio balloon statistics.");
     println!("    battery - Modify battery.");
+    #[cfg(feature = "composite-disk")]
+    println!("    create_composite  - Create a new composite disk image file.");
     println!("    create_qcow2  - Create a new qcow2 disk image file.");
     println!("    disk - Manage attached virtual disk devices.");
     println!("    resume - Resumes the crosvm instance.");
@@ -2523,9 +2719,12 @@ fn crosvm_main() -> std::result::Result<(), ()> {
         Some("stop") => stop_vms(args),
         Some("suspend") => suspend_vms(args),
         Some("resume") => resume_vms(args),
+        Some("make_rt") => make_rt(args),
         Some("run") => run_vm(args),
         Some("balloon") => balloon_vms(args),
         Some("balloon_stats") => balloon_stats(args),
+        #[cfg(feature = "composite-disk")]
+        Some("create_composite") => create_composite(args),
         Some("create_qcow2") => create_qcow2(args),
         Some("disk") => disk_cmd(args),
         Some("usb") => modify_usb(args),
@@ -2654,7 +2853,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "audio")]
+    #[cfg(feature = "audio_cras")]
     #[test]
     fn parse_ac97_vaild() {
         parse_ac97_options("backend=cras").expect("parse should have succeded");
@@ -2666,13 +2865,13 @@ mod tests {
         parse_ac97_options("backend=null").expect("parse should have succeded");
     }
 
-    #[cfg(feature = "audio")]
+    #[cfg(feature = "audio_cras")]
     #[test]
     fn parse_ac97_capture_vaild() {
         parse_ac97_options("backend=cras,capture=true").expect("parse should have succeded");
     }
 
-    #[cfg(feature = "audio")]
+    #[cfg(feature = "audio_cras")]
     #[test]
     fn parse_ac97_client_type() {
         parse_ac97_options("backend=cras,capture=true,client_type=crosvm")

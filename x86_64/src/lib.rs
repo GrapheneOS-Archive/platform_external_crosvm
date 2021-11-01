@@ -54,14 +54,14 @@ use std::mem;
 use std::sync::Arc;
 
 use crate::bootparam::boot_params;
-use acpi_tables::aml::Aml;
 use acpi_tables::sdt::SDT;
+use acpi_tables::{aml, aml::Aml};
 use arch::{
-    get_serial_cmdline, GetSerialCmdlineError, RunnableLinuxVm, SerialHardware, SerialParameters,
-    VmComponents, VmImage,
+    get_serial_cmdline, GetSerialCmdlineError, LinuxArch, RunnableLinuxVm, SerialHardware,
+    SerialParameters, VmComponents, VmImage,
 };
 use base::Event;
-use devices::{IrqChip, IrqChipX86_64, PciConfigIo, PciDevice, ProtectionType};
+use devices::{BusResumeDevice, IrqChip, IrqChipX86_64, PciConfigIo, PciDevice, ProtectionType};
 use hypervisor::{HypervisorX86_64, VcpuX86_64, VmX86_64};
 use minijail::Minijail;
 use remain::sorted;
@@ -71,7 +71,7 @@ use vm_control::{BatControl, BatteryType};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use {
-    gdbstub::arch::x86::reg::X86_64CoreRegs,
+    gdbstub_arch::x86::reg::{X86SegmentRegs, X86_64CoreRegs},
     hypervisor::x86_64::{Regs, Sregs},
 };
 
@@ -359,6 +359,10 @@ impl arch::LinuxArch for X8664arch {
         Ok(arch_memory_regions(components.memory_size, bios_size))
     }
 
+    fn get_phys_max_addr() -> u64 {
+        (1u64 << cpuid::phy_max_address_bits()) - 1
+    }
+
     fn create_system_allocator(guest_mem: &GuestMemory) -> SystemAllocator {
         let high_mmio_start = Self::get_high_mmio_base(guest_mem);
         SystemAllocator::builder()
@@ -430,7 +434,10 @@ impl arch::LinuxArch for X8664arch {
             serial_jail,
         )?;
 
+        let mut resume_notify_devices = Vec::new();
+
         let (acpi_dev_resource, bat_control) = Self::setup_acpi_devices(
+            &mem,
             &mut io_bus,
             system_allocator,
             suspend_evt.try_clone().map_err(Error::CloneEvent)?,
@@ -439,10 +446,17 @@ impl arch::LinuxArch for X8664arch {
             irq_chip.as_irq_chip_mut(),
             battery,
             &mut mmio_bus,
+            &mut resume_notify_devices,
         )?;
 
-        // Use ACPI description if provided by the user.
-        let noacpi = acpi_dev_resource.sdts.is_empty();
+        // Use IRQ info in ACPI if provided by the user.
+        let mut noirq = true;
+
+        for sdt in acpi_dev_resource.sdts.iter() {
+            if sdt.is_signature(b"DSDT") || sdt.is_signature(b"APIC") {
+                noirq = false;
+            }
+        }
 
         let ramoops_region = match components.pstore {
             Some(pstore) => Some(
@@ -476,8 +490,8 @@ impl arch::LinuxArch for X8664arch {
             VmImage::Kernel(ref mut kernel_image) => {
                 let mut cmdline = Self::get_base_linux_cmdline();
 
-                if noacpi {
-                    cmdline.insert_str("pci=noacpi").unwrap();
+                if noirq {
+                    cmdline.insert_str("acpi=noirq").unwrap();
                 }
 
                 get_serial_cmdline(&mut cmdline, serial_parameters, "io")
@@ -533,7 +547,9 @@ impl arch::LinuxArch for X8664arch {
             mmio_bus,
             pid_debug_label_map,
             suspend_evt,
+            resume_notify_devices,
             rt_cpus: components.rt_cpus,
+            delay_rt: components.delay_rt,
             bat_control,
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             gdb: components.gdb,
@@ -592,12 +608,14 @@ impl arch::LinuxArch for X8664arch {
 
         // Segment registers: CS, SS, DS, ES, FS, GS
         let sregs = vcpu.get_sregs().map_err(Error::ReadRegs)?;
-        let sgs = [sregs.cs, sregs.ss, sregs.ds, sregs.es, sregs.fs, sregs.gs];
-        let mut segments = [0u32; 6];
-        // GDB uses only the selectors.
-        for i in 0..sgs.len() {
-            segments[i] = sgs[i].selector as u32;
-        }
+        let segments = X86SegmentRegs {
+            cs: sregs.cs.selector as u32,
+            ss: sregs.ss.selector as u32,
+            ds: sregs.ds.selector as u32,
+            es: sregs.es.selector as u32,
+            fs: sregs.fs.selector as u32,
+            gs: sregs.gs.selector as u32,
+        };
 
         // TODO(keiichiw): Other registers such as FPU, xmm and mxcsr.
 
@@ -640,12 +658,12 @@ impl arch::LinuxArch for X8664arch {
         // Segment registers: CS, SS, DS, ES, FS, GS
         // Since GDB care only selectors, we call get_sregs() first.
         let mut sregs = vcpu.get_sregs().map_err(Error::ReadRegs)?;
-        sregs.cs.selector = regs.segments[0] as u16;
-        sregs.ss.selector = regs.segments[1] as u16;
-        sregs.ds.selector = regs.segments[2] as u16;
-        sregs.es.selector = regs.segments[3] as u16;
-        sregs.fs.selector = regs.segments[4] as u16;
-        sregs.gs.selector = regs.segments[5] as u16;
+        sregs.cs.selector = regs.segments.cs as u16;
+        sregs.ss.selector = regs.segments.ss as u16;
+        sregs.ds.selector = regs.segments.ds as u16;
+        sregs.es.selector = regs.segments.es as u16;
+        sregs.fs.selector = regs.segments.fs as u16;
+        sregs.gs.selector = regs.segments.gs as u16;
 
         vcpu.set_sregs(&sregs).map_err(Error::WriteRegs)?;
 
@@ -1029,6 +1047,7 @@ impl X8664arch {
     /// * - `battery` indicate whether to create the battery
     /// * - `mmio_bus` the MMIO bus to add the devices to
     fn setup_acpi_devices(
+        mem: &GuestMemory,
         io_bus: &mut devices::Bus,
         resources: &mut SystemAllocator,
         suspend_evt: Event,
@@ -1037,6 +1056,7 @@ impl X8664arch {
         irq_chip: &mut dyn IrqChip,
         battery: (&Option<BatteryType>, Option<Minijail>),
         mmio_bus: &mut devices::Bus,
+        resume_notify_devices: &mut Vec<Arc<Mutex<dyn BusResumeDevice>>>,
     ) -> Result<(acpi::ACPIDevResource, Option<BatControl>)> {
         // The AML data for the acpi devices
         let mut amls = Vec::new();
@@ -1056,6 +1076,43 @@ impl X8664arch {
 
         let pmresource = devices::ACPIPMResource::new(suspend_evt, exit_evt);
         Aml::to_aml_bytes(&pmresource, &mut amls);
+
+        let mut pci_dsdt_inner_data: Vec<&dyn aml::Aml> = Vec::new();
+        let hid = aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A08"));
+        pci_dsdt_inner_data.push(&hid);
+        let cid = aml::Name::new("_CID".into(), &aml::EISAName::new("PNP0A03"));
+        pci_dsdt_inner_data.push(&cid);
+        let adr = aml::Name::new("_ADR".into(), &aml::ZERO);
+        pci_dsdt_inner_data.push(&adr);
+        let seg = aml::Name::new("_SEG".into(), &aml::ZERO);
+        pci_dsdt_inner_data.push(&seg);
+        let uid = aml::Name::new("_UID".into(), &aml::ZERO);
+        pci_dsdt_inner_data.push(&uid);
+        let supp = aml::Name::new("SUPP".into(), &aml::ZERO);
+        pci_dsdt_inner_data.push(&supp);
+        let crs = aml::Name::new(
+            "_CRS".into(),
+            &aml::ResourceTemplate::new(vec![
+                &aml::AddressSpace::new_bus_number(0x0u16, 0xffu16),
+                &aml::IO::new(0xcf8, 0xcf8, 1, 0x8),
+                &aml::AddressSpace::new_memory(
+                    aml::AddressSpaceCachable::NotCacheable,
+                    true,
+                    END_ADDR_BEFORE_32BITS as u32,
+                    (END_ADDR_BEFORE_32BITS + MMIO_SIZE - 1) as u32,
+                ),
+                &aml::AddressSpace::new_memory(
+                    aml::AddressSpaceCachable::NotCacheable,
+                    true,
+                    Self::get_high_mmio_base(mem),
+                    X8664arch::get_phys_max_addr(),
+                ),
+            ]),
+        );
+        pci_dsdt_inner_data.push(&crs);
+
+        aml::Device::new("_SB_.PCI0".into(), pci_dsdt_inner_data).to_aml_bytes(&mut amls);
+
         let pm = Arc::new(Mutex::new(pmresource));
         io_bus
             .insert(
@@ -1064,7 +1121,7 @@ impl X8664arch {
                 devices::acpi::ACPIPM_RESOURCE_LEN as u64,
             )
             .unwrap();
-        io_bus.notify_on_resume(pm);
+        resume_notify_devices.push(pm);
 
         let bat_control = if let Some(battery_type) = battery.0 {
             match battery_type {

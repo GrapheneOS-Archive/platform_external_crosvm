@@ -17,11 +17,11 @@ use std::sync::Arc;
 
 use acpi_tables::aml::Aml;
 use acpi_tables::sdt::SDT;
-use base::{syslog, AsRawDescriptor, Event, Tube};
+use base::{syslog, AsRawDescriptor, AsRawDescriptors, Event, Tube};
 use devices::virtio::VirtioDevice;
 use devices::{
-    Bus, BusDevice, BusError, IrqChip, PciAddress, PciDevice, PciDeviceError, PciInterruptPin,
-    PciRoot, ProtectionType, ProxyDevice,
+    Bus, BusDevice, BusError, BusResumeDevice, IrqChip, PciAddress, PciDevice, PciDeviceError,
+    PciInterruptPin, PciRoot, ProtectionType, ProxyDevice,
 };
 use hypervisor::{IoEventAddress, Vm};
 use minijail::Minijail;
@@ -31,7 +31,7 @@ use vm_control::{BatControl, BatteryType};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
-use gdbstub::arch::x86::reg::X86_64CoreRegs as GdbStubRegs;
+use gdbstub_arch::x86::reg::X86_64CoreRegs as GdbStubRegs;
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 use {
@@ -76,6 +76,7 @@ pub enum VcpuAffinity {
 /// create a `RunnableLinuxVm`.
 pub struct VmComponents {
     pub memory_size: u64,
+    pub swiotlb: Option<u64>,
     pub vcpu_count: usize,
     pub vcpu_affinity: Option<VcpuAffinity>,
     pub cpu_clusters: Vec<Vec<usize>>,
@@ -87,9 +88,9 @@ pub struct VmComponents {
     pub pstore: Option<Pstore>,
     pub initrd_image: Option<File>,
     pub extra_kernel_params: Vec<String>,
-    pub wayland_dmabuf: bool,
     pub acpi_sdts: Vec<SDT>,
     pub rt_cpus: Vec<usize>,
+    pub delay_rt: bool,
     pub protected_vm: ProtectionType,
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     pub gdb: Option<(u32, Tube)>, // port and control tube.
@@ -113,9 +114,12 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub pid_debug_label_map: BTreeMap<u32, String>,
     pub suspend_evt: Event,
     pub rt_cpus: Vec<usize>,
+    pub delay_rt: bool,
     pub bat_control: Option<BatControl>,
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     pub gdb: Option<(u32, Tube)>,
+    /// Devices to be notified before the system resumes from the S3 suspended state.
+    pub resume_notify_devices: Vec<Arc<Mutex<dyn BusResumeDevice>>>,
 }
 
 /// The device and optional jail.
@@ -145,6 +149,8 @@ pub trait LinuxArch {
     ///
     /// * `guest_mem` - The memory to be used as a template for the `SystemAllocator`.
     fn create_system_allocator(guest_mem: &GuestMemory) -> SystemAllocator;
+
+    fn get_phys_max_addr() -> u64;
 
     /// Takes `VmComponents` and generates a `RunnableLinuxVm`.
     ///
@@ -365,6 +371,7 @@ pub fn generate_pci_root(
         let address = device_addrs[dev_idx];
         let mut keep_rds = device.keep_rds();
         syslog::push_descriptors(&mut keep_rds);
+        keep_rds.append(&mut vm.get_memory().as_raw_descriptors());
 
         let irqfd = Event::new().map_err(DeviceRegistrationError::EventCreate)?;
         let irq_resample_fd = Event::new().map_err(DeviceRegistrationError::EventCreate)?;

@@ -25,11 +25,15 @@ use vulkano::memory::DeviceMemoryAllocError;
 
 /// Represents a buffer.  `base` contains the address of a buffer, while `len` contains the length
 /// of the buffer.
+#[repr(C)]
 #[derive(Copy, Clone)]
 pub struct RutabagaIovec {
     pub base: *mut c_void,
     pub len: usize,
 }
+
+unsafe impl Send for RutabagaIovec {}
+unsafe impl Sync for RutabagaIovec {}
 
 /// 3D resource creation parameters.  Also used to create 2D resource.  Constants based on Mesa's
 /// (internal) Gallium interface.  Not in the virtio-gpu spec, but should be since dumb resources
@@ -89,7 +93,7 @@ pub const RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK: u32 = 0x00ff;
 
 /// Rutabaga flags for creating fences (fence ctx idx info not upstreamed).
 pub const RUTABAGA_FLAG_FENCE: u32 = 1 << 0;
-pub const RUTABAGA_FLAG_INFO_FENCE_CTX_IDX: u32 = 1 << 1;
+pub const RUTABAGA_FLAG_INFO_RING_IDX: u32 = 1 << 1;
 
 /// Convenience struct for Rutabaga fences
 #[derive(Copy, Clone)]
@@ -97,7 +101,7 @@ pub struct RutabagaFenceData {
     pub flags: u32,
     pub fence_id: u64,
     pub ctx_id: u32,
-    pub fence_ctx_idx: u32,
+    pub ring_idx: u32,
 }
 
 /// Mapped memory caching flags (see virtio_gpu spec)

@@ -45,6 +45,7 @@ set_robust_list: 1
 sigaltstack: 1
 write: 1
 writev: 1
+uname: 1
 
 # Rules specific to gpu
 connect: 1
@@ -75,6 +76,7 @@ socket: arg0 == 1 && arg1 == 0x80001 && arg2 == 0
 stat: 1
 statx: 1
 sysinfo: 1
+fstatfs: 1
 
 # Required for perfetto tracing
 # fcntl: arg1 == F_SETFD || arg1 == F_GETFL || arg1 == F_SETFL (merged above)
@@ -90,7 +92,6 @@ setpriority: 1
 unlink: 1
 
 # Rules specific to AMD gpus.
-uname: 1
 sched_setscheduler: 1
 sched_setaffinity: 1
 kcmp: 1

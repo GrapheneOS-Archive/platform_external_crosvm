@@ -248,6 +248,10 @@ impl arch::LinuxArch for AArch64 {
         Ok(arch_memory_regions(components.memory_size))
     }
 
+    fn get_phys_max_addr() -> u64 {
+        u64::max_value()
+    }
+
     fn create_system_allocator(guest_mem: &GuestMemory) -> SystemAllocator {
         Self::get_resource_allocator(guest_mem.memory_size())
     }
@@ -273,14 +277,6 @@ impl arch::LinuxArch for AArch64 {
         };
 
         let mem = vm.get_memory().clone();
-
-        if components.protected_vm == ProtectionType::Protected {
-            vm.enable_protected_vm(
-                GuestAddress(AARCH64_PROTECTED_VM_FW_START),
-                AARCH64_PROTECTED_VM_FW_MAX_SIZE,
-            )
-            .map_err(Error::ProtectVm)?;
-        }
 
         let mut use_pmu = vm
             .get_hypervisor()
@@ -321,6 +317,14 @@ impl arch::LinuxArch for AArch64 {
                 false,
             )
             .map_err(Error::MapPvtimeError)?;
+        }
+
+        if components.protected_vm == ProtectionType::Protected {
+            vm.enable_protected_vm(
+                GuestAddress(AARCH64_PROTECTED_VM_FW_START),
+                AARCH64_PROTECTED_VM_FW_MAX_SIZE,
+            )
+            .map_err(Error::ProtectVm)?;
         }
 
         for (vcpu_id, vcpu) in vcpus.iter().enumerate() {
@@ -435,6 +439,7 @@ impl arch::LinuxArch for AArch64 {
             irq_chip.get_vgic_version() == DeviceKind::ArmVgicV3,
             use_pmu,
             psci_version,
+            components.swiotlb,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -451,7 +456,9 @@ impl arch::LinuxArch for AArch64 {
             pid_debug_label_map,
             suspend_evt,
             rt_cpus: components.rt_cpus,
+            delay_rt: components.delay_rt,
             bat_control: None,
+            resume_notify_devices: Vec::new(),
         })
     }
 

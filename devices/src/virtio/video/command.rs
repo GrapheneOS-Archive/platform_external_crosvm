@@ -272,9 +272,12 @@ impl<'a> VideoCmd {
                 let virtio_video_get_control { control, .. } = r.read_obj()?;
                 let ctrl_type = match control.into() {
                     VIRTIO_VIDEO_CONTROL_BITRATE => CtrlType::Bitrate,
+                    VIRTIO_VIDEO_CONTROL_BITRATE_PEAK => CtrlType::BitratePeak,
+                    VIRTIO_VIDEO_CONTROL_BITRATE_MODE => CtrlType::BitrateMode,
                     VIRTIO_VIDEO_CONTROL_PROFILE => CtrlType::Profile,
                     VIRTIO_VIDEO_CONTROL_LEVEL => CtrlType::Level,
                     VIRTIO_VIDEO_CONTROL_FORCE_KEYFRAME => CtrlType::ForceKeyframe,
+                    VIRTIO_VIDEO_CONTROL_PREPEND_SPSPPS_TO_IDR => CtrlType::PrependSpsPpsToIdr,
                     t => {
                         return Err(ReadCmdError::UnsupportedCtrlType(t));
                     }
@@ -292,6 +295,16 @@ impl<'a> VideoCmd {
                             .bitrate
                             .into(),
                     ),
+                    VIRTIO_VIDEO_CONTROL_BITRATE_PEAK => CtrlVal::BitratePeak(
+                        r.read_obj::<virtio_video_control_val_bitrate_peak>()?
+                            .bitrate_peak
+                            .into(),
+                    ),
+                    VIRTIO_VIDEO_CONTROL_BITRATE_MODE => CtrlVal::BitrateMode(
+                        r.read_obj::<virtio_video_control_val_bitrate_mode>()?
+                            .bitrate_mode
+                            .try_into()?,
+                    ),
                     VIRTIO_VIDEO_CONTROL_PROFILE => CtrlVal::Profile(
                         r.read_obj::<virtio_video_control_val_profile>()?
                             .profile
@@ -302,7 +315,12 @@ impl<'a> VideoCmd {
                             .level
                             .try_into()?,
                     ),
-                    VIRTIO_VIDEO_CONTROL_FORCE_KEYFRAME => CtrlVal::ForceKeyframe(),
+                    VIRTIO_VIDEO_CONTROL_FORCE_KEYFRAME => CtrlVal::ForceKeyframe,
+                    VIRTIO_VIDEO_CONTROL_PREPEND_SPSPPS_TO_IDR => CtrlVal::PrependSpsPpsToIdr(
+                        r.read_obj::<virtio_video_control_val_prepend_spspps_to_idr>()?
+                            .prepend_spspps_to_idr
+                            != 0,
+                    ),
                     t => {
                         return Err(ReadCmdError::UnsupportedCtrlType(t));
                     }
