@@ -40,6 +40,7 @@ rust_defaults {
     proc_macros: [
         "libasync_trait",
         "libpaste",
+        "libremain",
     ],
 }
 
@@ -82,5 +83,6 @@ rust_library {
     proc_macros: [
         "libasync_trait",
         "libpaste",
+        "libremain",
     ],
 }

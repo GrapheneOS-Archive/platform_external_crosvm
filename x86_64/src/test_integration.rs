@@ -106,8 +106,8 @@ where
 
     let mut irq_chip = create_irq_chip(vm.try_clone().expect("failed to clone vm"), 1, device_tube);
 
-    let mut mmio_bus = devices::Bus::new();
-    let mut io_bus = devices::Bus::new();
+    let mmio_bus = Arc::new(devices::Bus::new());
+    let io_bus = Arc::new(devices::Bus::new());
     let exit_evt = Event::new().unwrap();
 
     let mut control_tubes = vec![TaggedControlTube::VmIrq(irqchip_tube)];
@@ -129,8 +129,8 @@ where
     let (pci, pci_irqs, _pid_debug_label_map) = arch::generate_pci_root(
         devices,
         &mut irq_chip,
-        &mut mmio_bus,
-        &mut io_bus,
+        mmio_bus.clone(),
+        io_bus.clone(),
         &mut resources,
         &mut vm,
         4,
@@ -140,7 +140,7 @@ where
     io_bus.insert(pci_bus, 0xcf8, 0x8).unwrap();
 
     X8664arch::setup_legacy_devices(
-        &mut io_bus,
+        &io_bus,
         irq_chip.pit_uses_speaker_port(),
         exit_evt.try_clone().unwrap(),
         memory_size,
@@ -154,7 +154,7 @@ where
     X8664arch::setup_serial_devices(
         ProtectionType::Unprotected,
         &mut irq_chip,
-        &mut io_bus,
+        &io_bus,
         &serial_params,
         None,
     )
@@ -181,7 +181,7 @@ where
     let mut resume_notify_devices = Vec::new();
     let acpi_dev_resource = X8664arch::setup_acpi_devices(
         &guest_mem,
-        &mut io_bus,
+        &io_bus,
         &mut resources,
         suspend_evt
             .try_clone()
@@ -190,7 +190,7 @@ where
         Default::default(),
         &mut irq_chip,
         (&None, None),
-        &mut mmio_bus,
+        &mmio_bus,
         &mut resume_notify_devices,
     )
     .unwrap();
@@ -210,7 +210,15 @@ where
     mptable::setup_mptable(&guest_mem, 1, pci_irqs).expect("failed to setup mptable");
     smbios::setup_smbios(&guest_mem, None).expect("failed to setup smbios");
 
-    acpi::create_acpi_tables(&guest_mem, 1, X86_64_SCI_IRQ, acpi_dev_resource.0);
+    let mut apic_ids = Vec::new();
+    acpi::create_acpi_tables(
+        &guest_mem,
+        1,
+        X86_64_SCI_IRQ,
+        acpi_dev_resource.0,
+        None,
+        &mut apic_ids,
+    );
 
     let guest_mem2 = guest_mem.clone();
 
@@ -228,7 +236,7 @@ where
                 .add_vcpu(0, &vcpu)
                 .expect("failed to add vcpu to irqchip");
 
-            setup_cpuid(&hyp, &irq_chip, &vcpu, 0, 1, false).unwrap();
+            setup_cpuid(&hyp, &irq_chip, &vcpu, 0, 1, false, false).unwrap();
             setup_msrs(&vcpu, END_ADDR_BEFORE_32BITS).unwrap();
 
             setup_regs(

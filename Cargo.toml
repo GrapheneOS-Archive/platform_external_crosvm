@@ -32,7 +32,6 @@ members = [
     "qcow_utils",
     "integration_tests",
     "libcrosvm_control",
-    "vhost_user_devices",
 ]
 exclude = [
     "assertions",
@@ -48,14 +47,24 @@ exclude = [
 ]
 
 [features]
+all-linux = [
+    # TODO(b/203105868): Enable remaining features on linux builds.
+    "composite-disk",
+    "default",
+    "gdb",
+    "tpm",
+    "virgl_renderer_next",
+    "virgl_renderer",
+    "x",
+    ]
 audio = ["devices/audio"]
 audio_cras = ["devices/audio_cras"]
-chromeos = ["base/chromeos", "audio_cras"]
+chromeos = ["base/chromeos", "audio_cras", "devices/chromeos"]
 composite-disk = ["protos/composite-disk", "protobuf", "disk/composite-disk"]
 default = ["audio", "gpu", "usb"]
 default-no-sandbox = []
 direct = ["devices/direct"]
-gdb = ["gdbstub", "gdbstub_arch", "thiserror",  "arch/gdb", "vm_control/gdb", "x86_64/gdb"]
+gdb = ["gdbstub", "gdbstub_arch", "arch/gdb", "vm_control/gdb", "x86_64/gdb"]
 gfxstream = ["devices/gfxstream"]
 gpu = ["devices/gpu"]
 plugin = ["protos/plugin", "crosvm_plugin", "kvm", "kvm_sys", "protobuf"]
@@ -99,8 +108,8 @@ remain = "*"
 resources = { path = "resources" }
 serde_json = "*"
 sync = { path = "sync" }
-tempfile = "*"
-thiserror = { version = "1.0.20", optional = true }
+tempfile = "3"
+thiserror = { version = "1.0.20" }
 vhost = { path = "vhost" }
 vm_control = { path = "vm_control" }
 acpi_tables = { path = "acpi_tables" }
@@ -119,13 +128,14 @@ base = "*"
 assertions = { path = "assertions" }
 audio_streams = { path = "audio_streams" }
 base = { path = "base" }
+cros_async =  { path = "cros_async" }
 cros_fuzz = { path = "common/cros-fuzz" } # ignored by ebuild
 data_model = { path = "data_model" }
 libcras = { path = "libcras_stub" } # ignored by ebuild
 p9 = { path = "common/p9" } # ignored by ebuild
 sync = { path = "sync" }
 sys_util = { path = "sys_util" }
-tempfile = { path = "tempfile" }
+system_api = { path = "system_api_stub" } # ignored by ebuild
 wire_format_derive = { path = "common/p9/wire_format_derive" } # ignored by ebuild
 minijail = { path = "../minijail/rust/minijail" } # ignored by ebuild
 vmm_vhost = { path = "../rust/vmm_vhost", features = ["vhost-user-master", "vhost-user-slave"] } # ignored by ebuild

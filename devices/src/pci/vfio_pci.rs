@@ -4,6 +4,8 @@
 
 use std::cmp::{max, min};
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::u32;
 
@@ -28,75 +30,15 @@ use crate::pci::{
     PciInterruptPin,
 };
 
-use crate::vfio::{VfioDevice, VfioIrqType};
+use crate::vfio::{VfioDevice, VfioIrqType, VfioPciConfig};
 
 const PCI_VENDOR_ID: u32 = 0x0;
 const INTEL_VENDOR_ID: u16 = 0x8086;
 const PCI_COMMAND: u32 = 0x4;
 const PCI_COMMAND_MEMORY: u8 = 0x2;
 const PCI_BASE_CLASS_CODE: u32 = 0x0B;
-
+const PCI_INTERRUPT_NUM: u32 = 0x3C;
 const PCI_INTERRUPT_PIN: u32 = 0x3D;
-
-struct VfioPciConfig {
-    device: Arc<VfioDevice>,
-}
-
-impl VfioPciConfig {
-    fn new(device: Arc<VfioDevice>) -> Self {
-        VfioPciConfig { device }
-    }
-
-    #[allow(dead_code)]
-    fn read_config_byte(&self, offset: u32) -> u8 {
-        let mut data: [u8; 1] = [0];
-        self.device
-            .region_read(VFIO_PCI_CONFIG_REGION_INDEX, data.as_mut(), offset.into());
-
-        data[0]
-    }
-
-    #[allow(dead_code)]
-    fn read_config_word(&self, offset: u32) -> u16 {
-        let mut data: [u8; 2] = [0, 0];
-        self.device
-            .region_read(VFIO_PCI_CONFIG_REGION_INDEX, data.as_mut(), offset.into());
-
-        u16::from_le_bytes(data)
-    }
-
-    #[allow(dead_code)]
-    fn read_config_dword(&self, offset: u32) -> u32 {
-        let mut data: [u8; 4] = [0, 0, 0, 0];
-        self.device
-            .region_read(VFIO_PCI_CONFIG_REGION_INDEX, data.as_mut(), offset.into());
-
-        u32::from_le_bytes(data)
-    }
-
-    #[allow(dead_code)]
-    fn write_config_byte(&self, buf: u8, offset: u32) {
-        self.device.region_write(
-            VFIO_PCI_CONFIG_REGION_INDEX,
-            ::std::slice::from_ref(&buf),
-            offset.into(),
-        )
-    }
-
-    #[allow(dead_code)]
-    fn write_config_word(&self, buf: u16, offset: u32) {
-        let data: [u8; 2] = buf.to_le_bytes();
-        self.device
-            .region_write(VFIO_PCI_CONFIG_REGION_INDEX, &data, offset.into())
-    }
-
-    #[allow(dead_code)]
-    fn write_config_dword(&self, buf: u32, offset: u32) {
-        let data: [u8; 4] = buf.to_le_bytes();
-        self.device
-            .region_write(VFIO_PCI_CONFIG_REGION_INDEX, &data, offset.into())
-    }
-}
 
 const PCI_CAPABILITY_LIST: u32 = 0x34;
 const PCI_CAP_ID_MSI: u8 = 0x05;
@@ -498,6 +440,7 @@ enum DeviceData {
 pub struct VfioPciDevice {
     device: Arc<VfioDevice>,
     config: VfioPciConfig,
+    bus_number: Option<u8>,
     pci_address: Option<PciAddress>,
     interrupt_evt: Option<Event>,
     interrupt_resample_evt: Option<Event>,
@@ -517,6 +460,7 @@ impl VfioPciDevice {
     /// Constructs a new Vfio Pci device for the give Vfio device
     pub fn new(
         device: VfioDevice,
+        bus_number: Option<u8>,
         vfio_device_socket_msi: Tube,
         vfio_device_socket_msix: Tube,
         vfio_device_socket_mem: Tube,
@@ -560,6 +504,7 @@ impl VfioPciDevice {
         VfioPciDevice {
             device: dev,
             config,
+            bus_number,
             pci_address: None,
             interrupt_evt: None,
             interrupt_resample_evt: None,
@@ -885,7 +830,15 @@ impl PciDevice for VfioPciDevice {
         resources: &mut SystemAllocator,
     ) -> Result<PciAddress, PciDeviceError> {
         if self.pci_address.is_none() {
-            let address = PciAddress::from_string(self.device.device_name());
+            let mut address = PciAddress::from_string(self.device.device_name());
+            if let Some(bus_num) = self.bus_number {
+                // Caller specify pcie bus number for hotplug device
+                address.bus = bus_num;
+                // devfn should be 0, otherwise pcie root port couldn't detect it
+                address.dev = 0;
+                address.func = 0;
+            }
+
             if resources.reserve_pci(
                 Alloc::PciBar {
                     bus: address.bus,
@@ -921,19 +874,38 @@ impl PciDevice for VfioPciDevice {
 
     fn assign_irq(
         &mut self,
-        irq_evt: Event,
-        irq_resample_evt: Event,
-        irq_num: u32,
-        _irq_pin: PciInterruptPin,
-    ) {
-        self.config.write_config_byte(irq_num as u8, 0x3C);
-        self.interrupt_evt = Some(irq_evt);
-        self.interrupt_resample_evt = Some(irq_resample_evt);
+        irq_evt: &Event,
+        irq_resample_evt: &Event,
+        _irq_num: Option<u32>,
+    ) -> Option<(u32, PciInterruptPin)> {
+        // Keep event/resample event references.
+        self.interrupt_evt = Some(irq_evt.try_clone().ok()?);
+        self.interrupt_resample_evt = Some(irq_resample_evt.try_clone().ok()?);
+
+        // Is INTx configured?
+        let pin = match self.config.read_config_byte(PCI_INTERRUPT_PIN) {
+            1 => Some(PciInterruptPin::IntA),
+            2 => Some(PciInterruptPin::IntB),
+            3 => Some(PciInterruptPin::IntC),
+            4 => Some(PciInterruptPin::IntD),
+            _ => None,
+        }?;
 
         // enable INTX
-        if self.config.read_config_byte(PCI_INTERRUPT_PIN) > 0 {
-            self.enable_intx();
-        }
+        self.enable_intx();
+
+        // TODO: replace sysfs/irq value parsing with vfio interface
+        //       reporting host allocated interrupt number and type.
+        let mut path = PathBuf::from("/sys/bus/pci/devices");
+        path.push(self.device.device_name());
+        path.push("irq");
+        let gsi = fs::read_to_string(path)
+            .map(|v| v.trim().parse::<u32>().unwrap_or(0))
+            .unwrap_or(0);
+
+        self.config.write_config_byte(gsi as u8, PCI_INTERRUPT_NUM);
+
+        Some((gsi, pin))
     }
 
     fn allocate_io_bars(

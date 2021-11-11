@@ -12,7 +12,7 @@
 if [[ ! -z "${DEBUG_SSH_KEY}" ]]; then
   echo "${DEBUG_SSH_KEY}" >>~/.ssh/authorized_keys
   external_ip=$(
-    curl -s -H "Metadata-Flavor: Google"
+    curl -s -H "Metadata-Flavor: Google" \
     http://metadata/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip
   )
   echo "SSH Debug enabled. Connect to: kbuilder@${external_ip}"
@@ -24,8 +24,24 @@ setup_source() {
     exit 1
   fi
 
+  mkdir -p "${KOKORO_ARTIFACTS_DIR}/logs"
+
   cd "${KOKORO_ARTIFACTS_DIR}/git/crosvm"
+
+  echo "Fetching Submodules..."
   git submodule update --init
+
+  echo "Rebasing changes to ToT"
+  # We cannot use the original origin that kokoro used, as we no longer have
+  # access the GoB host via rpc://.
+  git remote remove origin
+  git remote add origin https://chromium.googlesource.com/chromiumos/platform/crosvm
+  git fetch -q origin
+
+  # For some mysterious reason symlinks show up as modified, which prevents
+  # us from rebasing the changes.
+  git checkout -f
+  git rebase origin/main
 }
 
 cleanup() {
@@ -50,3 +66,7 @@ setup_source || {
 # Set logs directory so we can copy them to sponge
 export CROSVM_BUILDER_LOGS_DIR="${KOKORO_ARTIFACTS_DIR}/logs"
 cd "${KOKORO_ARTIFACTS_DIR}/git/crosvm"
+
+# Log how long it takes to pull the docker container
+echo "Downloading dev container image"
+time ./tools/dev_container echo "done"
