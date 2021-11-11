@@ -25,7 +25,9 @@ rust_library {
         "libcros_async",
         "libdata_model",
         "liblibc",
+        "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }
 
 rust_defaults {
@@ -44,7 +46,9 @@ rust_defaults {
         "libcros_async",
         "libdata_model",
         "liblibc",
+        "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }
 
 rust_test_host {

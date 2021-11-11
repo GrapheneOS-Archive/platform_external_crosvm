@@ -23,7 +23,9 @@ rust_library {
         "libbase_rust",
         "liblibc",
         "libserde",
+        "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }
 
 rust_defaults {
@@ -40,7 +42,9 @@ rust_defaults {
         "libbase_rust",
         "liblibc",
         "libserde",
+        "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }
 
 rust_test_host {

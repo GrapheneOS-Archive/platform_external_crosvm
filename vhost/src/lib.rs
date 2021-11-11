@@ -10,50 +10,43 @@ pub use crate::net::NetT;
 pub use crate::vsock::Vsock;
 
 use std::alloc::Layout;
-use std::fmt::{self, Display};
 use std::io::Error as IoError;
-use std::mem;
 use std::ptr::null;
 
 use assertions::const_assert;
 use base::{ioctl, ioctl_with_mut_ref, ioctl_with_ptr, ioctl_with_ref};
 use base::{AsRawDescriptor, Event, LayoutAllocation};
+use remain::sorted;
+use thiserror::Error;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
-#[derive(Debug)]
+#[sorted]
+#[derive(Error, Debug)]
 pub enum Error {
-    /// Error opening vhost device.
-    VhostOpen(IoError),
-    /// Error while running ioctl.
-    IoctlError(IoError),
-    /// Invalid queue.
-    InvalidQueue,
-    /// Invalid descriptor table address.
-    DescriptorTableAddress(GuestMemoryError),
-    /// Invalid used address.
-    UsedAddress(GuestMemoryError),
     /// Invalid available address.
+    #[error("invalid available address: {0}")]
     AvailAddress(GuestMemoryError),
+    /// Invalid descriptor table address.
+    #[error("invalid descriptor table address: {0}")]
+    DescriptorTableAddress(GuestMemoryError),
+    /// Invalid queue.
+    #[error("invalid queue")]
+    InvalidQueue,
+    /// Error while running ioctl.
+    #[error("failed to run ioctl: {0}")]
+    IoctlError(IoError),
     /// Invalid log address.
+    #[error("invalid log address: {0}")]
     LogAddress(GuestMemoryError),
+    /// Invalid used address.
+    #[error("invalid used address: {0}")]
+    UsedAddress(GuestMemoryError),
+    /// Error opening vhost device.
+    #[error("failed to open vhost device: {0}")]
+    VhostOpen(IoError),
 }
+
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            VhostOpen(e) => write!(f, "failed to open vhost device: {}", e),
-            IoctlError(e) => write!(f, "failed to run ioctl: {}", e),
-            InvalidQueue => write!(f, "invalid queue"),
-            DescriptorTableAddress(e) => write!(f, "invalid descriptor table address: {}", e),
-            UsedAddress(e) => write!(f, "invalid used address: {}", e),
-            AvailAddress(e) => write!(f, "invalid available address: {}", e),
-            LogAddress(e) => write!(f, "invalid log address: {}", e),
-        }
-    }
-}
 
 fn ioctl_result<T>() -> Result<T> {
     Err(Error::IoctlError(IoError::last_os_error()))
@@ -64,15 +57,24 @@ fn ioctl_result<T>() -> Result<T> {
 /// transfer.  The device itself only needs to deal with setting up the kernel driver and
 /// managing the control channel.
 pub trait Vhost: AsRawDescriptor + std::marker::Sized {
-    /// Get the guest memory mapping.
-    fn mem(&self) -> &GuestMemory;
-
     /// Set the current process as the owner of this file descriptor.
     /// This must be run before any other vhost ioctls.
     fn set_owner(&self) -> Result<()> {
         // This ioctl is called on a valid vhost_net fd and has its
         // return value checked.
         let ret = unsafe { ioctl(self, virtio_sys::VHOST_SET_OWNER()) };
+        if ret < 0 {
+            return ioctl_result();
+        }
+        Ok(())
+    }
+
+    /// Give up ownership and reset the device to default values. Allows a subsequent call to
+    /// `set_owner` to succeed.
+    fn reset_owner(&self) -> Result<()> {
+        // This ioctl is called on a valid vhost fd and has its
+        // return value checked.
+        let ret = unsafe { ioctl(self, virtio_sys::VHOST_RESET_OWNER()) };
         if ret < 0 {
             return ioctl_result();
         }
@@ -109,14 +111,14 @@ pub trait Vhost: AsRawDescriptor + std::marker::Sized {
     }
 
     /// Set the guest memory mappings for vhost to use.
-    fn set_mem_table(&self) -> Result<()> {
-        const SIZE_OF_MEMORY: usize = mem::size_of::<virtio_sys::vhost_memory>();
-        const SIZE_OF_REGION: usize = mem::size_of::<virtio_sys::vhost_memory_region>();
-        const ALIGN_OF_MEMORY: usize = mem::align_of::<virtio_sys::vhost_memory>();
-        const ALIGN_OF_REGION: usize = mem::align_of::<virtio_sys::vhost_memory_region>();
+    fn set_mem_table(&self, mem: &GuestMemory) -> Result<()> {
+        const SIZE_OF_MEMORY: usize = std::mem::size_of::<virtio_sys::vhost_memory>();
+        const SIZE_OF_REGION: usize = std::mem::size_of::<virtio_sys::vhost_memory_region>();
+        const ALIGN_OF_MEMORY: usize = std::mem::align_of::<virtio_sys::vhost_memory>();
+        const ALIGN_OF_REGION: usize = std::mem::align_of::<virtio_sys::vhost_memory_region>();
         const_assert!(ALIGN_OF_MEMORY >= ALIGN_OF_REGION);
 
-        let num_regions = self.mem().num_regions() as usize;
+        let num_regions = mem.num_regions() as usize;
         let size = SIZE_OF_MEMORY + num_regions * SIZE_OF_REGION;
         let layout = Layout::from_size_align(size, ALIGN_OF_MEMORY).expect("impossible layout");
         let mut allocation = LayoutAllocation::zeroed(layout);
@@ -130,17 +132,15 @@ pub trait Vhost: AsRawDescriptor + std::marker::Sized {
         // we correctly specify the size to match the amount of backing memory.
         let vhost_regions = unsafe { vhost_memory.regions.as_mut_slice(num_regions as usize) };
 
-        let _ = self
-            .mem()
-            .with_regions::<_, ()>(|index, guest_addr, size, host_addr, _, _| {
-                vhost_regions[index] = virtio_sys::vhost_memory_region {
-                    guest_phys_addr: guest_addr.offset() as u64,
-                    memory_size: size as u64,
-                    userspace_addr: host_addr as u64,
-                    flags_padding: 0u64,
-                };
-                Ok(())
-            });
+        let _ = mem.with_regions::<_, ()>(|index, guest_addr, size, host_addr, _, _| {
+            vhost_regions[index] = virtio_sys::vhost_memory_region {
+                guest_phys_addr: guest_addr.offset() as u64,
+                memory_size: size as u64,
+                userspace_addr: host_addr as u64,
+                flags_padding: 0u64,
+            };
+            Ok(())
+        });
 
         // This ioctl is called with a pointer that is valid for the lifetime
         // of this function. The kernel will make its own copy of the memory
@@ -179,6 +179,7 @@ pub trait Vhost: AsRawDescriptor + std::marker::Sized {
     #[allow(clippy::if_same_then_else)]
     fn is_valid(
         &self,
+        mem: &GuestMemory,
         queue_max_size: u16,
         queue_size: u16,
         desc_addr: GuestAddress,
@@ -192,17 +193,17 @@ pub trait Vhost: AsRawDescriptor + std::marker::Sized {
             false
         } else if desc_addr
             .checked_add(desc_table_size as u64)
-            .map_or(true, |v| !self.mem().address_in_range(v))
+            .map_or(true, |v| !mem.address_in_range(v))
         {
             false
         } else if avail_addr
             .checked_add(avail_ring_size as u64)
-            .map_or(true, |v| !self.mem().address_in_range(v))
+            .map_or(true, |v| !mem.address_in_range(v))
         {
             false
         } else if used_addr
             .checked_add(used_ring_size as u64)
-            .map_or(true, |v| !self.mem().address_in_range(v))
+            .map_or(true, |v| !mem.address_in_range(v))
         {
             false
         } else {
@@ -223,6 +224,7 @@ pub trait Vhost: AsRawDescriptor + std::marker::Sized {
     /// * `log_addr` - Optional address for logging.
     fn set_vring_addr(
         &self,
+        mem: &GuestMemory,
         queue_max_size: u16,
         queue_size: u16,
         queue_index: usize,
@@ -234,25 +236,29 @@ pub trait Vhost: AsRawDescriptor + std::marker::Sized {
     ) -> Result<()> {
         // TODO(smbarber): Refactor out virtio from crosvm so we can
         // validate a Queue struct directly.
-        if !self.is_valid(queue_max_size, queue_size, desc_addr, used_addr, avail_addr) {
+        if !self.is_valid(
+            mem,
+            queue_max_size,
+            queue_size,
+            desc_addr,
+            used_addr,
+            avail_addr,
+        ) {
             return Err(Error::InvalidQueue);
         }
 
-        let desc_addr = self
-            .mem()
+        let desc_addr = mem
             .get_host_address(desc_addr)
             .map_err(Error::DescriptorTableAddress)?;
-        let used_addr = self
-            .mem()
+        let used_addr = mem
             .get_host_address(used_addr)
             .map_err(Error::UsedAddress)?;
-        let avail_addr = self
-            .mem()
+        let avail_addr = mem
             .get_host_address(avail_addr)
             .map_err(Error::AvailAddress)?;
         let log_addr = match log_addr {
             None => null(),
-            Some(a) => self.mem().get_host_address(a).map_err(Error::LogAddress)?,
+            Some(a) => mem.get_host_address(a).map_err(Error::LogAddress)?,
         };
 
         let vring_addr = virtio_sys::vhost_vring_addr {
@@ -293,6 +299,27 @@ pub trait Vhost: AsRawDescriptor + std::marker::Sized {
         Ok(())
     }
 
+    /// Gets the index of the next available descriptor in the queue.
+    ///
+    /// # Arguments
+    /// * `queue_index` - Index of the queue to query.
+    fn get_vring_base(&self, queue_index: usize) -> Result<u16> {
+        let mut vring_state = virtio_sys::vhost_vring_state {
+            index: queue_index as u32,
+            num: 0,
+        };
+
+        // Safe because this will only modify `vring_state` and we check the return value.
+        let ret = unsafe {
+            ioctl_with_mut_ref(self, virtio_sys::VHOST_GET_VRING_BASE(), &mut vring_state)
+        };
+        if ret < 0 {
+            return ioctl_result();
+        }
+
+        Ok(vring_state.num as u16)
+    }
+
     /// Set the event to trigger when buffers have been used by the host.
     ///
     /// # Arguments
@@ -307,6 +334,26 @@ pub trait Vhost: AsRawDescriptor + std::marker::Sized {
         // This ioctl is called on a valid vhost_net fd and has its
         // return value checked.
         let ret = unsafe { ioctl_with_ref(self, virtio_sys::VHOST_SET_VRING_CALL(), &vring_file) };
+        if ret < 0 {
+            return ioctl_result();
+        }
+        Ok(())
+    }
+
+    /// Set the event to trigger to signal an error.
+    ///
+    /// # Arguments
+    /// * `queue_index` - Index of the queue to modify.
+    /// * `event` - Event to trigger.
+    fn set_vring_err(&self, queue_index: usize, event: &Event) -> Result<()> {
+        let vring_file = virtio_sys::vhost_vring_file {
+            index: queue_index as u32,
+            event: event.as_raw_descriptor(),
+        };
+
+        // This ioctl is called on a valid vhost_net fd and has its
+        // return value checked.
+        let ret = unsafe { ioctl_with_ref(self, virtio_sys::VHOST_SET_VRING_ERR(), &vring_file) };
         if ret < 0 {
             return ioctl_result();
         }
@@ -360,8 +407,7 @@ mod tests {
     }
 
     fn create_fake_vhost_net() -> FakeNet<FakeTap> {
-        let gm = create_guest_memory().unwrap();
-        FakeNet::<FakeTap>::new(&PathBuf::from(""), &gm).unwrap()
+        FakeNet::<FakeTap>::new(&PathBuf::from("")).unwrap()
     }
 
     #[test]
@@ -393,7 +439,8 @@ mod tests {
     #[test]
     fn set_mem_table() {
         let vhost_net = create_fake_vhost_net();
-        let res = vhost_net.set_mem_table();
+        let gm = create_guest_memory().unwrap();
+        let res = vhost_net.set_mem_table(&gm);
         assert_ok_or_known_failure(res);
     }
 
@@ -407,7 +454,9 @@ mod tests {
     #[test]
     fn set_vring_addr() {
         let vhost_net = create_fake_vhost_net();
+        let gm = create_guest_memory().unwrap();
         let res = vhost_net.set_vring_addr(
+            &gm,
             1,
             1,
             0,

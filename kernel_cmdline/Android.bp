@@ -22,7 +22,9 @@ rust_defaults {
     edition: "2018",
     rustlibs: [
         "liblibc",
+        "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }
 
 rust_test_host {
@@ -49,5 +51,7 @@ rust_library {
     edition: "2018",
     rustlibs: [
         "liblibc",
+        "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }

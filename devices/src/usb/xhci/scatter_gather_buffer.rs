@@ -6,35 +6,28 @@ use super::xhci_abi::{
     AddressedTrb, Error as TrbError, NormalTrb, TransferDescriptor, TrbCast, TrbType,
 };
 use bit_field::Error as BitFieldError;
-use std::fmt::{self, Display};
+use remain::sorted;
+use thiserror::Error;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
-#[derive(Debug)]
+#[sorted]
+#[derive(Error, Debug)]
 pub enum Error {
-    ReadGuestMemory(GuestMemoryError),
-    WriteGuestMemory(GuestMemoryError),
-    UnknownTrbType(BitFieldError),
-    CastTrb(TrbError),
+    #[error("should not build buffer from trb type: {0:?}")]
     BadTrbType(TrbType),
+    #[error("cannot cast trb: {0}")]
+    CastTrb(TrbError),
+    #[error("immediate data longer than allowed: {0}")]
     ImmediateDataTooLong(usize),
+    #[error("cannot read guest memory: {0}")]
+    ReadGuestMemory(GuestMemoryError),
+    #[error("unknown trb type: {0}")]
+    UnknownTrbType(BitFieldError),
+    #[error("cannot write guest memory: {0}")]
+    WriteGuestMemory(GuestMemoryError),
 }
 
 type Result<T> = std::result::Result<T, Error>;
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            ReadGuestMemory(e) => write!(f, "cannot read guest memory: {}", e),
-            WriteGuestMemory(e) => write!(f, "cannot write guest memory: {}", e),
-            UnknownTrbType(e) => write!(f, "unknown trb type: {}", e),
-            CastTrb(e) => write!(f, "cannot cast trb: {}", e),
-            BadTrbType(t) => write!(f, "should not build buffer from trb type: {:?}", t),
-            ImmediateDataTooLong(l) => write!(f, "immediate data longer than allowed: {}", l),
-        }
-    }
-}
 
 /// See xHCI spec 3.2.8 for scatter/gather transfer. It's used in bulk/interrupt transfers. See
 /// 3.2.10 for details.
@@ -94,7 +87,7 @@ impl ScatterGatherBuffer {
         let mut total_size = 0usize;
         let mut offset = 0;
         for atrb in &self.td {
-            let (guest_address, len) = self.get_trb_data(&atrb)?;
+            let (guest_address, len) = self.get_trb_data(atrb)?;
             let buffer_len = {
                 if offset == buffer.len() {
                     return Ok(total_size);
@@ -121,7 +114,7 @@ impl ScatterGatherBuffer {
         let mut total_size = 0usize;
         let mut offset = 0;
         for atrb in &self.td {
-            let (guest_address, len) = self.get_trb_data(&atrb)?;
+            let (guest_address, len) = self.get_trb_data(atrb)?;
             let buffer_len = {
                 if offset == buffer.len() {
                     return Ok(total_size);

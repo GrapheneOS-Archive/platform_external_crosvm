@@ -24,8 +24,12 @@ rust_defaults {
         "libcros_async",
         "libsync_rust",
         "libsys_util",
+        "libthiserror",
     ],
-    proc_macros: ["libasync_trait"],
+    proc_macros: [
+        "libasync_trait",
+        "libremain",
+    ],
 }
 
 rust_test_host {
@@ -54,6 +58,10 @@ rust_library {
         "libcros_async",
         "libsync_rust",
         "libsys_util",
+        "libthiserror",
     ],
-    proc_macros: ["libasync_trait"],
+    proc_macros: [
+        "libasync_trait",
+        "libremain",
+    ],
 }

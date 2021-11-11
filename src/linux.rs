@@ -7,15 +7,13 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 #[cfg(feature = "gpu")]
 use std::env;
-use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
-use std::io::{self, stdin};
+use std::io::stdin;
 use std::iter;
 use std::mem;
 use std::net::Ipv4Addr;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::ptr;
 use std::str;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
@@ -30,27 +28,36 @@ use acpi_tables::sdt::SDT;
 use crate::error::{Error, Result};
 use base::net::{UnixSeqpacket, UnixSeqpacketListener, UnlinkUnixSeqpacketListener};
 use base::*;
+use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::vfio::{VfioCommonSetup, VfioCommonTrait};
-#[cfg(feature = "gpu")]
-use devices::virtio::gpu::{DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH};
-use devices::virtio::vhost::user::{
+#[cfg(feature = "audio_cras")]
+use devices::virtio::snd::cras_backend::Parameters as CrasSndParameters;
+#[cfg(feature = "audio")]
+use devices::virtio::vhost::user::vmm::Snd as VhostUserSnd;
+use devices::virtio::vhost::user::vmm::{
     Block as VhostUserBlock, Console as VhostUserConsole, Fs as VhostUserFs,
-    Mac80211Hwsim as VhostUserMac80211Hwsim, Net as VhostUserNet, Wl as VhostUserWl,
+    Mac80211Hwsim as VhostUserMac80211Hwsim, Net as VhostUserNet, Vsock as VhostUserVsock,
+    Wl as VhostUserWl,
 };
-#[cfg(feature = "gpu")]
-use devices::virtio::EventDevice;
 use devices::virtio::{self, Console, VirtioDevice};
+#[cfg(feature = "gpu")]
+use devices::virtio::{
+    gpu::{DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH},
+    vhost::user::vmm::Gpu as VhostUserGpu,
+    EventDevice,
+};
 #[cfg(feature = "audio")]
 use devices::Ac97Dev;
 use devices::ProtectionType;
 use devices::{
-    self, IrqChip, IrqEventIndex, KvmKernelIrqChip, PciDevice, VcpuRunState, VfioContainer,
-    VfioDevice, VfioPciDevice, VirtioPciDevice,
+    self, BusDeviceObj, HostHotPlugKey, IrqChip, IrqEventIndex, KvmKernelIrqChip, PciAddress,
+    PciDevice, StubPciDevice, VcpuRunState, VfioContainer, VfioDevice, VfioPciDevice,
+    VfioPlatformDevice, VirtioPciDevice,
 };
 #[cfg(feature = "usb")]
 use devices::{HostBackendDeviceProvider, XhciController};
 use hypervisor::kvm::{Kvm, KvmVcpu, KvmVm};
-use hypervisor::{DeviceKind, HypervisorCap, Vcpu, VcpuExit, VcpuRunHandle, Vm, VmCap};
+use hypervisor::{HypervisorCap, Vcpu, VcpuExit, VcpuRunHandle, Vm, VmCap};
 use minijail::{self, Minijail};
 use net_util::{MacAddress, Tap};
 use resources::{Alloc, MmioType, SystemAllocator};
@@ -62,12 +69,11 @@ use vm_memory::{GuestAddress, GuestMemory, MemoryPolicy};
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use crate::gdb::{gdb_thread, GdbStub};
 use crate::{
-    Config, DiskOption, Executable, SharedDir, SharedDirKind, TouchDeviceOption, VhostUserFsOption,
-    VhostUserOption, VhostUserWlOption,
+    Config, DiskOption, Executable, SharedDir, SharedDirKind, TouchDeviceOption, VfioType,
+    VhostUserFsOption, VhostUserOption, VhostUserWlOption,
 };
 use arch::{
-    self, LinuxArch, RunnableLinuxVm, SerialHardware, SerialParameters, VcpuAffinity,
-    VirtioDeviceStub, VmComponents, VmImage,
+    self, LinuxArch, RunnableLinuxVm, VcpuAffinity, VirtioDeviceStub, VmComponents, VmImage,
 };
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -103,20 +109,6 @@ impl AsRef<Tube> for TaggedControlTube {
 impl AsRawDescriptor for TaggedControlTube {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.as_ref().as_raw_descriptor()
-    }
-}
-
-fn get_max_open_files() -> Result<u64> {
-    let mut buf = mem::MaybeUninit::<libc::rlimit64>::zeroed();
-
-    // Safe because this will only modify `buf` and we check the return value.
-    let res = unsafe { libc::prlimit64(0, libc::RLIMIT_NOFILE, ptr::null(), buf.as_mut_ptr()) };
-    if res == 0 {
-        // Safe because the kernel guarantees that the struct is fully initialized.
-        let limit = unsafe { buf.assume_init() };
-        Ok(limit.rlim_max)
-    } else {
-        Err(Error::GetMaxOpenFiles(io::Error::last_os_error()))
     }
 }
 
@@ -237,8 +229,10 @@ fn create_block_device(cfg: &Config, disk: &DiskOption, disk_device_tube: Tube) 
     };
     flock(&raw_image, lock_op, true).map_err(Error::DiskImageLock)?;
 
-    let dev = if disk::async_ok(&raw_image).map_err(Error::CreateDiskError)? {
-        let async_file = disk::create_async_disk_file(raw_image).map_err(Error::CreateDiskError)?;
+    info!("Trying to attach block device: {}", disk.path.display());
+    let dev = if disk::async_ok(&raw_image).map_err(Error::CreateDiskCheckAsyncOkError)? {
+        let async_file =
+            disk::create_async_disk_file(raw_image).map_err(Error::CreateAsyncDiskError)?;
         Box::new(
             virtio::BlockAsync::new(
                 virtio::base_features(cfg.protected_vm),
@@ -252,7 +246,8 @@ fn create_block_device(cfg: &Config, disk: &DiskOption, disk_device_tube: Tube) 
             .map_err(Error::BlockDeviceNew)?,
         ) as Box<dyn VirtioDevice>
     } else {
-        let disk_file = disk::create_disk_file(raw_image).map_err(Error::CreateDiskError)?;
+        let disk_file = disk::create_disk_file(raw_image, disk::MAX_NESTING_DEPTH)
+            .map_err(Error::CreateDiskError)?;
         Box::new(
             virtio::Block::new(
                 virtio::base_features(cfg.protected_vm),
@@ -269,7 +264,7 @@ fn create_block_device(cfg: &Config, disk: &DiskOption, disk_device_tube: Tube) 
 
     Ok(VirtioDeviceStub {
         dev,
-        jail: simple_jail(&cfg, "block_device")?,
+        jail: simple_jail(cfg, "block_device")?,
     })
 }
 
@@ -321,13 +316,61 @@ fn create_vhost_user_mac80211_hwsim_device(cfg: &Config, opt: &VhostUserOption) 
     })
 }
 
+#[cfg(feature = "audio")]
+fn create_vhost_user_snd_device(cfg: &Config, option: &VhostUserOption) -> DeviceResult {
+    let dev = VhostUserSnd::new(virtio::base_features(cfg.protected_vm), &option.socket)
+        .map_err(Error::VhostUserSndDeviceNew)?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        // no sandbox here because virtqueue handling is exported to a different process.
+        jail: None,
+    })
+}
+
 fn create_rng_device(cfg: &Config) -> DeviceResult {
     let dev =
         virtio::Rng::new(virtio::base_features(cfg.protected_vm)).map_err(Error::RngDeviceNew)?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "rng_device")?,
+        jail: simple_jail(cfg, "rng_device")?,
+    })
+}
+
+#[cfg(feature = "audio_cras")]
+fn create_cras_snd_device(cfg: &Config, cras_snd: CrasSndParameters) -> DeviceResult {
+    let dev = virtio::snd::cras_backend::VirtioSndCras::new(
+        virtio::base_features(cfg.protected_vm),
+        cras_snd,
+    )
+    .map_err(Error::CrasSoundDeviceNew)?;
+
+    let jail = match simple_jail(&cfg, "cras_snd_device")? {
+        Some(mut jail) => {
+            // Create a tmpfs in the device's root directory for cras_snd_device.
+            // The size is 20*1024, or 20 KB.
+            jail.mount_with_data(
+                Path::new("none"),
+                Path::new("/"),
+                "tmpfs",
+                (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as usize,
+                "size=20480",
+            )?;
+
+            let run_cras_path = Path::new("/run/cras");
+            jail.mount_bind(run_cras_path, run_cras_path, true)?;
+
+            add_current_user_to_jail(&mut jail)?;
+
+            Some(jail)
+        }
+        None => None,
+    };
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail,
     })
 }
 
@@ -338,7 +381,7 @@ fn create_tpm_device(cfg: &Config) -> DeviceResult {
     use std::process;
 
     let tpm_storage: PathBuf;
-    let mut tpm_jail = simple_jail(&cfg, "tpm_device")?;
+    let mut tpm_jail = simple_jail(cfg, "tpm_device")?;
 
     match &mut tpm_jail {
         Some(jail) => {
@@ -352,7 +395,7 @@ fn create_tpm_device(cfg: &Config) -> DeviceResult {
                 "size=20480",
             )?;
 
-            let crosvm_ids = add_crosvm_user_to_jail(jail, "tpm")?;
+            let crosvm_ids = add_current_user_to_jail(jail)?;
 
             let pid = process::id();
             let tpm_pid_dir = format!("/run/vm/tpm.{}", pid);
@@ -403,7 +446,7 @@ fn create_single_touch_device(
     .map_err(Error::InputDeviceNew)?;
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device")?,
+        jail: simple_jail(cfg, "input_device")?,
     })
 }
 
@@ -432,7 +475,7 @@ fn create_multi_touch_device(
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device")?,
+        jail: simple_jail(cfg, "input_device")?,
     })
 }
 
@@ -458,7 +501,7 @@ fn create_trackpad_device(
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device")?,
+        jail: simple_jail(cfg, "input_device")?,
     })
 }
 
@@ -473,7 +516,7 @@ fn create_mouse_device<T: IntoUnixStream>(cfg: &Config, mouse_socket: T, idx: u3
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device")?,
+        jail: simple_jail(cfg, "input_device")?,
     })
 }
 
@@ -492,7 +535,7 @@ fn create_keyboard_device<T: IntoUnixStream>(
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device")?,
+        jail: simple_jail(cfg, "input_device")?,
     })
 }
 
@@ -511,7 +554,7 @@ fn create_switches_device<T: IntoUnixStream>(
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device")?,
+        jail: simple_jail(cfg, "input_device")?,
     })
 }
 
@@ -527,7 +570,7 @@ fn create_vinput_device(cfg: &Config, dev_path: &Path) -> DeviceResult {
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "input_device")?,
+        jail: simple_jail(cfg, "input_device")?,
     })
 }
 
@@ -537,7 +580,7 @@ fn create_balloon_device(cfg: &Config, tube: Tube) -> DeviceResult {
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "balloon_device")?,
+        jail: simple_jail(cfg, "balloon_device")?,
     })
 }
 
@@ -561,7 +604,7 @@ fn create_tap_net_device(cfg: &Config, tap_fd: RawDescriptor) -> DeviceResult {
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "net_device")?,
+        jail: simple_jail(cfg, "net_device")?,
     })
 }
 
@@ -570,7 +613,6 @@ fn create_net_device(
     host_ip: Ipv4Addr,
     netmask: Ipv4Addr,
     mac_address: MacAddress,
-    mem: &GuestMemory,
 ) -> DeviceResult {
     let mut vq_pairs = cfg.net_vq_pairs.unwrap_or(1);
     let vcpu_count = cfg.vcpu_count.unwrap_or(1);
@@ -587,7 +629,6 @@ fn create_net_device(
             host_ip,
             netmask,
             mac_address,
-            mem,
         )
         .map_err(Error::VhostNetDeviceNew)?;
         Box::new(dev) as Box<dyn VirtioDevice>
@@ -605,7 +646,7 @@ fn create_net_device(
 
     Ok(VirtioDeviceStub {
         dev,
-        jail: simple_jail(&cfg, policy)?,
+        jail: simple_jail(cfg, policy)?,
     })
 }
 
@@ -620,11 +661,46 @@ fn create_vhost_user_net_device(cfg: &Config, opt: &VhostUserOption) -> DeviceRe
     })
 }
 
+fn create_vhost_user_vsock_device(cfg: &Config, opt: &VhostUserOption) -> DeviceResult {
+    let dev = VhostUserVsock::new(virtio::base_features(cfg.protected_vm), &opt.socket)
+        .map_err(Error::VhostUserVsockDeviceNew)?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        // no sandbox here because virtqueue handling is exported to a different process.
+        jail: None,
+    })
+}
+
 fn create_vhost_user_wl_device(cfg: &Config, opt: &VhostUserWlOption) -> DeviceResult {
     // The crosvm wl device expects us to connect the tube before it will accept a vhost-user
     // connection.
     let dev = VhostUserWl::new(virtio::base_features(cfg.protected_vm), &opt.socket)
         .map_err(Error::VhostUserWlDeviceNew)?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        // no sandbox here because virtqueue handling is exported to a different process.
+        jail: None,
+    })
+}
+
+#[cfg(feature = "gpu")]
+fn create_vhost_user_gpu_device(
+    cfg: &Config,
+    opt: &VhostUserOption,
+    host_tube: Tube,
+    device_tube: Tube,
+) -> DeviceResult {
+    // The crosvm gpu device expects us to connect the tube before it will accept a vhost-user
+    // connection.
+    let dev = VhostUserGpu::new(
+        virtio::base_features(cfg.protected_vm),
+        &opt.socket,
+        host_tube,
+        device_tube,
+    )
+    .map_err(Error::VhostUserGpuDeviceNew)?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
@@ -676,7 +752,7 @@ fn create_gpu_device(
         cfg.wayland_socket_paths.clone(),
     );
 
-    let jail = match simple_jail(&cfg, "gpu_device")? {
+    let jail = match simple_jail(cfg, "gpu_device")? {
         Some(mut jail) => {
             // Create a tmpfs in the device's root directory so that we can bind mount the
             // dri directory into it.  The size=67108864 is size=64*1024*1024 or size=64MB.
@@ -764,7 +840,7 @@ fn create_gpu_device(
                 jail.mount_bind(dir, dir, true)?;
             }
 
-            add_crosvm_user_to_jail(&mut jail, "gpu")?;
+            add_current_user_to_jail(&mut jail)?;
 
             // pvr driver requires read access to /proc/self/task/*/comm.
             let proc_path = Path::new("/proc");
@@ -814,7 +890,7 @@ fn create_wayland_device(
     )
     .map_err(Error::WaylandDeviceNew)?;
 
-    let jail = match simple_jail(&cfg, "wl_device")? {
+    let jail = match simple_jail(cfg, "wl_device")? {
         Some(mut jail) => {
             // Create a tmpfs in the device's root directory so that we can bind mount the wayland
             // socket directory into it. The size=67108864 is size=64*1024*1024 or size=64MB.
@@ -833,7 +909,7 @@ fn create_wayland_device(
             for dir in &wayland_socket_dirs {
                 jail.mount_bind(dir, dir, true)?;
             }
-            add_crosvm_user_to_jail(&mut jail, "Wayland")?;
+            add_current_user_to_jail(&mut jail)?;
 
             Some(jail)
         }
@@ -852,15 +928,11 @@ fn create_video_device(
     typ: devices::virtio::VideoDeviceType,
     resource_bridge: Tube,
 ) -> DeviceResult {
-    let jail = match simple_jail(&cfg, "video_device")? {
+    let jail = match simple_jail(cfg, "video_device")? {
         Some(mut jail) => {
             match typ {
-                devices::virtio::VideoDeviceType::Decoder => {
-                    add_crosvm_user_to_jail(&mut jail, "video-decoder")?
-                }
-                devices::virtio::VideoDeviceType::Encoder => {
-                    add_crosvm_user_to_jail(&mut jail, "video-encoder")?
-                }
+                devices::virtio::VideoDeviceType::Decoder => add_current_user_to_jail(&mut jail)?,
+                devices::virtio::VideoDeviceType::Encoder => add_current_user_to_jail(&mut jail)?,
             };
 
             // Create a tmpfs in the device's root directory so that we can bind mount files.
@@ -921,14 +993,14 @@ fn register_video_device(
     Ok(())
 }
 
-fn create_vhost_vsock_device(cfg: &Config, cid: u64, mem: &GuestMemory) -> DeviceResult {
+fn create_vhost_vsock_device(cfg: &Config, cid: u64) -> DeviceResult {
     let features = virtio::base_features(cfg.protected_vm);
-    let dev = virtio::vhost::Vsock::new(&cfg.vhost_vsock_device_path, features, cid, mem)
+    let dev = virtio::vhost::Vsock::new(&cfg.vhost_vsock_device_path, features, cid)
         .map_err(Error::VhostVsockDeviceNew)?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "vhost_vsock_device")?,
+        jail: simple_jail(cfg, "vhost_vsock_device")?,
     })
 }
 
@@ -941,7 +1013,7 @@ fn create_fs_device(
     fs_cfg: virtio::fs::passthrough::Config,
     device_tube: Tube,
 ) -> DeviceResult {
-    let max_open_files = get_max_open_files()?;
+    let max_open_files = base::get_max_open_files().map_err(Error::GetMaxOpenFiles)?;
     let j = if cfg.sandbox {
         let seccomp_policy = cfg.seccomp_policy_dir.join("fs_device");
         let config = SandboxConfig {
@@ -981,7 +1053,7 @@ fn create_9p_device(
     tag: &str,
     mut p9_cfg: p9::Config,
 ) -> DeviceResult {
-    let max_open_files = get_max_open_files()?;
+    let max_open_files = base::get_max_open_files().map_err(Error::GetMaxOpenFiles)?;
     let (jail, root) = if cfg.sandbox {
         let seccomp_policy = cfg.seccomp_policy_dir.join("9p_device");
         let config = SandboxConfig {
@@ -1026,7 +1098,8 @@ fn create_pmem_device(
 ) -> DeviceResult {
     let fd = open_file(&disk.path, disk.read_only, false /*O_DIRECT*/)
         .map_err(|e| Error::Disk(disk.path.clone(), e.into()))?;
-    let arena_size = {
+
+    let (disk_size, arena_size) = {
         let metadata =
             std::fs::metadata(&disk.path).map_err(|e| Error::Disk(disk.path.to_path_buf(), e))?;
         let disk_len = metadata.len();
@@ -1041,9 +1114,12 @@ fn create_pmem_device(
         } else {
             0
         };
-        disk_len
-            .checked_add(align_adjust)
-            .ok_or(Error::PmemDeviceImageTooBig)?
+        (
+            disk_len,
+            disk_len
+                .checked_add(align_adjust)
+                .ok_or(Error::PmemDeviceImageTooBig)?,
+        )
     };
 
     let protection = {
@@ -1057,11 +1133,25 @@ fn create_pmem_device(
     let arena = {
         // Conversion from u64 to usize may fail on 32bit system.
         let arena_size = usize::try_from(arena_size).map_err(|_| Error::PmemDeviceImageTooBig)?;
+        let disk_size = usize::try_from(disk_size).map_err(|_| Error::PmemDeviceImageTooBig)?;
 
         let mut arena = MemoryMappingArena::new(arena_size).map_err(Error::ReservePmemMemory)?;
         arena
-            .add_fd_offset_protection(0, arena_size, &fd, 0, protection)
+            .add_fd_offset_protection(0, disk_size, &fd, 0, protection)
             .map_err(Error::ReservePmemMemory)?;
+
+        // If the disk is not a multiple of the page size, the OS will fill the remaining part
+        // of the page with zeroes. However, the anonymous mapping added below must start on a
+        // page boundary, so round up the size before calculating the offset of the anon region.
+        let disk_size = round_up_to_page_size(disk_size);
+
+        if arena_size > disk_size {
+            // Add an anonymous region with the same protection as the disk mapping if the arena
+            // size was aligned.
+            arena
+                .add_anon_protection(disk_size, arena_size - disk_size, protection)
+                .map_err(Error::ReservePmemMemory)?;
+        }
         arena
     };
 
@@ -1097,7 +1187,7 @@ fn create_pmem_device(
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev) as Box<dyn VirtioDevice>,
-        jail: simple_jail(&cfg, "pmem_device")?,
+        jail: simple_jail(cfg, "pmem_device")?,
     })
 }
 
@@ -1115,7 +1205,7 @@ fn create_iommu_device(
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "iommu_device")?,
+        jail: simple_jail(cfg, "iommu_device")?,
     })
 }
 
@@ -1126,7 +1216,7 @@ fn create_console_device(cfg: &Config, param: &SerialParameters) -> DeviceResult
         .create_serial_device::<Console>(cfg.protected_vm, &evt, &mut keep_rds)
         .map_err(Error::CreateConsole)?;
 
-    let jail = match simple_jail(&cfg, "serial")? {
+    let jail = match simple_jail(cfg, "serial")? {
         Some(mut jail) => {
             // Create a tmpfs in the device's root directory so that we can bind mount the
             // log socket directory into it.
@@ -1138,7 +1228,7 @@ fn create_console_device(cfg: &Config, param: &SerialParameters) -> DeviceResult
                 (libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_NOSUID) as usize,
                 "size=67108864",
             )?;
-            add_crosvm_user_to_jail(&mut jail, "serial")?;
+            add_current_user_to_jail(&mut jail)?;
             let res = param.add_bind_mounts(&mut jail);
             if res.is_err() {
                 error!("failed to add bind mounts for console device");
@@ -1161,7 +1251,7 @@ fn create_sound_device(path: &Path, cfg: &Config) -> DeviceResult {
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: simple_jail(&cfg, "vios_audio_device")?,
+        jail: simple_jail(cfg, "vios_audio_device")?,
     })
 }
 
@@ -1174,6 +1264,7 @@ fn create_virtio_devices(
     _exit_evt: &Event,
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
+    vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
     balloon_device_tube: Tube,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
@@ -1218,6 +1309,13 @@ fn create_virtio_devices(
 
     devs.push(create_rng_device(cfg)?);
 
+    #[cfg(feature = "audio_cras")]
+    {
+        if let Some(cras_snd) = &cfg.cras_snd {
+            devs.push(create_cras_snd_device(cfg, cras_snd.clone())?);
+        }
+    }
+
     #[cfg(feature = "tpm")]
     {
         if cfg.software_tpm {
@@ -1258,7 +1356,7 @@ fn create_virtio_devices(
     }
 
     for dev_path in &cfg.virtio_input_evdevs {
-        devs.push(create_vinput_device(cfg, &dev_path)?);
+        devs.push(create_vinput_device(cfg, dev_path)?);
     }
 
     devs.push(create_balloon_device(cfg, balloon_device_tube)?);
@@ -1274,21 +1372,29 @@ fn create_virtio_devices(
         if !cfg.vhost_user_net.is_empty() {
             return Err(Error::VhostUserNetWithNetArgs);
         }
-        devs.push(create_net_device(
-            cfg,
-            host_ip,
-            netmask,
-            mac_address,
-            vm.get_memory(),
-        )?);
+        devs.push(create_net_device(cfg, host_ip, netmask, mac_address)?);
     }
 
     for net in &cfg.vhost_user_net {
         devs.push(create_vhost_user_net_device(cfg, net)?);
     }
 
+    for vsock in &cfg.vhost_user_vsock {
+        devs.push(create_vhost_user_vsock_device(cfg, vsock)?);
+    }
+
     for opt in &cfg.vhost_user_wl {
         devs.push(create_vhost_user_wl_device(cfg, opt)?);
+    }
+
+    #[cfg(feature = "gpu")]
+    for (opt, (host_tube, device_tube)) in cfg.vhost_user_gpu.iter().zip(vhost_user_gpu_tubes) {
+        devs.push(create_vhost_user_gpu_device(
+            cfg,
+            opt,
+            host_tube,
+            device_tube,
+        )?);
     }
 
     #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
@@ -1364,7 +1470,7 @@ fn create_virtio_devices(
                 .map_err(Error::InputDeviceNew)?;
                 devs.push(VirtioDeviceStub {
                     dev: Box::new(dev),
-                    jail: simple_jail(&cfg, "input_device")?,
+                    jail: simple_jail(cfg, "input_device")?,
                 });
                 event_devices.push(EventDevice::touchscreen(event_device_socket));
             }
@@ -1381,7 +1487,7 @@ fn create_virtio_devices(
                 .map_err(Error::InputDeviceNew)?;
                 devs.push(VirtioDeviceStub {
                     dev: Box::new(dev),
-                    jail: simple_jail(&cfg, "input_device")?,
+                    jail: simple_jail(cfg, "input_device")?,
                 });
                 event_devices.push(EventDevice::keyboard(event_device_socket));
             }
@@ -1424,11 +1530,16 @@ fn create_virtio_devices(
     }
 
     if let Some(cid) = cfg.cid {
-        devs.push(create_vhost_vsock_device(cfg, cid, vm.get_memory())?);
+        devs.push(create_vhost_vsock_device(cfg, cid)?);
     }
 
     for vhost_user_fs in &cfg.vhost_user_fs {
-        devs.push(create_vhost_user_fs_device(cfg, &vhost_user_fs)?);
+        devs.push(create_vhost_user_fs_device(cfg, vhost_user_fs)?);
+    }
+
+    #[cfg(feature = "audio")]
+    for vhost_user_snd in &cfg.vhost_user_snd {
+        devs.push(create_vhost_user_snd_device(cfg, vhost_user_snd)?);
     }
 
     for shared_dir in &cfg.shared_dirs {
@@ -1455,13 +1566,13 @@ fn create_virtio_devices(
     if let Some(vhost_user_mac80211_hwsim) = &cfg.vhost_user_mac80211_hwsim {
         devs.push(create_vhost_user_mac80211_hwsim_device(
             cfg,
-            &vhost_user_mac80211_hwsim,
+            vhost_user_mac80211_hwsim,
         )?);
     }
 
     #[cfg(feature = "audio")]
     if let Some(path) = &cfg.sound {
-        devs.push(create_sound_device(&path, &cfg)?);
+        devs.push(create_sound_device(path, cfg)?);
     }
 
     Ok(devs)
@@ -1473,7 +1584,7 @@ fn create_vfio_device(
     resources: &mut SystemAllocator,
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
-    kvm_vfio_file: &SafeDescriptor,
+    hotplug: bool,
     endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
     iommu_enabled: bool,
 ) -> DeviceResult<(Box<VfioPciDevice>, Option<Minijail>)> {
@@ -1490,16 +1601,13 @@ fn create_vfio_device(
     let (vfio_host_tube_mem, vfio_device_tube_mem) = Tube::pair().map_err(Error::CreateTube)?;
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
-    let vfio_device = VfioDevice::new(
-        vfio_path,
-        vm.get_memory(),
-        &kvm_vfio_file,
-        vfio_container.clone(),
-        iommu_enabled,
-    )
-    .map_err(Error::CreateVfioDevice)?;
+    // put hotplug vfio device on Bus#1 temporary
+    let bus_num = if hotplug { Some(1) } else { None };
+    let vfio_device = VfioDevice::new(vfio_path, vm, vfio_container.clone(), iommu_enabled)
+        .map_err(Error::CreateVfioDevice)?;
     let mut vfio_pci_device = Box::new(VfioPciDevice::new(
         vfio_device,
+        bus_num,
         vfio_device_tube_msi,
         vfio_device_tube_msix,
         vfio_device_tube_mem,
@@ -1520,6 +1628,28 @@ fn create_vfio_device(
     Ok((vfio_pci_device, simple_jail(cfg, "vfio_device")?))
 }
 
+fn create_vfio_platform_device(
+    cfg: &Config,
+    vm: &impl Vm,
+    _resources: &mut SystemAllocator,
+    control_tubes: &mut Vec<TaggedControlTube>,
+    vfio_path: &Path,
+    _endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
+    iommu_enabled: bool,
+) -> DeviceResult<(VfioPlatformDevice, Option<Minijail>)> {
+    let vfio_container = VfioCommonSetup::vfio_get_container(vfio_path, iommu_enabled)
+        .map_err(Error::CreateVfioDevice)?;
+
+    let (vfio_host_tube_mem, vfio_device_tube_mem) = Tube::pair().map_err(Error::CreateTube)?;
+    control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
+
+    let vfio_device = VfioDevice::new(vfio_path, vm, vfio_container, iommu_enabled)
+        .map_err(Error::CreateVfioDevice)?;
+    let vfio_plat_dev = VfioPlatformDevice::new(vfio_device, vfio_device_tube_mem);
+
+    Ok((vfio_plat_dev, simple_jail(cfg, "vfio_platform_device")?))
+}
+
 fn create_devices(
     cfg: &Config,
     vm: &mut impl Vm,
@@ -1529,20 +1659,22 @@ fn create_devices(
     control_tubes: &mut Vec<TaggedControlTube>,
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
+    vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
     balloon_device_tube: Tube,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "usb")] usb_provider: HostBackendDeviceProvider,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
-) -> DeviceResult<Vec<(Box<dyn PciDevice>, Option<Minijail>)>> {
+) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let stubs = create_virtio_devices(
-        &cfg,
+        cfg,
         vm,
         resources,
         exit_evt,
         wayland_device_tube,
         gpu_device_tube,
+        vhost_user_gpu_tubes,
         balloon_device_tube,
         disk_device_tubes,
         pmem_device_tubes,
@@ -1550,53 +1682,73 @@ fn create_devices(
         fs_device_tubes,
     )?;
 
-    let mut pci_devices = Vec::new();
+    let mut devices = Vec::new();
 
     for stub in stubs {
         let (msi_host_tube, msi_device_tube) = Tube::pair().map_err(Error::CreateTube)?;
         control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
         let dev = VirtioPciDevice::new(vm.get_memory().clone(), stub.dev, msi_device_tube)
             .map_err(Error::VirtioPciDev)?;
-        let dev = Box::new(dev) as Box<dyn PciDevice>;
-        pci_devices.push((dev, stub.jail));
+        let dev = Box::new(dev) as Box<dyn BusDeviceObj>;
+        devices.push((dev, stub.jail));
     }
 
     #[cfg(feature = "audio")]
     for ac97_param in &cfg.ac97_parameters {
         let dev = Ac97Dev::try_new(vm.get_memory().clone(), ac97_param.clone())
             .map_err(Error::CreateAc97)?;
-        let jail = simple_jail(&cfg, dev.minijail_policy())?;
-        pci_devices.push((Box::new(dev), jail));
+        let jail = simple_jail(cfg, dev.minijail_policy())?;
+        devices.push((Box::new(dev), jail));
     }
 
     #[cfg(feature = "usb")]
     {
         // Create xhci controller.
         let usb_controller = Box::new(XhciController::new(vm.get_memory().clone(), usb_provider));
-        pci_devices.push((usb_controller, simple_jail(&cfg, "xhci")?));
+        devices.push((usb_controller, simple_jail(cfg, "xhci")?));
     }
 
     if !cfg.vfio.is_empty() {
-        let kvm_vfio_file = vm
-            .create_device(DeviceKind::Vfio)
-            .map_err(Error::CreateVfioKvmDevice)?;
-
         let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> =
             BTreeMap::new();
 
-        for (vfio_path, enable_iommu) in cfg.vfio.iter() {
+        for vfio_dev in cfg
+            .vfio
+            .iter()
+            .filter(|dev| dev.get_type() == VfioType::Pci)
+        {
+            let vfio_path = &vfio_dev.vfio_path;
             let (vfio_pci_device, jail) = create_vfio_device(
                 cfg,
                 vm,
                 resources,
                 control_tubes,
                 vfio_path.as_path(),
-                &kvm_vfio_file,
+                false,
                 &mut iommu_attached_endpoints,
-                *enable_iommu,
+                vfio_dev.iommu_enabled(),
             )?;
 
-            pci_devices.push((vfio_pci_device, jail));
+            devices.push((vfio_pci_device, jail));
+        }
+
+        for vfio_dev in cfg
+            .vfio
+            .iter()
+            .filter(|dev| dev.get_type() == VfioType::Platform)
+        {
+            let vfio_path = &vfio_dev.vfio_path;
+            let (vfio_plat_dev, jail) = create_vfio_platform_device(
+                cfg,
+                vm,
+                resources,
+                control_tubes,
+                vfio_path.as_path(),
+                &mut iommu_attached_endpoints,
+                false, // Virtio IOMMU is not supported yet
+            )?;
+
+            devices.push((Box::new(vfio_plat_dev), jail));
         }
 
         if !iommu_attached_endpoints.is_empty() {
@@ -1611,11 +1763,16 @@ fn create_devices(
             dev.allocate_address(resources)
                 .map_err(|_| Error::VirtioPciDev(base::Error::new(EINVAL)))?;
             let dev = Box::new(dev);
-            pci_devices.push((dev, iommu_dev.jail));
+            devices.push((dev, iommu_dev.jail));
         }
     }
 
-    Ok(pci_devices)
+    for params in &cfg.stub_pci_devices {
+        // Stub devices don't need jailing since they don't do anything.
+        devices.push((Box::new(StubPciDevice::new(params)), None));
+    }
+
+    Ok(devices)
 }
 
 #[derive(Copy, Clone)]
@@ -1627,31 +1784,21 @@ struct Ids {
 
 // Set the uid/gid for the jailed process and give a basic id map. This is
 // required for bind mounts to work.
-fn add_crosvm_user_to_jail(jail: &mut Minijail, feature: &str) -> Result<Ids> {
-    let crosvm_user_group = CStr::from_bytes_with_nul(b"crosvm\0").unwrap();
+fn add_current_user_to_jail(jail: &mut Minijail) -> Result<Ids> {
+    let crosvm_uid = geteuid();
+    let crosvm_gid = getegid();
 
-    let crosvm_uid = match get_user_id(&crosvm_user_group) {
-        Ok(u) => u,
-        Err(e) => {
-            warn!("falling back to current user id for {}: {}", feature, e);
-            geteuid()
-        }
-    };
-
-    let crosvm_gid = match get_group_id(&crosvm_user_group) {
-        Ok(u) => u,
-        Err(e) => {
-            warn!("falling back to current group id for {}: {}", feature, e);
-            getegid()
-        }
-    };
-
-    jail.change_uid(crosvm_uid);
-    jail.change_gid(crosvm_gid);
     jail.uidmap(&format!("{0} {0} 1", crosvm_uid))
         .map_err(Error::SettingUidMap)?;
     jail.gidmap(&format!("{0} {0} 1", crosvm_gid))
         .map_err(Error::SettingGidMap)?;
+
+    if crosvm_uid != 0 {
+        jail.change_uid(crosvm_uid);
+    }
+    if crosvm_gid != 0 {
+        jail.change_gid(crosvm_gid);
+    }
 
     Ok(Ids {
         uid: crosvm_uid,
@@ -1710,6 +1857,7 @@ fn setup_vcpu_signal_handler<T: Vcpu>(use_hypervisor_signals: bool) -> Result<()
 // Sets up a vcpu and converts it into a runnable vcpu.
 fn runnable_vcpu<V>(
     cpu_id: usize,
+    kvm_vcpu_id: usize,
     vcpu: Option<V>,
     vm: impl VmArch,
     irq_chip: &mut dyn IrqChipArch,
@@ -1719,6 +1867,8 @@ fn runnable_vcpu<V>(
     no_smt: bool,
     has_bios: bool,
     use_hypervisor_signals: bool,
+    enable_per_vm_core_scheduling: bool,
+    host_cpu_topology: bool,
 ) -> Result<(V, VcpuRunHandle)>
 where
     V: VcpuArch,
@@ -1729,7 +1879,7 @@ where
             // If vcpu is None, it means this arch/hypervisor requires create_vcpu to be called from
             // the vcpu thread.
             match vm
-                .create_vcpu(cpu_id)
+                .create_vcpu(kvm_vcpu_id)
                 .map_err(Error::CreateVcpu)?
                 .downcast::<V>()
             {
@@ -1758,11 +1908,15 @@ where
         vcpu_count,
         has_bios,
         no_smt,
+        host_cpu_topology,
     )
     .map_err(Error::ConfigureVcpu)?;
 
-    if let Err(e) = enable_core_scheduling() {
-        error!("Failed to enable core scheduling: {}", e);
+    if !enable_per_vm_core_scheduling {
+        // Do per-vCPU core scheduling by setting a unique cookie to each vCPU.
+        if let Err(e) = enable_core_scheduling() {
+            error!("Failed to enable core scheduling: {}", e);
+        }
     }
 
     if run_rt {
@@ -1865,6 +2019,7 @@ where
 
 fn run_vcpu<V>(
     cpu_id: usize,
+    kvm_vcpu_id: usize,
     vcpu: Option<V>,
     vm: impl VmArch + 'static,
     mut irq_chip: Box<dyn IrqChipArch + 'static>,
@@ -1875,8 +2030,8 @@ fn run_vcpu<V>(
     no_smt: bool,
     start_barrier: Arc<Barrier>,
     has_bios: bool,
-    io_bus: devices::Bus,
-    mmio_bus: devices::Bus,
+    io_bus: Arc<devices::Bus>,
+    mmio_bus: Arc<devices::Bus>,
     exit_evt: Event,
     requires_pvclock_ctrl: bool,
     from_main_tube: mpsc::Receiver<VcpuControl>,
@@ -1884,6 +2039,8 @@ fn run_vcpu<V>(
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))] to_gdb_tube: Option<
         mpsc::Sender<VcpuDebugStatusMessage>,
     >,
+    enable_per_vm_core_scheduling: bool,
+    host_cpu_topology: bool,
 ) -> Result<JoinHandle<()>>
 where
     V: VcpuArch + 'static,
@@ -1899,6 +2056,7 @@ where
             let guest_mem = vm.get_memory().clone();
             let runnable_vcpu = runnable_vcpu(
                 cpu_id,
+                kvm_vcpu_id,
                 vcpu,
                 vm,
                 irq_chip.as_mut(),
@@ -1908,6 +2066,8 @@ where
                 no_smt,
                 has_bios,
                 use_hypervisor_signals,
+                enable_per_vm_core_scheduling,
+                host_cpu_topology,
             );
 
             start_barrier.wait();
@@ -1994,7 +2154,7 @@ where
                                     match &to_gdb_tube {
                                         Some(ref ch) => {
                                             if let Err(e) = handle_debug_msg(
-                                                cpu_id, &vcpu, &guest_mem, d, &ch,
+                                                cpu_id, &vcpu, &guest_mem, d, ch,
                                             ) {
                                                 error!("Failed to handle gdb message: {}", e);
                                             }
@@ -2221,6 +2381,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         gdb: None,
         dmi_path: cfg.dmi_path.clone(),
         no_legacy: cfg.no_legacy,
+        host_cpu_topology: cfg.host_cpu_topology,
     })
 }
 
@@ -2334,6 +2495,16 @@ where
         control_tubes.push(TaggedControlTube::VmMemory(wayland_host_tube));
     }
 
+    let mut vhost_user_gpu_tubes = Vec::with_capacity(cfg.vhost_user_gpu.len());
+    for _ in 0..cfg.vhost_user_gpu.len() {
+        let (host_tube, device_tube) = Tube::pair().map_err(Error::CreateTube)?;
+        vhost_user_gpu_tubes.push((
+            host_tube.try_clone().map_err(Error::CloneTube)?,
+            device_tube,
+        ));
+        control_tubes.push(TaggedControlTube::VmMemory(host_tube));
+    }
+
     let (wayland_host_tube, wayland_device_tube) = Tube::pair().map_err(Error::CreateTube)?;
     control_tubes.push(TaggedControlTube::VmMemory(wayland_host_tube));
     // Balloon gets a special socket so balloon requests can be forwarded from the main process.
@@ -2369,13 +2540,14 @@ where
     }
 
     let battery = if cfg.battery_type.is_some() {
+        #[cfg_attr(not(feature = "power-monitor-powerd"), allow(clippy::manual_map))]
         let jail = match simple_jail(&cfg, "battery")? {
-            #[cfg_attr(not(feature = "powerd-monitor-powerd"), allow(unused_mut))]
+            #[cfg_attr(not(feature = "power-monitor-powerd"), allow(unused_mut))]
             Some(mut jail) => {
                 // Setup a bind mount to the system D-Bus socket if the powerd monitor is used.
                 #[cfg(feature = "power-monitor-powerd")]
                 {
-                    add_crosvm_user_to_jail(&mut jail, "battery")?;
+                    add_current_user_to_jail(&mut jail)?;
 
                     // Create a tmpfs in the device's root directory so that we can bind mount files.
                     jail.mount_with_data(
@@ -2414,8 +2586,18 @@ where
 
     let exit_evt = Event::new().map_err(Error::CreateEvent)?;
     let mut sys_allocator = Arch::create_system_allocator(vm.get_memory());
+
+    // Allocate the ramoops region first. AArch64::build_vm() assumes this.
+    let ramoops_region = match &components.pstore {
+        Some(pstore) => Some(
+            arch::pstore::create_memory_region(&mut vm, &mut sys_allocator, pstore)
+                .map_err(Error::Pstore)?,
+        ),
+        None => None,
+    };
+
     let phys_max_addr = Arch::get_phys_max_addr();
-    let mut pci_devices = create_devices(
+    let mut devices = create_devices(
         &cfg,
         &mut vm,
         &mut sys_allocator,
@@ -2424,6 +2606,7 @@ where
         &mut control_tubes,
         wayland_device_tube,
         gpu_device_tube,
+        vhost_user_gpu_tubes,
         balloon_device_tube,
         &mut disk_device_tubes,
         &mut pmem_device_tubes,
@@ -2434,7 +2617,10 @@ where
     )?;
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    for (device, _jail) in pci_devices.iter_mut() {
+    for device in devices
+        .iter_mut()
+        .filter_map(|(dev, _)| dev.as_pci_device_mut())
+    {
         let sdts = device
             .generate_acpi(components.acpi_sdts)
             .or_else(|| {
@@ -2445,6 +2631,9 @@ where
         components.acpi_sdts = sdts;
     }
 
+    // KVM_CREATE_VCPU uses apic id for x86 and uses cpu id for others.
+    let mut kvm_vcpu_ids = Vec::new();
+
     #[cfg_attr(not(feature = "direct"), allow(unused_mut))]
     let mut linux = Arch::build_vm::<V, Vcpu>(
         components,
@@ -2454,8 +2643,10 @@ where
         simple_jail(&cfg, "serial")?,
         battery,
         vm,
-        pci_devices,
+        ramoops_region,
+        devices,
         irq_chip,
+        &mut kvm_vcpu_ids,
     )
     .map_err(Error::BuildVm)?;
 
@@ -2466,6 +2657,18 @@ where
         for range in pmio.ranges.iter() {
             linux
                 .io_bus
+                .insert_sync(direct_io.clone(), range.0, range.1)
+                .unwrap();
+        }
+    };
+
+    #[cfg(feature = "direct")]
+    if let Some(mmio) = &cfg.direct_mmio {
+        let direct_io =
+            Arc::new(devices::DirectIo::new(&mmio.path, false).map_err(Error::DirectIo)?);
+        for range in mmio.ranges.iter() {
+            linux
+                .mmio_bus
                 .insert_sync(direct_io.clone(), range.0, range.1)
                 .unwrap();
         }
@@ -2521,7 +2724,68 @@ where
         cfg.sandbox,
         Arc::clone(&map_request),
         gralloc,
+        cfg.per_vm_core_scheduling,
+        cfg.host_cpu_topology,
+        kvm_vcpu_ids,
     )
+}
+
+#[allow(dead_code)]
+fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
+    linux: &mut RunnableLinuxVm<V, Vcpu>,
+    sys_allocator: &mut SystemAllocator,
+    cfg: &Config,
+    control_tubes: &mut Vec<TaggedControlTube>,
+    vfio_path: &Path,
+) -> Result<()> {
+    let mut endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> = BTreeMap::new();
+    let (vfio_pci_device, jail) = create_vfio_device(
+        cfg,
+        &linux.vm,
+        sys_allocator,
+        control_tubes,
+        vfio_path,
+        true,
+        &mut endpoints,
+        false,
+    )?;
+
+    let pci_address = Arch::register_pci_device(linux, vfio_pci_device, jail, sys_allocator)
+        .map_err(Error::ConfigureHotPlugDevice)?;
+
+    let host_os_str = vfio_path.file_name().ok_or(Error::InvalidVfioPath)?;
+    let host_str = host_os_str.to_str().ok_or(Error::InvalidVfioPath)?;
+    let host_addr = PciAddress::from_string(host_str);
+    let host_key = HostHotPlugKey::Vfio { host_addr };
+    if let Some(hp_bus) = &linux.hotplug_bus {
+        let mut hp_bus = hp_bus.lock();
+        hp_bus.add_hotplug_device(host_key, pci_address);
+        hp_bus.hot_plug(pci_address);
+        return Ok(());
+    }
+
+    Err(Error::NoHotPlugBus)
+}
+
+#[allow(dead_code)]
+fn remove_vfio_device<V: VmArch, Vcpu: VcpuArch>(
+    linux: &RunnableLinuxVm<V, Vcpu>,
+    vfio_path: &Path,
+) -> Result<()> {
+    let host_os_str = vfio_path.file_name().ok_or(Error::InvalidVfioPath)?;
+    let host_str = host_os_str.to_str().ok_or(Error::InvalidVfioPath)?;
+    let host_addr = PciAddress::from_string(host_str);
+    let host_key = HostHotPlugKey::Vfio { host_addr };
+    if let Some(hp_bus) = &linux.hotplug_bus {
+        let mut hp_bus = hp_bus.lock();
+        let pci_addr = hp_bus
+            .get_hotplug_device(host_key)
+            .ok_or(Error::InvalidHotPlugKey)?;
+        hp_bus.hot_unplug(pci_addr);
+        return Ok(());
+    }
+
+    Err(Error::NoHotPlugBus)
 }
 
 /// Signals all running VCPUs to vmexit, sends VcpuControl message to each VCPU tube, and tells
@@ -2555,6 +2819,9 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     sandbox: bool,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     mut gralloc: RutabagaGralloc,
+    enable_per_vm_core_scheduling: bool,
+    host_cpu_topology: bool,
+    kvm_vcpu_ids: Vec<usize>,
 ) -> Result<()> {
     #[derive(PollToken)]
     enum Token {
@@ -2625,6 +2892,15 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         Some(vec) => vec.into_iter().map(Some).collect(),
         None => iter::repeat_with(|| None).take(linux.vcpu_count).collect(),
     };
+    // Enable core scheduling before creating vCPUs so that the cookie will be
+    // shared by all vCPU threads.
+    // TODO(b/199312402): Avoid enabling core scheduling for the crosvm process
+    // itself for even better performance. Only vCPUs need the feature.
+    if enable_per_vm_core_scheduling {
+        if let Err(e) = enable_core_scheduling() {
+            error!("Failed to enable core scheduling: {}", e);
+        }
+    }
     for (cpu_id, vcpu) in vcpus.into_iter().enumerate() {
         let (to_vcpu_channel, from_main_channel) = mpsc::channel();
         let vcpu_affinity = match linux.vcpu_affinity.clone() {
@@ -2634,6 +2910,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         };
         let handle = run_vcpu(
             cpu_id,
+            kvm_vcpu_ids[cpu_id],
             vcpu,
             linux.vm.try_clone().map_err(Error::CloneEvent)?,
             linux.irq_chip.try_box_clone().map_err(Error::CloneEvent)?,
@@ -2652,6 +2929,8 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             use_hypervisor_signals,
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             to_gdb_channel.clone(),
+            enable_per_vm_core_scheduling,
+            host_cpu_topology,
         )?;
         vcpu_handles.push((handle, to_vcpu_channel));
     }

@@ -28,7 +28,10 @@ rust_library {
         "libtempfile",
         "libthiserror",
     ],
-    proc_macros: ["libpoll_token_derive"],
+    proc_macros: [
+        "libpoll_token_derive",
+        "libremain",
+    ],
     shared_libs: ["libcap"],  // specified in src/capabilities.rs
     target: {
         android: {

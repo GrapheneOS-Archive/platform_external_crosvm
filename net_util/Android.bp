@@ -27,6 +27,7 @@ rust_library {
         "libnet_sys",
         "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }
 
 rust_defaults {
@@ -47,6 +48,7 @@ rust_defaults {
         "libnet_sys",
         "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }
 
 rust_test_host {
