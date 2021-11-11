@@ -47,7 +47,6 @@ mod smbios;
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::ffi::{CStr, CString};
-use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{self, Seek};
 use std::mem;
@@ -57,16 +56,20 @@ use crate::bootparam::boot_params;
 use acpi_tables::sdt::SDT;
 use acpi_tables::{aml, aml::Aml};
 use arch::{
-    get_serial_cmdline, GetSerialCmdlineError, LinuxArch, RunnableLinuxVm, SerialHardware,
-    SerialParameters, VmComponents, VmImage,
+    get_serial_cmdline, GetSerialCmdlineError, LinuxArch, RunnableLinuxVm, VmComponents, VmImage,
 };
 use base::Event;
-use devices::{BusResumeDevice, IrqChip, IrqChipX86_64, PciConfigIo, PciDevice, ProtectionType};
+use devices::serial_device::{SerialHardware, SerialParameters};
+use devices::{
+    BusDeviceObj, BusResumeDevice, IrqChip, IrqChipX86_64, PciAddress, PciConfigIo, PciDevice,
+    ProtectionType,
+};
 use hypervisor::{HypervisorX86_64, VcpuX86_64, VmX86_64};
 use minijail::Minijail;
 use remain::sorted;
 use resources::SystemAllocator;
 use sync::Mutex;
+use thiserror::Error;
 use vm_control::{BatControl, BatteryType};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
@@ -76,126 +79,117 @@ use {
 };
 
 #[sorted]
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
+    #[error("error allocating IO resource: {0}")]
     AllocateIOResouce(resources::Error),
+    #[error("error allocating a single irq")]
     AllocateIrq,
+    #[error("unable to clone an Event: {0}")]
     CloneEvent(base::Error),
+    #[error("failed to clone IRQ chip: {0}")]
     CloneIrqChip(base::Error),
+    #[error("the given kernel command line was invalid: {0}")]
     Cmdline(kernel_cmdline::Error),
+    #[error("failed to configure hotplugged pci device: {0}")]
+    ConfigurePciDevice(arch::DeviceRegistrationError),
+    #[error("error configuring the system")]
     ConfigureSystem,
+    #[error("unable to create ACPI tables")]
+    CreateAcpi,
+    #[error("unable to create battery devices: {0}")]
     CreateBatDevices(arch::DeviceRegistrationError),
+    #[error("error creating devices: {0}")]
     CreateDevices(Box<dyn StdError>),
+    #[error("unable to make an Event: {0}")]
     CreateEvent(base::Error),
+    #[error("failed to create fdt: {0}")]
     CreateFdt(arch::fdt::Error),
+    #[error("failed to create IOAPIC device: {0}")]
     CreateIoapicDevice(base::Error),
+    #[error("failed to create a PCI root hub: {0}")]
     CreatePciRoot(arch::DeviceRegistrationError),
+    #[error("unable to create PIT: {0}")]
     CreatePit(base::Error),
+    #[error("unable to make PIT device: {0}")]
     CreatePitDevice(devices::PitError),
+    #[error("unable to create serial devices: {0}")]
     CreateSerialDevices(arch::DeviceRegistrationError),
+    #[error("failed to create socket: {0}")]
     CreateSocket(io::Error),
+    #[error("failed to create VCPU: {0}")]
     CreateVcpu(base::Error),
+    #[error("failed to create VM: {0}")]
     CreateVm(Box<dyn StdError>),
+    #[error("invalid e820 setup params")]
     E820Configuration,
+    #[error("failed to enable singlestep execution: {0}")]
     EnableSinglestep(base::Error),
+    #[error("failed to enable split irqchip: {0}")]
     EnableSplitIrqchip(base::Error),
+    #[error("failed to get serial cmdline: {0}")]
     GetSerialCmdline(GetSerialCmdlineError),
+    #[error("the kernel extends past the end of RAM")]
     KernelOffsetPastEnd,
+    #[error("error loading bios: {0}")]
     LoadBios(io::Error),
+    #[error("error loading kernel bzImage: {0}")]
     LoadBzImage(bzimage::Error),
+    #[error("error loading command line: {0}")]
     LoadCmdline(kernel_loader::Error),
+    #[error("error loading initrd: {0}")]
     LoadInitrd(arch::LoadImageError),
+    #[error("error loading Kernel: {0}")]
     LoadKernel(kernel_loader::Error),
+    #[error("error translating address: Page not present")]
     PageNotPresent,
+    #[error("failed to allocate pstore region: {0}")]
     Pstore(arch::pstore::Error),
+    #[error("error reading guest memory {0}")]
     ReadingGuestMemory(vm_memory::GuestMemoryError),
+    #[error("error reading CPU registers {0}")]
     ReadRegs(base::Error),
+    #[error("error registering an IrqFd: {0}")]
     RegisterIrqfd(base::Error),
+    #[error("error registering virtual socket device: {0}")]
     RegisterVsock(arch::DeviceRegistrationError),
+    #[error("failed to set a hardware breakpoint: {0}")]
     SetHwBreakpoint(base::Error),
+    #[error("failed to set interrupts: {0}")]
     SetLint(interrupts::Error),
+    #[error("failed to set tss addr: {0}")]
     SetTssAddr(base::Error),
+    #[error("failed to set up cpuid: {0}")]
     SetupCpuid(cpuid::Error),
+    #[error("failed to set up FPU: {0}")]
     SetupFpu(regs::Error),
+    #[error("failed to set up guest memory: {0}")]
     SetupGuestMemory(GuestMemoryError),
+    #[error("failed to set up mptable: {0}")]
     SetupMptable(mptable::Error),
+    #[error("failed to set up MSRs: {0}")]
     SetupMsrs(regs::Error),
+    #[error("failed to set up registers: {0}")]
     SetupRegs(regs::Error),
+    #[error("failed to set up SMBIOS: {0}")]
     SetupSmbios(smbios::Error),
+    #[error("failed to set up sregs: {0}")]
     SetupSregs(regs::Error),
+    #[error("failed to translate virtual address")]
     TranslatingVirtAddr,
+    #[error("protected VMs not supported on x86_64")]
     UnsupportedProtectionType,
+    #[error("error writing CPU registers {0}")]
     WriteRegs(base::Error),
+    #[error("error writing guest memory {0}")]
     WritingGuestMemory(GuestMemoryError),
+    #[error("the zero page extends past the end of guest_mem")]
     ZeroPagePastRamEnd,
+    #[error("error writing the zero page of guest memory")]
     ZeroPageSetup,
 }
 
-impl Display for Error {
-    #[remain::check]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        #[sorted]
-        match self {
-            AllocateIOResouce(e) => write!(f, "error allocating IO resource: {}", e),
-            AllocateIrq => write!(f, "error allocating a single irq"),
-            CloneEvent(e) => write!(f, "unable to clone an Event: {}", e),
-            CloneIrqChip(e) => write!(f, "failed to clone IRQ chip: {}", e),
-            Cmdline(e) => write!(f, "the given kernel command line was invalid: {}", e),
-            ConfigureSystem => write!(f, "error configuring the system"),
-            CreateBatDevices(e) => write!(f, "unable to create battery devices: {}", e),
-            CreateDevices(e) => write!(f, "error creating devices: {}", e),
-            CreateEvent(e) => write!(f, "unable to make an Event: {}", e),
-            CreateFdt(e) => write!(f, "failed to create fdt: {}", e),
-            CreateIoapicDevice(e) => write!(f, "failed to create IOAPIC device: {}", e),
-            CreatePciRoot(e) => write!(f, "failed to create a PCI root hub: {}", e),
-            CreatePit(e) => write!(f, "unable to create PIT: {}", e),
-            CreatePitDevice(e) => write!(f, "unable to make PIT device: {}", e),
-            CreateSerialDevices(e) => write!(f, "unable to create serial devices: {}", e),
-            CreateSocket(e) => write!(f, "failed to create socket: {}", e),
-            CreateVcpu(e) => write!(f, "failed to create VCPU: {}", e),
-            CreateVm(e) => write!(f, "failed to create VM: {}", e),
-            E820Configuration => write!(f, "invalid e820 setup params"),
-            EnableSinglestep(e) => write!(f, "failed to enable singlestep execution: {}", e),
-            EnableSplitIrqchip(e) => write!(f, "failed to enable split irqchip: {}", e),
-            GetSerialCmdline(e) => write!(f, "failed to get serial cmdline: {}", e),
-            KernelOffsetPastEnd => write!(f, "the kernel extends past the end of RAM"),
-            LoadBios(e) => write!(f, "error loading bios: {}", e),
-            LoadBzImage(e) => write!(f, "error loading kernel bzImage: {}", e),
-            LoadCmdline(e) => write!(f, "error loading command line: {}", e),
-            LoadInitrd(e) => write!(f, "error loading initrd: {}", e),
-            LoadKernel(e) => write!(f, "error loading Kernel: {}", e),
-            PageNotPresent => write!(f, "error translating address: Page not present"),
-            Pstore(e) => write!(f, "failed to allocate pstore region: {}", e),
-            ReadingGuestMemory(e) => write!(f, "error reading guest memory {}", e),
-            ReadRegs(e) => write!(f, "error reading CPU registers {}", e),
-            RegisterIrqfd(e) => write!(f, "error registering an IrqFd: {}", e),
-            RegisterVsock(e) => write!(f, "error registering virtual socket device: {}", e),
-            SetHwBreakpoint(e) => write!(f, "failed to set a hardware breakpoint: {}", e),
-            SetLint(e) => write!(f, "failed to set interrupts: {}", e),
-            SetTssAddr(e) => write!(f, "failed to set tss addr: {}", e),
-            SetupCpuid(e) => write!(f, "failed to set up cpuid: {}", e),
-            SetupFpu(e) => write!(f, "failed to set up FPU: {}", e),
-            SetupGuestMemory(e) => write!(f, "failed to set up guest memory: {}", e),
-            SetupMptable(e) => write!(f, "failed to set up mptable: {}", e),
-            SetupMsrs(e) => write!(f, "failed to set up MSRs: {}", e),
-            SetupRegs(e) => write!(f, "failed to set up registers: {}", e),
-            SetupSmbios(e) => write!(f, "failed to set up SMBIOS: {}", e),
-            SetupSregs(e) => write!(f, "failed to set up sregs: {}", e),
-            TranslatingVirtAddr => write!(f, "failed to translate virtual address"),
-            UnsupportedProtectionType => write!(f, "protected VMs not supported on x86_64"),
-            WriteRegs(e) => write!(f, "error writing CPU registers {}", e),
-            WritingGuestMemory(e) => write!(f, "error writing guest memory {}", e),
-            ZeroPagePastRamEnd => write!(f, "the zero page extends past the end of guest_mem"),
-            ZeroPageSetup => write!(f, "error writing the zero page of guest memory"),
-        }
-    }
-}
-
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl std::error::Error for Error {}
 
 pub struct X8664arch;
 
@@ -381,8 +375,10 @@ impl arch::LinuxArch for X8664arch {
         serial_jail: Option<Minijail>,
         battery: (&Option<BatteryType>, Option<Minijail>),
         mut vm: V,
-        pci_devices: Vec<(Box<dyn PciDevice>, Option<Minijail>)>,
+        ramoops_region: Option<arch::pstore::RamoopsRegion>,
+        devs: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
         irq_chip: &mut dyn IrqChipX86_64,
+        kvm_vcpu_ids: &mut Vec<usize>,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
         V: VmX86_64,
@@ -399,28 +395,37 @@ impl arch::LinuxArch for X8664arch {
         let tss_addr = GuestAddress(TSS_ADDR);
         vm.set_tss_addr(tss_addr).map_err(Error::SetTssAddr)?;
 
-        let mut mmio_bus = devices::Bus::new();
-        let mut io_bus = devices::Bus::new();
+        let mmio_bus = Arc::new(devices::Bus::new());
+        let io_bus = Arc::new(devices::Bus::new());
+
+        let (pci_devices, _others): (Vec<_>, Vec<_>) = devs
+            .into_iter()
+            .partition(|(dev, _)| dev.as_pci_device().is_some());
+
+        let pci_devices = pci_devices
+            .into_iter()
+            .map(|(dev, jail_orig)| (dev.into_pci_device().unwrap(), jail_orig))
+            .collect();
 
         let (pci, pci_irqs, pid_debug_label_map) = arch::generate_pci_root(
             pci_devices,
             irq_chip.as_irq_chip_mut(),
-            &mut mmio_bus,
-            &mut io_bus,
+            mmio_bus.clone(),
+            io_bus.clone(),
             system_allocator,
             &mut vm,
             4, // Share the four pin interrupts (INTx#)
         )
         .map_err(Error::CreatePciRoot)?;
         let pci_bus = Arc::new(Mutex::new(PciConfigIo::new(pci)));
-        io_bus.insert(pci_bus, 0xcf8, 0x8).unwrap();
+        io_bus.insert(pci_bus.clone(), 0xcf8, 0x8).unwrap();
 
         // Event used to notify crosvm that guest OS is trying to suspend.
         let suspend_evt = Event::new().map_err(Error::CreateEvent)?;
 
         if !components.no_legacy {
             Self::setup_legacy_devices(
-                &mut io_bus,
+                &io_bus,
                 irq_chip.pit_uses_speaker_port(),
                 exit_evt.try_clone().map_err(Error::CloneEvent)?,
                 components.memory_size,
@@ -429,7 +434,7 @@ impl arch::LinuxArch for X8664arch {
         Self::setup_serial_devices(
             components.protected_vm,
             irq_chip.as_irq_chip_mut(),
-            &mut io_bus,
+            &io_bus,
             serial_parameters,
             serial_jail,
         )?;
@@ -438,14 +443,14 @@ impl arch::LinuxArch for X8664arch {
 
         let (acpi_dev_resource, bat_control) = Self::setup_acpi_devices(
             &mem,
-            &mut io_bus,
+            &io_bus,
             system_allocator,
             suspend_evt.try_clone().map_err(Error::CloneEvent)?,
             exit_evt.try_clone().map_err(Error::CloneEvent)?,
             components.acpi_sdts,
             irq_chip.as_irq_chip_mut(),
             battery,
-            &mut mmio_bus,
+            &mmio_bus,
             &mut resume_notify_devices,
         )?;
 
@@ -458,16 +463,8 @@ impl arch::LinuxArch for X8664arch {
             }
         }
 
-        let ramoops_region = match components.pstore {
-            Some(pstore) => Some(
-                arch::pstore::create_memory_region(&mut vm, system_allocator, &pstore)
-                    .map_err(Error::Pstore)?,
-            ),
-            None => None,
-        };
-
         irq_chip
-            .finalize_devices(system_allocator, &mut io_bus, &mut mmio_bus)
+            .finalize_devices(system_allocator, &io_bus, &mmio_bus)
             .map_err(Error::RegisterIrqfd)?;
 
         // All of these bios generated tables are set manually for the benefit of the kernel boot
@@ -482,43 +479,53 @@ impl arch::LinuxArch for X8664arch {
         mptable::setup_mptable(&mem, vcpu_count as u8, pci_irqs).map_err(Error::SetupMptable)?;
         smbios::setup_smbios(&mem, components.dmi_path).map_err(Error::SetupSmbios)?;
 
+        let host_cpus = if components.host_cpu_topology {
+            components.vcpu_affinity.clone()
+        } else {
+            None
+        };
+
         // TODO (tjeznach) Write RSDP to bootconfig before writing to memory
-        acpi::create_acpi_tables(&mem, vcpu_count as u8, X86_64_SCI_IRQ, acpi_dev_resource);
+        acpi::create_acpi_tables(
+            &mem,
+            vcpu_count as u8,
+            X86_64_SCI_IRQ,
+            acpi_dev_resource,
+            host_cpus,
+            kvm_vcpu_ids,
+        )
+        .ok_or(Error::CreateAcpi)?;
+
+        let mut cmdline = Self::get_base_linux_cmdline();
+
+        if noirq {
+            cmdline.insert_str("acpi=noirq").unwrap();
+        }
+
+        get_serial_cmdline(&mut cmdline, serial_parameters, "io")
+            .map_err(Error::GetSerialCmdline)?;
+
+        for param in components.extra_kernel_params {
+            cmdline.insert_str(&param).map_err(Error::Cmdline)?;
+        }
+
+        if let Some(ramoops_region) = ramoops_region {
+            arch::pstore::add_ramoops_kernel_cmdline(&mut cmdline, &ramoops_region)
+                .map_err(Error::Cmdline)?;
+        }
 
         match components.vm_image {
-            VmImage::Bios(ref mut bios) => Self::load_bios(&mem, bios)?,
+            VmImage::Bios(ref mut bios) => {
+                // Allow a bios to hardcode CMDLINE_OFFSET and read the kernel command line from it.
+                kernel_loader::load_cmdline(
+                    &mem,
+                    GuestAddress(CMDLINE_OFFSET),
+                    &CString::new(cmdline).unwrap(),
+                )
+                .map_err(Error::LoadCmdline)?;
+                Self::load_bios(&mem, bios)?
+            }
             VmImage::Kernel(ref mut kernel_image) => {
-                let mut cmdline = Self::get_base_linux_cmdline();
-
-                if noirq {
-                    cmdline.insert_str("acpi=noirq").unwrap();
-                }
-
-                get_serial_cmdline(&mut cmdline, serial_parameters, "io")
-                    .map_err(Error::GetSerialCmdline)?;
-
-                for param in components.extra_kernel_params {
-                    cmdline.insert_str(&param).map_err(Error::Cmdline)?;
-                }
-                // It seems that default record_size is only 4096 byte even if crosvm allocates
-                // more memory. It means that one crash can only 4096 byte.
-                // Set record_size and console_size to 1/4 of allocated memory size.
-                // This configulation is same as the host.
-                if let Some(ramoops_region) = ramoops_region {
-                    let ramoops_opts = [
-                        ("mem_address", ramoops_region.address),
-                        ("mem_size", ramoops_region.size as u64),
-                        ("console_size", (ramoops_region.size / 4) as u64),
-                        ("record_size", (ramoops_region.size / 4) as u64),
-                        ("dump_oops", 1_u64),
-                    ];
-                    for (name, val) in &ramoops_opts {
-                        cmdline
-                            .insert_str(format!("ramoops.{}={:#x}", name, val))
-                            .map_err(Error::Cmdline)?;
-                    }
-                }
-
                 // separate out load_kernel from other setup to get a specific error for
                 // kernel loading
                 let (params, kernel_end) = Self::load_kernel(&mem, kernel_image)?;
@@ -553,6 +560,8 @@ impl arch::LinuxArch for X8664arch {
             bat_control,
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             gdb: components.gdb,
+            root_config: pci_bus,
+            hotplug_bus: None,
         })
     }
 
@@ -565,9 +574,18 @@ impl arch::LinuxArch for X8664arch {
         num_cpus: usize,
         has_bios: bool,
         no_smt: bool,
+        host_cpu_topology: bool,
     ) -> Result<()> {
-        cpuid::setup_cpuid(hypervisor, irq_chip, vcpu, vcpu_id, num_cpus, no_smt)
-            .map_err(Error::SetupCpuid)?;
+        cpuid::setup_cpuid(
+            hypervisor,
+            irq_chip,
+            vcpu,
+            vcpu_id,
+            num_cpus,
+            no_smt,
+            host_cpu_topology,
+        )
+        .map_err(Error::SetupCpuid)?;
 
         if has_bios {
             return Ok(());
@@ -590,6 +608,18 @@ impl arch::LinuxArch for X8664arch {
         interrupts::set_lint(vcpu_id, irq_chip).map_err(Error::SetLint)?;
 
         Ok(())
+    }
+
+    fn register_pci_device<V: VmX86_64, Vcpu: VcpuX86_64>(
+        linux: &mut RunnableLinuxVm<V, Vcpu>,
+        device: Box<dyn PciDevice>,
+        minijail: Option<Minijail>,
+        resources: &mut SystemAllocator,
+    ) -> Result<PciAddress> {
+        let pci_address = arch::configure_pci_device(linux, device, minijail, resources)
+            .map_err(Error::ConfigurePciDevice)?;
+
+        Ok(pci_address)
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
@@ -735,7 +765,7 @@ impl arch::LinuxArch for X8664arch {
         vcpu: &T,
         breakpoints: &[GuestAddress],
     ) -> Result<()> {
-        vcpu.set_guest_debug(&breakpoints, false /* enable_singlestep */)
+        vcpu.set_guest_debug(breakpoints, false /* enable_singlestep */)
             .map_err(Error::SetHwBreakpoint)
     }
 }
@@ -982,7 +1012,7 @@ impl X8664arch {
     /// * - `exit_evt` - the event object which should receive exit events
     /// * - `mem_size` - the size in bytes of physical ram for the guest
     fn setup_legacy_devices(
-        io_bus: &mut devices::Bus,
+        io_bus: &devices::Bus,
         pit_uses_speaker_port: bool,
         exit_evt: Event,
         mem_size: u64,
@@ -1048,14 +1078,14 @@ impl X8664arch {
     /// * - `mmio_bus` the MMIO bus to add the devices to
     fn setup_acpi_devices(
         mem: &GuestMemory,
-        io_bus: &mut devices::Bus,
+        io_bus: &devices::Bus,
         resources: &mut SystemAllocator,
         suspend_evt: Event,
         exit_evt: Event,
         sdts: Vec<SDT>,
         irq_chip: &mut dyn IrqChip,
         battery: (&Option<BatteryType>, Option<Minijail>),
-        mmio_bus: &mut devices::Bus,
+        mmio_bus: &devices::Bus,
         resume_notify_devices: &mut Vec<Arc<Mutex<dyn BusResumeDevice>>>,
     ) -> Result<(acpi::ACPIDevResource, Option<BatControl>)> {
         // The AML data for the acpi devices
@@ -1166,7 +1196,7 @@ impl X8664arch {
     fn setup_serial_devices(
         protected_vm: ProtectionType,
         irq_chip: &mut dyn IrqChip,
-        io_bus: &mut devices::Bus,
+        io_bus: &devices::Bus,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
     ) -> Result<()> {
@@ -1178,7 +1208,7 @@ impl X8664arch {
             io_bus,
             &com_evt_1_3,
             &com_evt_2_4,
-            &serial_parameters,
+            serial_parameters,
             serial_jail,
         )
         .map_err(Error::CreateSerialDevices)?;

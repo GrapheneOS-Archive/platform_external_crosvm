@@ -35,6 +35,7 @@ rust_defaults {
         "libvm_control",
         "libvm_memory",
     ],
+    proc_macros: ["libremain"],
 }
 
 rust_test_host {
@@ -94,6 +95,7 @@ rust_library {
         "libvm_control",
         "libvm_memory",
     ],
+    proc_macros: ["libremain"],
     target: {
         linux_glibc_x86_64: {
             features: [

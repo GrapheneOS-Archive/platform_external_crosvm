@@ -29,8 +29,10 @@ rust_library {
         "libserde",
         "libserde_json",
         "libsync_rust",
+        "libthiserror",
         "libvm_memory",
     ],
+    proc_macros: ["libremain"],
     target: {
         linux_glibc_x86_64: {
             features: [

@@ -274,7 +274,7 @@ impl Vm {
     pub fn new(kvm: &Kvm, guest_mem: GuestMemory) -> Result<Vm> {
         // Safe because we know kvm is a real kvm fd as this module is the only one that can make
         // Kvm objects.
-        let ret = unsafe { ioctl(kvm, KVM_CREATE_VM()) };
+        let ret = unsafe { ioctl_with_val(kvm, KVM_CREATE_VM(), 0) };
         if ret >= 0 {
             // Safe because we verify the value of ret and we are the owners of the fd.
             let vm_file = unsafe { File::from_raw_descriptor(ret) };
@@ -1235,7 +1235,7 @@ impl Vcpu {
             // Mapping the unsized array to a slice is unsafe because the length isn't known.
             // Providing the length used to create the struct guarantees the entire slice is valid.
             let entries: &mut [kvm_msr_entry] = msrs[0].entries.as_mut_slice(msr_entries.len());
-            entries.copy_from_slice(&msr_entries);
+            entries.copy_from_slice(msr_entries);
         }
         msrs[0].nmsrs = msr_entries.len() as u32;
         let ret = unsafe {
@@ -1251,7 +1251,7 @@ impl Vcpu {
             assert!(count <= msr_entries.len());
             let entries: &mut [kvm_msr_entry] = msrs[0].entries.as_mut_slice(count);
             msr_entries.truncate(count);
-            msr_entries.copy_from_slice(&entries);
+            msr_entries.copy_from_slice(entries);
         }
         Ok(())
     }

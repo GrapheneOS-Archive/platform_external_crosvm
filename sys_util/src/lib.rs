@@ -29,9 +29,9 @@ mod external_mapping;
 mod file_flags;
 pub mod file_traits;
 mod fork;
+mod get_filesystem_type;
 mod mmap;
 pub mod net;
-mod passwd;
 mod poll;
 mod priority;
 pub mod rand;
@@ -45,7 +45,6 @@ mod shm;
 pub mod signal;
 mod signalfd;
 mod sock_ctrl_msg;
-mod struct_util;
 mod terminal;
 mod timerfd;
 pub mod vsock;
@@ -60,9 +59,9 @@ pub use crate::eventfd::*;
 pub use crate::external_mapping::*;
 pub use crate::file_flags::*;
 pub use crate::fork::*;
+pub use crate::get_filesystem_type::*;
 pub use crate::ioctl::*;
 pub use crate::mmap::*;
-pub use crate::passwd::*;
 pub use crate::poll::*;
 pub use crate::priority::*;
 pub use crate::raw_fd::*;
@@ -72,7 +71,6 @@ pub use crate::shm::*;
 pub use crate::signal::*;
 pub use crate::signalfd::*;
 pub use crate::sock_ctrl_msg::*;
-pub use crate::struct_util::*;
 pub use crate::terminal::*;
 pub use crate::timerfd::*;
 pub use descriptor_reflection::{
@@ -93,12 +91,14 @@ pub use crate::signalfd::Error as SignalFdError;
 pub use crate::write_zeroes::{PunchHole, WriteZeroes, WriteZeroesAt};
 
 use std::cell::Cell;
+use std::convert::TryFrom;
 use std::ffi::CStr;
 use std::fs::{remove_file, File, OpenOptions};
 use std::mem;
+use std::ops::Deref;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::{UnixDatagram, UnixListener};
 use std::path::Path;
 use std::ptr;
 use std::time::Duration;
@@ -277,6 +277,69 @@ pub fn fallocate(
     syscall!(unsafe { libc::fallocate64(file.as_raw_fd(), mode, offset, len) }).map(|_| ())
 }
 
+/// A trait used to abstract types that provide a process id that can be operated on.
+pub trait AsRawPid {
+    fn as_raw_pid(&self) -> Pid;
+}
+
+impl AsRawPid for Pid {
+    fn as_raw_pid(&self) -> Pid {
+        *self
+    }
+}
+
+impl AsRawPid for std::process::Child {
+    fn as_raw_pid(&self) -> Pid {
+        self.id() as Pid
+    }
+}
+
+/// A logical set of the values *status can take from libc::wait and libc::waitpid.
+pub enum WaitStatus {
+    Continued,
+    Exited(u8),
+    Running,
+    Signaled(Signal),
+    Stopped(Signal),
+}
+
+impl From<c_int> for WaitStatus {
+    fn from(status: c_int) -> WaitStatus {
+        use WaitStatus::*;
+        if libc::WIFEXITED(status) {
+            Exited(libc::WEXITSTATUS(status) as u8)
+        } else if libc::WIFSIGNALED(status) {
+            Signaled(Signal::try_from(libc::WTERMSIG(status)).unwrap())
+        } else if libc::WIFSTOPPED(status) {
+            Stopped(Signal::try_from(libc::WSTOPSIG(status)).unwrap())
+        } else if libc::WIFCONTINUED(status) {
+            Continued
+        } else {
+            Running
+        }
+    }
+}
+
+/// A safe wrapper around waitpid.
+///
+/// On success if a process was reaped, it will be returned as the first value.
+/// The second returned value is the WaitStatus from the libc::waitpid() call.
+///
+/// Note: this can block if libc::WNOHANG is not set and EINTR is not handled internally.
+pub fn wait_for_pid<A: AsRawPid>(pid: A, options: c_int) -> Result<(Option<Pid>, WaitStatus)> {
+    let pid = pid.as_raw_pid();
+    let mut status: c_int = 1;
+    // Safe because status is owned and the error is checked.
+    let ret = unsafe { libc::waitpid(pid, &mut status, options) };
+    if ret < 0 {
+        return errno_result();
+    }
+    Ok((
+        if ret == 0 { None } else { Some(ret) },
+        WaitStatus::from(status),
+    ))
+}
+
 /// Reaps a child process that has terminated.
 ///
 /// Returns `Ok(pid)` where `pid` is the process that was reaped or `Ok(0)` if none of the children
@@ -378,6 +441,35 @@ impl AsRef<UnixDatagram> for UnlinkUnixDatagram {
     }
 }
 impl Drop for UnlinkUnixDatagram {
+    fn drop(&mut self) {
+        if let Ok(addr) = self.0.local_addr() {
+            if let Some(path) = addr.as_pathname() {
+                if let Err(e) = remove_file(path) {
+                    warn!("failed to remove control socket file: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Used to attempt to clean up a named pipe after it is no longer used.
+pub struct UnlinkUnixListener(pub UnixListener);
+
+impl AsRef<UnixListener> for UnlinkUnixListener {
+    fn as_ref(&self) -> &UnixListener {
+        &self.0
+    }
+}
+
+impl Deref for UnlinkUnixListener {
+    type Target = UnixListener;
+
+    fn deref(&self) -> &UnixListener {
+        &self.0
+    }
+}
+
+impl Drop for UnlinkUnixListener {
     fn drop(&mut self) {
         if let Ok(addr) = self.0.local_addr() {
             if let Some(path) = addr.as_pathname() {
@@ -520,6 +612,21 @@ pub fn open_file<P: AsRef<Path>>(path: P, read_only: bool, o_direct: bool) -> Re
         }
         options.write(!read_only).read(true).open(path)?
     })
+}
+
+/// Get the max number of open files allowed by the environment.
+pub fn get_max_open_files() -> Result<u64> {
+    let mut buf = mem::MaybeUninit::<libc::rlimit64>::zeroed();
+
+    // Safe because this will only modify `buf` and we check the return value.
+    let res = unsafe { libc::prlimit64(0, libc::RLIMIT_NOFILE, ptr::null(), buf.as_mut_ptr()) };
+    if res == 0 {
+        // Safe because the kernel guarantees that the struct is fully initialized.
+        let limit = unsafe { buf.assume_init() };
+        Ok(limit.rlim_max)
+    } else {
+        errno_result()
+    }
 }
 
 #[cfg(test)]
