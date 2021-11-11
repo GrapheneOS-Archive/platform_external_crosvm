@@ -141,6 +141,8 @@ pub struct BalloonStats {
     pub disk_caches: Option<u64>,
     pub hugetlb_allocations: Option<u64>,
     pub hugetlb_failures: Option<u64>,
+    pub shared_memory: Option<u64>,
+    pub unevictable_memory: Option<u64>,
 }
 
 // BalloonControlResult holds results for BalloonControlCommand defined above.
@@ -512,7 +514,7 @@ impl VmIrqRequest {
         match *self {
             AllocateOneMsi { ref irqfd } => {
                 if let Some(irq_num) = sys_allocator.allocate_irq() {
-                    match set_up_irq(IrqSetup::Event(irq_num, &irqfd)) {
+                    match set_up_irq(IrqSetup::Event(irq_num, irqfd)) {
                         Ok(_) => VmIrqResponse::AllocateOneMsi { gsi: irq_num },
                         Err(e) => VmIrqResponse::Err(e),
                     }

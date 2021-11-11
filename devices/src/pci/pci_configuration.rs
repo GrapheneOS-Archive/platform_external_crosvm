@@ -2,11 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::convert::TryFrom;
 use std::convert::TryInto;
-use std::fmt::{self, Display};
+
+use base::warn;
+use remain::sorted;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::pci::PciInterruptPin;
-use base::warn;
 
 // The number of 32bit registers in the config space, 256 bytes.
 const NUM_CONFIGURATION_REGISTERS: usize = 64;
@@ -41,7 +45,7 @@ pub enum PciHeaderType {
 
 /// Classes of PCI nodes.
 #[allow(dead_code)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, enumn::N)]
 pub enum PciClassCode {
     TooOld,
     MassStorage,
@@ -58,14 +62,34 @@ pub enum PciClassCode {
     SerialBusController,
     WirelessController,
     IntelligentIoController,
+    SatelliteCommunicationController,
     EncryptionController,
     DataAcquisitionSignalProcessing,
+    ProcessingAccelerator,
+    NonEssentialInstrumentation,
     Other = 0xff,
 }
 
 impl PciClassCode {
     pub fn get_register_value(&self) -> u8 {
         *self as u8
+    }
+}
+
+#[sorted]
+#[derive(Error, Debug)]
+pub enum PciClassCodeParseError {
+    #[error("Unknown class code")]
+    Unknown,
+}
+
+impl TryFrom<u8> for PciClassCode {
+    type Error = PciClassCodeParseError;
+    fn try_from(v: u8) -> std::result::Result<PciClassCode, PciClassCodeParseError> {
+        match PciClassCode::n(v) {
+            Some(class) => Ok(class),
+            None => Err(PciClassCodeParseError::Unknown),
+        }
     }
 }
 
@@ -203,14 +227,14 @@ pub struct PciConfiguration {
 }
 
 /// See pci_regs.h in kernel
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PciBarRegionType {
     Memory32BitRegion = 0,
     IORegion = 0x01,
     Memory64BitRegion = 0x04,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PciBarPrefetchable {
     NotPrefetchable = 0,
     Prefetchable = 0x08,
@@ -218,7 +242,7 @@ pub enum PciBarPrefetchable {
 
 pub type PciBarIndex = usize;
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PciBarConfiguration {
     addr: u64,
     size: u64,
@@ -248,47 +272,34 @@ impl<'a> Iterator for PciBarIter<'a> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[sorted]
+#[derive(Error, Debug, PartialEq)]
 pub enum Error {
+    #[error("address {0} size {1} too big")]
     BarAddressInvalid(u64, u64),
+    #[error("address {0} is not aligned to size {1}")]
     BarAlignmentInvalid(u64, u64),
+    #[error("bar {0} already used")]
     BarInUse(PciBarIndex),
+    #[error("64bit bar {0} already used (requires two regs)")]
     BarInUse64(PciBarIndex),
+    #[error("bar {0} invalid, max {}", NUM_BAR_REGS - 1)]
     BarInvalid(PciBarIndex),
+    #[error("64bitbar {0} invalid, requires two regs, max {}", ROM_BAR_IDX - 1)]
     BarInvalid64(PciBarIndex),
+    #[error("expansion rom bar must be a memory region")]
     BarInvalidRomType,
+    #[error("bar address {0} not a power of two")]
     BarSizeInvalid(u64),
+    #[error("empty capabilities are invalid")]
     CapabilityEmpty,
+    #[error("Invalid capability length {0}")]
     CapabilityLengthInvalid(usize),
+    #[error("capability of size {0} doesn't fit")]
     CapabilitySpaceFull(usize),
 }
+
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl std::error::Error for Error {}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-        match self {
-            BarAddressInvalid(a, s) => write!(f, "address {} size {} too big", a, s),
-            BarAlignmentInvalid(a, s) => write!(f, "address {} is not aligned to size {}", a, s),
-            BarInUse(b) => write!(f, "bar {} already used", b),
-            BarInUse64(b) => write!(f, "64bit bar {} already used(requires two regs)", b),
-            BarInvalid(b) => write!(f, "bar {} invalid, max {}", b, NUM_BAR_REGS - 1),
-            BarInvalid64(b) => write!(
-                f,
-                "64bitbar {} invalid, requires two regs, max {}",
-                b,
-                ROM_BAR_IDX - 1
-            ),
-            BarInvalidRomType => write!(f, "expansion rom bar must be a memory region"),
-            BarSizeInvalid(s) => write!(f, "bar address {} not a power of two", s),
-            CapabilityEmpty => write!(f, "empty capabilities are invalid"),
-            CapabilityLengthInvalid(l) => write!(f, "Invalid capability length {}", l),
-            CapabilitySpaceFull(s) => write!(f, "capability of size {} doesn't fit", s),
-        }
-    }
-}
 
 impl PciConfiguration {
     pub fn new(
@@ -298,6 +309,7 @@ impl PciConfiguration {
         subclass: &dyn PciSubclass,
         programming_interface: Option<&dyn PciProgrammingInterface>,
         header_type: PciHeaderType,
+        multifunction: bool,
         subsystem_vendor_id: u16,
         subsystem_id: u16,
         revision_id: u8,
@@ -327,14 +339,21 @@ impl PciConfiguration {
                 registers[3] = 0x0001_0000; // Header type 1 (bridge)
                 writable_bits[6] = 0x00ff_ffff; // Primary/secondary/subordinate bus number,
                                                 // secondary latency timer
+                registers[7] = 0x0000_00f0; // IO base > IO Limit, no IO address on secondary side at initialize
                 writable_bits[7] = 0xf900_0000; // IO base and limit, secondary status,
+                registers[8] = 0x0000_fff0; // mem base > mem Limit, no MMIO address on secondary side at initialize
                 writable_bits[8] = 0xfff0_fff0; // Memory base and limit
+                registers[9] = 0x0001_fff1; // pmem base > pmem Limit, no prefetch MMIO address on secondary side at initialize
                 writable_bits[9] = 0xfff0_fff0; // Prefetchable base and limit
                 writable_bits[10] = 0xffff_ffff; // Prefetchable base upper 32 bits
                 writable_bits[11] = 0xffff_ffff; // Prefetchable limit upper 32 bits
                 writable_bits[15] = 0xffff_00ff; // Bridge control (r/w), interrupt line (r/w)
             }
         };
+        // Multifunction is indicated by the highest bit in the header_type field.
+        if multifunction {
+            registers[3] |= 0x0080_0000;
+        }
 
         PciConfiguration {
             registers,
@@ -521,7 +540,7 @@ impl PciConfiguration {
     #[allow(dead_code)] // TODO(dverkamp): remove this once used
     pub fn get_bars(&self) -> PciBarIter {
         PciBarIter {
-            config: &self,
+            config: self,
             bar_num: 0,
         }
     }
@@ -721,6 +740,7 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             None,
             PciHeaderType::Device,
+            false,
             0xABCD,
             0x2468,
             0,
@@ -783,6 +803,7 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
+            false,
             0xABCD,
             0x2468,
             0,
@@ -798,6 +819,24 @@ mod tests {
     }
 
     #[test]
+    fn multifunction() {
+        let cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            Some(&TestPI::Test),
+            PciHeaderType::Device,
+            true,
+            0xABCD,
+            0x2468,
+            0,
+        );
+
+        assert!((cfg.read_reg(3) & 0x0080_0000) != 0);
+    }
+
+    #[test]
     fn read_only_bits() {
         let mut cfg = PciConfiguration::new(
             0x1234,
@@ -806,6 +845,7 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
+            false,
             0xABCD,
             0x2468,
             0,
@@ -826,6 +866,7 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
+            false,
             0xABCD,
             0x2468,
             0,
@@ -848,6 +889,7 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
+            false,
             0xABCD,
             0x2468,
             0,
@@ -895,6 +937,7 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
+            false,
             0xABCD,
             0x2468,
             0,
@@ -941,6 +984,7 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
+            false,
             0xABCD,
             0x2468,
             0,
@@ -984,6 +1028,7 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
+            false,
             0xABCD,
             0x2468,
             0,
@@ -1106,6 +1151,7 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
+            false,
             0xABCD,
             0x2468,
             0,
@@ -1163,6 +1209,7 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
+            false,
             0xABCD,
             0x2468,
             0,

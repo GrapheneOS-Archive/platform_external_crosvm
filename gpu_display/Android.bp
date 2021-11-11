@@ -27,9 +27,13 @@ rust_library {
         "libdata_model",
         "liblibc",
         "liblinux_input_sys",
+        "libthiserror",
     ],
     static_libs: [
         "libdisplay_wl",
+    ],
+    proc_macros: [
+        "libremain",
     ],
 
     // added manually

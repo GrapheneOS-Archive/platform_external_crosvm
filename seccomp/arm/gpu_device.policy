@@ -62,7 +62,9 @@ socket: arg0 == 1 && arg1 == 0x80001 && arg2 == 0
 _llseek: 1
 ftruncate64: 1
 stat64: 1
+statx: 1
 fstat64: 1
+fstatat64: 1
 getdents: 1
 getdents64: 1
 sysinfo: 1
@@ -96,3 +98,12 @@ clock_gettime64: 1
 sched_setscheduler: 1
 sched_setaffinity: 1
 kcmp: 1
+
+# Rules for Vulkan loader / layers
+access: 1
+getgid32: 1
+getegid32: 1
+getcwd: 1
+
+# Rules for virglrenderer
+sched_yield: 1

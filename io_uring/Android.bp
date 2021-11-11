@@ -28,6 +28,7 @@ rust_defaults {
         "libtempfile",
         "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }
 
 rust_test_host {
@@ -59,4 +60,5 @@ rust_library {
         "libsys_util",
         "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }
