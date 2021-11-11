@@ -4,7 +4,6 @@
 
 //! rutabaga_utils: Utility enums, structs, and implementations needed by the rest of the crate.
 
-use std::fmt::{self, Display};
 use std::io::Error as IoError;
 use std::num::TryFromIntError;
 use std::os::raw::c_void;
@@ -13,6 +12,8 @@ use std::str::Utf8Error;
 
 use base::{Error as BaseError, ExternalMappingError, SafeDescriptor};
 use data_model::VolatileMemoryError;
+use remain::sorted;
+use thiserror::Error;
 
 #[cfg(feature = "vulkano")]
 use vulkano::device::DeviceCreationError;
@@ -40,6 +41,7 @@ unsafe impl Sync for RutabagaIovec {}
 /// can't work with gfxstream/virglrenderer without this.
 pub const RUTABAGA_PIPE_TEXTURE_2D: u32 = 2;
 pub const RUTABAGA_PIPE_BIND_RENDER_TARGET: u32 = 2;
+#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ResourceCreate3D {
     pub target: u32,
@@ -62,6 +64,7 @@ pub const RUTABAGA_BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 pub const RUTABAGA_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 pub const RUTABAGA_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
 pub const RUTABAGA_BLOB_FLAG_USE_CROSS_DEVICE: u32 = 0x0004;
+#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ResourceCreateBlob {
     pub blob_mem: u32,
@@ -96,12 +99,13 @@ pub const RUTABAGA_FLAG_FENCE: u32 = 1 << 0;
 pub const RUTABAGA_FLAG_INFO_RING_IDX: u32 = 1 << 1;
 
 /// Convenience struct for Rutabaga fences
+#[repr(C)]
 #[derive(Copy, Clone)]
-pub struct RutabagaFenceData {
+pub struct RutabagaFence {
     pub flags: u32,
     pub fence_id: u64,
     pub ctx_id: u32,
-    pub ring_idx: u32,
+    pub ring_idx: u8,
 }
 
 /// Mapped memory caching flags (see virtio_gpu spec)
@@ -118,121 +122,126 @@ pub const RUTABAGA_CAPSET_VENUS: u32 = 4;
 pub const RUTABAGA_CAPSET_CROSS_DOMAIN: u32 = 5;
 
 /// An error generated while using this crate.
-#[derive(Debug)]
+#[sorted]
+#[derive(Error, Debug)]
 pub enum RutabagaError {
     /// Indicates `Rutabaga` was already initialized since only one Rutabaga instance per process
     /// is allowed.
+    #[error("attempted to use a rutabaga asset already in use")]
     AlreadyInUse,
+    /// Base error returned as a result of rutabaga library operation.
+    #[error("rutabaga received a base error: {0}")]
+    BaseError(BaseError),
     /// Checked Arithmetic error
+    #[error("arithmetic failed: {}({}) {op} {}({})", .field1.0, .field1.1, .field2.0, .field2.1)]
     CheckedArithmetic {
         field1: (&'static str, usize),
         field2: (&'static str, usize),
         op: &'static str,
     },
     /// Checked Range error
+    #[error("range check failed: {}({}) vs {}({})", .field1.0, .field1.1, .field2.0, .field2.1)]
     CheckedRange {
         field1: (&'static str, usize),
         field2: (&'static str, usize),
     },
-    /// The Rutabaga component failed to export a RutabagaHandle.
-    ExportedRutabagaHandle,
+    /// An internal Rutabaga component error was returned.
+    #[error("rutabaga component failed with error {0}")]
+    ComponentError(i32),
+    /// Invalid 2D info
+    #[error("invalid 2D info")]
+    Invalid2DInfo,
     /// Invalid Capset
+    #[error("invalid capset")]
     InvalidCapset,
     /// A command size was submitted that was invalid.
+    #[error("command buffer submitted with invalid size: {0}")]
     InvalidCommandSize(usize),
     /// Invalid RutabagaComponent
+    #[error("invalid rutabaga component")]
     InvalidComponent,
     /// Invalid Context ID
+    #[error("invalid context id")]
     InvalidContextId,
+    /// Invalid cross domain channel
+    #[error("invalid cross domain channel")]
+    InvalidCrossDomainChannel,
+    /// Invalid cross domain item ID
+    #[error("invalid cross domain item id")]
+    InvalidCrossDomainItemId,
+    /// Invalid cross domain item type
+    #[error("invalid cross domain item type")]
+    InvalidCrossDomainItemType,
+    /// Invalid cross domain state
+    #[error("invalid cross domain state")]
+    InvalidCrossDomainState,
+    /// Invalid gralloc backend.
+    #[error("invalid gralloc backend")]
+    InvalidGrallocBackend,
+    /// Invalid gralloc dimensions.
+    #[error("invalid gralloc dimensions")]
+    InvalidGrallocDimensions,
+    /// Invalid gralloc DRM format.
+    #[error("invalid gralloc DRM format")]
+    InvalidGrallocDrmFormat,
+    /// Invalid GPU type.
+    #[error("invalid GPU type for gralloc")]
+    InvalidGrallocGpuType,
+    /// Invalid number of YUV planes.
+    #[error("invalid number of YUV planes")]
+    InvalidGrallocNumberOfPlanes,
     /// The indicated region of guest memory is invalid.
+    #[error("an iovec is outside of guest memory's range")]
     InvalidIovec,
     /// Invalid Resource ID.
+    #[error("invalid resource id")]
     InvalidResourceId,
     /// Indicates an error in the RutabagaBuilder.
+    #[error("invalid rutabaga build parameters")]
     InvalidRutabagaBuild,
+    /// An error with the RutabagaHandle
+    #[error("invalid rutabaga handle")]
+    InvalidRutabagaHandle,
+    /// Invalid Vulkan info
+    #[error("invalid vulkan info")]
+    InvalidVulkanInfo,
     /// An input/output error occured.
+    #[error("an input/output error occur: {0}")]
     IoError(IoError),
     /// The mapping failed.
+    #[error("The mapping failed for the following reason: {0}")]
     MappingFailed(ExternalMappingError),
-    /// An internal Rutabaga component error was returned.
-    ComponentError(i32),
     /// Violation of the Rutabaga spec occured.
-    SpecViolation,
-    /// Base error returned as a result of rutabaga library operation.
-    BaseError(BaseError),
+    #[error("violation of the rutabaga spec: {0}")]
+    SpecViolation(&'static str),
     /// An attempted integer conversion failed.
+    #[error("int conversion failed: {0}")]
     TryFromIntError(TryFromIntError),
     /// The command is unsupported.
+    #[error("the requested function is not implemented")]
     Unsupported,
     /// Utf8 error.
+    #[error("an utf8 error occured: {0}")]
     Utf8Error(Utf8Error),
-    /// Volatile memory error
-    VolatileMemoryError(VolatileMemoryError),
-    /// Image creation error
-    #[cfg(feature = "vulkano")]
-    VkImageCreationError(ImageCreationError),
-    /// Instance creation error
-    #[cfg(feature = "vulkano")]
-    VkInstanceCreationError(InstanceCreationError),
     /// Device creation error
     #[cfg(feature = "vulkano")]
+    #[error("vulkano device creation failure {0}")]
     VkDeviceCreationError(DeviceCreationError),
     /// Device memory allocation error
     #[cfg(feature = "vulkano")]
+    #[error("vulkano device memory allocation failure {0}")]
     VkDeviceMemoryAllocError(DeviceMemoryAllocError),
-}
-
-impl Display for RutabagaError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::RutabagaError::*;
-        match self {
-            AlreadyInUse => write!(f, "attempted to use a rutabaga asset already in use"),
-            CheckedArithmetic {
-                field1: (label1, value1),
-                field2: (label2, value2),
-                op,
-            } => write!(
-                f,
-                "arithmetic failed: {}({}) {} {}({})",
-                label1, value1, op, label2, value2
-            ),
-            CheckedRange {
-                field1: (label1, value1),
-                field2: (label2, value2),
-            } => write!(
-                f,
-                "range check failed: {}({}) vs {}({})",
-                label1, value1, label2, value2
-            ),
-            ExportedRutabagaHandle => write!(f, "failed to export Rutabaga handle"),
-            InvalidCapset => write!(f, "invalid capset"),
-            InvalidCommandSize(s) => write!(f, "command buffer submitted with invalid size: {}", s),
-            InvalidComponent => write!(f, "invalid rutabaga component"),
-            InvalidContextId => write!(f, "invalid context id"),
-            InvalidIovec => write!(f, "an iovec is outside of guest memory's range"),
-            InvalidResourceId => write!(f, "invalid resource id"),
-            InvalidRutabagaBuild => write!(f, "invalid rutabaga build parameters"),
-            IoError(e) => write!(f, "an input/output error occur: {}", e),
-            MappingFailed(s) => write!(f, "The mapping failed for the following reason: {}", s),
-            ComponentError(ret) => write!(f, "rutabaga component failed with error {}", ret),
-            SpecViolation => write!(f, "violation of the rutabaga spec"),
-            BaseError(e) => write!(f, "rutabaga received a base error: {}", e),
-            TryFromIntError(e) => write!(f, "int conversion failed: {}", e),
-            Unsupported => write!(f, "feature or function unsupported"),
-            Utf8Error(e) => write!(f, "an utf8 error occured: {}", e),
-            VolatileMemoryError(e) => write!(f, "noticed a volatile memory error {}", e),
-            #[cfg(feature = "vulkano")]
-            VkDeviceCreationError(e) => write!(f, "vulkano device creation failure {}", e),
-            #[cfg(feature = "vulkano")]
-            VkDeviceMemoryAllocError(e) => {
-                write!(f, "vulkano device memory allocation failure {}", e)
-            }
-            #[cfg(feature = "vulkano")]
-            VkImageCreationError(e) => write!(f, "vulkano image creation failure {}", e),
-            #[cfg(feature = "vulkano")]
-            VkInstanceCreationError(e) => write!(f, "vulkano instance creation failure {}", e),
-        }
-    }
+    /// Image creation error
+    #[cfg(feature = "vulkano")]
+    #[error("vulkano image creation failure {0}")]
+    VkImageCreationError(ImageCreationError),
+    /// Instance creation error
+    #[cfg(feature = "vulkano")]
+    #[error("vulkano instance creation failure {0}")]
+    VkInstanceCreationError(InstanceCreationError),
+    /// Volatile memory error
+    #[error("noticed a volatile memory error {0}")]
+    VolatileMemoryError(VolatileMemoryError),
 }
 
 impl From<IoError> for RutabagaError {
@@ -432,7 +441,8 @@ impl From<GfxstreamFlags> for i32 {
 }
 
 /// Transfers {to, from} 1D buffers, 2D textures, 3D textures, and cubemaps.
-#[derive(Debug)]
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
 pub struct Transfer3D {
     pub x: u32,
     pub y: u32,
@@ -511,7 +521,7 @@ impl RutabagaHandle {
         let clone = self
             .os_handle
             .try_clone()
-            .map_err(|_| RutabagaError::Unsupported)?;
+            .map_err(|_| RutabagaError::InvalidRutabagaHandle)?;
         Ok(RutabagaHandle {
             os_handle: clone,
             handle_type: self.handle_type,
@@ -521,7 +531,7 @@ impl RutabagaHandle {
 
 /// Trait for fence completion handlers
 pub trait RutabagaFenceCallback: Send {
-    fn call(&self, data: RutabagaFenceData);
+    fn call(&self, data: RutabagaFence);
     fn clone_box(&self) -> RutabagaFenceHandler;
 }
 
@@ -542,7 +552,7 @@ pub struct RutabagaFenceClosure<T> {
 
 impl<T> RutabagaFenceClosure<T>
 where
-    T: Fn(RutabagaFenceData) + Clone + Send + 'static,
+    T: Fn(RutabagaFence) + Clone + Send + 'static,
 {
     pub fn new(closure: T) -> RutabagaFenceHandler {
         Box::new(RutabagaFenceClosure { closure })
@@ -551,9 +561,9 @@ where
 
 impl<T> RutabagaFenceCallback for RutabagaFenceClosure<T>
 where
-    T: Fn(RutabagaFenceData) + Clone + Send + 'static,
+    T: Fn(RutabagaFence) + Clone + Send + 'static,
 {
-    fn call(&self, data: RutabagaFenceData) {
+    fn call(&self, data: RutabagaFence) {
         (self.closure)(data)
     }
 

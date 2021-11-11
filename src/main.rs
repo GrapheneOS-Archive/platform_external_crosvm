@@ -7,6 +7,7 @@
 pub mod panic_hook;
 
 use std::collections::BTreeMap;
+use std::convert::TryFrom;
 use std::default::Default;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader};
@@ -16,26 +17,33 @@ use std::string::String;
 use std::thread::sleep;
 use std::time::Duration;
 
-use arch::{
-    set_default_serial_parameters, Pstore, SerialHardware, SerialParameters, SerialType,
-    VcpuAffinity,
-};
+use arch::{set_default_serial_parameters, Pstore, VcpuAffinity};
 use base::{debug, error, getpid, info, kill_process_group, reap_child, syslog, warn};
 #[cfg(feature = "direct")]
 use crosvm::DirectIoOption;
 use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
     platform, BindMount, Config, DiskOption, Executable, GidMap, SharedDir, TouchDeviceOption,
-    VhostUserFsOption, VhostUserOption, VhostUserWlOption, DISK_ID_LEN,
+    VfioCommand, VhostUserFsOption, VhostUserOption, VhostUserWlOption, DISK_ID_LEN,
+};
+use devices::serial_device::{SerialHardware, SerialParameters, SerialType};
+#[cfg(feature = "audio_cras")]
+use devices::virtio::snd::cras_backend::Error as CrasSndError;
+use devices::virtio::vhost::user::device::{
+    run_block_device, run_console_device, run_fs_device, run_net_device, run_vsock_device,
+    run_wl_device,
 };
 #[cfg(feature = "gpu")]
-use devices::virtio::gpu::{
-    GpuDisplayParameters, GpuMode, GpuParameters, DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH,
+use devices::virtio::{
+    gpu::{
+        GpuDisplayParameters, GpuMode, GpuParameters, DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH,
+    },
+    vhost::user::device::run_gpu_device,
 };
-use devices::ProtectionType;
 #[cfg(feature = "audio")]
 use devices::{Ac97Backend, Ac97Parameters};
-use disk::QcowFile;
+use devices::{PciAddress, PciClassCode, ProtectionType, StubPciParameters};
+use disk::{self, QcowFile};
 #[cfg(feature = "composite-disk")]
 use disk::{
     create_composite_disk, create_disk_file, create_zero_filler, ImagePartitionType, PartitionInfo,
@@ -542,6 +550,15 @@ fn parse_ac97_options(s: &str) -> argument::Result<Ac97Parameters> {
                         expected: e.to_string(),
                     })?;
             }
+            #[cfg(feature = "audio_cras")]
+            "socket_type" => {
+                ac97_params
+                    .set_socket_type(v)
+                    .map_err(|e| argument::Error::InvalidValue {
+                        value: v.to_string(),
+                        expected: e.to_string(),
+                    })?;
+            }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             "server" => {
                 ac97_params.vios_server_path =
@@ -860,6 +877,52 @@ fn parse_direct_io_options(s: Option<&str>) -> argument::Result<DirectIoOption> 
     })
 }
 
+fn parse_stub_pci_parameters(s: Option<&str>) -> argument::Result<StubPciParameters> {
+    let s = s.ok_or(argument::Error::ExpectedValue(String::from(
+        "stub-pci-device configuration expected",
+    )))?;
+
+    let mut options = argument::parse_key_value_options("stub-pci-device", s, ',');
+    let addr = options
+        .next()
+        .ok_or(argument::Error::ExpectedValue(String::from(
+            "stub-pci-device: expected device address",
+        )))?
+        .key();
+    let mut params = StubPciParameters {
+        address: PciAddress::from_string(addr),
+        vendor_id: 0,
+        device_id: 0,
+        class: PciClassCode::Other,
+        subclass: 0,
+        programming_interface: 0,
+        multifunction: false,
+        subsystem_device_id: 0,
+        subsystem_vendor_id: 0,
+        revision_id: 0,
+    };
+    for opt in options {
+        match opt.key() {
+            "vendor" => params.vendor_id = opt.parse_numeric::<u16>()?,
+            "device" => params.device_id = opt.parse_numeric::<u16>()?,
+            "class" => {
+                let class = opt.parse_numeric::<u32>()?;
+                params.class = PciClassCode::try_from((class >> 16) as u8)
+                    .map_err(|_| opt.invalid_value_err(String::from("Unknown class code")))?;
+                params.subclass = (class >> 8) as u8;
+                params.programming_interface = class as u8;
+            }
+            "multifunction" => params.multifunction = opt.parse_or::<bool>(true)?,
+            "subsystem_vendor" => params.subsystem_vendor_id = opt.parse_numeric::<u16>()?,
+            "subsystem_device" => params.subsystem_device_id = opt.parse_numeric::<u16>()?,
+            "revision" => params.revision_id = opt.parse_numeric::<u8>()?,
+            _ => return Err(opt.invalid_key_err()),
+        }
+    }
+
+    Ok(params)
+}
+
 fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::Result<()> {
     match name {
         "" => {
@@ -962,6 +1025,18 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         "cpu-capacity" => {
             parse_cpu_capacity(value.unwrap(), &mut cfg.cpu_capacity)?;
+        }
+        "per-vm-core-scheduling" => {
+            cfg.per_vm_core_scheduling = true;
+        }
+        #[cfg(feature = "audio_cras")]
+        "cras-snd" => {
+            cfg.cras_snd = Some(
+                value
+                    .unwrap()
+                    .parse()
+                    .map_err(|e: CrasSndError| argument::Error::Syntax(e.to_string()))?,
+            );
         }
         "no-smt" => {
             cfg.no_smt = true;
@@ -1435,6 +1510,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             //   (default: "0 <current euid> 1")
             // * gidmap=GIDMAP - a gid map in the same format as uidmap
             //   (default: "0 <current egid> 1")
+            // * privileged_quota_uids=UIDS - Space-separated list of privileged uid values. When
+            //   performing quota-related operations, these UIDs are treated as if they have
+            //   CAP_FOWNER.
             // * timeout=TIMEOUT - a timeout value in seconds, which indicates how long attributes
             //   and directory contents should be considered valid (default: 5)
             // * cache=CACHE - one of "never", "always", or "auto" (default: auto)
@@ -1491,6 +1569,11 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                     }
                     "uidmap" => shared_dir.uid_map = value.into(),
                     "gidmap" => shared_dir.gid_map = value.into(),
+                    #[cfg(feature = "chromeos")]
+                    "privileged_quota_uids" => {
+                        shared_dir.fs_cfg.privileged_quota_uids =
+                            value.split(' ').map(|s| s.parse().unwrap()).collect();
+                    }
                     "timeout" => {
                         let seconds = value.parse().map_err(|_| argument::Error::InvalidValue {
                             value: value.to_owned(),
@@ -1536,6 +1619,21 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                             })?;
                         shared_dir.fs_cfg.ascii_casefold = ascii_casefold;
                         shared_dir.p9_cfg.ascii_casefold = ascii_casefold;
+                    }
+                    "dax" => {
+                        let use_dax = value.parse().map_err(|_| argument::Error::InvalidValue {
+                            value: value.to_owned(),
+                            expected: String::from("`dax` must be a boolean"),
+                        })?;
+                        shared_dir.fs_cfg.use_dax = use_dax;
+                    }
+                    "posix_acl" => {
+                        let posix_acl =
+                            value.parse().map_err(|_| argument::Error::InvalidValue {
+                                value: value.to_owned(),
+                                expected: String::from("`posix_acl` must be a boolean"),
+                            })?;
+                        shared_dir.fs_cfg.posix_acl = posix_acl;
                     }
                     _ => {
                         return Err(argument::Error::InvalidValue {
@@ -1735,53 +1833,10 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.executable_path = Some(Executable::Bios(PathBuf::from(value.unwrap().to_owned())));
         }
-        "vfio" => {
-            let mut param = value.unwrap().split(',');
-            let vfio_path =
-                PathBuf::from(param.next().ok_or_else(|| argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
-                    expected: String::from("missing vfio path"),
-                })?);
-            if !vfio_path.exists() {
-                return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
-                    expected: String::from("the vfio path does not exist"),
-                });
-            }
-            if !vfio_path.is_dir() {
-                return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
-                    expected: String::from("the vfio path should be directory"),
-                });
-            }
-
-            let mut enable_iommu = false;
-            if let Some(p) = param.next() {
-                let mut kv = p.splitn(2, '=');
-                if let (Some(kind), Some(value)) = (kv.next(), kv.next()) {
-                    match kind {
-                        "iommu" => (),
-                        _ => {
-                            return Err(argument::Error::InvalidValue {
-                                value: p.to_owned(),
-                                expected: String::from("option must be `iommu=on|off`"),
-                            })
-                        }
-                    }
-                    match value {
-                        "on" => enable_iommu = true,
-                        "off" => (),
-                        _ => {
-                            return Err(argument::Error::InvalidValue {
-                                value: p.to_owned(),
-                                expected: String::from("option must be `iommu=on|off`"),
-                            })
-                        }
-                    }
-                };
-            }
-
-            cfg.vfio.insert(vfio_path, enable_iommu);
+        "vfio" | "vfio-platform" => {
+            let vfio_type = name.parse().unwrap();
+            let vfio_dev = VfioCommand::new(vfio_type, value.unwrap())?;
+            cfg.vfio.push(vfio_dev);
         }
         "video-decoder" => {
             cfg.video_dec = true;
@@ -1842,12 +1897,22 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "vhost-user-console" => cfg.vhost_user_console.push(VhostUserOption {
             socket: PathBuf::from(value.unwrap()),
         }),
+        "vhost-user-gpu" => cfg.vhost_user_gpu.push(VhostUserOption {
+            socket: PathBuf::from(value.unwrap()),
+        }),
         "vhost-user-mac80211-hwsim" => {
             cfg.vhost_user_mac80211_hwsim = Some(VhostUserOption {
                 socket: PathBuf::from(value.unwrap()),
             });
         }
         "vhost-user-net" => cfg.vhost_user_net.push(VhostUserOption {
+            socket: PathBuf::from(value.unwrap()),
+        }),
+        #[cfg(feature = "audio")]
+        "vhost-user-snd" => cfg.vhost_user_snd.push(VhostUserOption {
+            socket: PathBuf::from(value.unwrap()),
+        }),
+        "vhost-user-vsock" => cfg.vhost_user_vsock.push(VhostUserOption {
             socket: PathBuf::from(value.unwrap()),
         }),
         "vhost-user-wl" => {
@@ -1897,6 +1962,15 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 ));
             }
             cfg.direct_pmio = Some(parse_direct_io_options(value)?);
+        }
+        #[cfg(feature = "direct")]
+        "direct-mmio" => {
+            if cfg.direct_mmio.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`direct_mmio` already given".to_owned(),
+                ));
+            }
+            cfg.direct_mmio = Some(parse_direct_io_options(value)?);
         }
         #[cfg(feature = "direct")]
         "direct-level-irq" => {
@@ -1951,6 +2025,13 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         "no-legacy" => {
             cfg.no_legacy = true;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "host-cpu-topology" => {
+            cfg.host_cpu_topology = true;
+        }
+        "stub-pci-device" => {
+            cfg.stub_pci_devices.push(parse_stub_pci_parameters(value)?);
         }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
@@ -2013,6 +2094,38 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
             ));
         }
     }
+    if cfg.host_cpu_topology {
+        // Safe because we pass a flag for this call and the host supports this system call
+        let pcpu_count = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) } as usize;
+        if cfg.vcpu_count.is_some() {
+            if pcpu_count != cfg.vcpu_count.unwrap() {
+                return Err(argument::Error::ExpectedArgument(format!(
+                    "`host-cpu-topology` requires the count of vCPUs({}) to equal the \
+                            count of CPUs({}) on host.",
+                    cfg.vcpu_count.unwrap(),
+                    pcpu_count
+                )));
+            }
+        } else {
+            cfg.vcpu_count = Some(pcpu_count);
+        }
+
+        match &cfg.vcpu_affinity {
+            None => {
+                let mut affinity_map = BTreeMap::new();
+                for cpu_id in 0..cfg.vcpu_count.unwrap() {
+                    affinity_map.insert(cpu_id, vec![cpu_id]);
+                }
+                cfg.vcpu_affinity = Some(VcpuAffinity::PerVcpu(affinity_map));
+            }
+            _ => {
+                return Err(argument::Error::ExpectedArgument(
+                    "`host-cpu-topology` requires not to set `cpu-affinity` at the same time"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
     set_default_serial_parameters(&mut cfg.serial_parameters);
     Ok(())
 }
@@ -2034,6 +2147,17 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                               or colon-separated list of assignments of guest to host CPU assignments (e.g. 0=0:1=1:2=2) (default: no mask)"),
           Argument::value("cpu-cluster", "CPUSET", "Group the given CPUs into a cluster (default: no clusters)"),
           Argument::value("cpu-capacity", "CPU=CAP[,CPU=CAP[,...]]", "Set the relative capacity of the given CPU (default: no capacity)"),
+          Argument::flag("per-vm-core-scheduling", "Enable per-VM core scheduling intead of the default one (per-vCPU core scheduing) by
+              making all vCPU threads share same cookie for core scheduling.
+              This option is no-op on devices that have neither MDS nor L1TF vulnerability."),
+          #[cfg(feature = "audio_cras")]
+          Argument::value("cras-snd",
+          "[capture=true,client=crosvm,socket=unified]",
+          "Comma separated key=value pairs for setting up cras snd devices.
+              Possible key values:
+              capture - Enable audio capture.
+              client_type - Set specific client type for cras backend.
+              socket_type - Set specific socket type for cras backend (legacy/unified)"),
           Argument::flag("no-smt", "Don't use SMT in the guest"),
           Argument::value("rt-cpus", "CPUSET", "Comma-separated list of CPUs or CPU ranges to run VCPUs on. (e.g. 0,1-3,5) (default: none)"),
           Argument::flag("delay-rt", "Don't set VCPUs real-time until make-rt command is run"),
@@ -2077,6 +2201,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                               capture - Enable audio capture
                               capture_effects - | separated effects to be enabled for recording. The only supported effect value now is EchoCancellation or aec.
                               client_type - Set specific client type for cras backend.
+                              socket_type - Set specific socket type for cras backend.
                               server - The to the VIOS server (unix socket)."),
           #[cfg(feature = "audio")]
           Argument::value("sound", "[PATH]", "Path to the VioS server socket for setting up virtio-snd devices."),
@@ -2106,7 +2231,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                                 "Path to put the control socket. If PATH is a directory, a name will be generated."),
           Argument::flag("disable-sandbox", "Run all devices in one, non-sandboxed process."),
           Argument::value("cid", "CID", "Context ID for virtual sockets."),
-          Argument::value("shared-dir", "PATH:TAG[:type=TYPE:writeback=BOOL:timeout=SECONDS:uidmap=UIDMAP:gidmap=GIDMAP:cache=CACHE]",
+          Argument::value("shared-dir", "PATH:TAG[:type=TYPE:writeback=BOOL:timeout=SECONDS:uidmap=UIDMAP:gidmap=GIDMAP:cache=CACHE:dax=BOOL,posix_acl=BOOL]",
                           "Colon-separated options for configuring a directory to be shared with the VM.
                               The first field is the directory to be shared and the second field is the tag that the VM can use to identify the device.
                               The remaining fields are key=value pairs that may appear in any order.  Valid keys are:
@@ -2116,6 +2241,8 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
                               cache=(never, auto, always) - Indicates whether the VM can cache the contents of the shared directory (default: auto).  When set to \"auto\" and the type is \"fs\", the VM will use close-to-open consistency for file contents.
                               timeout=SECONDS - How long the VM should consider file attributes and directory entries to be valid (default: 5).  If the VM has exclusive access to the directory, then this should be a large value.  If the directory can be modified by other processes, then this should be 0.
                               writeback=BOOL - Indicates whether the VM can use writeback caching (default: false).  This is only safe to do when the VM has exclusive access to the files in a directory.  Additionally, the server should have read permission for all files as the VM may issue read requests even for files that are opened write-only.
+                              dax=BOOL - Indicates whether DAX support should be enabled.  Enabling DAX can improve performance for frequently accessed files by mapping regions of the file directory into the VM's memory, allowing direct access at the cost of slightly increased latency the first time the file is accessed.  Since the mapping is shared directly from the host kernel's file cache, enabling DAX can improve performance even when the cache policy is \"Never\".  The default value for this option is \"false\".
+                              posix_acl=BOOL - Indicates whether the shared directory supports POSIX ACLs.  This should only be enabled when the underlying file system supports POSIX ACLs.  The default value for this option is \"true\".
 "),
           Argument::value("seccomp-policy-dir", "PATH", "Path to seccomp .policy files."),
           Argument::flag("seccomp-log-failures", "Instead of seccomp filter failures being fatal, they will be logged instead."),
@@ -2168,8 +2295,9 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
           #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("split-irqchip", "(EXPERIMENTAL) enable split-irqchip support"),
           Argument::value("bios", "PATH", "Path to BIOS/firmware ROM"),
-          Argument::value("vfio", "PATH[,iommu=on|off]", "Path to sysfs of pass through or mdev device.
+          Argument::value("vfio", "PATH[,iommu=on|off]", "Path to sysfs of PCI pass through or mdev device.
 iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
+          Argument::value("vfio-platform", "PATH", "Path to sysfs of platform pass through"),
           #[cfg(feature = "video-decoder")]
           Argument::flag("video-decoder", "(EXPERIMENTAL) enable virtio-video decoder device"),
           #[cfg(feature = "video-encoder")]
@@ -2187,19 +2315,36 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("balloon_bias_mib", "N", "Amount to bias balance of memory between host and guest as the balloon inflates, in MiB."),
           Argument::value("vhost-user-blk", "SOCKET_PATH", "Path to a socket for vhost-user block"),
           Argument::value("vhost-user-console", "SOCKET_PATH", "Path to a socket for vhost-user console"),
+          Argument::value("vhost-user-gpu", "SOCKET_PATH", "Paths to a vhost-user socket for gpu"),
           Argument::value("vhost-user-mac80211-hwsim", "SOCKET_PATH", "Path to a socket for vhost-user mac80211_hwsim"),
           Argument::value("vhost-user-net", "SOCKET_PATH", "Path to a socket for vhost-user net"),
+          #[cfg(feature = "audio")]
+          Argument::value("vhost-user-snd", "SOCKET_PATH", "Path to a socket for vhost-user snd"),
+          Argument::value("vhost-user-vsock", "SOCKET_PATH", "Path to a socket for vhost-user vsock"),
           Argument::value("vhost-user-wl", "SOCKET_PATH:TUBE_PATH", "Paths to a vhost-user socket for wayland and a Tube socket for additional wayland-specific messages"),
           Argument::value("vhost-user-fs", "SOCKET_PATH:TAG",
                           "Path to a socket path for vhost-user fs, and tag for the shared dir"),
           #[cfg(feature = "direct")]
-          Argument::value("direct-pmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct port I/O access"),
+          Argument::value("direct-pmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct port mapped I/O access"),
+          #[cfg(feature = "direct")]
+          Argument::value("direct-mmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct memory mapped I/O access"),
           #[cfg(feature = "direct")]
           Argument::value("direct-level-irq", "irq", "Enable interrupt passthrough"),
           #[cfg(feature = "direct")]
           Argument::value("direct-edge-irq", "irq", "Enable interrupt passthrough"),
           Argument::value("dmi", "DIR", "Directory with smbios_entry_point/DMI files"),
           Argument::flag("no-legacy", "Don't use legacy KBD/RTC devices emulation"),
+          #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+          Argument::flag("host-cpu-topology", "Use mirror cpu topology of Host for Guest VM"),
+          Argument::value("stub-pci-device", "DOMAIN:BUS:DEVICE.FUNCTION[,vendor=NUM][,device=NUM][,class=NUM][,multifunction][,subsystem_vendor=NUM][,subsystem_device=NUM][,revision=NUM]", "Comma-separated key=value pairs for setting up a stub PCI device that just enumerates. The first option in the list must specify a PCI address to claim.
+                              Optional further parameters
+                              vendor=NUM - PCI vendor ID
+                              device=NUM - PCI device ID
+                              class=NUM - PCI class (including class code, subclass, and programming interface)
+                              multifunction - whether to set the multifunction flag
+                              subsystem_vendor=NUM - PCI subsystem vendor ID
+                              subsystem_device=NUM - PCI subsystem device ID
+                              revision=NUM - revision"),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -2276,17 +2421,6 @@ fn resume_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     vms_request(&VmRequest::Resume, socket_path)
 }
 
-fn make_rt(mut args: std::env::Args) -> std::result::Result<(), ()> {
-    if args.len() == 0 {
-        print_help("crosvm make_rt", "VM_SOCKET...", &[]);
-        println!("Makes the crosvm instance listening on each `VM_SOCKET` given RT.");
-        return Err(());
-    }
-    let socket_path = &args.next().unwrap();
-    let socket_path = Path::new(&socket_path);
-    vms_request(&VmRequest::MakeRT, socket_path)
-}
-
 fn balloon_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     if args.len() < 2 {
         print_help("crosvm balloon", "SIZE VM_SOCKET...", &[]);
@@ -2329,6 +2463,32 @@ fn balloon_stats(mut args: std::env::Args) -> std::result::Result<(), ()> {
         VmResponse::BalloonStats { .. } => Ok(()),
         _ => Err(()),
     }
+}
+
+fn modify_battery(mut args: std::env::Args) -> std::result::Result<(), ()> {
+    if args.len() < 4 {
+        print_help(
+            "crosvm battery BATTERY_TYPE ",
+            "[status STATUS | \
+             present PRESENT | \
+             health HEALTH | \
+             capacity CAPACITY | \
+             aconline ACONLINE ] \
+             VM_SOCKET...",
+            &[],
+        );
+        return Err(());
+    }
+
+    // This unwrap will not panic because of the above length check.
+    let battery_type = args.next().unwrap();
+    let property = args.next().unwrap();
+    let target = args.next().unwrap();
+
+    let socket_path = args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+
+    do_modify_battery(socket_path, &*battery_type, &*property, &*target)
 }
 
 #[cfg(feature = "composite-disk")]
@@ -2393,7 +2553,7 @@ fn create_composite(mut args: std::env::Args) -> std::result::Result<(), ()> {
             if let [label, path] = partition_arg.split(":").collect::<Vec<_>>()[..] {
                 let partition_file = File::open(path)
                     .map_err(|e| error!("Failed to open partition image: {}", e))?;
-                let size = create_disk_file(partition_file)
+                let size = create_disk_file(partition_file, disk::MAX_NESTING_DEPTH)
                     .map_err(|e| error!("Failed to create DiskFile instance: {}", e))?
                     .get_len()
                     .map_err(|e| error!("Failed to get length of partition image: {}", e))?;
@@ -2503,13 +2663,53 @@ with a '--backing_file'."
             error!("Failed to create qcow file at '{}': {}", file_path, e);
         })?,
         (None, Some(backing_file)) => {
-            QcowFile::new_from_backing(file, &backing_file).map_err(|e| {
-                error!("Failed to create qcow file at '{}': {}", file_path, e);
-            })?
+            QcowFile::new_from_backing(file, &backing_file, disk::MAX_NESTING_DEPTH).map_err(
+                |e| {
+                    error!("Failed to create qcow file at '{}': {}", file_path, e);
+                },
+            )?
         }
         _ => unreachable!(),
     };
     Ok(())
+}
+
+fn start_device(mut args: std::env::Args) -> std::result::Result<(), ()> {
+    let print_usage = || {
+        print_help(
+            "crosvm device",
+            " (block|console|fs|gpu|net|wl) <device-specific arguments>",
+            &[],
+        );
+    };
+
+    if args.len() == 0 {
+        print_usage();
+        return Err(());
+    }
+
+    let device = args.next().unwrap();
+
+    let program_name = format!("crosvm device {}", device);
+    let result = match device.as_str() {
+        "block" => run_block_device(&program_name, args),
+        "console" => run_console_device(&program_name, args),
+        "fs" => run_fs_device(&program_name, args),
+        #[cfg(feature = "gpu")]
+        "gpu" => run_gpu_device(&program_name, args),
+        "net" => run_net_device(&program_name, args),
+        "vsock" => run_vsock_device(&program_name, args),
+        "wl" => run_wl_device(&program_name, args),
+        _ => {
+            println!("Unknown device name: {}", device);
+            print_usage();
+            return Err(());
+        }
+    };
+
+    result.map_err(|e| {
+        error!("Failed to run {} device: {}", device, e);
+    })
 }
 
 fn disk_cmd(mut args: std::env::Args) -> std::result::Result<(), ()> {
@@ -2556,6 +2756,17 @@ fn disk_cmd(mut args: std::env::Args) -> std::result::Result<(), ()> {
     vms_request(&request, socket_path)
 }
 
+fn make_rt(mut args: std::env::Args) -> std::result::Result<(), ()> {
+    if args.len() == 0 {
+        print_help("crosvm make_rt", "VM_SOCKET...", &[]);
+        println!("Makes the crosvm instance listening on each `VM_SOCKET` given RT.");
+        return Err(());
+    }
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    vms_request(&VmRequest::MakeRT, socket_path)
+}
+
 fn parse_bus_id_addr(v: &str) -> ModifyUsbResult<(u8, u8, u16, u16)> {
     debug!("parse_bus_id_addr: {}", v);
     let mut ids = v.split(':');
@@ -2567,9 +2778,9 @@ fn parse_bus_id_addr(v: &str) -> ModifyUsbResult<(u8, u8, u16, u16)> {
             let addr = addr
                 .parse::<u8>()
                 .map_err(|e| ModifyUsbError::ArgParseInt("addr", addr.to_owned(), e))?;
-            let vid = u16::from_str_radix(&vid, 16)
+            let vid = u16::from_str_radix(vid, 16)
                 .map_err(|e| ModifyUsbError::ArgParseInt("vid", vid.to_owned(), e))?;
-            let pid = u16::from_str_radix(&pid, 16)
+            let pid = u16::from_str_radix(pid, 16)
                 .map_err(|e| ModifyUsbError::ArgParseInt("pid", pid.to_owned(), e))?;
             Ok((bus_id, addr, vid, pid))
         }
@@ -2595,7 +2806,7 @@ fn usb_attach(mut args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
         .ok_or(ModifyUsbError::ArgMissing("control socket path"))?;
     let socket_path = Path::new(&socket_path);
 
-    do_usb_attach(&socket_path, bus, addr, vid, pid, &dev_path)
+    do_usb_attach(socket_path, bus, addr, vid, pid, &dev_path)
 }
 
 fn usb_detach(mut args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
@@ -2609,7 +2820,7 @@ fn usb_detach(mut args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
         .next()
         .ok_or(ModifyUsbError::ArgMissing("control socket path"))?;
     let socket_path = Path::new(&socket_path);
-    do_usb_detach(&socket_path, port)
+    do_usb_detach(socket_path, port)
 }
 
 fn usb_list(mut args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
@@ -2617,7 +2828,7 @@ fn usb_list(mut args: std::env::Args) -> ModifyUsbResult<UsbControlResult> {
         .next()
         .ok_or(ModifyUsbError::ArgMissing("control socket path"))?;
     let socket_path = Path::new(&socket_path);
-    do_usb_list(&socket_path)
+    do_usb_list(socket_path)
 }
 
 fn modify_usb(mut args: std::env::Args) -> std::result::Result<(), ()> {
@@ -2647,24 +2858,6 @@ fn modify_usb(mut args: std::env::Args) -> std::result::Result<(), ()> {
     }
 }
 
-fn print_usage() {
-    print_help("crosvm", "[command]", &[]);
-    println!("Commands:");
-    println!("    balloon - Set balloon size of the crosvm instance.");
-    println!("    balloon_stats - Prints virtio balloon statistics.");
-    println!("    battery - Modify battery.");
-    #[cfg(feature = "composite-disk")]
-    println!("    create_composite  - Create a new composite disk image file.");
-    println!("    create_qcow2  - Create a new qcow2 disk image file.");
-    println!("    disk - Manage attached virtual disk devices.");
-    println!("    resume - Resumes the crosvm instance.");
-    println!("    run - Start a new crosvm instance.");
-    println!("    stop - Stops crosvm instances via their control sockets.");
-    println!("    suspend - Suspends the crosvm instance.");
-    println!("    usb - Manage attached virtual USB devices.");
-    println!("    version - Show package version.");
-}
-
 #[allow(clippy::unnecessary_wraps)]
 fn pkg_version() -> std::result::Result<(), ()> {
     const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
@@ -2678,22 +2871,27 @@ fn pkg_version() -> std::result::Result<(), ()> {
     Ok(())
 }
 
-fn modify_battery(mut args: std::env::Args) -> std::result::Result<(), ()> {
-    if args.len() < 4 {
-        print_help("crosvm battery BATTERY_TYPE ",
-                   "[status STATUS | present PRESENT | health HEALTH | capacity CAPACITY | aconline ACONLINE ] VM_SOCKET...", &[]);
-        return Err(());
-    }
-
-    // This unwrap will not panic because of the above length check.
-    let battery_type = args.next().unwrap();
-    let property = args.next().unwrap();
-    let target = args.next().unwrap();
-
-    let socket_path = args.next().unwrap();
-    let socket_path = Path::new(&socket_path);
-
-    do_modify_battery(&socket_path, &*battery_type, &*property, &*target)
+fn print_usage() {
+    print_help("crosvm", "[command]", &[]);
+    println!("Commands:");
+    println!("    balloon - Set balloon size of the crosvm instance.");
+    println!("    balloon_stats - Prints virtio balloon statistics.");
+    println!("    battery - Modify battery.");
+    #[cfg(feature = "composite-disk")]
+    println!("    create_composite  - Create a new composite disk image file.");
+    println!("    create_qcow2  - Create a new qcow2 disk image file.");
+    println!("    device - Start a device process.");
+    println!("    disk - Manage attached virtual disk devices.");
+    println!(
+        "    make_rt - Enables real-time vcpu priority for crosvm instances started with \
+         `--delay-rt`."
+    );
+    println!("    resume - Resumes the crosvm instance.");
+    println!("    run - Start a new crosvm instance.");
+    println!("    stop - Stops crosvm instances via their control sockets.");
+    println!("    suspend - Suspends the crosvm instance.");
+    println!("    usb - Manage attached virtual USB devices.");
+    println!("    version - Show package version.");
 }
 
 fn crosvm_main() -> std::result::Result<(), ()> {
@@ -2716,20 +2914,21 @@ fn crosvm_main() -> std::result::Result<(), ()> {
             print_usage();
             Ok(())
         }
-        Some("stop") => stop_vms(args),
-        Some("suspend") => suspend_vms(args),
-        Some("resume") => resume_vms(args),
-        Some("make_rt") => make_rt(args),
-        Some("run") => run_vm(args),
         Some("balloon") => balloon_vms(args),
         Some("balloon_stats") => balloon_stats(args),
+        Some("battery") => modify_battery(args),
         #[cfg(feature = "composite-disk")]
         Some("create_composite") => create_composite(args),
         Some("create_qcow2") => create_qcow2(args),
+        Some("device") => start_device(args),
         Some("disk") => disk_cmd(args),
+        Some("make_rt") => make_rt(args),
+        Some("resume") => resume_vms(args),
+        Some("run") => run_vm(args),
+        Some("stop") => stop_vms(args),
+        Some("suspend") => suspend_vms(args),
         Some("usb") => modify_usb(args),
         Some("version") => pkg_version(),
-        Some("battery") => modify_battery(args),
         Some(c) => {
             println!("invalid subcommand: {:?}", c);
             print_usage();
@@ -2882,6 +3081,13 @@ mod tests {
             .expect_err("parse should have failed");
     }
 
+    #[cfg(feature = "audio_cras")]
+    #[test]
+    fn parse_ac97_socket_type() {
+        parse_ac97_options("socket_type=unified").expect("parse should have succeded");
+        parse_ac97_options("socket_type=legacy").expect("parse should have succeded");
+    }
+
     #[cfg(feature = "audio")]
     #[test]
     fn parse_ac97_vios_valid() {
@@ -2964,7 +3170,7 @@ mod tests {
         .expect("parse should succeed");
         assert_eq!(config.plugin_mounts[0].src, PathBuf::from("/dev/null"));
         assert_eq!(config.plugin_mounts[0].dst, PathBuf::from("/dev/zero"));
-        assert_eq!(config.plugin_mounts[0].writable, true);
+        assert!(config.plugin_mounts[0].writable);
     }
 
     #[test]
@@ -2972,15 +3178,15 @@ mod tests {
         let mut config = Config::default();
         set_argument(&mut config, "plugin-mount", Some("/dev/null")).expect("parse should succeed");
         assert_eq!(config.plugin_mounts[0].dst, PathBuf::from("/dev/null"));
-        assert_eq!(config.plugin_mounts[0].writable, false);
+        assert!(!config.plugin_mounts[0].writable);
         set_argument(&mut config, "plugin-mount", Some("/dev/null:/dev/zero"))
             .expect("parse should succeed");
         assert_eq!(config.plugin_mounts[1].dst, PathBuf::from("/dev/zero"));
-        assert_eq!(config.plugin_mounts[1].writable, false);
+        assert!(!config.plugin_mounts[1].writable);
         set_argument(&mut config, "plugin-mount", Some("/dev/null::true"))
             .expect("parse should succeed");
         assert_eq!(config.plugin_mounts[2].dst, PathBuf::from("/dev/null"));
-        assert_eq!(config.plugin_mounts[2].writable, true);
+        assert!(config.plugin_mounts[2].writable);
     }
 
     #[test]
@@ -3392,5 +3598,22 @@ mod tests {
     #[test]
     fn parse_battery_invaild_type_value() {
         parse_battery_options(Some("type=xxx")).expect_err("parse should have failed");
+    }
+
+    #[test]
+    fn parse_stub_pci() {
+        let params = parse_stub_pci_parameters(Some("0000:01:02.3,vendor=0xfffe,device=0xfffd,class=0xffc1c2,multifunction=true,subsystem_vendor=0xfffc,subsystem_device=0xfffb,revision=0xa")).unwrap();
+        assert_eq!(params.address.bus, 1);
+        assert_eq!(params.address.dev, 2);
+        assert_eq!(params.address.func, 3);
+        assert_eq!(params.vendor_id, 0xfffe);
+        assert_eq!(params.device_id, 0xfffd);
+        assert_eq!(params.class as u8, PciClassCode::Other as u8);
+        assert_eq!(params.subclass, 0xc1);
+        assert_eq!(params.programming_interface, 0xc2);
+        assert!(params.multifunction);
+        assert_eq!(params.subsystem_vendor_id, 0xfffc);
+        assert_eq!(params.subsystem_device_id, 0xfffb);
+        assert_eq!(params.revision_id, 0xa);
     }
 }

@@ -5,7 +5,7 @@
 use arch::{self, LinuxArch};
 use base::TubeError;
 use devices::virtio;
-use devices::virtio::vhost::user::Error as VhostUserError;
+use devices::virtio::vhost::user::vmm::Error as VhostUserVmmError;
 use std::error::Error as StdError;
 use std::fmt::{self, Display};
 use std::io;
@@ -41,13 +41,19 @@ pub enum Error {
     BuildVm(<Arch as LinuxArch>::Error),
     ChownTpmStorage(base::Error),
     CloneEvent(base::Error),
+    CloneTube(base::TubeError),
     CloneVcpu(base::Error),
+    ConfigureHotPlugDevice(<Arch as LinuxArch>::Error),
     ConfigureVcpu(<Arch as LinuxArch>::Error),
     ConnectTube(io::Error),
+    #[cfg(feature = "audio_cras")]
+    CrasSoundDeviceNew(virtio::snd::cras_backend::Error),
     #[cfg(feature = "audio")]
     CreateAc97(devices::PciDeviceError),
-    CreateConsole(arch::serial::Error),
+    CreateAsyncDiskError(disk::Error),
+    CreateConsole(devices::SerialError),
     CreateControlServer(io::Error),
+    CreateDiskCheckAsyncOkError(disk::Error),
     CreateDiskError(disk::Error),
     CreateEvent(base::Error),
     CreateGrallocError(rutabaga_gfx::RutabagaError),
@@ -64,7 +70,6 @@ pub enum Error {
     CreateUsbProvider(devices::usb::host_backend::error::Error),
     CreateVcpu(base::Error),
     CreateVfioDevice(devices::vfio::VfioError),
-    CreateVfioKvmDevice(base::Error),
     CreateVirtioIommu(base::Error),
     CreateVm(base::Error),
     CreateWaitContext(base::Error),
@@ -79,18 +84,21 @@ pub enum Error {
     DropCapabilities(base::Error),
     FsDeviceNew(virtio::fs::Error),
     GenerateAcpi,
-    GetMaxOpenFiles(io::Error),
+    GetMaxOpenFiles(base::Error),
     GetSignalMask(base::signal::Error),
     GuestMemoryLayout(<Arch as LinuxArch>::Error),
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     HandleDebugCommand(<Arch as LinuxArch>::Error),
     InputDeviceNew(virtio::InputError),
     InputEventsOpen(io::Error),
+    InvalidHotPlugKey,
+    InvalidVfioPath,
     InvalidWaylandPath,
     IoJail(minijail::Error),
     LoadKernel(Box<dyn StdError>),
     MemoryTooLarge,
     NetDeviceNew(virtio::NetError),
+    NoHotPlugBus,
     OpenAcpiTable(PathBuf, io::Error),
     OpenAndroidFstab(PathBuf, io::Error),
     OpenBios(PathBuf, io::Error),
@@ -102,6 +110,7 @@ pub enum Error {
     PivotRootDoesntExist(&'static str),
     PmemDeviceImageTooBig,
     PmemDeviceNew(base::Error),
+    Pstore(arch::pstore::Error),
     ReadMemAvailable(io::Error),
     ReadStatm(io::Error),
     RegisterBalloon(arch::DeviceRegistrationError),
@@ -134,15 +143,19 @@ pub enum Error {
     Timer(base::Error),
     ValidateRawDescriptor(base::Error),
     VhostNetDeviceNew(virtio::vhost::Error),
-    VhostUserBlockDeviceNew(VhostUserError),
-    VhostUserConsoleDeviceNew(VhostUserError),
-    VhostUserFsDeviceNew(VhostUserError),
-    VhostUserMac80211HwsimNew(VhostUserError),
-    VhostUserNetDeviceNew(VhostUserError),
+    VhostUserBlockDeviceNew(VhostUserVmmError),
+    VhostUserConsoleDeviceNew(VhostUserVmmError),
+    VhostUserFsDeviceNew(VhostUserVmmError),
+    VhostUserGpuDeviceNew(VhostUserVmmError),
+    VhostUserMac80211HwsimNew(VhostUserVmmError),
+    VhostUserNetDeviceNew(VhostUserVmmError),
     VhostUserNetWithNetArgs,
-    VhostUserWlDeviceNew(VhostUserError),
+    VhostUserSndDeviceNew(VhostUserVmmError),
+    VhostUserVsockDeviceNew(VhostUserVmmError),
+    VhostUserWlDeviceNew(VhostUserVmmError),
     VhostVsockDeviceNew(virtio::vhost::Error),
     VirtioPciDev(base::Error),
+    VirtioVhostUserDeviceNew(VhostUserVmmError),
     WaitContextAdd(base::Error),
     WaitContextDelete(base::Error),
     WaylandDeviceNew(base::Error),
@@ -168,13 +181,21 @@ impl Display for Error {
             BuildVm(e) => write!(f, "The architecture failed to build the vm: {}", e),
             ChownTpmStorage(e) => write!(f, "failed to chown tpm storage: {}", e),
             CloneEvent(e) => write!(f, "failed to clone event: {}", e),
+            CloneTube(e) => write!(f, "failed to clone tube: {}", e),
             CloneVcpu(e) => write!(f, "failed to clone vcpu: {}", e),
+            ConfigureHotPlugDevice(e) => write!(f, "Failed to configure pci hotplug device:{}", e),
             ConfigureVcpu(e) => write!(f, "failed to configure vcpu: {}", e),
             ConnectTube(e) => write!(f, "failed to connect to tube: {}", e),
+            #[cfg(feature = "audio_cras")]
+            CrasSoundDeviceNew(e) => write!(f, "failed to create cras sound device: {}", e),
             #[cfg(feature = "audio")]
             CreateAc97(e) => write!(f, "failed to create ac97 device: {}", e),
+            CreateAsyncDiskError(e) => write!(f, "failed to create virtual disk (async): {}", e),
             CreateConsole(e) => write!(f, "failed to create console device: {}", e),
             CreateControlServer(e) => write!(f, "failed to create control server: {}", e),
+            CreateDiskCheckAsyncOkError(e) => {
+                write!(f, "failed to create virtual disk checking async: {}", e)
+            }
             CreateDiskError(e) => write!(f, "failed to create virtual disk: {}", e),
             CreateEvent(e) => write!(f, "failed to create event: {}", e),
             CreateGrallocError(e) => write!(f, "failed to create gralloc: {}", e),
@@ -193,7 +214,6 @@ impl Display for Error {
             CreateUsbProvider(e) => write!(f, "failed to create usb provider: {}", e),
             CreateVcpu(e) => write!(f, "failed to create vcpu: {}", e),
             CreateVfioDevice(e) => write!(f, "Failed to create vfio device {}", e),
-            CreateVfioKvmDevice(e) => write!(f, "failed to create KVM vfio device: {}", e),
             CreateVirtioIommu(e) => write!(f, "Failed to create IOMMU device {}", e),
             CreateVm(e) => write!(f, "failed to create vm: {}", e),
             CreateWaitContext(e) => write!(f, "failed to create wait context: {}", e),
@@ -215,11 +235,14 @@ impl Display for Error {
             HandleDebugCommand(e) => write!(f, "failed to handle a gdb command: {}", e),
             InputDeviceNew(e) => write!(f, "failed to set up input device: {}", e),
             InputEventsOpen(e) => write!(f, "failed to open event device: {}", e),
+            InvalidHotPlugKey => write!(f, "failed to find hotplug key in hotplug bus"),
+            InvalidVfioPath => write!(f, "failed to parse or find vfio path"),
             InvalidWaylandPath => write!(f, "wayland socket path has no parent or file name"),
             IoJail(e) => write!(f, "{}", e),
             LoadKernel(e) => write!(f, "failed to load kernel: {}", e),
             MemoryTooLarge => write!(f, "requested memory size too large"),
             NetDeviceNew(e) => write!(f, "failed to set up virtio networking: {}", e),
+            NoHotPlugBus => write!(f, "HotPlugBus hasn't been implemented"),
             OpenAcpiTable(p, e) => write!(f, "failed to open ACPI file {}: {}", p.display(), e),
             OpenAndroidFstab(p, e) => write!(
                 f,
@@ -238,6 +261,7 @@ impl Display for Error {
                 write!(f, "failed to create pmem device: pmem device image too big")
             }
             PmemDeviceNew(e) => write!(f, "failed to create pmem device: {}", e),
+            Pstore(e) => write!(f, "failed to allocate pstore region: {}", e),
             ReadMemAvailable(e) => write!(
                 f,
                 "failed to read /sys/kernel/mm/chromeos-low_mem/available: {}",
@@ -281,6 +305,7 @@ impl Display for Error {
                 write!(f, "failed to set up vhost-user console device: {}", e)
             }
             VhostUserFsDeviceNew(e) => write!(f, "failed to set up vhost-user fs device: {}", e),
+            VhostUserGpuDeviceNew(e) => write!(f, "failed to set up vhost-user gpu device: {}", e),
             VhostUserMac80211HwsimNew(e) => {
                 write!(f, "failed to set up vhost-user mac80211_hwsim device {}", e)
             }
@@ -289,11 +314,18 @@ impl Display for Error {
                 f,
                 "vhost-user-net cannot be used with any of --host_ip, --netmask or --mac"
             ),
+            VhostUserSndDeviceNew(e) => write!(f, "failed to set up vhost-user snd device: {}", e),
+            VhostUserVsockDeviceNew(e) => {
+                write!(f, "failed to set up vhost-user vsock device: {}", e)
+            }
             VhostUserWlDeviceNew(e) => {
                 write!(f, "failed to set up vhost-user wl device: {}", e)
             }
             VhostVsockDeviceNew(e) => write!(f, "failed to set up virtual socket device: {}", e),
             VirtioPciDev(e) => write!(f, "failed to create virtio pci dev: {}", e),
+            VirtioVhostUserDeviceNew(e) => {
+                write!(f, "failed to set up virtio-vhost-user net device: {}", e)
+            }
             WaitContextAdd(e) => write!(f, "failed to add descriptor to wait context: {}", e),
             WaitContextDelete(e) => {
                 write!(f, "failed to remove descriptor from wait context: {}", e)

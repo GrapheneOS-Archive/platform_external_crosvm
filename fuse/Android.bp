@@ -27,7 +27,10 @@ rust_defaults {
         "liblibc",
         "libthiserror",
     ],
-    proc_macros: ["libenumn"],
+    proc_macros: [
+        "libenumn",
+        "libremain",
+    ],
 }
 
 rust_test_host {
@@ -60,5 +63,8 @@ rust_library {
         "liblibc",
         "libthiserror",
     ],
-    proc_macros: ["libenumn"],
+    proc_macros: [
+        "libenumn",
+        "libremain",
+    ],
 }
