@@ -15,7 +15,7 @@
 //! let frame_size = num_channels * sample_format.sample_bytes();
 //!
 //! let (_, mut stream) = stream_source
-//!     .new_capture_stream(num_channels, sample_format, 48000, buffer_size)?;
+//!     .new_capture_stream(num_channels, sample_format, 48000, buffer_size, &[])?;
 //! // Capture 10 buffers of zeros.
 //! let mut buf = Vec::new();
 //! buf.resize(buffer_size * frame_size, 0xa5u8);
@@ -32,8 +32,6 @@
 
 use async_trait::async_trait;
 use std::{
-    error,
-    fmt::{self, Display},
     io::{self, Read},
     time::{Duration, Instant},
 };
@@ -42,6 +40,8 @@ use super::{
     AsyncBufferCommit, AudioBuffer, BoxError, BufferCommit, NoopBufferCommit, SampleFormat,
 };
 use cros_async::{Executor, TimerAsync};
+use remain::sorted;
+use thiserror::Error;
 
 /// `CaptureBufferStream` provides `CaptureBuffer`s to read with audio samples from capture.
 pub trait CaptureBufferStream: Send {
@@ -100,19 +100,11 @@ pub struct AsyncCaptureBuffer<'a> {
 }
 
 /// Errors that are possible from a `CaptureBuffer`.
-#[derive(Debug)]
+#[sorted]
+#[derive(Error, Debug)]
 pub enum CaptureBufferError {
+    #[error("Invalid buffer length")]
     InvalidLength,
-}
-
-impl error::Error for CaptureBufferError {}
-
-impl Display for CaptureBufferError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            CaptureBufferError::InvalidLength => write!(f, "Invalid buffer length"),
-        }
-    }
 }
 
 impl<'a> CaptureBuffer<'a> {
@@ -351,7 +343,7 @@ mod tests {
     fn sixteen_bit_stereo() {
         let mut server = NoopStreamSource::new();
         let (_, mut stream) = server
-            .new_capture_stream(2, SampleFormat::S16LE, 48000, 480)
+            .new_capture_stream(2, SampleFormat::S16LE, 48000, 480, &[])
             .unwrap();
         let mut copy_func = |b: &mut CaptureBuffer| {
             assert_eq!(b.buffer.frame_capacity(), 480);
@@ -366,7 +358,7 @@ mod tests {
     fn consumption_rate() {
         let mut server = NoopStreamSource::new();
         let (_, mut stream) = server
-            .new_capture_stream(2, SampleFormat::S16LE, 48000, 480)
+            .new_capture_stream(2, SampleFormat::S16LE, 48000, 480, &[])
             .unwrap();
         let start = Instant::now();
         {
@@ -428,7 +420,7 @@ mod tests {
         async fn this_test(ex: &Executor) {
             let mut server = NoopStreamSource::new();
             let (_, mut stream) = server
-                .new_async_capture_stream(2, SampleFormat::S16LE, 48000, 480, ex)
+                .new_async_capture_stream(2, SampleFormat::S16LE, 48000, 480, &[], ex)
                 .unwrap();
             let start = Instant::now();
             {

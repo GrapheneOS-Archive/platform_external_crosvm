@@ -16,6 +16,7 @@ mod pci;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod pit;
 pub mod pl030;
+mod platform;
 mod proxy;
 #[cfg(feature = "usb")]
 #[macro_use]
@@ -34,7 +35,10 @@ pub mod virtio;
 pub use self::acpi::ACPIPMResource;
 pub use self::bat::{BatteryError, GoldfishBattery};
 pub use self::bus::Error as BusError;
-pub use self::bus::{Bus, BusAccessInfo, BusDevice, BusDeviceSync, BusRange, BusResumeDevice};
+pub use self::bus::{
+    Bus, BusAccessInfo, BusDevice, BusDeviceObj, BusDeviceSync, BusRange, BusResumeDevice,
+    HostHotPlugKey, HotPlugBus,
+};
 pub use self::cmos::Cmos;
 #[cfg(feature = "direct")]
 pub use self::direct_io::DirectIo;
@@ -45,16 +49,19 @@ pub use self::irqchip::*;
 #[cfg(feature = "audio")]
 pub use self::pci::{Ac97Backend, Ac97Dev, Ac97Parameters};
 pub use self::pci::{
-    PciAddress, PciConfigIo, PciConfigMmio, PciDevice, PciDeviceError, PciInterruptPin, PciRoot,
-    VfioPciDevice,
+    PciAddress, PciBridge, PciClassCode, PciConfigIo, PciConfigMmio, PciDevice, PciDeviceError,
+    PciInterruptPin, PciRoot, PcieRootPort, StubPciDevice, StubPciParameters, VfioPciDevice,
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use self::pit::{Pit, PitError};
 pub use self::pl030::Pl030;
+pub use self::platform::VfioPlatformDevice;
 pub use self::proxy::Error as ProxyError;
 pub use self::proxy::ProxyDevice;
 pub use self::serial::Serial;
-pub use self::serial_device::SerialDevice;
+pub use self::serial_device::{
+    Error as SerialError, SerialDevice, SerialHardware, SerialParameters, SerialType,
+};
 #[cfg(feature = "usb")]
 pub use self::usb::host_backend::host_backend_device_provider::HostBackendDeviceProvider;
 #[cfg(feature = "usb")]

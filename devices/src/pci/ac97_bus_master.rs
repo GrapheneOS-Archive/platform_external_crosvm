@@ -4,7 +4,6 @@
 
 use std::collections::VecDeque;
 use std::convert::TryInto;
-use std::fmt::{self, Display};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -18,7 +17,9 @@ use base::{
     self, error, set_rt_prio_limit, set_rt_round_robin, warn, AsRawDescriptors, Event,
     RawDescriptor,
 };
+use remain::sorted;
 use sync::{Condvar, Mutex};
+use thiserror::Error;
 use vm_memory::{GuestAddress, GuestMemory};
 
 use crate::pci::ac97_mixer::Ac97Mixer;
@@ -97,24 +98,12 @@ impl Ac97BusMasterRegs {
 }
 
 // Internal error type used for reporting errors from guest memory reading.
-#[derive(Debug)]
+#[sorted]
+#[derive(Error, Debug)]
 enum GuestMemoryError {
     // Failure getting the address of the audio buffer.
+    #[error("Failed to get the address of the audio buffer: {0}.")]
     ReadingGuestBufferAddress(vm_memory::GuestMemoryError),
-}
-
-impl std::error::Error for GuestMemoryError {}
-
-impl Display for GuestMemoryError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::GuestMemoryError::*;
-
-        match self {
-            ReadingGuestBufferAddress(e) => {
-                write!(f, "Failed to get the address of the audio buffer: {}.", e)
-            }
-        }
-    }
 }
 
 impl From<GuestMemoryError> for AudioError {
@@ -126,40 +115,30 @@ impl From<GuestMemoryError> for AudioError {
 type GuestMemoryResult<T> = std::result::Result<T, GuestMemoryError>;
 
 // Internal error type used for reporting errors from the audio thread.
-#[derive(Debug)]
+#[sorted]
+#[derive(Error, Debug)]
 enum AudioError {
     // Failed to create a new stream.
+    #[error("Failed to create audio stream: {0}.")]
     CreateStream(BoxError),
     // Failure to get regions from guest memory.
+    #[error("Failed to get guest memory region: {0}.")]
     GuestRegion(GuestMemoryError),
     // Invalid buffer offset received from the audio server.
+    #[error("Offset > max usize")]
     InvalidBufferOffset,
     // Guest did not provide a buffer when needed.
+    #[error("No buffer was available from the Guest")]
     NoBufferAvailable,
     // Failure to read guest memory.
+    #[error("Failed to read guest memory: {0}.")]
     ReadingGuestError(GuestMemoryError),
     // Failure to respond to the ServerRequest.
+    #[error("Failed to respond to the ServerRequest: {0}")]
     RespondRequest(BoxError),
     // Failure to wait for a request from the stream.
+    #[error("Failed to wait for a message from the stream: {0}")]
     WaitForAction(BoxError),
-}
-
-impl std::error::Error for AudioError {}
-
-impl Display for AudioError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::AudioError::*;
-
-        match self {
-            CreateStream(e) => write!(f, "Failed to create audio stream: {}.", e),
-            GuestRegion(e) => write!(f, "Failed to get guest memory region: {}.", e),
-            InvalidBufferOffset => write!(f, "Offset > max usize"),
-            NoBufferAvailable => write!(f, "No buffer was available from the Guest"),
-            ReadingGuestError(e) => write!(f, "Failed to read guest memory: {}.", e),
-            RespondRequest(e) => write!(f, "Failed to respond to the ServerRequest: {}", e),
-            WaitForAction(e) => write!(f, "Failed to wait for a message from the stream: {}", e),
-        }
-    }
 }
 
 type AudioResult<T> = std::result::Result<T, AudioError>;
@@ -607,7 +586,7 @@ impl Ac97BusMaster {
             pending_buffers,
             message_interval: Duration::from_secs_f64(buffer_frames as f64 / sample_rate as f64),
         };
-        Ok(AudioWorker::new(&self, params))
+        Ok(AudioWorker::new(self, params))
     }
 
     fn thread_info(&self, func: Ac97Function) -> &AudioThreadInfo {
@@ -776,7 +755,7 @@ fn buffer_completed(
 
     update_sr(regs, func, new_sr);
 
-    regs.func_regs_mut(func).picb = current_buffer_size(regs.func_regs(func), &mem)? as u16;
+    regs.func_regs_mut(func).picb = current_buffer_size(regs.func_regs(func), mem)? as u16;
     if func == Ac97Function::Output {
         regs.po_pointer_update_time = Instant::now();
     }

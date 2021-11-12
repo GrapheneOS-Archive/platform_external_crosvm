@@ -21,5 +21,7 @@ rust_library {
     edition: "2018",
     rustlibs: [
         "libbase_rust",
+        "libthiserror",
     ],
+    proc_macros: ["libremain"],
 }

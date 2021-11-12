@@ -2,15 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::fmt::{self, Display};
-
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use acpi_tables::sdt::SDT;
 use base::{Event, RawDescriptor};
 use hypervisor::Datamatch;
+use remain::sorted;
 use resources::{Error as SystemAllocatorFaliure, SystemAllocator};
+use thiserror::Error;
 
-use crate::bus::ConfigWriteResult;
+use crate::bus::{BusDeviceObj, ConfigWriteResult};
 use crate::pci::pci_configuration::{
     self, PciBarConfiguration, COMMAND_REG, COMMAND_REG_IO_SPACE_MASK,
     COMMAND_REG_MEMORY_SPACE_MASK,
@@ -20,63 +20,44 @@ use crate::pci::{PciAddress, PciInterruptPin};
 use crate::virtio::snd::vios_backend::Error as VioSError;
 use crate::{BusAccessInfo, BusDevice};
 
-#[derive(Debug)]
+#[sorted]
+#[derive(Error, Debug)]
 pub enum Error {
     /// Setup of the device capabilities failed.
+    #[error("failed to add capability {0}")]
     CapabilitiesSetup(pci_configuration::Error),
-    /// Allocating space for an IO BAR failed.
-    IoAllocationFailed(u64, SystemAllocatorFaliure),
-    /// Registering an IO BAR failed.
-    IoRegistrationFailed(u64, pci_configuration::Error),
     /// Create cras client failed.
     #[cfg(all(feature = "audio", feature = "audio_cras"))]
+    #[error("failed to create CRAS Client: {0}")]
     CreateCrasClientFailed(libcras::Error),
     /// Create VioS client failed.
     #[cfg(feature = "audio")]
+    #[error("failed to create VioS Client: {0}")]
     CreateViosClientFailed(VioSError),
-    /// PCI Address allocation failure.
-    PciAllocationFailed,
-    /// PCI Address is not allocated.
-    PciAddressMissing,
-    /// MSIX Allocator encounters size of zero
-    MsixAllocatorSizeZero,
-    /// MSIX Allocator encounters overflow
-    MsixAllocatorOverflow { base: u64, size: u64 },
+    /// Allocating space for an IO BAR failed.
+    #[error("failed to allocate space for an IO BAR, size={0}: {1}")]
+    IoAllocationFailed(u64, SystemAllocatorFaliure),
+    /// Registering an IO BAR failed.
+    #[error("failed to register an IO BAR, addr={0} err={1}")]
+    IoRegistrationFailed(u64, pci_configuration::Error),
     /// MSIX Allocator encounters out-of-space
+    #[error("Out-of-space detected in MSIX Allocator")]
     MsixAllocatorOutOfSpace,
+    /// MSIX Allocator encounters overflow
+    #[error("base={base} + size={size} overflows in MSIX Allocator")]
+    MsixAllocatorOverflow { base: u64, size: u64 },
+    /// MSIX Allocator encounters size of zero
+    #[error("Size of zero detected in MSIX Allocator")]
+    MsixAllocatorSizeZero,
+    /// PCI Address is not allocated.
+    #[error("PCI address is not allocated")]
+    PciAddressMissing,
+    /// PCI Address allocation failure.
+    #[error("failed to allocate PCI address")]
+    PciAllocationFailed,
 }
+
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            CapabilitiesSetup(e) => write!(f, "failed to add capability {}", e),
-            #[cfg(all(feature = "audio", feature = "audio_cras"))]
-            CreateCrasClientFailed(e) => write!(f, "failed to create CRAS Client: {}", e),
-            #[cfg(feature = "audio")]
-            CreateViosClientFailed(e) => write!(f, "failed to create VioS Client: {}", e),
-            IoAllocationFailed(size, e) => write!(
-                f,
-                "failed to allocate space for an IO BAR, size={}: {}",
-                size, e
-            ),
-            IoRegistrationFailed(addr, e) => {
-                write!(f, "failed to register an IO BAR, addr={} err={}", addr, e)
-            }
-            PciAllocationFailed => write!(f, "failed to allocate PCI address"),
-            PciAddressMissing => write!(f, "PCI address is not allocated"),
-            MsixAllocatorSizeZero => write!(f, "Size of zero detected in MSIX Allocator"),
-            MsixAllocatorOverflow { base, size } => write!(
-                f,
-                "base={} + size={} overflows in MSIX Allocator",
-                base, size
-            ),
-            MsixAllocatorOutOfSpace => write!(f, "Out-of-space detected in MSIX Allocator"),
-        }
-    }
-}
 
 pub trait PciDevice: Send {
     /// Returns a label suitable for debug output.
@@ -89,13 +70,15 @@ pub trait PciDevice: Send {
     /// Assign a legacy PCI IRQ to this device.
     /// The device may write to `irq_evt` to trigger an interrupt.
     /// When `irq_resample_evt` is signaled, the device should re-assert `irq_evt` if necessary.
+    /// Optional irq_num can be used for default INTx allocation, device can overwrite it.
+    /// If legacy INTx is used, function shall return requested IRQ number and PCI INTx pin.
     fn assign_irq(
         &mut self,
-        _irq_evt: Event,
-        _irq_resample_evt: Event,
-        _irq_num: u32,
-        _irq_pin: PciInterruptPin,
-    ) {
+        _irq_evt: &Event,
+        _irq_resample_evt: &Event,
+        _irq_num: Option<u32>,
+    ) -> Option<(u32, PciInterruptPin)> {
+        None
     }
     /// Allocates the needed IO BAR space using the `allocate` function which takes a size and
     /// returns an address. Returns a Vec of (address, length) tuples.
@@ -222,12 +205,11 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     }
     fn assign_irq(
         &mut self,
-        irq_evt: Event,
-        irq_resample_evt: Event,
-        irq_num: u32,
-        irq_pin: PciInterruptPin,
-    ) {
-        (**self).assign_irq(irq_evt, irq_resample_evt, irq_num, irq_pin)
+        irq_evt: &Event,
+        irq_resample_evt: &Event,
+        irq_num: Option<u32>,
+    ) -> Option<(u32, PciInterruptPin)> {
+        (**self).assign_irq(irq_evt, irq_resample_evt, irq_num)
     }
     fn allocate_io_bars(&mut self, resources: &mut SystemAllocator) -> Result<Vec<(u64, u64)>> {
         (**self).allocate_io_bars(resources)
@@ -264,6 +246,18 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn generate_acpi(&mut self, sdts: Vec<SDT>) -> Option<Vec<SDT>> {
         (**self).generate_acpi(sdts)
+    }
+}
+
+impl<T: 'static + PciDevice> BusDeviceObj for T {
+    fn as_pci_device(&self) -> Option<&dyn PciDevice> {
+        Some(self)
+    }
+    fn as_pci_device_mut(&mut self) -> Option<&mut dyn PciDevice> {
+        Some(self)
+    }
+    fn into_pci_device(self: Box<Self>) -> Option<Box<dyn PciDevice>> {
+        Some(self)
     }
 }
 
@@ -316,6 +310,7 @@ mod tests {
                 &PciMultimediaSubclass::AudioDevice,
                 None,
                 PciHeaderType::Device,
+                false,
                 0x5678,
                 0xEF01,
                 0,

@@ -20,13 +20,17 @@ use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use arch::{Pstore, SerialHardware, SerialParameters, VcpuAffinity};
+use arch::{Pstore, VcpuAffinity};
+use devices::serial_device::{SerialHardware, SerialParameters};
+#[cfg(feature = "audio_cras")]
+use devices::virtio::cras_backend::Parameters as CrasSndParameters;
 use devices::virtio::fs::passthrough;
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::GpuParameters;
 #[cfg(feature = "audio")]
 use devices::Ac97Parameters;
 use devices::ProtectionType;
+use devices::StubPciParameters;
 use libc::{getegid, geteuid};
 use vm_control::BatteryType;
 
@@ -198,6 +202,97 @@ impl Default for SharedDir {
     }
 }
 
+/// Vfio device type, recognized based on command line option.
+#[derive(Eq, PartialEq, Clone, Copy)]
+pub enum VfioType {
+    Pci,
+    Platform,
+}
+
+impl FromStr for VfioType {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use VfioType::*;
+        match s {
+            "vfio" => Ok(Pci),
+            "vfio-platform" => Ok(Platform),
+            _ => Err("invalid vfio device type, must be 'vfio|vfio-platform'"),
+        }
+    }
+}
+
+/// VFIO device structure for creating a new instance based on command line options.
+pub struct VfioCommand {
+    vfio_path: PathBuf,
+    dev_type: VfioType,
+    params: BTreeMap<String, String>,
+}
+
+impl VfioCommand {
+    pub fn new(dev_type: VfioType, path: &str) -> argument::Result<VfioCommand> {
+        let mut param = path.split(',');
+        let vfio_path =
+            PathBuf::from(param.next().ok_or_else(|| argument::Error::InvalidValue {
+                value: path.to_owned(),
+                expected: String::from("missing vfio path"),
+            })?);
+
+        if !vfio_path.exists() {
+            return Err(argument::Error::InvalidValue {
+                value: path.to_owned(),
+                expected: String::from("the vfio path does not exist"),
+            });
+        }
+        if !vfio_path.is_dir() {
+            return Err(argument::Error::InvalidValue {
+                value: path.to_owned(),
+                expected: String::from("the vfio path should be directory"),
+            });
+        }
+
+        let mut params = BTreeMap::new();
+        for p in param {
+            let mut kv = p.splitn(2, '=');
+            if let (Some(kind), Some(value)) = (kv.next(), kv.next()) {
+                Self::validate_params(kind, value)?;
+                params.insert(kind.to_owned(), value.to_owned());
+            };
+        }
+        Ok(VfioCommand {
+            vfio_path,
+            params,
+            dev_type,
+        })
+    }
+
+    fn validate_params(kind: &str, value: &str) -> Result<(), argument::Error> {
+        match kind {
+            "iommu" => match value {
+                "on" | "off" => Ok(()),
+                _ => {
+                    return Err(argument::Error::InvalidValue {
+                        value: format!("{}={}", kind.to_owned(), value.to_owned()),
+                        expected: String::from("option must be `iommu=on|off`"),
+                    })
+                }
+            },
+            _ => Err(argument::Error::InvalidValue {
+                value: format!("{}={}", kind.to_owned(), value.to_owned()),
+                expected: String::from("option must be `iommu=<val>`"),
+            }),
+        }
+    }
+
+    pub fn get_type(&self) -> VfioType {
+        self.dev_type
+    }
+
+    pub fn iommu_enabled(&self) -> bool {
+        matches!(self.params.get("iommu"), Some(value) if value.as_str() == "on")
+    }
+}
+
 /// Aggregate of all configurable options for a running VM.
 pub struct Config {
     pub kvm_device_path: PathBuf,
@@ -208,6 +303,9 @@ pub struct Config {
     pub vcpu_affinity: Option<VcpuAffinity>,
     pub cpu_clusters: Vec<Vec<usize>>,
     pub cpu_capacity: BTreeMap<usize, u32>, // CPU index -> capacity
+    pub per_vm_core_scheduling: bool,
+    #[cfg(feature = "audio_cras")]
+    pub cras_snd: Option<CrasSndParameters>,
     pub delay_rt: bool,
     pub no_smt: bool,
     pub memory: Option<u64>,
@@ -257,7 +355,7 @@ pub struct Config {
     pub virtio_switches: Vec<PathBuf>,
     pub virtio_input_evdevs: Vec<PathBuf>,
     pub split_irqchip: bool,
-    pub vfio: BTreeMap<PathBuf, bool>,
+    pub vfio: Vec<VfioCommand>,
     pub video_dec: bool,
     pub video_enc: bool,
     pub acpi_tables: Vec<PathBuf>,
@@ -269,17 +367,25 @@ pub struct Config {
     pub vhost_user_blk: Vec<VhostUserOption>,
     pub vhost_user_console: Vec<VhostUserOption>,
     pub vhost_user_fs: Vec<VhostUserFsOption>,
+    pub vhost_user_gpu: Vec<VhostUserOption>,
     pub vhost_user_mac80211_hwsim: Option<VhostUserOption>,
     pub vhost_user_net: Vec<VhostUserOption>,
+    #[cfg(feature = "audio")]
+    pub vhost_user_snd: Vec<VhostUserOption>,
+    pub vhost_user_vsock: Vec<VhostUserOption>,
     pub vhost_user_wl: Vec<VhostUserWlOption>,
     #[cfg(feature = "direct")]
     pub direct_pmio: Option<DirectIoOption>,
+    #[cfg(feature = "direct")]
+    pub direct_mmio: Option<DirectIoOption>,
     #[cfg(feature = "direct")]
     pub direct_level_irq: Vec<u32>,
     #[cfg(feature = "direct")]
     pub direct_edge_irq: Vec<u32>,
     pub dmi_path: Option<PathBuf>,
     pub no_legacy: bool,
+    pub host_cpu_topology: bool,
+    pub stub_pci_devices: Vec<StubPciParameters>,
 }
 
 impl Default for Config {
@@ -293,6 +399,9 @@ impl Default for Config {
             vcpu_affinity: None,
             cpu_clusters: Vec::new(),
             cpu_capacity: BTreeMap::new(),
+            per_vm_core_scheduling: false,
+            #[cfg(feature = "audio_cras")]
+            cras_snd: None,
             delay_rt: false,
             no_smt: false,
             memory: None,
@@ -342,7 +451,7 @@ impl Default for Config {
             virtio_switches: Vec::new(),
             virtio_input_evdevs: Vec::new(),
             split_irqchip: false,
-            vfio: BTreeMap::new(),
+            vfio: Vec::new(),
             video_dec: false,
             video_enc: false,
             acpi_tables: Vec::new(),
@@ -353,18 +462,26 @@ impl Default for Config {
             balloon_bias: 0,
             vhost_user_blk: Vec::new(),
             vhost_user_console: Vec::new(),
+            vhost_user_gpu: Vec::new(),
             vhost_user_fs: Vec::new(),
             vhost_user_mac80211_hwsim: None,
             vhost_user_net: Vec::new(),
+            #[cfg(feature = "audio")]
+            vhost_user_snd: Vec::new(),
+            vhost_user_vsock: Vec::new(),
             vhost_user_wl: Vec::new(),
             #[cfg(feature = "direct")]
             direct_pmio: None,
+            #[cfg(feature = "direct")]
+            direct_mmio: None,
             #[cfg(feature = "direct")]
             direct_level_irq: Vec::new(),
             #[cfg(feature = "direct")]
             direct_edge_irq: Vec::new(),
             dmi_path: None,
             no_legacy: false,
+            host_cpu_topology: false,
+            stub_pci_devices: Vec::new(),
         }
     }
 }
