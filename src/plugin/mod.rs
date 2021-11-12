@@ -5,9 +5,9 @@
 mod process;
 mod vcpu;
 
-use std::fmt::{self, Display};
 use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::result;
@@ -19,16 +19,17 @@ use std::time::{Duration, Instant};
 use libc::{
     c_int, c_ulong, fcntl, ioctl, socketpair, AF_UNIX, EAGAIN, EBADF, EDEADLK, EEXIST, EINTR,
     EINVAL, ENOENT, EOVERFLOW, EPERM, FIOCLEX, F_SETPIPE_SZ, MS_NODEV, MS_NOEXEC, MS_NOSUID,
-    MS_RDONLY, SIGCHLD, SOCK_SEQPACKET,
+    MS_RDONLY, O_NONBLOCK, SIGCHLD, SOCK_SEQPACKET,
 };
 
 use protobuf::ProtobufError;
 use remain::sorted;
+use thiserror::Error;
 
 use base::{
-    block_signal, clear_signal, drop_capabilities, enable_core_scheduling, error, getegid, geteuid,
-    info, pipe, register_rt_signal_handler, validate_raw_descriptor, warn, AsRawDescriptor,
-    Error as SysError, Event, FromRawDescriptor, Killable, MmapError, PollToken,
+    add_fd_flags, block_signal, clear_signal, drop_capabilities, enable_core_scheduling, error,
+    getegid, geteuid, info, pipe, register_rt_signal_handler, validate_raw_descriptor, warn,
+    AsRawDescriptor, Error as SysError, Event, FromRawDescriptor, Killable, MmapError, PollToken,
     Result as SysResult, SignalFd, SignalFdError, WaitContext, SIGRTMIN,
 };
 use kvm::{Cap, Datamatch, IoeventAddress, Kvm, Vcpu, VcpuExit, Vm};
@@ -45,138 +46,127 @@ const MAX_VCPU_DATAGRAM_SIZE: usize = 0x40000;
 
 /// An error that occurs during the lifetime of a plugin process.
 #[sorted]
+#[derive(Error, Debug)]
 pub enum Error {
+    #[error("failed to clone event: {0}")]
     CloneEvent(SysError),
+    #[error("failed to clone vcpu pipe: {0}")]
     CloneVcpuPipe(io::Error),
+    #[error("failed to create event: {0}")]
     CreateEvent(SysError),
+    #[error("failed to create kvm irqchip: {0}")]
     CreateIrqChip(SysError),
+    #[error("failed to create jail: {0}")]
     CreateJail(minijail::Error),
+    #[error("error creating Kvm: {0}")]
     CreateKvm(SysError),
+    #[error("error creating main request socket: {0}")]
     CreateMainSocket(SysError),
+    #[error("failed to create kvm PIT: {0}")]
     CreatePIT(SysError),
+    #[error("failed to create signalfd: {0}")]
     CreateSignalFd(SignalFdError),
+    #[error("failed to create socket pair: {0}")]
     CreateSocketPair(io::Error),
+    #[error("failed to create stderr pipe: {0}")]
+    CreateStderrPipe(SysError),
+    #[error("failed to create tap device from raw fd: {0}")]
     CreateTapFd(TapError),
+    #[error("error creating vcpu: {0}")]
     CreateVcpu(SysError),
+    #[error("error creating vcpu request socket: {0}")]
     CreateVcpuSocket(SysError),
+    #[error("error creating vm: {0}")]
     CreateVm(SysError),
+    #[error("failed to create wait context: {0}")]
     CreateWaitContext(SysError),
+    #[error("failed to decode plugin request: {0}")]
     DecodeRequest(ProtobufError),
+    #[error("failed to drop process capabilities: {0}")]
     DropCapabilities(SysError),
+    #[error("failed to encode plugin response: {0}")]
     EncodeResponse(ProtobufError),
+    #[error("failed to mount: {0}")]
     Mount(minijail::Error),
+    #[error("failed to mount dev: {0}")]
     MountDev(minijail::Error),
+    #[error("failed to mount lib: {0}")]
     MountLib(minijail::Error),
+    #[error("failed to mount lib64: {0}")]
     MountLib64(minijail::Error),
+    #[error("failed to mount plugin: {0}")]
     MountPlugin(minijail::Error),
+    #[error("failed to mount pluginlib: {0}")]
     MountPluginLib(minijail::Error),
+    #[error("failed to mount proc: {0}")]
     MountProc(minijail::Error),
+    #[error("failed to mount root: {0}")]
     MountRoot(minijail::Error),
+    #[error("no root directory for jailed process to pivot root into")]
     NoRootDir,
+    #[error("failed to set jail pivot root: {0}")]
     ParsePivotRoot(minijail::Error),
+    #[error("failed to parse jail seccomp filter: {0}")]
     ParseSeccomp(minijail::Error),
+    #[error("plugin exited with error: {0}")]
     PluginFailed(i32),
+    #[error("error sending kill signal to plugin: {0}")]
     PluginKill(SysError),
+    #[error("plugin exited with signal {0}")]
     PluginKilled(i32),
+    #[error("failed to run jail: {0}")]
     PluginRunJail(minijail::Error),
+    #[error("plugin request socket has been hung up")]
     PluginSocketHup,
+    #[error("failed to poll plugin request sockets: {0}")]
     PluginSocketPoll(SysError),
+    #[error("failed to recv from plugin request socket: {0}")]
     PluginSocketRecv(SysError),
+    #[error("failed to send to plugin request socket: {0}")]
     PluginSocketSend(SysError),
+    #[error("failed to spawn plugin: {0}")]
     PluginSpawn(io::Error),
+    #[error("plugin did not exit within timeout")]
     PluginTimeout,
+    #[error("error waiting for plugin to exit: {0}")]
     PluginWait(SysError),
+    #[error("failed to poll all FDs: {0}")]
     Poll(SysError),
+    #[error("path to the root directory must be absolute")]
     RootNotAbsolute,
+    #[error("specified root directory is not a directory")]
     RootNotDir,
+    #[error("failed to set gidmap for jail: {0}")]
     SetGidMap(minijail::Error),
+    #[error("failed to set uidmap for jail: {0}")]
     SetUidMap(minijail::Error),
+    #[error("process {pid} died with signal {signo}, status {status}, and code {code}")]
     SigChild {
         pid: u32,
         signo: u32,
         status: i32,
         code: i32,
     },
+    #[error("failed to read signal fd: {0}")]
     SignalFd(SignalFdError),
+    #[error("error spawning vcpu thread: {0}")]
     SpawnVcpu(io::Error),
+    #[error("error marking stderr nonblocking: {0}")]
+    StderrNonblock(SysError),
+    #[error("error enabling tap device: {0}")]
     TapEnable(TapError),
+    #[error("error opening tap device: {0}")]
     TapOpen(TapError),
+    #[error("error setting tap ip: {0}")]
     TapSetIp(TapError),
+    #[error("error setting tap mac address: {0}")]
     TapSetMacAddress(TapError),
+    #[error("error setting tap netmask: {0}")]
     TapSetNetmask(TapError),
+    #[error("failed to validate raw tap fd: {0}")]
     ValidateTapFd(SysError),
+    #[error("failed to add descriptor to wait context: {0}")]
     WaitContextAdd(SysError),
-}
-
-impl Display for Error {
-    #[remain::check]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        #[sorted]
-        match self {
-            CloneEvent(e) => write!(f, "failed to clone event: {}", e),
-            CloneVcpuPipe(e) => write!(f, "failed to clone vcpu pipe: {}", e),
-            CreateEvent(e) => write!(f, "failed to create event: {}", e),
-            CreateIrqChip(e) => write!(f, "failed to create kvm irqchip: {}", e),
-            CreateJail(e) => write!(f, "failed to create jail: {}", e),
-            CreateKvm(e) => write!(f, "error creating Kvm: {}", e),
-            CreateMainSocket(e) => write!(f, "error creating main request socket: {}", e),
-            CreatePIT(e) => write!(f, "failed to create kvm PIT: {}", e),
-            CreateSignalFd(e) => write!(f, "failed to create signalfd: {}", e),
-            CreateSocketPair(e) => write!(f, "failed to create socket pair: {}", e),
-            CreateTapFd(e) => write!(f, "failed to create tap device from raw fd: {}", e),
-            CreateVcpu(e) => write!(f, "error creating vcpu: {}", e),
-            CreateVcpuSocket(e) => write!(f, "error creating vcpu request socket: {}", e),
-            CreateVm(e) => write!(f, "error creating vm: {}", e),
-            CreateWaitContext(e) => write!(f, "failed to create wait context: {}", e),
-            DecodeRequest(e) => write!(f, "failed to decode plugin request: {}", e),
-            DropCapabilities(e) => write!(f, "failed to drop process capabilities: {}", e),
-            EncodeResponse(e) => write!(f, "failed to encode plugin response: {}", e),
-            Mount(e) | MountDev(e) | MountLib(e) | MountLib64(e) | MountPlugin(e)
-            | MountPluginLib(e) | MountProc(e) | MountRoot(e) => {
-                write!(f, "failed to mount: {}", e)
-            }
-            NoRootDir => write!(f, "no root directory for jailed process to pivot root into"),
-            ParsePivotRoot(e) => write!(f, "failed to set jail pivot root: {}", e),
-            ParseSeccomp(e) => write!(f, "failed to parse jail seccomp filter: {}", e),
-            PluginFailed(e) => write!(f, "plugin exited with error: {}", e),
-            PluginKill(e) => write!(f, "error sending kill signal to plugin: {}", e),
-            PluginKilled(e) => write!(f, "plugin exited with signal {}", e),
-            PluginRunJail(e) => write!(f, "failed to run jail: {}", e),
-            PluginSocketHup => write!(f, "plugin request socket has been hung up"),
-            PluginSocketPoll(e) => write!(f, "failed to poll plugin request sockets: {}", e),
-            PluginSocketRecv(e) => write!(f, "failed to recv from plugin request socket: {}", e),
-            PluginSocketSend(e) => write!(f, "failed to send to plugin request socket: {}", e),
-            PluginSpawn(e) => write!(f, "failed to spawn plugin: {}", e),
-            PluginTimeout => write!(f, "plugin did not exit within timeout"),
-            PluginWait(e) => write!(f, "error waiting for plugin to exit: {}", e),
-            Poll(e) => write!(f, "failed to poll all FDs: {}", e),
-            RootNotAbsolute => write!(f, "path to the root directory must be absolute"),
-            RootNotDir => write!(f, "specified root directory is not a directory"),
-            SetGidMap(e) => write!(f, "failed to set gidmap for jail: {}", e),
-            SetUidMap(e) => write!(f, "failed to set uidmap for jail: {}", e),
-            SigChild {
-                pid,
-                signo,
-                status,
-                code,
-            } => write!(
-                f,
-                "process {} died with signal {}, status {}, and code {}",
-                pid, signo, status, code
-            ),
-            SignalFd(e) => write!(f, "failed to read signal fd: {}", e),
-            SpawnVcpu(e) => write!(f, "error spawning vcpu thread: {}", e),
-            TapEnable(e) => write!(f, "error enabling tap device: {}", e),
-            TapOpen(e) => write!(f, "error opening tap device: {}", e),
-            TapSetIp(e) => write!(f, "error setting tap ip: {}", e),
-            TapSetMacAddress(e) => write!(f, "error setting tap mac address: {}", e),
-            TapSetNetmask(e) => write!(f, "error setting tap netmask: {}", e),
-            ValidateTapFd(e) => write!(f, "failed to validate raw tap fd: {}", e),
-            WaitContextAdd(e) => write!(f, "failed to add descriptor to wait context: {}", e),
-        }
-    }
 }
 
 type Result<T> = result::Result<T, Error>;
@@ -597,6 +587,7 @@ pub fn run_vcpus(
 enum Token {
     Exit,
     ChildSignal,
+    Stderr,
     Plugin { index: usize },
 }
 
@@ -611,6 +602,10 @@ pub fn run_config(cfg: Config) -> Result<()> {
     // before any jailed devices have been spawned, so that we can catch any of them that fail very
     // quickly.
     let sigchld_fd = SignalFd::new(SIGCHLD).map_err(Error::CreateSignalFd)?;
+
+    // Create a pipe to capture error messages from plugin and minijail.
+    let (mut stderr_rd, stderr_wr) = pipe(true).map_err(Error::CreateStderrPipe)?;
+    add_fd_flags(stderr_rd.as_raw_descriptor(), O_NONBLOCK).map_err(Error::StderrNonblock)?;
 
     let jail = if cfg.sandbox {
         // An empty directory for jailed plugin pivot root.
@@ -706,7 +701,7 @@ pub fn run_config(cfg: Config) -> Result<()> {
     vm.create_irq_chip().map_err(Error::CreateIrqChip)?;
     vm.create_pit().map_err(Error::CreatePIT)?;
 
-    let mut plugin = Process::new(vcpu_count, plugin_path, &plugin_args, jail)?;
+    let mut plugin = Process::new(vcpu_count, plugin_path, &plugin_args, jail, stderr_wr)?;
     // Now that the jail for the plugin has been created and we had a chance to adjust gids there,
     // we can drop all our capabilities in case we had any.
     drop_capabilities().map_err(Error::DropCapabilities)?;
@@ -720,9 +715,12 @@ pub fn run_config(cfg: Config) -> Result<()> {
     let kill_signaled = Arc::new(AtomicBool::new(false));
     let mut vcpu_handles = Vec::with_capacity(vcpu_count as usize);
 
-    let wait_ctx =
-        WaitContext::build_with(&[(&exit_evt, Token::Exit), (&sigchld_fd, Token::ChildSignal)])
-            .map_err(Error::WaitContextAdd)?;
+    let wait_ctx = WaitContext::build_with(&[
+        (&exit_evt, Token::Exit),
+        (&sigchld_fd, Token::ChildSignal),
+        (&stderr_rd, Token::Stderr),
+    ])
+    .map_err(Error::WaitContextAdd)?;
 
     let mut sockets_to_drop = Vec::new();
     let mut redo_wait_ctx_sockets = true;
@@ -764,6 +762,13 @@ pub fn run_config(cfg: Config) -> Result<()> {
                 }
             }
         };
+
+        for event in events.iter().filter(|e| e.is_hungup) {
+            if let Token::Stderr = event.token {
+                let _ = wait_ctx.delete(&stderr_rd);
+            }
+        }
+
         for event in events.iter().filter(|e| e.is_readable) {
             match event.token {
                 Token::Exit => {
@@ -815,6 +820,23 @@ pub fn run_config(cfg: Config) -> Result<()> {
                         res = sig_res.map_err(Error::PluginKill);
                     }
                 }
+                Token::Stderr => loop {
+                    let mut buf = [0u8; 4096];
+                    match stderr_rd.read(&mut buf) {
+                        Ok(len) => {
+                            for l in String::from_utf8_lossy(&buf[0..len]).lines() {
+                                error!("minijail/plugin: {}", l);
+                            }
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            break;
+                        }
+                        Err(e) => {
+                            error!("failed reading from stderr: {}", e);
+                            break;
+                        }
+                    }
+                },
                 Token::Plugin { index } => {
                     match plugin.handle_socket(index, &kvm, &mut vm, &vcpu_handles, &tap_interfaces)
                     {

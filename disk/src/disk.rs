@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base::{
-    AsRawDescriptors, FileAllocate, FileReadWriteAtVolatile, FileSetLen, FileSync, PunchHole,
-    SeekHole, WriteZeroesAt,
+    get_filesystem_type, info, AsRawDescriptors, FileAllocate, FileReadWriteAtVolatile, FileSetLen,
+    FileSync, PunchHole, SeekHole, WriteZeroesAt,
 };
 use cros_async::Executor;
 use libc::EINVAL;
@@ -39,6 +39,9 @@ pub use gpt::Error as GptError;
 mod android_sparse;
 use android_sparse::{AndroidSparse, SPARSE_HEADER_MAGIC};
 
+/// Nesting depth limit for disk formats that can open other disk files.
+pub const MAX_NESTING_DEPTH: u32 = 10;
+
 #[sorted]
 #[derive(ThisError, Debug)]
 pub enum Error {
@@ -57,6 +60,10 @@ pub enum Error {
     Fallocate(cros_async::AsyncError),
     #[error("failure with fsync: {0}")]
     Fsync(cros_async::AsyncError),
+    #[error("checking host fs type: {0}")]
+    HostFsType(base::Error),
+    #[error("maximum disk nesting depth exceeded")]
+    MaxNestingDepthExceeded,
     #[error("failure in qcow: {0}")]
     QcowError(qcow::Error),
     #[error("failed to read data: {0}")]
@@ -245,11 +252,17 @@ where
 /// Copy the contents of a disk image in `src_file` into `dst_file`.
 /// The type of `src_file` is automatically detected, and the output file type is
 /// determined by `dst_type`.
-pub fn convert(src_file: File, dst_file: File, dst_type: ImageType) -> Result<()> {
+pub fn convert(
+    src_file: File,
+    dst_file: File,
+    dst_type: ImageType,
+    src_max_nesting_depth: u32,
+) -> Result<()> {
     let src_type = detect_image_type(&src_file)?;
     match src_type {
         ImageType::Qcow2 => {
-            let mut src_reader = QcowFile::from(src_file).map_err(Error::QcowError)?;
+            let mut src_reader =
+                QcowFile::from(src_file, src_max_nesting_depth).map_err(Error::QcowError)?;
             convert_reader(&mut src_reader, dst_file, dst_type)
         }
         ImageType::Raw => {
@@ -262,6 +275,12 @@ pub fn convert(src_file: File, dst_file: File, dst_type: ImageType) -> Result<()
     }
 }
 
+fn log_host_fs_type(file: &File) -> Result<()> {
+    let fstype = get_filesystem_type(file).map_err(Error::HostFsType)?;
+    info!("Disk image file is hosted on file system type {:x}", fstype);
+    Ok(())
+}
+
 /// Detect the type of an image file by checking for a valid header of the supported formats.
 pub fn detect_image_type(file: &File) -> Result<ImageType> {
     let mut f = file;
@@ -269,9 +288,11 @@ pub fn detect_image_type(file: &File) -> Result<ImageType> {
     let orig_seek = f.seek(SeekFrom::Current(0)).map_err(Error::SeekingFile)?;
     f.seek(SeekFrom::Start(0)).map_err(Error::SeekingFile)?;
 
+    info!("disk size {}, ", disk_size);
+    log_host_fs_type(f)?;
     // Try to read the disk in a nicely-aligned block size unless the whole file is smaller.
     const MAGIC_BLOCK_SIZE: usize = 4096;
-    #[repr(align(512))]
+    #[repr(align(4096))]
     struct BlockAlignedBuffer {
         data: [u8; MAGIC_BLOCK_SIZE],
     }
@@ -330,18 +351,26 @@ pub fn create_async_disk_file(raw_image: File) -> Result<Box<dyn ToAsyncDisk>> {
 }
 
 /// Inspect the image file type and create an appropriate disk file to match it.
-pub fn create_disk_file(raw_image: File) -> Result<Box<dyn DiskFile>> {
+pub fn create_disk_file(raw_image: File, mut max_nesting_depth: u32) -> Result<Box<dyn DiskFile>> {
+    if max_nesting_depth == 0 {
+        return Err(Error::MaxNestingDepthExceeded);
+    }
+    max_nesting_depth -= 1;
+
     let image_type = detect_image_type(&raw_image)?;
     Ok(match image_type {
         ImageType::Raw => Box::new(raw_image) as Box<dyn DiskFile>,
         ImageType::Qcow2 => {
-            Box::new(QcowFile::from(raw_image).map_err(Error::QcowError)?) as Box<dyn DiskFile>
+            Box::new(QcowFile::from(raw_image, max_nesting_depth).map_err(Error::QcowError)?)
+                as Box<dyn DiskFile>
         }
         #[cfg(feature = "composite-disk")]
         ImageType::CompositeDisk => {
             // Valid composite disk header present
-            Box::new(CompositeDiskFile::from_file(raw_image).map_err(Error::CreateCompositeDisk)?)
-                as Box<dyn DiskFile>
+            Box::new(
+                CompositeDiskFile::from_file(raw_image, max_nesting_depth)
+                    .map_err(Error::CreateCompositeDisk)?,
+            ) as Box<dyn DiskFile>
         }
         #[cfg(not(feature = "composite-disk"))]
         ImageType::CompositeDisk => return Err(Error::UnknownType),

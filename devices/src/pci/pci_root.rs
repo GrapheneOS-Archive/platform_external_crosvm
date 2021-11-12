@@ -5,9 +5,10 @@
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fmt::{self, Display};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use base::RawDescriptor;
+use serde::{Deserialize, Serialize};
 use sync::Mutex;
 
 use crate::pci::pci_configuration::{
@@ -55,7 +56,7 @@ impl PciDevice for PciRootConfiguration {
 }
 
 /// PCI Device Address, AKA Bus:Device.Function
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PciAddress {
     pub bus: u8,
     pub dev: u8,  /* u5 */
@@ -133,21 +134,21 @@ impl PciAddress {
 #[allow(dead_code)] // TODO(b/174705596): remove once mmio_bus and io_bus are used
 pub struct PciRoot {
     /// Memory (MMIO) bus.
-    mmio_bus: Bus,
+    mmio_bus: Weak<Bus>,
     /// IO bus (x86 only - for non-x86 platforms, this is just an empty Bus).
-    io_bus: Bus,
+    io_bus: Weak<Bus>,
     /// Bus configuration for the root device.
     root_configuration: PciRootConfiguration,
     /// Devices attached to this bridge.
     devices: BTreeMap<PciAddress, Arc<Mutex<dyn BusDevice>>>,
 }
 
-const PCI_VENDOR_ID_INTEL: u16 = 0x8086;
+pub const PCI_VENDOR_ID_INTEL: u16 = 0x8086;
 const PCI_DEVICE_ID_INTEL_82441: u16 = 0x1237;
 
 impl PciRoot {
     /// Create an empty PCI root bus.
-    pub fn new(mmio_bus: Bus, io_bus: Bus) -> Self {
+    pub fn new(mmio_bus: Weak<Bus>, io_bus: Weak<Bus>) -> Self {
         PciRoot {
             mmio_bus,
             io_bus,
@@ -159,6 +160,7 @@ impl PciRoot {
                     &PciBridgeSubclass::HostBridge,
                     None,
                     PciHeaderType::Device,
+                    false,
                     0,
                     0,
                     0,
@@ -260,6 +262,10 @@ impl PciConfigIo {
         };
         self.config_address = (self.config_address & !mask) | value;
     }
+
+    pub fn add_device(&mut self, address: PciAddress, device: Arc<Mutex<dyn BusDevice>>) {
+        self.pci_root.add_device(address, device)
+    }
 }
 
 impl BusDevice for PciConfigIo {
@@ -319,6 +325,10 @@ impl PciConfigMmio {
         let (address, register) = PciAddress::from_config_address(config_address);
         self.pci_root
             .config_space_write(address, register, offset, data)
+    }
+
+    pub fn add_device(&mut self, address: PciAddress, device: Arc<Mutex<dyn BusDevice>>) {
+        self.pci_root.add_device(address, device)
     }
 }
 
