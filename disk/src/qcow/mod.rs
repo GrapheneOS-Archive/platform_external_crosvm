@@ -2721,7 +2721,7 @@ mod tests {
         let _level1_qcow_file = QcowFile::new_from_backing(
             level1_qcow_file,
             &backing_file_path.to_str().unwrap(),
-            1000 /* allow deep nesting */,
+            1000, /* allow deep nesting */
         )
         .unwrap();
 
@@ -2729,7 +2729,7 @@ mod tests {
         let _level2_qcow_file = QcowFile::new_from_backing(
             level2_qcow_file,
             &level1_qcow_file_path.to_str().unwrap(),
-            1000 /* allow deep nesting */,
+            1000, /* allow deep nesting */
         )
         .expect("failed to create level2 qcow file");
     }

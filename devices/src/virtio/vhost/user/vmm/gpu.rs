@@ -5,9 +5,8 @@
 use std::{cell::RefCell, path::Path, thread};
 
 use base::{error, Event, RawDescriptor, Tube};
-use cros_async::Executor;
 use vm_memory::GuestMemory;
-use vmm_vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
+use vmm_vhost::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 
 use crate::{
     pci::{PciBarConfiguration, PciCapability},
@@ -142,14 +141,13 @@ impl VirtioDevice for Gpu {
         let worker_result = thread::Builder::new()
             .name("vhost_user_gpu".to_string())
             .spawn(move || {
-                let ex = Executor::new().expect("failed to create an executor");
                 let mut worker = Worker {
                     queues,
                     mem,
                     kill_evt,
                 };
 
-                if let Err(e) = worker.run(&ex, interrupt) {
+                if let Err(e) = worker.run(interrupt) {
                     error!("failed to start a worker: {}", e);
                 }
                 worker

@@ -104,6 +104,3 @@ access: 1
 getgid32: 1
 getegid32: 1
 getcwd: 1
-
-# Rules for virglrenderer
-sched_yield: 1

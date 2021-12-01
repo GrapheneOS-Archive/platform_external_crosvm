@@ -4,7 +4,6 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
-use std::fs::File;
 
 use libvda::encode::{EncodeCapabilities, VeaImplType, VeaInstance};
 
@@ -12,12 +11,12 @@ use base::{error, warn, AsRawDescriptor, IntoRawDescriptor};
 
 use super::*;
 use crate::virtio::video::format::{
-    Bitrate, Format, FormatDesc, FormatRange, FrameFormat, FramePlane, Level, Profile,
+    Bitrate, Format, FormatDesc, FormatRange, FrameFormat, Level, Profile,
 };
 use crate::virtio::video::{
-    encoder::{encoder::*, EncoderDevice},
+    encoder::encoder::*,
     error::{VideoError, VideoResult},
-    Tube,
+    resource::{GuestObjectHandle, GuestResource, GuestResourceHandle},
 };
 
 impl From<Bitrate> for libvda::encode::Bitrate {
@@ -37,13 +36,15 @@ impl From<Bitrate> for libvda::encode::Bitrate {
     }
 }
 
+/// A VDA encoder backend that can be passed to `EncoderDevice::new` in order to create a working
+/// encoder.
 pub struct LibvdaEncoder {
     instance: VeaInstance,
     capabilities: EncoderCapabilities,
 }
 
 impl LibvdaEncoder {
-    fn new() -> VideoResult<Self> {
+    pub fn new() -> VideoResult<Self> {
         let instance = VeaInstance::new(VeaImplType::Gavea)?;
 
         let EncodeCapabilities {
@@ -281,14 +282,15 @@ pub struct LibvdaEncoderSession {
 impl EncoderSession for LibvdaEncoderSession {
     fn encode(
         &mut self,
-        resource: File,
-        planes: &[FramePlane],
+        resource: GuestResource,
         timestamp: u64,
         force_keyframe: bool,
     ) -> VideoResult<InputBufferId> {
         let input_buffer_id = self.next_input_buffer_id;
+        let GuestResourceHandle::Object(GuestObjectHandle { desc, .. }) = resource.handle;
 
-        let libvda_planes = planes
+        let libvda_planes = resource
+            .planes
             .iter()
             .map(|plane| libvda::FramePlane {
                 offset: plane.offset as i32,
@@ -298,7 +300,8 @@ impl EncoderSession for LibvdaEncoderSession {
 
         self.session.encode(
             input_buffer_id as i32,
-            resource.into_raw_descriptor(),
+            // Steal the descriptor of the resource, as libvda will close it.
+            desc.into_raw_descriptor(),
             &libvda_planes,
             timestamp as i64,
             force_keyframe,
@@ -311,15 +314,17 @@ impl EncoderSession for LibvdaEncoderSession {
 
     fn use_output_buffer(
         &mut self,
-        file: File,
+        resource: GuestResourceHandle,
         offset: u32,
         size: u32,
     ) -> VideoResult<OutputBufferId> {
         let output_buffer_id = self.next_output_buffer_id;
+        let GuestResourceHandle::Object(GuestObjectHandle { desc, .. }) = resource;
 
         self.session.use_output_buffer(
             output_buffer_id as i32,
-            file.into_raw_descriptor(),
+            // Steal the descriptor of the resource, as libvda will close it.
+            desc.into_raw_descriptor(),
             offset,
             size,
         )?;
@@ -383,14 +388,5 @@ impl EncoderSession for LibvdaEncoderSession {
         };
 
         Ok(encoder_event)
-    }
-}
-
-/// Create a new encoder instance using a Libvda encoder instance to perform
-/// the encoding.
-impl EncoderDevice<LibvdaEncoder> {
-    pub fn new(resource_bridge: Tube) -> VideoResult<Self> {
-        let vea = LibvdaEncoder::new()?;
-        EncoderDevice::from_backend(vea, resource_bridge)
     }
 }
