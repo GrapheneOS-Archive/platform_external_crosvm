@@ -12,6 +12,7 @@ use base::{
 };
 use data_model::vec_with_array_field;
 use kvm_sys::*;
+use std::os::raw::c_ulong;
 use vm_memory::GuestAddress;
 
 use super::{Kvm, KvmVcpu, KvmVm};
@@ -63,6 +64,11 @@ impl Kvm {
     pub fn get_cpuid(&self, kind: IoctlNr) -> Result<CpuId> {
         const KVM_MAX_ENTRIES: usize = 256;
         get_cpuid_with_initial_capacity(self, kind, KVM_MAX_ENTRIES)
+    }
+
+    // The x86 machine type is always 0
+    pub fn get_vm_type(&self) -> c_ulong {
+        0
     }
 }
 
@@ -1295,7 +1301,7 @@ mod tests {
     #[test]
     fn ioapic_state() {
         let mut entry = IoapicRedirectionTableEntry::default();
-        let mut noredir = IoapicRedirectionTableEntry::default();
+        let noredir = IoapicRedirectionTableEntry::default();
 
         // default entry should be 0
         assert_eq!(entry.get(0, 64), 0);
@@ -1479,7 +1485,7 @@ mod tests {
     #[test]
     fn mp_state() {
         let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&vec![(GuestAddress(0), 0x10000)]).unwrap();
+        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vm = KvmVm::new(&kvm, gm).unwrap();
         vm.create_irq_chip().unwrap();
         let vcpu = vm.create_vcpu(0).unwrap();

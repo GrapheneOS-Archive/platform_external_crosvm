@@ -14,6 +14,31 @@ rust_defaults {
     name: "bit_field_test_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "bit_field",
+    srcs: ["src/lib.rs"],
+    cargo_env_compat: true,
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+    edition: "2018",
+    proc_macros: ["libbit_field_derive"],
+}
+
+rust_test_host {
+    name: "bit_field_host_test_src_lib",
+    defaults: ["bit_field_test_defaults"],
+    test_options: {
+        unit_test: true,
+    },
+}
+
+rust_test {
+    name: "bit_field_device_test_src_lib",
+    defaults: ["bit_field_test_defaults"],
+}
+
+rust_defaults {
+    name: "bit_field_test_defaults_bit_field",
+    defaults: ["crosvm_defaults"],
+    crate_name: "bit_field",
     cargo_env_compat: true,
     test_suites: ["general-tests"],
     auto_gen_config: true,
@@ -26,7 +51,7 @@ rust_defaults {
 
 rust_test_host {
     name: "bit_field_host_test_tests_test_enum",
-    defaults: ["bit_field_test_defaults"],
+    defaults: ["bit_field_test_defaults_bit_field"],
     srcs: ["tests/test_enum.rs"],
     test_options: {
         unit_test: true,
@@ -35,13 +60,13 @@ rust_test_host {
 
 rust_test {
     name: "bit_field_device_test_tests_test_enum",
-    defaults: ["bit_field_test_defaults"],
+    defaults: ["bit_field_test_defaults_bit_field"],
     srcs: ["tests/test_enum.rs"],
 }
 
 rust_test_host {
     name: "bit_field_host_test_tests_test_tuple_struct",
-    defaults: ["bit_field_test_defaults"],
+    defaults: ["bit_field_test_defaults_bit_field"],
     srcs: ["tests/test_tuple_struct.rs"],
     test_options: {
         unit_test: true,
@@ -50,7 +75,7 @@ rust_test_host {
 
 rust_test {
     name: "bit_field_device_test_tests_test_tuple_struct",
-    defaults: ["bit_field_test_defaults"],
+    defaults: ["bit_field_test_defaults_bit_field"],
     srcs: ["tests/test_tuple_struct.rs"],
 }
 

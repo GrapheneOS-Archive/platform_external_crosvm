@@ -4,6 +4,7 @@
 # found in the LICENSE file.
 set -ex
 
+sudo apt-get update
 sudo apt-get install --yes --no-install-recommends \
     ca-certificates \
     clang \
@@ -25,18 +26,21 @@ sudo apt-get install --yes --no-install-recommends \
     libwayland-dev \
     libxext-dev \
     make \
-    meson \
     nasm \
     ninja-build \
     openssh-client \
     pkg-config \
     protobuf-compiler \
     python3 \
+    python3-pip \
     python3-setuptools \
     qemu-system-x86 \
     rsync \
     screen \
     wayland-protocols
+
+# Install meson for rutabaga_gfx
+pip3 install meson
 
 rustup component add clippy
 rustup component add rustfmt

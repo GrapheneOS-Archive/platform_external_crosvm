@@ -8,10 +8,10 @@ edition = "2018"
 path = "src/lib.rs"
 
 [dependencies]
-base = { path = "../base" }
+base = { path = "../common/base" }
 bitflags = "1"
-data_model = { path = "../data_model" }
-enumn = { path = "../enumn" }
+data_model = { path = "../common/data_model" }
+enumn = "0.1.0"
 libc = "*"
 remain = "0.2"
 thiserror = "1.0.20"
