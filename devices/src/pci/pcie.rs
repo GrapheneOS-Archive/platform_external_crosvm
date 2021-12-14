@@ -1,6 +1,7 @@
 // Copyright 2021 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
+use std::cmp::Ordering;
 use std::sync::Arc;
 use sync::Mutex;
 
@@ -26,15 +27,21 @@ pub trait PcieDevice: Send {
     fn clone_interrupt(&mut self, msix_config: Arc<Mutex<MsixConfig>>);
     fn get_caps(&self) -> Vec<Box<dyn PciCapability>>;
     fn set_capability_reg_idx(&mut self, id: PciCapabilityID, reg_idx: usize);
+    fn set_secondary_bus_num(&mut self, secondary_number: u8);
+    fn get_removed_devices(&self) -> Vec<PciAddress>;
 }
 
 const BR_MSIX_TABLE_OFFSET: u64 = 0x0;
 const BR_MSIX_PBA_OFFSET: u64 = 0x100;
 const PCI_BRIDGE_BAR_SIZE: u64 = 0x1000;
+const BR_BUS_NUMBER_REG: usize = 0x6;
 pub struct PciBridge {
-    device: Box<dyn PcieDevice>,
+    device: Arc<Mutex<dyn PcieDevice>>,
     config: PciConfiguration,
     pci_address: Option<PciAddress>,
+    primary_number: u8,
+    secondary_number: u8,
+    subordinate_number: u8,
     setting_bar: u8,
     msix_config: Arc<Mutex<MsixConfig>>,
     msix_cap_reg_idx: Option<usize>,
@@ -43,10 +50,15 @@ pub struct PciBridge {
 }
 
 impl PciBridge {
-    pub fn new(device: Box<dyn PcieDevice>, msi_device_tube: Tube) -> Self {
+    pub fn new(
+        device: Arc<Mutex<dyn PcieDevice>>,
+        msi_device_tube: Tube,
+        primary_number: u8,
+        secondary_number: u8,
+    ) -> Self {
         let msix_config = Arc::new(Mutex::new(MsixConfig::new(1, msi_device_tube)));
-        let device_id = device.get_device_id();
-        let config = PciConfiguration::new(
+        let device_id = device.lock().get_device_id();
+        let mut config = PciConfiguration::new(
             PCI_VENDOR_ID_INTEL,
             device_id,
             PciClassCode::BridgeDevice,
@@ -59,10 +71,18 @@ impl PciBridge {
             0,
         );
 
+        let data = [primary_number, secondary_number, secondary_number, 0];
+        config.write_reg(BR_BUS_NUMBER_REG, 0, &data[..]);
+
+        device.lock().set_secondary_bus_num(secondary_number);
+
         PciBridge {
             device,
             config,
             pci_address: None,
+            primary_number,
+            secondary_number,
+            subordinate_number: secondary_number,
             setting_bar: 0,
             msix_config,
             msix_cap_reg_idx: None,
@@ -74,7 +94,7 @@ impl PciBridge {
 
 impl PciDevice for PciBridge {
     fn debug_label(&self) -> String {
-        self.device.debug_label()
+        self.device.lock().debug_label()
     }
 
     fn allocate_address(
@@ -82,7 +102,8 @@ impl PciDevice for PciBridge {
         resources: &mut SystemAllocator,
     ) -> std::result::Result<PciAddress, PciDeviceError> {
         if self.pci_address.is_none() {
-            self.pci_address = match resources.allocate_pci(0, self.debug_label()) {
+            self.pci_address = match resources.allocate_pci(self.primary_number, self.debug_label())
+            {
                 Some(Alloc::PciBar {
                     bus,
                     dev,
@@ -117,7 +138,7 @@ impl PciDevice for PciBridge {
         self.interrupt_evt = Some(irq_evt.try_clone().ok()?);
         self.interrupt_resample_evt = Some(irq_resample_evt.try_clone().ok()?);
         let msix_config_clone = self.msix_config.clone();
-        self.device.clone_interrupt(msix_config_clone);
+        self.device.lock().clone_interrupt(msix_config_clone);
 
         let gsi = irq_num?;
         self.config.set_irq(gsi as u8, PciInterruptPin::IntA);
@@ -189,14 +210,16 @@ impl PciDevice for PciBridge {
     }
 
     fn register_device_capabilities(&mut self) -> std::result::Result<(), PciDeviceError> {
-        let caps = self.device.get_caps();
+        let caps = self.device.lock().get_caps();
         for cap in caps {
             let cap_reg = self
                 .config
                 .add_capability(&*cap)
                 .map_err(PciDeviceError::CapabilitiesSetup)?;
 
-            self.device.set_capability_reg_idx(cap.id(), cap_reg / 4);
+            self.device
+                .lock()
+                .set_capability_reg_idx(cap.id(), cap_reg / 4);
         }
 
         Ok(())
@@ -215,7 +238,7 @@ impl PciDevice for PciBridge {
             }
         }
 
-        self.device.read_config(reg_idx, &mut data);
+        self.device.lock().read_config(reg_idx, &mut data);
         data
     }
 
@@ -226,7 +249,42 @@ impl PciDevice for PciBridge {
             }
         }
 
-        self.device.write_config(reg_idx, offset, data);
+        // Suppose kernel won't modify primary/secondary/subordinate bus number,
+        // if it indeed modify, print a warning
+        if reg_idx == BR_BUS_NUMBER_REG {
+            let len = data.len();
+            if offset == 0 && len == 1 && data[0] != self.primary_number {
+                warn!(
+                    "kernel modify primary bus number: {} -> {}",
+                    self.primary_number, data[0]
+                );
+            } else if offset == 0 && len == 2 {
+                if data[0] != self.primary_number {
+                    warn!(
+                        "kernel modify primary bus number: {} -> {}",
+                        self.primary_number, data[0]
+                    );
+                }
+                if data[1] != self.secondary_number {
+                    warn!(
+                        "kernel modify secondary bus number: {} -> {}",
+                        self.secondary_number, data[1]
+                    );
+                }
+            } else if offset == 1 && len == 1 && data[0] != self.secondary_number {
+                warn!(
+                    "kernel modify secondary bus number: {} -> {}",
+                    self.secondary_number, data[0]
+                );
+            } else if offset == 2 && len == 1 && data[0] != self.subordinate_number {
+                warn!(
+                    "kernel modify subordinate bus number: {} -> {}",
+                    self.subordinate_number, data[0]
+                );
+            }
+        }
+
+        self.device.lock().write_config(reg_idx, offset, data);
 
         (&mut self.config).write_reg(reg_idx, offset, data)
     }
@@ -235,29 +293,41 @@ impl PciDevice for PciBridge {
         // The driver is only allowed to do aligned, properly sized access.
         let bar0 = self.config.get_bar_addr(self.setting_bar as usize);
         let offset = addr - bar0;
-        if offset < BR_MSIX_PBA_OFFSET {
-            self.msix_config
-                .lock()
-                .read_msix_table(offset - BR_MSIX_TABLE_OFFSET, data);
-        } else if BR_MSIX_PBA_OFFSET == offset {
-            self.msix_config
-                .lock()
-                .read_pba_entries(offset - BR_MSIX_PBA_OFFSET, data);
+        match offset.cmp(&BR_MSIX_PBA_OFFSET) {
+            Ordering::Less => {
+                self.msix_config
+                    .lock()
+                    .read_msix_table(offset - BR_MSIX_TABLE_OFFSET, data);
+            }
+            Ordering::Equal => {
+                self.msix_config
+                    .lock()
+                    .read_pba_entries(offset - BR_MSIX_PBA_OFFSET, data);
+            }
+            Ordering::Greater => (),
         }
     }
 
     fn write_bar(&mut self, addr: u64, data: &[u8]) {
         let bar0 = self.config.get_bar_addr(self.setting_bar as usize);
         let offset = addr - bar0;
-        if offset < BR_MSIX_PBA_OFFSET {
-            self.msix_config
-                .lock()
-                .write_msix_table(offset - BR_MSIX_TABLE_OFFSET, data);
-        } else if BR_MSIX_PBA_OFFSET == offset {
-            self.msix_config
-                .lock()
-                .write_pba_entries(offset - BR_MSIX_PBA_OFFSET, data);
+        match offset.cmp(&BR_MSIX_PBA_OFFSET) {
+            Ordering::Less => {
+                self.msix_config
+                    .lock()
+                    .write_msix_table(offset - BR_MSIX_TABLE_OFFSET, data);
+            }
+            Ordering::Equal => {
+                self.msix_config
+                    .lock()
+                    .write_pba_entries(offset - BR_MSIX_PBA_OFFSET, data);
+            }
+            Ordering::Greater => (),
         }
+    }
+
+    fn get_removed_children_devices(&self) -> Vec<PciAddress> {
+        self.device.lock().get_removed_devices()
     }
 }
 
@@ -345,7 +415,7 @@ impl PciCapability for PcieCap {
     }
 
     fn id(&self) -> PciCapabilityID {
-        PciCapabilityID::PCIExpress
+        PciCapabilityID::PciExpress
     }
 
     fn writable_bits(&self) -> Vec<u32> {
@@ -437,7 +507,9 @@ pub struct PcieRootPort {
     msix_config: Option<Arc<Mutex<MsixConfig>>>,
     slot_control: u16,
     slot_status: u16,
+    secondary_number: u8,
     downstream_device: Option<(PciAddress, Option<HostHotPlugKey>)>,
+    removed_downstream: Option<PciAddress>,
 }
 
 impl PcieRootPort {
@@ -448,7 +520,9 @@ impl PcieRootPort {
             msix_config: None,
             slot_control: PCIE_SLTCTL_PIC_OFF | PCIE_SLTCTL_AIC_OFF,
             slot_status: 0,
+            secondary_number: 255,
             downstream_device: None,
+            removed_downstream: None,
         }
     }
 
@@ -459,11 +533,28 @@ impl PcieRootPort {
     }
 
     fn write_pcie_cap(&mut self, offset: usize, data: &[u8]) {
+        self.removed_downstream = None;
         match offset {
             PCIE_SLTCTL_OFFSET => match get_word(data) {
                 Some(v) => {
                     let old_control = self.slot_control;
                     self.slot_control = v;
+
+                    // if slot is populated, power indicator is off,
+                    // it will detach devices
+                    if (self.slot_status & PCIE_SLTSTA_PDS != 0)
+                        && (v & PCIE_SLTCTL_PIC_OFF == PCIE_SLTCTL_PIC_OFF)
+                        && (old_control & PCIE_SLTCTL_PIC_OFF != PCIE_SLTCTL_PIC_OFF)
+                    {
+                        if let Some((guest_pci_addr, _)) = self.downstream_device {
+                            self.removed_downstream = Some(guest_pci_addr);
+                            self.downstream_device = None;
+                        }
+                        self.slot_status &= !PCIE_SLTSTA_PDS;
+                        self.slot_status |= PCIE_SLTSTA_PDC;
+                        self.trigger_hp_interrupt();
+                    }
+
                     if old_control != v {
                         // send Command completed events
                         self.slot_status |= PCIE_SLTSTA_CC;
@@ -545,7 +636,7 @@ impl PcieDevice for PcieRootPort {
     }
 
     fn set_capability_reg_idx(&mut self, id: PciCapabilityID, reg_idx: usize) {
-        if let PciCapabilityID::PCIExpress = id {
+        if let PciCapabilityID::PciExpress = id {
             self.pcie_cap_reg_idx = Some(reg_idx)
         }
     }
@@ -566,6 +657,19 @@ impl PcieDevice for PcieRootPort {
                 self.write_pcie_cap(delta, data);
             }
         }
+    }
+
+    fn set_secondary_bus_num(&mut self, secondary_number: u8) {
+        self.secondary_number = secondary_number;
+    }
+
+    fn get_removed_devices(&self) -> Vec<PciAddress> {
+        let mut removed_devices = Vec::new();
+        if let Some(removed_downstream) = self.removed_downstream {
+            removed_devices.push(removed_downstream);
+        }
+
+        removed_devices
     }
 }
 
@@ -594,9 +698,16 @@ impl HotPlugBus for PcieRootPort {
             None => return,
         }
 
-        self.slot_status &= !PCIE_SLTSTA_PDS;
         self.slot_status = self.slot_status | PCIE_SLTSTA_PDC | PCIE_SLTSTA_ABP;
         self.trigger_hp_interrupt();
+    }
+
+    fn is_match(&self, _host_addr: PciAddress) -> Option<u8> {
+        if self.downstream_device.is_none() {
+            Some(self.secondary_number)
+        } else {
+            None
+        }
     }
 
     fn add_hotplug_device(&mut self, host_key: HostHotPlugKey, guest_addr: PciAddress) {

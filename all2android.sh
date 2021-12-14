@@ -20,7 +20,7 @@ cargo2android() {
 cargo2android --no-subdir
 
 initial_dir=`pwd`
-for dir in */src common/*/src
+for dir in */src common/*/src third_party/*/src
 do
   base=`dirname $dir`
   echo "$base"

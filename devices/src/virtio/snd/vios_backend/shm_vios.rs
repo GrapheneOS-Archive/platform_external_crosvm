@@ -14,7 +14,7 @@ use data_model::{DataInit, VolatileMemory, VolatileMemoryError, VolatileSlice};
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{Error as IOError, ErrorKind as IOErrorKind, Seek, SeekFrom};
+use std::io::{Error as IOError, ErrorKind as IOErrorKind, IoSliceMut, Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, RecvError, Sender};
@@ -137,7 +137,7 @@ impl VioSClient {
         const NUM_FDS: usize = 5;
         fds.resize(NUM_FDS, 0);
         let (recv_size, fd_count) = client_socket
-            .recv_with_fds(config.as_mut_slice(), &mut fds)
+            .recv_with_fds(IoSliceMut::new(config.as_mut_slice()), &mut fds)
             .map_err(Error::ServerError)?;
 
         // Resize the vector to the actual number of file descriptors received and wrap them in
@@ -762,21 +762,21 @@ pub struct VioSStreamParams {
     pub rate: u8,
 }
 
-impl Into<virtio_snd_pcm_set_params> for (u32, VioSStreamParams) {
-    fn into(self) -> virtio_snd_pcm_set_params {
+impl From<(u32, VioSStreamParams)> for virtio_snd_pcm_set_params {
+    fn from(val: (u32, VioSStreamParams)) -> Self {
         virtio_snd_pcm_set_params {
             hdr: virtio_snd_pcm_hdr {
                 hdr: virtio_snd_hdr {
                     code: VIRTIO_SND_R_PCM_SET_PARAMS.into(),
                 },
-                stream_id: self.0.into(),
+                stream_id: val.0.into(),
             },
-            buffer_bytes: self.1.buffer_bytes.into(),
-            period_bytes: self.1.period_bytes.into(),
-            features: self.1.features.into(),
-            channels: self.1.channels,
-            format: self.1.format,
-            rate: self.1.rate,
+            buffer_bytes: val.1.buffer_bytes.into(),
+            period_bytes: val.1.period_bytes.into(),
+            features: val.1.features.into(),
+            channels: val.1.channels,
+            format: val.1.format,
+            rate: val.1.rate,
             padding: 0u8,
         }
     }
