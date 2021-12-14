@@ -23,14 +23,14 @@ gfxstream = ["gpu", "rutabaga_gfx/gfxstream"]
 async-task = "4"
 acpi_tables = {path = "../acpi_tables" }
 anyhow = "*"
-audio_streams = { path = "../audio_streams" }
-base = { path = "../base" }
+audio_streams = { path = "../common/audio_streams" }
+base = { path = "../common/base" }
 bit_field = { path = "../bit_field" }
-cros_async = { path = "../cros_async" }
-data_model = { path = "../data_model" }
+cros_async = { path = "../common/cros_async" }
+data_model = { path = "../common/data_model" }
 dbus = { version = "0.9", optional = true }
 disk = { path = "../disk" }
-enumn = { path = "../enumn" }
+enumn = "0.1.0"
 fuse = {path = "../fuse" }
 getopts = { version = "0.2" }
 gpu_display = { path = "../gpu_display", optional = true }
@@ -54,15 +54,15 @@ resources = { path = "../resources" }
 serde = { version = "1", features = [ "derive" ] }
 serde_json = "1"
 smallvec = "1.6.1"
-sync = { path = "../sync" }
-sys_util = { path = "../sys_util" }
+sync = { path = "../common/sync" }
+sys_util = { path = "../common/sys_util" }
 system_api = { path = "../system_api_stub", optional = true }
 thiserror = "1.0.20"
 tpm2 = { path = "../tpm2", optional = true }
 usb_util = { path = "../usb_util" }
 vfio_sys = { path = "../vfio_sys" }
 vhost = { path = "../vhost" }
-vmm_vhost = { path = "../../rust/vmm_vhost", version = "*", features = ["vhost-user-master", "vhost-user-slave"] }
+vmm_vhost = { path = "../third_party/vmm_vhost", features = ["vmm", "device"] }
 virtio_sys = { path = "../virtio_sys" }
 vm_control = { path = "../vm_control" }
 vm_memory = { path = "../vm_memory" }
