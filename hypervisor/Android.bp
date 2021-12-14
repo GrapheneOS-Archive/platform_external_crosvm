@@ -14,7 +14,6 @@ rust_defaults {
     name: "hypervisor_test_defaults",
     defaults: ["crosvm_defaults"],
     crate_name: "hypervisor",
-    // has rustc warnings
     srcs: ["src/lib.rs"],
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
@@ -52,7 +51,6 @@ rust_test {
 rust_library {
     name: "libhypervisor",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "hypervisor",
     cargo_env_compat: true,

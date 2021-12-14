@@ -50,6 +50,7 @@ rust_binary {
     ],
     rustlibs: [
         "libacpi_tables",
+        "libanyhow",
         "libarch",
         "libassertions",
         "libaudio_streams",
@@ -133,6 +134,7 @@ rust_defaults {
     ],
     rustlibs: [
         "libacpi_tables",
+        "libanyhow",
         "libarch",
         "libassertions",
         "libaudio_streams",
@@ -246,6 +248,7 @@ rust_defaults {
     ],
     rustlibs: [
         "libacpi_tables",
+        "libanyhow",
         "libarch",
         "libassertions",
         "libaudio_streams",
@@ -359,6 +362,7 @@ rust_library {
     ],
     rustlibs: [
         "libacpi_tables",
+        "libanyhow",
         "libarch",
         "libassertions",
         "libaudio_streams",

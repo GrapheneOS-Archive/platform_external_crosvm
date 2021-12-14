@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use base::{error, warn, AsRawDescriptor, RawDescriptor};
+use base::{error, warn, AsRawDescriptor, IntoRawDescriptor};
 use remain::sorted;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -12,10 +12,10 @@ use thiserror::Error as ThisError;
 use libvda::decode::Event as LibvdaEvent;
 
 use crate::virtio::video::{
-    decoder::{backend::*, Capability, Decoder},
+    decoder::{backend::*, Capability},
     error::{VideoError, VideoResult},
     format::*,
-    Tube,
+    resource::{GuestResource, GuestResourceHandle},
 };
 
 #[sorted]
@@ -175,13 +175,19 @@ impl DecoderSession for VdaDecoderSession {
     fn decode(
         &mut self,
         bitstream_id: i32,
-        descriptor: RawDescriptor,
+        resource: GuestResourceHandle,
         offset: u32,
         bytes_used: u32,
     ) -> VideoResult<()> {
-        Ok(self
-            .vda_session
-            .decode(bitstream_id, descriptor, offset, bytes_used)?)
+        let GuestResourceHandle::Object(handle) = resource;
+
+        Ok(self.vda_session.decode(
+            bitstream_id,
+            // Steal the descriptor of the resource, as libvda will close it.
+            handle.desc.into_raw_descriptor(),
+            offset,
+            bytes_used,
+        )?)
     }
 
     fn flush(&mut self) -> VideoResult<()> {
@@ -199,17 +205,18 @@ impl DecoderSession for VdaDecoderSession {
     fn use_output_buffer(
         &mut self,
         picture_buffer_id: i32,
-        output_buffer: RawDescriptor,
-        planes: &[FramePlane],
-        modifier: u64,
+        resource: GuestResource,
     ) -> VideoResult<()> {
-        let vda_planes: Vec<libvda::FramePlane> = planes.iter().map(Into::into).collect();
+        let GuestResourceHandle::Object(handle) = resource.handle;
+        let vda_planes: Vec<libvda::FramePlane> = resource.planes.iter().map(Into::into).collect();
+
         Ok(self.vda_session.use_output_buffer(
             picture_buffer_id,
             self.format.ok_or(VdaBackendError::OutputParamsNotSet)?,
-            output_buffer,
+            // Steal the descriptor of the resource, as libvda will close it.
+            handle.desc.into_raw_descriptor(),
             &vda_planes,
-            modifier,
+            handle.modifier,
         )?)
     }
 
@@ -225,14 +232,26 @@ impl DecoderSession for VdaDecoderSession {
     }
 }
 
-impl DecoderBackend for libvda::decode::VdaInstance {
+/// A VDA decoder backend that can be passed to `Decoder::new` in order to create a working decoder.
+pub struct LibvdaDecoder(libvda::decode::VdaInstance);
+
+impl LibvdaDecoder {
+    /// Create a decoder backend instance that can be used to instantiate an decoder.
+    pub fn new() -> VideoResult<Self> {
+        Ok(Self(libvda::decode::VdaInstance::new(
+            libvda::decode::VdaImplType::Gavda,
+        )?))
+    }
+}
+
+impl DecoderBackend for LibvdaDecoder {
     type Session = VdaDecoderSession;
 
     fn new_session(&mut self, format: Format) -> VideoResult<Self::Session> {
         let profile = libvda::Profile::try_from(format)?;
 
         Ok(VdaDecoderSession {
-            vda_session: self.open_session(profile).map_err(|e| {
+            vda_session: self.0.open_session(profile).map_err(|e| {
                 error!("failed to open a session for {:?}: {}", format, e);
                 VideoError::InvalidOperation
             })?,
@@ -241,7 +260,7 @@ impl DecoderBackend for libvda::decode::VdaInstance {
     }
 
     fn get_capabilities(&self) -> Capability {
-        let caps = libvda::decode::VdaInstance::get_capabilities(self);
+        let caps = libvda::decode::VdaInstance::get_capabilities(&self.0);
 
         // Raise the first |# of supported raw formats|-th bits because we can assume that any
         // combination of (a coded format, a raw format) is valid in Chrome.
@@ -312,14 +331,5 @@ impl DecoderBackend for libvda::decode::VdaInstance {
             .collect();
 
         Capability::new(in_fmts, out_fmts, profiles, levels)
-    }
-}
-
-/// Create a new decoder instance using a Libvda decoder instance to perform
-/// the decoding.
-impl Decoder<libvda::decode::VdaInstance> {
-    pub fn new(resource_bridge: Tube) -> VideoResult<Self> {
-        let vda = libvda::decode::VdaInstance::new(libvda::decode::VdaImplType::Gavda)?;
-        Ok(Decoder::from_backend(vda, resource_bridge))
     }
 }

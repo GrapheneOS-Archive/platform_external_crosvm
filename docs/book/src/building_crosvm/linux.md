@@ -1,5 +1,13 @@
 # Building for Linux
 
+## Checking out
+
+Obtain the source code via git clone.
+
+```
+git clone https://chromium.googlesource.com/chromiumos/platform/crosvm
+```
+
 ## Setting up the development environment
 
 Crosvm uses submodules to manage external dependencies. Initialize them via:
@@ -17,8 +25,9 @@ git config --global submodule.recurse true
 git config push.recurseSubmodules no
 ```
 
-Crosvm development best works on Debian derivatives. We provide a script to
-install the necessary packages on Debian:
+Crosvm development best works on Debian derivatives. First install rust via
+https://rustup.rs/. Then for the rest, we provide a script to install the
+necessary packages on Debian:
 
 ```
 $ ./tools/install-deps
@@ -67,6 +76,25 @@ The container image is big and may take a while to download when first used.
 Once started, you can follow all instructions in this document within the
 container shell.
 
+Instead of using the interactive shell, commands to execute can be provided
+directly:
+
+```sh
+$ ./tools/dev_container cargo build
+```
+
+Note: The container and build artifacts are preserved between calls to
+`./tools/dev_container`. If you wish to start fresh, use the `--reset` flag.
+
+## Building a binary
+
+If you simply want to try crosvm, run `cargo build`. Then the binary is
+generated at `./target/debug/crosvm`. Now you can move to
+[Basic Usage](../running_crosvm/basic_usage.md).
+
+If you want to enable [additional features](../running_crosvm/features.md), use
+the `--features` flag. (e.g. `cargo build --features=gdb`)
+
 ## Development
 
 ### Iterative development
@@ -111,14 +139,6 @@ you can use the dev container to build and run the tests.
 $ ./tools/dev_container ./tools/run_tests --target=vm:aarch64
 ```
 
-Note however, that using an interactive shell in the container is preferred, as
-the build artifacts are not preserved between calls:
-
-```sh
-$ ./tools/dev_container
-crosvm_dev$ ./tools/run_tests --target=vm:aarch64
-```
-
 It is also possible to run tests on a remote machine via ssh. The target
 architecture is automatically detected:
 
@@ -138,14 +158,21 @@ To verify changes before submitting, use the `presubmit` script:
 $ ./tools/presubmit
 ```
 
-or
+This will run clippy, formatters and runs all tests. The presubmits will use the
+dev container to build for other platforms if your host is not set up to do so.
+
+To run checks faster, they can be run in parallel in multiple tmux panes:
+
+```
+$ ./tools/presubmit --tmux
+```
+
+The `--quick` variant will skip some slower checks, like building for other
+platforms altogether:
 
 ```
 $ ./tools/presubmit --quick
 ```
-
-This will run clippy, formatters and runs all tests. The `--quick` variant will
-skip some slower checks, like building for other platforms.
 
 ## Known issues
 
