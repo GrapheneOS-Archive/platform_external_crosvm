@@ -8,12 +8,10 @@ use std::path::Path;
 use std::thread;
 
 use base::{error, Event, RawDescriptor};
-use cros_async::Executor;
 use data_model::{DataInit, Le32};
 use vm_memory::GuestMemory;
-use vmm_vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
-use vmm_vhost::vhost_user::Error as VhostUserError;
-use vmm_vhost::Error as VhostError;
+use vmm_vhost::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
+use vmm_vhost::Error as VhostUserError;
 
 use crate::virtio::fs::{virtio_fs_config, FS_MAX_TAG_LEN, QUEUE_SIZE};
 use crate::virtio::vhost::user::vmm::{handler::VhostUserHandler, worker::Worker, Error, Result};
@@ -108,9 +106,9 @@ impl VirtioDevice for Fs {
             Ok(()) => {}
             // copy local config when VhostUserProtocolFeatures::CONFIG is not supported by the
             // device
-            Err(Error::GetConfig(VhostError::VhostUserProtocol(
-                VhostUserError::InvalidOperation,
-            ))) => copy_config(data, 0, self.cfg.as_slice(), offset),
+            Err(Error::GetConfig(VhostUserError::InvalidOperation)) => {
+                copy_config(data, 0, self.cfg.as_slice(), offset)
+            }
             Err(e) => error!("Failed to fetch device config: {}", e),
         }
     }
@@ -143,14 +141,13 @@ impl VirtioDevice for Fs {
         let worker_result = thread::Builder::new()
             .name("vhost_user_virtio_fs".to_string())
             .spawn(move || {
-                let ex = Executor::new().expect("failed to create an executor");
                 let mut worker = Worker {
                     queues,
                     mem,
                     kill_evt,
                 };
 
-                if let Err(e) = worker.run(&ex, interrupt) {
+                if let Err(e) = worker.run(interrupt) {
                     error!("failed to start a worker: {}", e);
                 }
                 worker

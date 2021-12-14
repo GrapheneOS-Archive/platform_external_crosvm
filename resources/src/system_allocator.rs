@@ -153,6 +153,15 @@ impl SystemAllocator {
         self.pci_allocator.get_mut(&bus)
     }
 
+    // Check whether devices exist or not on the specified bus
+    pub fn pci_bus_empty(&self, bus: u8) -> bool {
+        if self.pci_allocator.get(&bus).is_none() {
+            true
+        } else {
+            false
+        }
+    }
+
     /// Allocate PCI slot location.
     pub fn allocate_pci(&mut self, bus: u8, tag: String) -> Option<Alloc> {
         let id = self.get_anon_alloc();
@@ -190,6 +199,16 @@ impl SystemAllocator {
             }
             _ => false,
         }
+    }
+
+    /// release PCI slot location.
+    pub fn release_pci(&mut self, bus: u8, dev: u8, func: u8) -> bool {
+        let allocator = match self.get_pci_allocator_mut(bus) {
+            Some(v) => v,
+            None => return false,
+        };
+        let df = ((dev as u64) << 3) | (func as u64);
+        allocator.release_containing(df).is_ok()
     }
 
     /// Gets an allocator to be used for platform device MMIO allocation.

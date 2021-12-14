@@ -9,7 +9,9 @@
 
 use std::thread;
 
-use base::{error, info, AsRawDescriptor, Error as SysError, Event, RawDescriptor, Tube};
+#[cfg(feature = "video-encoder")]
+use base::info;
+use base::{error, AsRawDescriptor, Error as SysError, Event, RawDescriptor, Tube};
 use data_model::{DataInit, Le32};
 use remain::sorted;
 use thiserror::Error;
@@ -23,20 +25,24 @@ mod macros;
 mod async_cmd_desc_map;
 mod command;
 mod control;
+#[cfg(feature = "video-decoder")]
 mod decoder;
 mod device;
+#[cfg(feature = "video-encoder")]
 mod encoder;
 mod error;
 mod event;
 mod format;
 mod params;
 mod protocol;
+mod resource;
 mod response;
 mod worker;
 
 mod vda;
 
 use command::ReadCmdError;
+use device::Device;
 use worker::Worker;
 
 const QUEUE_SIZE: u16 = 256;
@@ -73,12 +79,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum VideoDeviceType {
+    #[cfg(feature = "video-decoder")]
     Decoder,
+    #[cfg(feature = "video-encoder")]
     Encoder,
 }
 
 pub struct VideoDevice {
     device_type: VideoDeviceType,
+    backend: VideoBackendType,
     kill_evt: Option<Event>,
     resource_bridge: Option<Tube>,
     base_features: u64,
@@ -88,10 +97,12 @@ impl VideoDevice {
     pub fn new(
         base_features: u64,
         device_type: VideoDeviceType,
+        backend: VideoBackendType,
         resource_bridge: Option<Tube>,
     ) -> VideoDevice {
         VideoDevice {
             device_type,
+            backend,
             kill_evt: None,
             resource_bridge,
             base_features,
@@ -108,6 +119,11 @@ impl Drop for VideoDevice {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VideoBackendType {
+    Libvda,
+}
+
 impl VirtioDevice for VideoDevice {
     fn keep_rds(&self) -> Vec<RawDescriptor> {
         let mut keep_rds = Vec::new();
@@ -119,7 +135,9 @@ impl VirtioDevice for VideoDevice {
 
     fn device_type(&self) -> u32 {
         match &self.device_type {
+            #[cfg(feature = "video-decoder")]
             VideoDeviceType::Decoder => virtio::TYPE_VIDEO_DEC,
+            #[cfg(feature = "video-encoder")]
             VideoDeviceType::Encoder => virtio::TYPE_VIDEO_ENC,
         }
     }
@@ -179,6 +197,7 @@ impl VirtioDevice for VideoDevice {
         let cmd_evt = queue_evts.remove(0);
         let event_queue = queues.remove(0);
         let event_evt = queue_evts.remove(0);
+        let backend = self.backend;
         let resource_bridge = match self.resource_bridge.take() {
             Some(r) => r,
             None => {
@@ -196,31 +215,52 @@ impl VirtioDevice for VideoDevice {
             kill_evt,
         );
         let worker_result = match &self.device_type {
+            #[cfg(feature = "video-decoder")]
             VideoDeviceType::Decoder => thread::Builder::new()
                 .name("virtio video decoder".to_owned())
                 .spawn(move || {
-                    let device = match decoder::Decoder::new(resource_bridge) {
-                        Ok(device) => Box::new(device),
-                        Err(e) => {
-                            error!("Failed to initialize vda: {}", e);
-                            return;
+                    let device: Box<dyn Device> = match backend {
+                        VideoBackendType::Libvda => {
+                            let vda = match decoder::backend::vda::LibvdaDecoder::new() {
+                                Ok(vda) => vda,
+                                Err(e) => {
+                                    error!("Failed to initialize VDA for decoder: {}", e);
+                                    return;
+                                }
+                            };
+                            Box::new(decoder::Decoder::new(vda, resource_bridge))
                         }
                     };
+
                     if let Err(e) = worker.run(device) {
                         error!("Failed to start decoder worker: {}", e);
                     };
                     // Don't return any information since the return value is never checked.
                 }),
+            #[cfg(feature = "video-encoder")]
             VideoDeviceType::Encoder => thread::Builder::new()
                 .name("virtio video encoder".to_owned())
                 .spawn(move || {
-                    let device = match encoder::EncoderDevice::new(resource_bridge) {
-                        Ok(d) => Box::new(d),
-                        Err(e) => {
-                            error!("Failed to create encoder device: {}", e);
-                            return;
+                    let device: Box<dyn Device> = match backend {
+                        VideoBackendType::Libvda => {
+                            let vda = match encoder::backend::vda::LibvdaEncoder::new() {
+                                Ok(vda) => vda,
+                                Err(e) => {
+                                    error!("Failed to initialize VDA for encoder: {}", e);
+                                    return;
+                                }
+                            };
+
+                            match encoder::EncoderDevice::new(vda, resource_bridge) {
+                                Ok(encoder) => Box::new(encoder),
+                                Err(e) => {
+                                    error!("Failed to create encoder device: {}", e);
+                                    return;
+                                }
+                            }
                         }
                     };
+
                     if let Err(e) = worker.run(device) {
                         error!("Failed to start encoder worker: {}", e);
                     }
@@ -243,6 +283,7 @@ impl VirtioDevice for VideoDevice {
 /// for that purpose.
 ///
 /// TODO(b/149725148): Remove this when libvda supports buffer flags.
+#[cfg(feature = "video-encoder")]
 struct EosBufferManager {
     stream_id: u32,
     eos_buffer: Option<u32>,
@@ -250,6 +291,7 @@ struct EosBufferManager {
     responses: Vec<device::VideoEvtResponseType>,
 }
 
+#[cfg(feature = "video-encoder")]
 impl EosBufferManager {
     /// Create a new EOS manager for stream `stream_id`.
     fn new(stream_id: u32) -> Self {
