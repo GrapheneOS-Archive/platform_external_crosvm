@@ -10,6 +10,36 @@ package {
     default_applicable_licenses: ["external_crosvm_license"],
 }
 
+rust_defaults {
+    name: "libcrosvm_control_test_defaults",
+    defaults: ["crosvm_defaults"],
+    crate_name: "libcrosvm_control",
+    srcs: ["src/lib.rs"],
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+    edition: "2018",
+    rustlibs: [
+        "libbase_rust",
+        "liblibc",
+        "libvm_control",
+    ],
+}
+
+rust_test_host {
+    name: "libcrosvm_control_host_test_src_lib",
+    defaults: ["libcrosvm_control_test_defaults"],
+    test_options: {
+        unit_test: true,
+    },
+}
+
+rust_test {
+    name: "libcrosvm_control_device_test_src_lib",
+    defaults: ["libcrosvm_control_test_defaults"],
+}
+
 rust_ffi_shared {
     name: "liblibcrosvm_control_shared",
     defaults: ["crosvm_defaults"],

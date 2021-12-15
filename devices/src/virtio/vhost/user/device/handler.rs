@@ -64,7 +64,7 @@ use sync::Mutex;
 use sys_util::clear_fd_flags;
 use thiserror::Error as ThisError;
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
-use vmm_vhost::vhost_user::{
+use vmm_vhost::{
     message::{
         VhostUserConfigFlags, VhostUserInflight, VhostUserMemoryRegion, VhostUserProtocolFeatures,
         VhostUserSingleMemoryRegion, VhostUserVirtioFeatures, VhostUserVringAddrFlags,
@@ -72,9 +72,7 @@ use vmm_vhost::vhost_user::{
     },
     SlaveReqHandler,
 };
-use vmm_vhost::vhost_user::{
-    Error as VhostError, Result as VhostResult, VhostUserSlaveReqHandlerMut,
-};
+use vmm_vhost::{Error as VhostError, Result as VhostResult, VhostUserSlaveReqHandlerMut};
 
 use crate::virtio::{Queue, SignalableInterrupt};
 
@@ -131,7 +129,7 @@ pub fn create_guest_memory(
 ) -> VhostResult<(GuestMemory, Vec<MappingInfo>)> {
     let mut regions = Vec::with_capacity(files.len());
     for (region, file) in contexts.iter().zip(files.into_iter()) {
-        let region = MemoryRegion::new(
+        let region = MemoryRegion::new_from_shm(
             region.memory_size,
             GuestAddress(region.guest_phys_addr),
             region.mmap_offset,
@@ -763,14 +761,14 @@ mod tests {
 
     #[test]
     fn test_vhost_user_activate() {
-        use vmm_vhost::vhost_user::{Listener, SlaveListener};
+        use vmm_vhost::{SlaveListener, SocketEndpoint, SocketListener};
 
         const QUEUES_NUM: usize = 2;
 
         let dir = temp_dir();
         let mut path = dir.path().to_owned();
         path.push("sock");
-        let listener = Listener::new(&path, true).unwrap();
+        let listener = SocketListener::new(&path, true).unwrap();
 
         let vmm_bar = Arc::new(Barrier::new(2));
         let dev_bar = vmm_bar.clone();
@@ -822,7 +820,7 @@ mod tests {
         let handler = Arc::new(std::sync::Mutex::new(DeviceRequestHandler::new(
             FakeBackend::new(),
         )));
-        let mut listener = SlaveListener::new(listener, handler).unwrap();
+        let mut listener = SlaveListener::<SocketEndpoint<_>, _>::new(listener, handler).unwrap();
 
         // Notify listener is ready.
         tx.send(()).unwrap();

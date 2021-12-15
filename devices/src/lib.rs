@@ -36,12 +36,12 @@ pub use self::acpi::ACPIPMResource;
 pub use self::bat::{BatteryError, GoldfishBattery};
 pub use self::bus::Error as BusError;
 pub use self::bus::{
-    Bus, BusAccessInfo, BusDevice, BusDeviceObj, BusDeviceSync, BusRange, BusResumeDevice,
+    Bus, BusAccessInfo, BusDevice, BusDeviceObj, BusDeviceSync, BusRange, BusResumeDevice, BusType,
     HostHotPlugKey, HotPlugBus,
 };
 pub use self::cmos::Cmos;
 #[cfg(feature = "direct")]
-pub use self::direct_io::DirectIo;
+pub use self::direct_io::{DirectIo, DirectMmio};
 #[cfg(feature = "direct")]
 pub use self::direct_irq::{DirectIrq, DirectIrqError};
 pub use self::i8042::I8042Device;

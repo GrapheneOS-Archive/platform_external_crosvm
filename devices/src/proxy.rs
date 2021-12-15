@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::bus::ConfigWriteResult;
-use crate::{BusAccessInfo, BusDevice};
+use crate::pci::PciAddress;
+use crate::{BusAccessInfo, BusDevice, BusRange, BusType};
 
 /// Errors for proxy devices.
 #[sorted]
@@ -50,6 +51,7 @@ enum Command {
         data: [u8; 4],
     },
     Shutdown,
+    GetRanges,
 }
 #[derive(Debug, Serialize, Deserialize)]
 enum CommandResult {
@@ -57,9 +59,13 @@ enum CommandResult {
     ReadResult([u8; 8]),
     ReadConfigResult(u32),
     WriteConfigResult {
-        mem_bus_new_state: Option<bool>,
-        io_bus_new_state: Option<bool>,
+        mmio_remove: Vec<BusRange>,
+        mmio_add: Vec<BusRange>,
+        io_remove: Vec<BusRange>,
+        io_add: Vec<BusRange>,
+        removed_pci_devices: Vec<PciAddress>,
     },
+    GetRangesResult(Vec<(BusRange, BusType)>),
 }
 
 fn child_proc<D: BusDevice>(tube: Tube, device: &mut D) {
@@ -100,13 +106,20 @@ fn child_proc<D: BusDevice>(tube: Tube, device: &mut D) {
                 let res =
                     device.config_register_write(reg_idx as usize, offset as u64, &data[0..len]);
                 tube.send(&CommandResult::WriteConfigResult {
-                    mem_bus_new_state: res.mem_bus_new_state,
-                    io_bus_new_state: res.io_bus_new_state,
+                    mmio_remove: res.mmio_remove,
+                    mmio_add: res.mmio_add,
+                    io_remove: res.io_remove,
+                    io_add: res.io_add,
+                    removed_pci_devices: res.removed_pci_devices,
                 })
             }
             Command::Shutdown => {
                 running = false;
                 tube.send(&CommandResult::Ok)
+            }
+            Command::GetRanges => {
+                let ranges = device.get_ranges();
+                tube.send(&CommandResult::GetRangesResult(ranges))
             }
         };
         if let Err(e) = res {
@@ -236,8 +249,11 @@ impl BusDevice for ProxyDevice {
         let reg_idx = reg_idx as u32;
         let offset = offset as u32;
         if let Some(CommandResult::WriteConfigResult {
-            mem_bus_new_state,
-            io_bus_new_state,
+            mmio_remove,
+            mmio_add,
+            io_remove,
+            io_add,
+            removed_pci_devices,
         }) = self.sync_send(&Command::WriteConfig {
             reg_idx,
             offset,
@@ -245,8 +261,11 @@ impl BusDevice for ProxyDevice {
             data: buffer,
         }) {
             ConfigWriteResult {
-                mem_bus_new_state,
-                io_bus_new_state,
+                mmio_remove,
+                mmio_add,
+                io_remove,
+                io_add,
+                removed_pci_devices,
             }
         } else {
             Default::default()
@@ -281,6 +300,14 @@ impl BusDevice for ProxyDevice {
             info,
             data: buffer,
         });
+    }
+
+    fn get_ranges(&self) -> Vec<(BusRange, BusType)> {
+        if let Some(CommandResult::GetRangesResult(ranges)) = self.sync_send(&Command::GetRanges) {
+            ranges
+        } else {
+            Default::default()
+        }
     }
 }
 
