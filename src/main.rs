@@ -24,7 +24,8 @@ use crosvm::DirectIoOption;
 use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
     platform, BindMount, Config, DiskOption, Executable, GidMap, SharedDir, TouchDeviceOption,
-    VfioCommand, VhostUserFsOption, VhostUserOption, VhostUserWlOption, DISK_ID_LEN,
+    VfioCommand, VhostUserFsOption, VhostUserOption, VhostUserWlOption, VhostVsockDeviceParameter,
+    DISK_ID_LEN,
 };
 use devices::serial_device::{SerialHardware, SerialParameters, SerialType};
 #[cfg(feature = "audio_cras")]
@@ -33,6 +34,8 @@ use devices::virtio::vhost::user::device::{
     run_block_device, run_console_device, run_fs_device, run_net_device, run_vsock_device,
     run_wl_device,
 };
+#[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
+use devices::virtio::VideoBackendType;
 #[cfg(feature = "gpu")]
 use devices::virtio::{
     gpu::{
@@ -453,6 +456,20 @@ fn parse_gpu_options(s: Option<&str>, gpu_params: &mut GpuParameters) -> argumen
     }
 
     Ok(())
+}
+
+#[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
+fn parse_video_options(s: Option<&str>) -> argument::Result<VideoBackendType> {
+    const VALID_VIDEO_BACKENDS: &[&str] = &["libvda"];
+
+    match s {
+        None => Ok(VideoBackendType::Libvda),
+        Some("libvda") => Ok(VideoBackendType::Libvda),
+        Some(s) => Err(argument::Error::InvalidValue {
+            value: s.to_owned(),
+            expected: format!("should be one of ({})", VALID_VIDEO_BACKENDS.join("|")),
+        }),
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -952,7 +969,32 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
 
             cfg.kvm_device_path = kvm_device_path;
         }
+        "vhost-vsock-fd" => {
+            if cfg.vhost_vsock_device.is_some() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("A vhost-vsock device was already specified"),
+                });
+            }
+            cfg.vhost_vsock_device = Some(VhostVsockDeviceParameter::Fd(
+                value
+                    .unwrap()
+                    .parse()
+                    .map_err(|_| argument::Error::InvalidValue {
+                        value: value.unwrap().to_owned(),
+                        expected: String::from(
+                            "this value for `vhost-vsock-fd` needs to be integer",
+                        ),
+                    })?,
+            ));
+        }
         "vhost-vsock-device" => {
+            if cfg.vhost_vsock_device.is_some() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("A vhost-vsock device was already specified"),
+                });
+            }
             let vhost_vsock_device_path = PathBuf::from(value.unwrap());
             if !vhost_vsock_device_path.exists() {
                 return Err(argument::Error::InvalidValue {
@@ -961,7 +1003,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 });
             }
 
-            cfg.vhost_vsock_device_path = vhost_vsock_device_path;
+            cfg.vhost_vsock_device = Some(VhostVsockDeviceParameter::Path(vhost_vsock_device_path));
         }
         "vhost-net-device" => {
             let vhost_net_device_path = PathBuf::from(value.unwrap());
@@ -1838,11 +1880,13 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             let vfio_dev = VfioCommand::new(vfio_type, value.unwrap())?;
             cfg.vfio.push(vfio_dev);
         }
+        #[cfg(feature = "video-decoder")]
         "video-decoder" => {
-            cfg.video_dec = true;
+            cfg.video_dec = Some(parse_video_options(value)?);
         }
+        #[cfg(feature = "video-encoder")]
         "video-encoder" => {
-            cfg.video_enc = true;
+            cfg.video_enc = Some(parse_video_options(value)?);
         }
         "acpi-table" => {
             let acpi_table = PathBuf::from(value.unwrap());
@@ -2087,12 +2131,10 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
         }
     }
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
-    if cfg.gdb.is_some() {
-        if cfg.vcpu_count.unwrap_or(1) != 1 {
-            return Err(argument::Error::ExpectedArgument(
-                "`gdb` requires the number of vCPU to be 1".to_owned(),
-            ));
-        }
+    if cfg.gdb.is_some() && cfg.vcpu_count.unwrap_or(1) != 1 {
+        return Err(argument::Error::ExpectedArgument(
+            "`gdb` requires the number of vCPU to be 1".to_owned(),
+        ));
     }
     if cfg.host_cpu_topology {
         // Safe because we pass a flag for this call and the host supports this system call
@@ -2134,6 +2176,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
     let arguments =
         &[Argument::positional("KERNEL", "bzImage of kernel to run"),
           Argument::value("kvm-device", "PATH", "Path to the KVM device. (default /dev/kvm)"),
+          Argument::value("vhost-vsock-fd", "FD", "Open FD to the vhost-vsock device, mutually exclusive with vhost-vsock-device."),
           Argument::value("vhost-vsock-device", "PATH", "Path to the vhost-vsock device. (default /dev/vhost-vsock)"),
           Argument::value("vhost-net-device", "PATH", "Path to the vhost-net device. (default /dev/vhost-net)"),
           Argument::value("android-fstab", "PATH", "Path to Android fstab"),
@@ -2299,9 +2342,11 @@ fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
 iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("vfio-platform", "PATH", "Path to sysfs of platform pass through"),
           #[cfg(feature = "video-decoder")]
-          Argument::flag("video-decoder", "(EXPERIMENTAL) enable virtio-video decoder device"),
+          Argument::flag_or_value("video-decoder", "[backend]", "(EXPERIMENTAL) enable virtio-video decoder device
+                              Possible backend values: libvda"),
           #[cfg(feature = "video-encoder")]
-          Argument::flag("video-encoder", "(EXPERIMENTAL) enable virtio-video encoder device"),
+          Argument::flag_or_value("video-encoder", "[backend]", "(EXPERIMENTAL) enable virtio-video encoder device
+                              Possible backend values: libvda"),
           Argument::value("acpi-table", "PATH", "Path to user provided ACPI table"),
           Argument::flag("protected-vm", "(EXPERIMENTAL) prevent host access to guest memory"),
           #[cfg(target_arch = "aarch64")]

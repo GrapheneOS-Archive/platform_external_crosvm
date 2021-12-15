@@ -4,16 +4,16 @@
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use acpi_tables::sdt::SDT;
-use base::{Event, RawDescriptor};
+use base::{error, Event, RawDescriptor};
 use hypervisor::Datamatch;
 use remain::sorted;
 use resources::{Error as SystemAllocatorFaliure, SystemAllocator};
 use thiserror::Error;
 
-use crate::bus::{BusDeviceObj, ConfigWriteResult};
+use crate::bus::{BusDeviceObj, BusRange, BusType, ConfigWriteResult};
 use crate::pci::pci_configuration::{
-    self, PciBarConfiguration, COMMAND_REG, COMMAND_REG_IO_SPACE_MASK,
-    COMMAND_REG_MEMORY_SPACE_MASK,
+    self, PciBarConfiguration, BAR0_REG, COMMAND_REG, COMMAND_REG_IO_SPACE_MASK,
+    COMMAND_REG_MEMORY_SPACE_MASK, NUM_BAR_REGS, ROM_BAR_REG,
 };
 use crate::pci::{PciAddress, PciInterruptPin};
 #[cfg(feature = "audio")]
@@ -135,6 +135,14 @@ pub trait PciDevice: Send {
     fn generate_acpi(&mut self, sdts: Vec<SDT>) -> Option<Vec<SDT>> {
         Some(sdts)
     }
+
+    /// Invoked when the device is destroyed
+    fn destroy_device(&mut self) {}
+
+    /// Get the removed children devices under pci bridge
+    fn get_removed_children_devices(&self) -> Vec<PciAddress> {
+        Vec::new()
+    }
 }
 
 impl<T: PciDevice> BusDevice for T {
@@ -165,19 +173,78 @@ impl<T: PciDevice> BusDevice for T {
 
         if reg_idx == COMMAND_REG {
             let old_command_reg = self.read_config_register(COMMAND_REG);
+            let old_ranges = self.get_ranges();
             self.write_config_register(reg_idx, offset, data);
             let new_command_reg = self.read_config_register(COMMAND_REG);
+            let new_ranges = self.get_ranges();
 
             // Inform the caller of state changes.
             if (old_command_reg ^ new_command_reg) & COMMAND_REG_MEMORY_SPACE_MASK != 0 {
-                result.mem_bus_new_state =
-                    Some((new_command_reg & COMMAND_REG_MEMORY_SPACE_MASK) != 0);
+                // Enable memory, add new_mmio into mmio_bus
+                if new_command_reg & COMMAND_REG_MEMORY_SPACE_MASK != 0 {
+                    for (range, bus_type) in new_ranges.iter() {
+                        if *bus_type == BusType::Mmio {
+                            result.mmio_add.push(*range);
+                        }
+                    }
+                } else {
+                    // Disable memory, remove old_mmio from mmio_bus
+                    for (range, bus_type) in old_ranges.iter() {
+                        if *bus_type == BusType::Mmio {
+                            result.mmio_remove.push(*range);
+                        }
+                    }
+                }
             }
             if (old_command_reg ^ new_command_reg) & COMMAND_REG_IO_SPACE_MASK != 0 {
-                result.io_bus_new_state = Some((new_command_reg & COMMAND_REG_IO_SPACE_MASK) != 0);
+                // Enable IO, add new_io into io_bus
+                if new_command_reg & COMMAND_REG_IO_SPACE_MASK != 0 {
+                    for (range, bus_type) in new_ranges.iter() {
+                        if *bus_type == BusType::Io {
+                            result.io_add.push(*range);
+                        }
+                    }
+                } else {
+                    // Disable IO, remove old_io from io_bus
+                    for (range, bus_type) in old_ranges.iter() {
+                        if *bus_type == BusType::Io {
+                            result.io_remove.push(*range);
+                        }
+                    }
+                }
+            }
+        } else if (BAR0_REG..=BAR0_REG + 5).contains(&reg_idx) || reg_idx == ROM_BAR_REG {
+            let old_ranges = self.get_ranges();
+            self.write_config_register(reg_idx, offset, data);
+            let new_ranges = self.get_ranges();
+
+            for ((old_range, old_type), (new_range, new_type)) in
+                old_ranges.iter().zip(new_ranges.iter())
+            {
+                if *old_type != *new_type {
+                    error!(
+                        "{}: bar {:x} type changed after a bar write",
+                        self.debug_label(),
+                        reg_idx
+                    );
+                    continue;
+                }
+                if old_range.base != new_range.base {
+                    if *new_type == BusType::Mmio {
+                        result.mmio_remove.push(*old_range);
+                        result.mmio_add.push(*new_range);
+                    } else {
+                        result.io_remove.push(*old_range);
+                        result.io_add.push(*new_range);
+                    }
+                }
             }
         } else {
             self.write_config_register(reg_idx, offset, data);
+            let children_pci_addr = self.get_removed_children_devices();
+            if !children_pci_addr.is_empty() {
+                result.removed_pci_devices = children_pci_addr;
+            }
         }
 
         result
@@ -189,6 +256,32 @@ impl<T: PciDevice> BusDevice for T {
 
     fn on_sandboxed(&mut self) {
         self.on_device_sandboxed();
+    }
+
+    fn get_ranges(&self) -> Vec<(BusRange, BusType)> {
+        let mut ranges = Vec::new();
+        for bar_num in 0..NUM_BAR_REGS {
+            if let Some(bar) = self.get_bar_configuration(bar_num) {
+                let bus_type = if bar.is_memory() {
+                    BusType::Mmio
+                } else {
+                    BusType::Io
+                };
+                ranges.push((
+                    BusRange {
+                        base: bar.address(),
+                        len: bar.size(),
+                    },
+                    bus_type,
+                ));
+            }
+        }
+        ranges
+    }
+
+    // Invoked when the device is destroyed
+    fn destroy_device(&mut self) {
+        self.destroy_device()
     }
 }
 
@@ -247,6 +340,13 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     fn generate_acpi(&mut self, sdts: Vec<SDT>) -> Option<Vec<SDT>> {
         (**self).generate_acpi(sdts)
     }
+
+    fn destroy_device(&mut self) {
+        (**self).destroy_device();
+    }
+    fn get_removed_children_devices(&self) -> Vec<PciAddress> {
+        (**self).get_removed_children_devices()
+    }
 }
 
 impl<T: 'static + PciDevice> BusDeviceObj for T {
@@ -264,7 +364,15 @@ impl<T: 'static + PciDevice> BusDeviceObj for T {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pci_configuration::{PciClassCode, PciConfiguration, PciHeaderType, PciMultimediaSubclass};
+    use pci_configuration::{
+        PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration, PciHeaderType,
+        PciMultimediaSubclass,
+    };
+
+    const BAR0_SIZE: u64 = 0x1000;
+    const BAR2_SIZE: u64 = 0x20;
+    const BAR0_ADDR: u64 = 0xc0000000;
+    const BAR2_ADDR: u64 = 0x800;
 
     struct TestDev {
         pub config_regs: PciConfiguration,
@@ -296,7 +404,7 @@ mod tests {
         }
 
         fn get_bar_configuration(&self, bar_num: usize) -> Option<PciBarConfiguration> {
-            None
+            self.config_regs.get_bar_configuration(bar_num)
         }
     }
 
@@ -317,6 +425,33 @@ mod tests {
             ),
         };
 
+        let _ = test_dev.config_regs.add_pci_bar(
+            PciBarConfiguration::new(
+                0,
+                BAR0_SIZE,
+                PciBarRegionType::Memory64BitRegion,
+                PciBarPrefetchable::Prefetchable,
+            )
+            .set_address(BAR0_ADDR),
+        );
+        let _ = test_dev.config_regs.add_pci_bar(
+            PciBarConfiguration::new(
+                2,
+                BAR2_SIZE,
+                PciBarRegionType::IoRegion,
+                PciBarPrefetchable::NotPrefetchable,
+            )
+            .set_address(BAR2_ADDR),
+        );
+        let bar0_range = BusRange {
+            base: BAR0_ADDR,
+            len: BAR0_SIZE,
+        };
+        let bar2_range = BusRange {
+            base: BAR2_ADDR,
+            len: BAR2_SIZE,
+        };
+
         // Initialize command register to an all-zeroes value.
         test_dev.config_register_write(COMMAND_REG, 0, &0u32.to_le_bytes());
 
@@ -324,8 +459,11 @@ mod tests {
         assert_eq!(
             test_dev.config_register_write(COMMAND_REG, 0, &1u32.to_le_bytes()),
             ConfigWriteResult {
-                mem_bus_new_state: None,
-                io_bus_new_state: Some(true),
+                mmio_remove: Vec::new(),
+                mmio_add: Vec::new(),
+                io_remove: Vec::new(),
+                io_add: vec![bar2_range],
+                removed_pci_devices: Vec::new(),
             }
         );
 
@@ -333,8 +471,11 @@ mod tests {
         assert_eq!(
             test_dev.config_register_write(COMMAND_REG, 0, &3u32.to_le_bytes()),
             ConfigWriteResult {
-                mem_bus_new_state: Some(true),
-                io_bus_new_state: None,
+                mmio_remove: Vec::new(),
+                mmio_add: vec![bar0_range],
+                io_remove: Vec::new(),
+                io_add: Vec::new(),
+                removed_pci_devices: Vec::new(),
             }
         );
 
@@ -342,8 +483,11 @@ mod tests {
         assert_eq!(
             test_dev.config_register_write(COMMAND_REG, 0, &3u32.to_le_bytes()),
             ConfigWriteResult {
-                mem_bus_new_state: None,
-                io_bus_new_state: None,
+                mmio_remove: Vec::new(),
+                mmio_add: Vec::new(),
+                io_remove: Vec::new(),
+                io_add: Vec::new(),
+                removed_pci_devices: Vec::new(),
             }
         );
 
@@ -351,17 +495,52 @@ mod tests {
         assert_eq!(
             test_dev.config_register_write(COMMAND_REG, 0, &2u32.to_le_bytes()),
             ConfigWriteResult {
-                mem_bus_new_state: None,
-                io_bus_new_state: Some(false),
+                mmio_remove: Vec::new(),
+                mmio_add: Vec::new(),
+                io_remove: vec![bar2_range],
+                io_add: Vec::new(),
+                removed_pci_devices: Vec::new(),
             }
         );
 
-        // Re-enable IO space and disable mem simultaneously.
+        // Disable mem space access.
         assert_eq!(
-            test_dev.config_register_write(COMMAND_REG, 0, &1u32.to_le_bytes()),
+            test_dev.config_register_write(COMMAND_REG, 0, &0u32.to_le_bytes()),
             ConfigWriteResult {
-                mem_bus_new_state: Some(false),
-                io_bus_new_state: Some(true),
+                mmio_remove: vec![bar0_range],
+                mmio_add: Vec::new(),
+                io_remove: Vec::new(),
+                io_add: Vec::new(),
+                removed_pci_devices: Vec::new(),
+            }
+        );
+
+        assert_eq!(test_dev.get_ranges(), Vec::new());
+
+        // Re-enable mem and IO space.
+        assert_eq!(
+            test_dev.config_register_write(COMMAND_REG, 0, &3u32.to_le_bytes()),
+            ConfigWriteResult {
+                mmio_remove: Vec::new(),
+                mmio_add: vec![bar0_range],
+                io_remove: Vec::new(),
+                io_add: vec![bar2_range],
+                removed_pci_devices: Vec::new(),
+            }
+        );
+
+        // Change Bar0's address
+        assert_eq!(
+            test_dev.config_register_write(BAR0_REG, 0, &0xD0000000u32.to_le_bytes()),
+            ConfigWriteResult {
+                mmio_remove: vec!(bar0_range),
+                mmio_add: vec![BusRange {
+                    base: 0xD0000000,
+                    len: BAR0_SIZE
+                }],
+                io_remove: Vec::new(),
+                io_add: Vec::new(),
+                removed_pci_devices: Vec::new(),
             }
         );
     }

@@ -37,21 +37,29 @@ impl std::fmt::Display for BusAccessInfo {
 
 /// Result of a write to a device's PCI configuration space.
 /// This value represents the state change(s) that occurred due to the write.
-/// Each member of this structure may be `None` if no change occurred, or `Some(new_value)` to
-/// indicate a state change.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ConfigWriteResult {
-    /// New state of the memory bus for this PCI device:
-    /// - `None`: no change in state.
-    /// - `Some(true)`: memory decode enabled; device should respond to memory accesses.
-    /// - `Some(false)`: memory decode disabled; device should not respond to memory accesses.
-    pub mem_bus_new_state: Option<bool>,
+    /// The BusRange in the vector will be removed from mmio_bus
+    pub mmio_remove: Vec<BusRange>,
 
-    /// New state of the I/O bus for this PCI device:
-    /// - `None`: no change in state.
-    /// - `Some(true)`: I/O decode enabled; device should respond to I/O accesses.
-    /// - `Some(false)`: I/O decode disabled; device should not respond to I/O accesses.
-    pub io_bus_new_state: Option<bool>,
+    /// The BusRange in the vector will be added into mmio_bus
+    pub mmio_add: Vec<BusRange>,
+
+    /// The BusRange in the vector will be removed from io_bus
+    pub io_remove: Vec<BusRange>,
+
+    /// The BusRange in the vector will be added into io_bus
+    pub io_add: Vec<BusRange>,
+
+    /// Device specified at PciAddress will be removed after this config write
+    /// - 'Vec<PciAddress>>': specified device will be removed after this config write
+    pub removed_pci_devices: Vec<PciAddress>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum BusType {
+    Mmio,
+    Io,
 }
 
 /// Trait for devices that respond to reads or writes in an arbitrary address space.
@@ -86,6 +94,14 @@ pub trait BusDevice: Send {
     }
     /// Invoked when the device is sandboxed.
     fn on_sandboxed(&mut self) {}
+
+    /// Gets a list of all ranges registered by this BusDevice.
+    fn get_ranges(&self) -> Vec<(BusRange, BusType)> {
+        Vec::new()
+    }
+
+    /// Invoked when the device is destroyed
+    fn destroy_device(&mut self) {}
 }
 
 pub trait BusDeviceSync: BusDevice + Sync {
@@ -102,6 +118,7 @@ pub trait BusResumeDevice: Send {
 /// The key to identify hotplug device from host view.
 /// like host sysfs path for vfio pci device, host disk file
 /// path for virtio block device
+#[derive(Copy, Clone)]
 pub enum HostHotPlugKey {
     Vfio { host_addr: PciAddress },
 }
@@ -114,6 +131,11 @@ pub trait HotPlugBus {
     /// Notify hotplug out event into guest
     /// * 'addr' - the guest pci address for hotplug out device
     fn hot_unplug(&mut self, addr: PciAddress);
+    /// Check whether the hotplug bus is available to add the new device
+    ///
+    /// - 'None': hotplug bus isn't match with host pci device
+    /// - 'Some(bus_num)': hotplug bus is match and put the device at bus_num
+    fn is_match(&self, host_addr: PciAddress) -> Option<u8>;
     /// Add hotplug device into this bus
     /// * 'host_key' - the key to identify hotplug device from host view
     /// * 'guest_addr' - the guest pci address for hotplug device
@@ -150,6 +172,8 @@ pub trait BusDeviceObj {
 #[sorted]
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("Bus Range not found")]
+    Empty,
     /// The insertion failed because the new device overlapped with an old device.
     #[error("new device overlaps with an old device")]
     Overlap,
@@ -161,7 +185,7 @@ pub type Result<T> = result::Result<T, Error>;
 ///
 /// * base - The address at which the range start.
 /// * len - The length of the range in bytes.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct BusRange {
     pub base: u64,
     pub len: u64,
@@ -222,6 +246,11 @@ impl Bus {
             devices: Arc::new(Mutex::new(BTreeMap::new())),
             access_id: 0,
         }
+    }
+
+    /// Sets the id that will be used for BusAccessInfo.
+    pub fn set_access_id(&mut self, id: usize) {
+        self.access_id = id;
     }
 
     fn first_before(&self, addr: u64) -> Option<(BusRange, BusDeviceEntry)> {
@@ -293,6 +322,28 @@ impl Bus {
         }
 
         Ok(())
+    }
+
+    /// Remove the given device at the given address space.
+    pub fn remove(&self, base: u64, len: u64) -> Result<()> {
+        if len == 0 {
+            return Err(Error::Overlap);
+        }
+
+        let mut devices = self.devices.lock();
+        if devices
+            .iter()
+            .any(|(range, _dev)| range.base == base && range.len == len)
+        {
+            let ret = devices.remove(&BusRange { base, len });
+            if ret.is_some() {
+                Ok(())
+            } else {
+                Err(Error::Empty)
+            }
+        } else {
+            Err(Error::Empty)
+        }
     }
 
     /// Reads data from the device that owns the range containing `addr` and puts it into `data`.
