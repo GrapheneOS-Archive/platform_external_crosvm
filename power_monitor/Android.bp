@@ -25,33 +25,3 @@ rust_library {
     ],
     proc_macros: ["libremain"],
 }
-
-rust_defaults {
-    name: "power_monitor_test_defaults",
-    defaults: ["crosvm_defaults"],
-    crate_name: "power_monitor",
-    srcs: ["src/lib.rs"],
-    cargo_env_compat: true,
-    cargo_pkg_version: "0.1.0",
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-    edition: "2018",
-    rustlibs: [
-        "libbase_rust",
-        "libthiserror",
-    ],
-    proc_macros: ["libremain"],
-}
-
-rust_test_host {
-    name: "power_monitor_host_test_src_lib",
-    defaults: ["power_monitor_test_defaults"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
-rust_test {
-    name: "power_monitor_device_test_src_lib",
-    defaults: ["power_monitor_test_defaults"],
-}
