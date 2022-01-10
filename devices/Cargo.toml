@@ -18,6 +18,7 @@ minigbm = ["rutabaga_gfx/minigbm"]
 x = ["gpu_display/x"]
 virgl_renderer = ["gpu", "rutabaga_gfx/virgl_renderer"]
 gfxstream = ["gpu", "rutabaga_gfx/gfxstream"]
+vvu = []
 
 [dependencies]
 async-task = "4"
@@ -69,7 +70,7 @@ vm_memory = { path = "../vm_memory" }
 
 [dependencies.futures]
 version = "*"
-features = ["std"]
+features = ["async-await", "std"]
 default-features = false
 
 [dev-dependencies]

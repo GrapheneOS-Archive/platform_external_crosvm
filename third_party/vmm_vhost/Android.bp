@@ -54,6 +54,7 @@ rust_library {
         "vmm",
     ],
     rustlibs: [
+        "libanyhow",
         "libbitflags",
         "libdata_model",
         "liblibc",
@@ -83,6 +84,7 @@ rust_test {
         "vmm",
     ],
     rustlibs: [
+        "libanyhow",
         "libbitflags",
         "libdata_model",
         "liblibc",

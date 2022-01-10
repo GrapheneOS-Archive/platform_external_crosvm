@@ -4,25 +4,25 @@
 //! Structs for Unix Domain Socket listener and endpoint.
 
 use std::fs::File;
-use std::io::{ErrorKind, IoSliceMut};
+use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::marker::PhantomData;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
-use sys_util::ScmSocket;
+use sys_util::{AsRawDescriptor, RawDescriptor, ScmSocket};
 
 use super::{Error, Result};
-use crate::connection::{Endpoint, Listener, Req};
+use crate::connection::{Endpoint as EndpointTrait, Listener as ListenerTrait, Req};
 use crate::message::*;
 
 /// Unix domain socket listener for accepting incoming connections.
-pub struct SocketListener {
+pub struct Listener {
     fd: UnixListener,
     path: PathBuf,
 }
 
-impl SocketListener {
+impl Listener {
     /// Create a unix domain socket listener.
     ///
     /// # Return:
@@ -33,14 +33,14 @@ impl SocketListener {
             let _ = std::fs::remove_file(&path);
         }
         let fd = UnixListener::bind(&path).map_err(Error::SocketError)?;
-        Ok(SocketListener {
+        Ok(Listener {
             fd,
             path: path.as_ref().to_owned(),
         })
     }
 }
 
-impl Listener for SocketListener {
+impl ListenerTrait for Listener {
     type Connection = UnixStream;
 
     /// Accept an incoming connection.
@@ -49,7 +49,7 @@ impl Listener for SocketListener {
     /// * - Some(UnixStream): new UnixStream object if new incoming connection is available.
     /// * - None: no incoming connection available.
     /// * - SocketError: errors from accept().
-    fn accept(&self) -> Result<Option<Self::Connection>> {
+    fn accept(&mut self) -> Result<Option<Self::Connection>> {
         loop {
             match self.fd.accept() {
                 Ok((socket, _addr)) => return Ok(Some(socket)),
@@ -78,27 +78,26 @@ impl Listener for SocketListener {
     }
 }
 
-impl AsRawFd for SocketListener {
+impl AsRawFd for Listener {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-impl Drop for SocketListener {
+impl Drop for Listener {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
 /// Unix domain socket endpoint for vhost-user connection.
-pub struct SocketEndpoint<R: Req> {
+pub struct Endpoint<R: Req> {
     sock: UnixStream,
     _r: PhantomData<R>,
 }
 
-impl<R: Req> SocketEndpoint<R> {
-    /// Create an endpoint from a stream object.
-    pub fn from_stream(sock: UnixStream) -> Self {
+impl<R: Req> From<UnixStream> for Endpoint<R> {
+    fn from(sock: UnixStream) -> Self {
         Self {
             sock,
             _r: PhantomData,
@@ -106,11 +105,13 @@ impl<R: Req> SocketEndpoint<R> {
     }
 }
 
-impl<R: Req> Endpoint<R> for SocketEndpoint<R> {
-    type Listener = SocketListener;
+impl<R: Req> EndpointTrait<R> for Endpoint<R> {
+    type Listener = Listener;
 
     /// Create an endpoint from a stream object.
-    fn from_connection(sock: <<Self as Endpoint<R>>::Listener as Listener>::Connection) -> Self {
+    fn from_connection(
+        sock: <<Self as EndpointTrait<R>>::Listener as ListenerTrait>::Connection,
+    ) -> Self {
         Self {
             sock,
             _r: PhantomData,
@@ -124,7 +125,7 @@ impl<R: Req> Endpoint<R> for SocketEndpoint<R> {
     /// * - SocketConnect: failed to connect to peer.
     fn connect<P: AsRef<Path>>(path: P) -> Result<Self> {
         let sock = UnixStream::connect(path).map_err(Error::SocketConnect)?;
-        Ok(Self::from_stream(sock))
+        Ok(Self::from(sock))
     }
 
     /// Sends bytes from scatter-gather vectors over the socket with optional attached file
@@ -135,7 +136,7 @@ impl<R: Req> Endpoint<R> for SocketEndpoint<R> {
     /// * - SocketRetry: temporary error caused by signals or short of resources.
     /// * - SocketBroken: the underline socket is broken.
     /// * - SocketError: other socket related errors.
-    fn send_iovec(&mut self, iovs: &[&[u8]], fds: Option<&[RawFd]>) -> Result<usize> {
+    fn send_iovec(&mut self, iovs: &[IoSlice], fds: Option<&[RawFd]>) -> Result<usize> {
         let rfds = match fds {
             Some(rfds) => rfds,
             _ => &[],
@@ -193,9 +194,21 @@ impl<R: Req> Endpoint<R> for SocketEndpoint<R> {
     }
 }
 
-impl<T: Req> AsRawFd for SocketEndpoint<T> {
+impl<T: Req> AsRawFd for Endpoint<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.sock.as_raw_fd()
+    }
+}
+
+impl<T: Req> AsRawDescriptor for Endpoint<T> {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
+        self.as_raw_fd()
+    }
+}
+
+impl<T: Req> AsMut<UnixStream> for Endpoint<T> {
+    fn as_mut(&mut self) -> &mut UnixStream {
+        &mut self.sock
     }
 }
 
@@ -217,7 +230,7 @@ mod tests {
         let dir = temp_dir();
         let mut path = dir.path().to_owned();
         path.push("sock");
-        let listener = SocketListener::new(&path, true).unwrap();
+        let listener = Listener::new(&path, true).unwrap();
 
         assert!(listener.as_raw_fd() > 0);
     }
@@ -227,7 +240,7 @@ mod tests {
         let dir = temp_dir();
         let mut path = dir.path().to_owned();
         path.push("sock");
-        let listener = SocketListener::new(&path, true).unwrap();
+        let mut listener = Listener::new(&path, true).unwrap();
         listener.set_nonblocking(true).unwrap();
 
         // accept on a fd without incoming connection
@@ -240,20 +253,20 @@ mod tests {
         let dir = temp_dir();
         let mut path = dir.path().to_owned();
         path.push("sock");
-        let listener = SocketListener::new(&path, true).unwrap();
+        let mut listener = Listener::new(&path, true).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut master = SocketEndpoint::<MasterReq>::connect(&path).unwrap();
+        let mut master = Endpoint::<MasterReq>::connect(&path).unwrap();
         let sock = listener.accept().unwrap().unwrap();
-        let mut slave = SocketEndpoint::<MasterReq>::from_stream(sock);
+        let mut slave = Endpoint::<MasterReq>::from(sock);
 
         let buf1 = vec![0x1, 0x2, 0x3, 0x4];
-        let mut len = master.send_slice(&buf1[..], None).unwrap();
+        let mut len = master.send_slice(IoSlice::new(&buf1[..]), None).unwrap();
         assert_eq!(len, 4);
         let (bytes, buf2, _) = slave.recv_into_buf(0x1000).unwrap();
         assert_eq!(bytes, 4);
         assert_eq!(&buf1[..], &buf2[..bytes]);
 
-        len = master.send_slice(&buf1[..], None).unwrap();
+        len = master.send_slice(IoSlice::new(&buf1[..]), None).unwrap();
         assert_eq!(len, 4);
         let (bytes, buf2, _) = slave.recv_into_buf(0x2).unwrap();
         assert_eq!(bytes, 2);
@@ -268,11 +281,11 @@ mod tests {
         let dir = temp_dir();
         let mut path = dir.path().to_owned();
         path.push("sock");
-        let listener = SocketListener::new(&path, true).unwrap();
+        let mut listener = Listener::new(&path, true).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut master = SocketEndpoint::<MasterReq>::connect(&path).unwrap();
+        let mut master = Endpoint::<MasterReq>::connect(&path).unwrap();
         let sock = listener.accept().unwrap().unwrap();
-        let mut slave = SocketEndpoint::<MasterReq>::from_stream(sock);
+        let mut slave = Endpoint::<MasterReq>::from(sock);
 
         let mut fd = tempfile().unwrap();
         write!(fd, "test").unwrap();
@@ -280,7 +293,7 @@ mod tests {
         // Normal case for sending/receiving file descriptors
         let buf1 = vec![0x1, 0x2, 0x3, 0x4];
         let len = master
-            .send_slice(&buf1[..], Some(&[fd.as_raw_fd()]))
+            .send_slice(IoSlice::new(&buf1[..]), Some(&[fd.as_raw_fd()]))
             .unwrap();
         assert_eq!(len, 4);
 
@@ -303,7 +316,7 @@ mod tests {
         // Receiving side: data(header) with fds, data(body)
         let len = master
             .send_slice(
-                &buf1[..],
+                IoSlice::new(&buf1[..]),
                 Some(&[fd.as_raw_fd(), fd.as_raw_fd(), fd.as_raw_fd()]),
             )
             .unwrap();
@@ -332,7 +345,7 @@ mod tests {
         // Receiving side: data(header), data(body) with fds
         let len = master
             .send_slice(
-                &buf1[..],
+                IoSlice::new(&buf1[..]),
                 Some(&[fd.as_raw_fd(), fd.as_raw_fd(), fd.as_raw_fd()]),
             )
             .unwrap();
@@ -349,11 +362,11 @@ mod tests {
         // Following communication pattern should work:
         // Sending side: data, data with fds
         // Receiving side: data, data with fds
-        let len = master.send_slice(&buf1[..], None).unwrap();
+        let len = master.send_slice(IoSlice::new(&buf1[..]), None).unwrap();
         assert_eq!(len, 4);
         let len = master
             .send_slice(
-                &buf1[..],
+                IoSlice::new(&buf1[..]),
                 Some(&[fd.as_raw_fd(), fd.as_raw_fd(), fd.as_raw_fd()]),
             )
             .unwrap();
@@ -385,11 +398,11 @@ mod tests {
         // Following communication pattern should not work:
         // Sending side: data1, data2 with fds
         // Receiving side: data + partial of data2, left of data2 with fds
-        let len = master.send_slice(&buf1[..], None).unwrap();
+        let len = master.send_slice(IoSlice::new(&buf1[..]), None).unwrap();
         assert_eq!(len, 4);
         let len = master
             .send_slice(
-                &buf1[..],
+                IoSlice::new(&buf1[..]),
                 Some(&[fd.as_raw_fd(), fd.as_raw_fd(), fd.as_raw_fd()]),
             )
             .unwrap();
@@ -405,7 +418,7 @@ mod tests {
         // If the target fd array is too small, extra file descriptors will get lost.
         let len = master
             .send_slice(
-                &buf1[..],
+                IoSlice::new(&buf1[..]),
                 Some(&[fd.as_raw_fd(), fd.as_raw_fd(), fd.as_raw_fd()]),
             )
             .unwrap();
@@ -421,11 +434,11 @@ mod tests {
         let dir = temp_dir();
         let mut path = dir.path().to_owned();
         path.push("sock");
-        let listener = SocketListener::new(&path, true).unwrap();
+        let mut listener = Listener::new(&path, true).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut master = SocketEndpoint::<MasterReq>::connect(&path).unwrap();
+        let mut master = Endpoint::<MasterReq>::connect(&path).unwrap();
         let sock = listener.accept().unwrap().unwrap();
-        let mut slave = SocketEndpoint::<MasterReq>::from_stream(sock);
+        let mut slave = Endpoint::<MasterReq>::from(sock);
 
         let mut hdr1 =
             VhostUserMsgHeader::new(MasterReq::GET_FEATURES, 0, mem::size_of::<u64>() as u32);

@@ -4,7 +4,7 @@
 
 //! gfxstream: Handles 3D virtio-gpu hypercalls using gfxstream.
 //!
-//! External code found at https://android.googlesource.com/device/generic/vulkan-cereal/.
+//! External code found at <https://android.googlesource.com/device/generic/vulkan-cereal/>.
 
 #![cfg(feature = "gfxstream")]
 
@@ -210,6 +210,7 @@ impl Gfxstream {
 
         let cookie: *mut VirglCookie = Box::into_raw(Box::new(VirglCookie {
             fence_state: Rc::clone(&fence_state),
+            render_server_fd: None,
         }));
 
         unsafe {
