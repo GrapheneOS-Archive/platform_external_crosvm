@@ -10,15 +10,19 @@ package {
     default_applicable_licenses: ["external_crosvm_license"],
 }
 
-rust_defaults {
-    name: "base_test_defaults",
+rust_test {
+    name: "base_test_src_lib",
     defaults: ["crosvm_defaults"],
+    host_supported: true,
     crate_name: "base",
-    srcs: ["src/lib.rs"],
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
+    srcs: ["src/lib.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
+    test_options: {
+        unit_test: true,
+    },
     edition: "2018",
     rustlibs: [
         "libaudio_streams",
@@ -33,19 +37,6 @@ rust_defaults {
         "libthiserror",
     ],
     proc_macros: ["libremain"],
-}
-
-rust_test_host {
-    name: "base_host_test_src_lib",
-    defaults: ["base_test_defaults"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
-rust_test {
-    name: "base_device_test_src_lib",
-    defaults: ["base_test_defaults"],
 }
 
 rust_library {
