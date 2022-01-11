@@ -1,8 +1,8 @@
 diff --git a/devices/Android.bp b/devices/Android.bp
-index 09290b81..8580691c 100644
+index 40ee2404..097f777d 100644
 --- a/devices/Android.bp
 +++ b/devices/Android.bp
-@@ -21,6 +21,8 @@ rust_defaults {
+@@ -26,6 +26,8 @@ rust_test {
      edition: "2018",
      features: [
          "audio",
@@ -11,8 +11,7 @@ index 09290b81..8580691c 100644
          "usb",
      ],
      rustlibs: [
-@@ -33,6 +35,7 @@ rust_defaults {
-         "libdisk",
+@@ -41,6 +43,7 @@ rust_test {
          "libfuse_rust",
          "libfutures",
          "libgetopts",
@@ -20,15 +19,15 @@ index 09290b81..8580691c 100644
          "libhypervisor",
          "libkvm_sys",
          "liblibc",
-@@ -45,6 +48,7 @@ rust_defaults {
+@@ -52,6 +55,7 @@ rust_test {
+         "libp9",
          "libpower_monitor",
-         "librand_ish",
          "libresources",
 +        "librutabaga_gfx",
          "libserde",
+         "libserde_json",
          "libsmallvec",
-         "libsync_rust",
-@@ -63,6 +67,19 @@ rust_defaults {
+@@ -71,6 +75,19 @@ rust_test {
          "libenumn",
          "libremain",
      ],
@@ -45,10 +44,10 @@ index 09290b81..8580691c 100644
 +            ],
 +        },
 +    },
+     shared_libs: ["libgfxstream_backend"],
  }
  
- rust_test_host {
-@@ -90,6 +107,8 @@ rust_library {
+@@ -85,6 +102,8 @@ rust_library {
      edition: "2018",
      features: [
          "audio",
@@ -57,8 +56,7 @@ index 09290b81..8580691c 100644
          "usb",
      ],
      rustlibs: [
-@@ -102,6 +121,7 @@ rust_library {
-         "libdisk",
+@@ -100,6 +119,7 @@ rust_library {
          "libfuse_rust",
          "libfutures",
          "libgetopts",
@@ -66,11 +64,11 @@ index 09290b81..8580691c 100644
          "libhypervisor",
          "libkvm_sys",
          "liblibc",
-@@ -114,6 +134,7 @@ rust_library {
+@@ -111,6 +131,7 @@ rust_library {
+         "libp9",
          "libpower_monitor",
-         "librand_ish",
          "libresources",
 +        "librutabaga_gfx",
          "libserde",
+         "libserde_json",
          "libsmallvec",
-         "libsync_rust",

@@ -10,15 +10,19 @@ package {
     default_applicable_licenses: ["external_crosvm_license"],
 }
 
-rust_defaults {
-    name: "kvm_sys_test_defaults",
+rust_test {
+    name: "kvm_sys_test_src_lib",
     defaults: ["crosvm_defaults"],
-    crate_name: "kvm_sys",
     // has rustc warnings
-    srcs: ["src/lib.rs"],
+    host_supported: true,
+    crate_name: "kvm_sys",
     cargo_env_compat: true,
+    srcs: ["src/lib.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
+    test_options: {
+        unit_test: false,
+    },
     edition: "2018",
     rustlibs: [
         "libbase_rust",
@@ -27,28 +31,19 @@ rust_defaults {
     ],
 }
 
-rust_test_host {
-    name: "kvm_sys_host_test_src_lib",
-    defaults: ["kvm_sys_test_defaults"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
 rust_test {
-    name: "kvm_sys_device_test_src_lib",
-    defaults: ["kvm_sys_test_defaults"],
-}
-
-rust_defaults {
-    name: "kvm_sys_test_defaults_basic",
+    name: "kvm_sys_test_tests_basic",
     defaults: ["crosvm_defaults"],
-    crate_name: "basic",
     // has rustc warnings
-    srcs: ["tests/basic.rs"],
+    host_supported: true,
+    crate_name: "basic",
     cargo_env_compat: true,
+    srcs: ["tests/basic.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
+    test_options: {
+        unit_test: false,
+    },
     edition: "2018",
     rustlibs: [
         "libbase_rust",
@@ -56,19 +51,6 @@ rust_defaults {
         "libkvm_sys",
         "liblibc",
     ],
-}
-
-rust_test_host {
-    name: "kvm_sys_host_test_tests_basic",
-    defaults: ["kvm_sys_test_defaults_basic"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
-rust_test {
-    name: "kvm_sys_device_test_tests_basic",
-    defaults: ["kvm_sys_test_defaults_basic"],
 }
 
 rust_library {
