@@ -4,10 +4,10 @@
 //  "presubmit": [
 //    {
 //      "host": true,
-//      "name": "io_uring_host_test_src_lib"
+//      "name": "io_uring_test_src_lib"
 //    },
 //    {
-//      "name": "io_uring_device_test_src_lib"
+//      "name": "io_uring_test_src_lib"
 //    }
 //  ]
 }
