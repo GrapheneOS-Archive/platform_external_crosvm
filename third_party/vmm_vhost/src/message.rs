@@ -9,6 +9,7 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::upper_case_acronyms)]
 
+use std::convert::TryInto;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
@@ -43,11 +44,11 @@ pub const VHOST_USER_CONFIG_SIZE: u32 = 0x1000;
 /// Maximum number of vrings supported.
 pub const VHOST_USER_MAX_VRINGS: u64 = 0x8000u64;
 
-// TODO(keiichiw): Can't we avoid exposing `Req`?
-#[allow(missing_docs)]
+/// Used for the payload in Vhost Master messages.
 pub trait Req:
     Clone + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Into<u32> + Send + Sync
 {
+    /// Is the entity valid.
     fn is_valid(&self) -> bool;
 }
 
@@ -230,7 +231,7 @@ bitflags! {
 /// machine native byte order.
 #[repr(packed)]
 #[derive(Copy)]
-pub(super) struct VhostUserMsgHeader<R: Req> {
+pub struct VhostUserMsgHeader<R: Req> {
     request: u32,
     flags: u32,
     size: u32,
@@ -348,6 +349,19 @@ impl<R: Req> Default for VhostUserMsgHeader<R> {
             size: 0,
             _r: PhantomData,
         }
+    }
+}
+
+impl From<[u8; 12]> for VhostUserMsgHeader<MasterReq> {
+    fn from(buf: [u8; 12]) -> Self {
+        // Convert 4-length slice into [u8; 4]. This must succeed.
+        let req = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        // Safe because `MasterReq` is defined with `#[repr(u32)]`.
+        let req = unsafe { std::mem::transmute_copy::<u32, MasterReq>(&req) };
+
+        let flags = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let size = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        Self::new(req, flags, size)
     }
 }
 

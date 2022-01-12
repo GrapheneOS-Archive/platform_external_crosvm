@@ -3,11 +3,13 @@
 
 //! Common data structures for listener and endpoint.
 
-mod socket;
-pub use self::socket::{SocketEndpoint, SocketListener};
+pub mod socket;
+
+#[cfg(feature = "vfio-device")]
+pub mod vfio;
 
 use std::fs::File;
-use std::io::IoSliceMut;
+use std::io::{IoSlice, IoSliceMut};
 use std::mem;
 use std::os::unix::io::RawFd;
 use std::path::Path;
@@ -24,12 +26,13 @@ pub trait Listener: Sized {
     type Connection;
 
     /// Accept an incoming connection.
-    fn accept(&self) -> Result<Option<Self::Connection>>;
+    fn accept(&mut self) -> Result<Option<Self::Connection>>;
 
     /// Change blocking status on the listener.
     fn set_nonblocking(&self, block: bool) -> Result<()>;
 }
 
+/// Abstracts a vhost-user connection and related operations.
 pub trait Endpoint<R: Req>: Sized {
     /// Type of an object that Endpoint is created from.
     type Listener: Listener;
@@ -44,7 +47,7 @@ pub trait Endpoint<R: Req>: Sized {
     ///
     /// # Return:
     /// * - number of bytes sent on success
-    fn send_iovec(&mut self, iovs: &[&[u8]], fds: Option<&[RawFd]>) -> Result<usize>;
+    fn send_iovec(&mut self, iovs: &[IoSlice], fds: Option<&[RawFd]>) -> Result<usize>;
 
     /// Reads bytes into the given scatter/gather vectors with optional attached file.
     ///
@@ -101,12 +104,19 @@ fn advance_slices_mut(bufs: &mut &mut [&mut [u8]], mut count: usize) {
     }
 }
 
-pub(super) trait EndpointExt<R: Req>: Endpoint<R> {
+/// Abstracts VVU message parsing, sending and receiving.
+pub trait EndpointExt<R: Req>: Endpoint<R> {
     /// Sends all bytes from scatter-gather vectors with optional attached file descriptors. Will
     /// loop until all data has been transfered.
     ///
     /// # Return:
     /// * - number of bytes sent on success
+    ///
+    /// # TODO
+    /// This function takes a slice of `&[u8]` instead of `IoSlice` because the internal
+    /// cursor needs to be moved by `advance_slices()`.
+    /// Once `IoSlice::advance_slices()` becomes stable, this should be updated.
+    /// <https://github.com/rust-lang/rust/issues/62726>.
     fn send_iovec_all(
         &mut self,
         mut iovs: &mut [&[u8]],
@@ -117,7 +127,8 @@ pub(super) trait EndpointExt<R: Req>: Endpoint<R> {
 
         let mut data_sent = 0;
         while !iovs.is_empty() {
-            match self.send_iovec(iovs, fds) {
+            let iovec: Vec<_> = iovs.iter_mut().map(|i| IoSlice::new(i)).collect();
+            match self.send_iovec(&iovec, fds) {
                 Ok(0) => {
                     break;
                 }
@@ -140,7 +151,7 @@ pub(super) trait EndpointExt<R: Req>: Endpoint<R> {
     /// # Return:
     /// * - number of bytes sent on success
     #[cfg(test)]
-    fn send_slice(&mut self, data: &[u8], fds: Option<&[RawFd]>) -> Result<usize> {
+    fn send_slice(&mut self, data: IoSlice, fds: Option<&[RawFd]>) -> Result<usize> {
         self.send_iovec(&[data], fds)
     }
 
@@ -241,6 +252,12 @@ pub(super) trait EndpointExt<R: Req>: Endpoint<R> {
     /// * - (number of bytes received, [received fds]) on success
     /// * - SocketBroken: the underline socket is broken.
     /// * - SocketError: other socket related errors.
+    ///
+    /// # TODO
+    /// This function takes a slice of `&mut [u8]` instead of `IoSliceMut` because the internal
+    /// cursor needs to be moved by `advance_slices_mut()`.
+    /// Once `IoSliceMut::advance_slices()` becomes stable, this should be updated.
+    /// <https://github.com/rust-lang/rust/issues/62726>.
     fn recv_into_bufs_all(
         &mut self,
         mut bufs: &mut [&mut [u8]],

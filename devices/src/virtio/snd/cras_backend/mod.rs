@@ -4,22 +4,25 @@
 
 // virtio-sound spec: https://github.com/oasis-tcs/virtio-spec/blob/master/virtio-sound.tex
 
+use std::cell::RefCell;
 use std::fmt;
 use std::io;
+use std::num::ParseIntError;
 use std::rc::Rc;
 use std::str::{FromStr, ParseBoolError};
 use std::thread;
 
+use anyhow::Context;
 use audio_streams::{SampleFormat, StreamSource};
 use base::{error, warn, Error as SysError, Event, RawDescriptor};
-use cros_async::sync::{Condvar, Mutex as AsyncMutex};
-use cros_async::{select6, AsyncError, EventAsync, Executor, SelectResult};
+use cros_async::sync::Mutex as AsyncMutex;
+use cros_async::{AsyncError, EventAsync, Executor};
 use data_model::DataInit;
 use futures::channel::{
     mpsc,
     oneshot::{self, Canceled},
 };
-use futures::{pin_mut, Future, TryFutureExt};
+use futures::{pin_mut, select, Future, FutureExt, TryFutureExt};
 use libcras::{BoxError, CrasClient, CrasClientType, CrasSocketType};
 use sys_util::{set_rt_prio_limit, set_rt_round_robin};
 use thiserror::Error as ThisError;
@@ -106,6 +109,12 @@ pub enum Error {
     /// Failed to parse bool value.
     #[error("Invalid bool value: {0}")]
     InvalidBoolValue(ParseBoolError),
+    /// Failed to parse int value.
+    #[error("Invalid int value: {0}")]
+    InvalidIntValue(ParseIntError),
+    // Invalid PCM worker state.
+    #[error("Invalid PCM worker state")]
+    InvalidPCMWorkerState,
 }
 
 /// Holds the parameters for a cras sound device
@@ -114,14 +123,18 @@ pub struct Parameters {
     pub capture: bool,
     pub client_type: CrasClientType,
     pub socket_type: CrasSocketType,
+    pub num_output_streams: u32,
+    pub num_input_streams: u32,
 }
 
 impl Default for Parameters {
     fn default() -> Self {
         Parameters {
-            capture: true,
+            capture: false,
             client_type: CrasClientType::CRAS_CLIENT_TYPE_CROSVM,
             socket_type: CrasSocketType::Unified,
+            num_output_streams: 1,
+            num_input_streams: 1,
         }
     }
 }
@@ -149,6 +162,12 @@ impl FromStr for Parameters {
                     params.socket_type = v.parse().map_err(|e: libcras::Error| {
                         Error::InvalidParameterValue(v.to_string(), e.to_string())
                     })?;
+                }
+                "num_output_streams" => {
+                    params.num_output_streams = v.parse::<u32>().map_err(Error::InvalidIntValue)?;
+                }
+                "num_input_streams" => {
+                    params.num_input_streams = v.parse::<u32>().map_err(Error::InvalidIntValue)?;
                 }
                 _ => {
                     return Err(Error::UnknownParameter(k.to_string()));
@@ -184,7 +203,6 @@ pub struct StreamInfo<'a> {
 
     // Worker related
     status_mutex: Rc<AsyncMutex<WorkerStatus>>,
-    cv: Rc<Condvar>,
     sender: Option<mpsc::UnboundedSender<DescriptorChain>>,
     worker_future: Option<Box<dyn Future<Output = Result<(), Error>> + Unpin>>,
 }
@@ -215,7 +233,6 @@ impl Default for StreamInfo<'_> {
             direction: 0,
             state: 0,
             status_mutex: Rc::new(AsyncMutex::new(WorkerStatus::Pause)),
-            cv: Rc::new(Condvar::new()),
             sender: None,
             worker_future: None,
         }
@@ -267,6 +284,9 @@ impl<'a> StreamInfo<'a> {
                 get_virtio_snd_r_pcm_cmd_name(VIRTIO_SND_R_PCM_PREPARE)
             );
             return Err(Error::OperationNotSupported);
+        }
+        if self.state == VIRTIO_SND_R_PCM_PREPARE {
+            self.release_worker().await?;
         }
         let frame_size = self.channels as usize * self.format.sample_bytes();
         if self.period_bytes % frame_size != 0 {
@@ -335,13 +355,11 @@ impl<'a> StreamInfo<'a> {
         self.state = VIRTIO_SND_R_PCM_PREPARE;
 
         self.status_mutex = Rc::new(AsyncMutex::new(WorkerStatus::Pause));
-        self.cv = Rc::new(Condvar::new());
         let f = start_pcm_worker(
             ex.clone(),
             stream,
             receiver,
             self.status_mutex.clone(),
-            self.cv.clone(),
             mem,
             pcm_sender,
             self.period_bytes,
@@ -361,7 +379,6 @@ impl<'a> StreamInfo<'a> {
         }
         self.state = VIRTIO_SND_R_PCM_START;
         *self.status_mutex.lock().await = WorkerStatus::Running;
-        self.cv.notify_one();
         Ok(())
     }
 
@@ -376,7 +393,6 @@ impl<'a> StreamInfo<'a> {
         }
         self.state = VIRTIO_SND_R_PCM_STOP;
         *self.status_mutex.lock().await = WorkerStatus::Pause;
-        self.cv.notify_one();
         Ok(())
     }
 
@@ -397,7 +413,6 @@ impl<'a> StreamInfo<'a> {
 
     async fn release_worker(&mut self) -> Result<(), Error> {
         *self.status_mutex.lock().await = WorkerStatus::Quit;
-        self.cv.notify_one();
         match self.sender.take() {
             Some(s) => s.close_channel(),
             None => (),
@@ -422,7 +437,7 @@ pub struct VirtioSndCras {
 
 impl VirtioSndCras {
     pub fn new(base_features: u64, params: Parameters) -> Result<VirtioSndCras, Error> {
-        let cfg = hardcoded_virtio_snd_config();
+        let cfg = hardcoded_virtio_snd_config(&params);
 
         let avail_features = base_features;
 
@@ -439,51 +454,48 @@ impl VirtioSndCras {
 }
 
 // To be used with hardcoded_snd_data
-pub fn hardcoded_virtio_snd_config() -> virtio_snd_config {
+pub fn hardcoded_virtio_snd_config(params: &Parameters) -> virtio_snd_config {
     virtio_snd_config {
         jacks: 0.into(),
-        streams: 2.into(),
-        chmaps: 2.into(),
+        streams: (params.num_output_streams + params.num_input_streams).into(),
+        chmaps: 4.into(),
     }
 }
 
 // To be used with hardcoded_virtio_snd_config
-// TODO(woodychow): Remove this once we can query config from CRAS
-fn hardcoded_snd_data() -> SndData {
+fn hardcoded_snd_data(params: &Parameters) -> SndData {
     let jack_info: Vec<virtio_snd_jack_info> = Vec::new();
     let mut pcm_info: Vec<virtio_snd_pcm_info> = Vec::new();
     let mut chmap_info: Vec<virtio_snd_chmap_info> = Vec::new();
 
-    // for _ in 0..(Into::<u32>::into(self.cfg.streams) as usize) {
-    // TODO(woodychow): Remove this hack
-    // Assume this single device for now
-    pcm_info.push(virtio_snd_pcm_info {
-        hdr: virtio_snd_info {
-            hda_fn_nid: 0.into(),
-        },
-        features: 0.into(), /* 1 << VIRTIO_SND_PCM_F_XXX */
-        formats: SUPPORTED_FORMATS.into(),
-        rates: SUPPORTED_FRAME_RATES.into(),
-        direction: VIRTIO_SND_D_OUTPUT,
-        channels_min: 1,
-        channels_max: 2,
-        padding: [0; 5],
-    });
-    pcm_info.push(virtio_snd_pcm_info {
-        hdr: virtio_snd_info {
-            hda_fn_nid: 0.into(),
-        },
-        features: 0.into(), /* 1 << VIRTIO_SND_PCM_F_XXX */
-        formats: SUPPORTED_FORMATS.into(),
-        rates: SUPPORTED_FRAME_RATES.into(),
-        direction: VIRTIO_SND_D_INPUT,
-        channels_min: 1,
-        channels_max: 2,
-        padding: [0; 5],
-    });
-    // }
-
-    // for _ in 0..(Into::<u32>::into(self.cfg.chmaps) as usize) {
+    for _ in 0..params.num_output_streams {
+        pcm_info.push(virtio_snd_pcm_info {
+            hdr: virtio_snd_info {
+                hda_fn_nid: 0.into(),
+            },
+            features: 0.into(), /* 1 << VIRTIO_SND_PCM_F_XXX */
+            formats: SUPPORTED_FORMATS.into(),
+            rates: SUPPORTED_FRAME_RATES.into(),
+            direction: VIRTIO_SND_D_OUTPUT,
+            channels_min: 1,
+            channels_max: 6,
+            padding: [0; 5],
+        });
+    }
+    for _ in 0..params.num_input_streams {
+        pcm_info.push(virtio_snd_pcm_info {
+            hdr: virtio_snd_info {
+                hda_fn_nid: 0.into(),
+            },
+            features: 0.into(), /* 1 << VIRTIO_SND_PCM_F_XXX */
+            formats: SUPPORTED_FORMATS.into(),
+            rates: SUPPORTED_FRAME_RATES.into(),
+            direction: VIRTIO_SND_D_INPUT,
+            channels_min: 1,
+            channels_max: 2,
+            padding: [0; 5],
+        });
+    }
 
     // Use stereo channel map.
     let mut positions = [VIRTIO_SND_CHMAP_NONE; VIRTIO_SND_CHMAP_MAX_SIZE];
@@ -506,7 +518,28 @@ fn hardcoded_snd_data() -> SndData {
         channels: 2,
         positions,
     });
-    // }
+    positions[2] = VIRTIO_SND_CHMAP_RL;
+    positions[3] = VIRTIO_SND_CHMAP_RR;
+    chmap_info.push(virtio_snd_chmap_info {
+        hdr: virtio_snd_info {
+            hda_fn_nid: 0.into(),
+        },
+        direction: VIRTIO_SND_D_OUTPUT,
+        channels: 4,
+        positions,
+    });
+    positions[2] = VIRTIO_SND_CHMAP_FC;
+    positions[3] = VIRTIO_SND_CHMAP_LFE;
+    positions[4] = VIRTIO_SND_CHMAP_RL;
+    positions[5] = VIRTIO_SND_CHMAP_RR;
+    chmap_info.push(virtio_snd_chmap_info {
+        hdr: virtio_snd_info {
+            hda_fn_nid: 0.into(),
+        },
+        direction: VIRTIO_SND_D_OUTPUT,
+        channels: 6,
+        positions,
+    });
 
     SndData {
         jack_info,
@@ -588,7 +621,7 @@ impl VirtioDevice for VirtioSndCras {
                     interrupt,
                     queues,
                     guest_mem,
-                    hardcoded_snd_data(),
+                    hardcoded_snd_data(&params),
                     queue_evts,
                     kill_evt,
                     params,
@@ -637,7 +670,8 @@ fn run_worker(
     streams.resize_with(snd_data.pcm_info.len(), Default::default);
     let streams = Rc::new(AsyncMutex::new(streams));
 
-    let interrupt = Rc::new(interrupt);
+    let interrupt = Rc::new(RefCell::new(interrupt));
+    let interrupt_ref = &*interrupt.borrow();
 
     let ctrl_queue = queues.remove(0);
     let _event_queue = queues.remove(0);
@@ -666,7 +700,7 @@ fn run_worker(
         &snd_data,
         ctrl_queue,
         ctrl_queue_evt,
-        interrupt.as_ref(),
+        interrupt_ref,
         tx_send,
         rx_send,
         &params,
@@ -683,45 +717,42 @@ fn run_worker(
 
     let f_tx = handle_pcm_queue(&mem, &streams, tx_send2, &tx_queue, tx_queue_evt);
 
-    let f_tx_response = send_pcm_response_worker(&mem, &tx_queue, interrupt.as_ref(), &mut tx_recv);
+    let f_tx_response = send_pcm_response_worker(&mem, &tx_queue, interrupt_ref, &mut tx_recv);
 
     let f_rx = handle_pcm_queue(&mem, &streams, rx_send2, &rx_queue, rx_queue_evt);
 
-    let f_rx_response = send_pcm_response_worker(&mem, &rx_queue, interrupt.as_ref(), &mut rx_recv);
+    let f_rx_response = send_pcm_response_worker(&mem, &rx_queue, interrupt_ref, &mut rx_recv);
+
+    let f_resample = async_utils::handle_irq_resample(&ex, interrupt.clone());
 
     // Exit if the kill event is triggered.
     let f_kill = async_utils::await_and_exit(&ex, kill_evt);
 
-    pin_mut!(f_ctrl, f_tx, f_tx_response, f_rx, f_rx_response, f_kill);
-
-    match ex.run_until(select6(
+    pin_mut!(
         f_ctrl,
         f_tx,
         f_tx_response,
         f_rx,
         f_rx_response,
-        f_kill,
-    )) {
-        Ok((r_ctrl, r_tx, r_tx_response, r_rx, r_rx_response, _r_kill)) => {
-            if let SelectResult::Finished(Err(e)) = r_ctrl {
-                return Err(format!("Error in handling ctrl queue: {}", e));
-            }
-            if let SelectResult::Finished(Err(e)) = r_tx {
-                return Err(format!("Error in handling tx queue: {}", e));
-            }
-            if let SelectResult::Finished(Err(e)) = r_tx_response {
-                return Err(format!("Error in handling tx response: {}", e));
-            }
-            if let SelectResult::Finished(Err(e)) = r_rx {
-                return Err(format!("Error in handling rx queue: {}", e));
-            }
-            if let SelectResult::Finished(Err(e)) = r_rx_response {
-                return Err(format!("Error in handling rx response: {}", e));
-            }
+        f_resample,
+        f_kill
+    );
+
+    let done = async {
+        select! {
+            res = f_ctrl.fuse() => res.context("error in handling ctrl queue"),
+            res = f_tx.fuse() => res.context("error in handling tx queue"),
+            res = f_tx_response.fuse() => res.context("error in handling tx response"),
+            res = f_rx.fuse() => res.context("error in handling rx queue"),
+            res = f_rx_response.fuse() => res.context("error in handling rx response"),
+            res = f_resample.fuse() => res.context("error in handle_irq_resample"),
+            res = f_kill.fuse() => res.context("error in await_and_exit"),
         }
-        Err(e) => {
-            error!("Error happened in executor: {}", e);
-        }
+    };
+    match ex.run_until(done) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("Error in worker: {}", e),
+        Err(e) => error!("Error happened in executor: {}", e),
     }
 
     Ok(())
@@ -736,11 +767,15 @@ mod tests {
             capture: bool,
             client_type: CrasClientType,
             socket_type: CrasSocketType,
+            num_output_streams: u32,
+            num_input_streams: u32,
         ) {
             let params = s.parse::<Parameters>().expect("parse should have succeded");
             assert_eq!(params.capture, capture);
             assert_eq!(params.client_type, client_type);
             assert_eq!(params.socket_type, socket_type);
+            assert_eq!(params.num_output_streams, num_output_streams);
+            assert_eq!(params.num_input_streams, num_input_streams);
         }
         fn check_failure(s: &str) {
             s.parse::<Parameters>()
@@ -752,31 +787,49 @@ mod tests {
             false,
             CrasClientType::CRAS_CLIENT_TYPE_CROSVM,
             CrasSocketType::Unified,
+            1,
+            1,
         );
         check_success(
             "capture=true,client_type=crosvm",
             true,
             CrasClientType::CRAS_CLIENT_TYPE_CROSVM,
             CrasSocketType::Unified,
+            1,
+            1,
         );
         check_success(
             "capture=true,client_type=arcvm",
             true,
             CrasClientType::CRAS_CLIENT_TYPE_ARCVM,
             CrasSocketType::Unified,
+            1,
+            1,
         );
         check_failure("capture=true,client_type=none");
         check_success(
             "socket_type=legacy",
-            true,
+            false,
             CrasClientType::CRAS_CLIENT_TYPE_CROSVM,
             CrasSocketType::Legacy,
+            1,
+            1,
         );
         check_success(
             "socket_type=unified",
-            true,
+            false,
             CrasClientType::CRAS_CLIENT_TYPE_CROSVM,
             CrasSocketType::Unified,
+            1,
+            1,
+        );
+        check_success(
+            "capture=true,client_type=arcvm,num_output_streams=2,num_input_streams=3",
+            true,
+            CrasClientType::CRAS_CLIENT_TYPE_ARCVM,
+            CrasSocketType::Unified,
+            2,
+            3,
         );
     }
 }

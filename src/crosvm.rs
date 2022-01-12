@@ -31,8 +31,10 @@ use devices::virtio::gpu::GpuParameters;
 use devices::virtio::VideoBackendType;
 #[cfg(feature = "audio")]
 use devices::Ac97Parameters;
-use devices::ProtectionType;
+#[cfg(feature = "direct")]
+use devices::BusRange;
 use devices::StubPciParameters;
+use hypervisor::ProtectionType;
 use libc::{getegid, geteuid};
 use vm_control::BatteryType;
 
@@ -96,9 +98,10 @@ pub struct GidMap {
 
 /// Direct IO forwarding options
 #[cfg(feature = "direct")]
+#[derive(Debug)]
 pub struct DirectIoOption {
     pub path: PathBuf,
-    pub ranges: Vec<(u64, u64)>,
+    pub ranges: Vec<BusRange>,
 }
 
 pub const DEFAULT_TOUCH_DEVICE_HEIGHT: u32 = 1024;
@@ -318,7 +321,7 @@ pub struct Config {
     pub cpu_capacity: BTreeMap<usize, u32>, // CPU index -> capacity
     pub per_vm_core_scheduling: bool,
     #[cfg(feature = "audio_cras")]
-    pub cras_snd: Option<CrasSndParameters>,
+    pub cras_snds: Vec<CrasSndParameters>,
     pub delay_rt: bool,
     pub no_smt: bool,
     pub memory: Option<u64>,
@@ -342,6 +345,7 @@ pub struct Config {
     pub net_vq_pairs: Option<u16>,
     pub vhost_net: bool,
     pub tap_fd: Vec<RawFd>,
+    pub tap_name: Vec<String>,
     pub cid: Option<u64>,
     pub wayland_socket_paths: BTreeMap<String, PathBuf>,
     pub x_display: Option<String>,
@@ -416,7 +420,7 @@ impl Default for Config {
             cpu_capacity: BTreeMap::new(),
             per_vm_core_scheduling: false,
             #[cfg(feature = "audio_cras")]
-            cras_snd: None,
+            cras_snds: Vec::new(),
             delay_rt: false,
             no_smt: false,
             memory: None,
@@ -440,6 +444,7 @@ impl Default for Config {
             net_vq_pairs: None,
             vhost_net: false,
             tap_fd: Vec::new(),
+            tap_name: Vec::new(),
             cid: None,
             #[cfg(feature = "gpu")]
             gpu_parameters: None,
