@@ -23,10 +23,10 @@ fi
 while IFS= read -r line
 do
   if echo "$line" | egrep "@include[[:space:]]+/usr/share/policy/crosvm/common_device.policy" > /dev/null; then
-    cat $common_device | egrep "^[a-zA-Z0-9_-]+:"
+    cat $common_device
     continue
   elif echo "$line" | egrep "@include[[:space:]]+/usr/share/policy/crosvm/gpu_common.policy" > /dev/null; then
-    cat $gpu_common | egrep "^[a-zA-Z0-9_-]+:"
+    cat $gpu_common
     continue
   fi
   echo $line
