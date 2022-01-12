@@ -44,7 +44,7 @@ members = [
     "kernel_loader",
     "kvm",
     "kvm_sys",
-    "libcrosvm_control",
+    "crosvm_control",
     "libvda",
     "linux_input_sys",
     "net_sys",
@@ -73,6 +73,7 @@ exclude = [
     "common/base",
     "common/cros-fuzz",
     "common/cros_async",
+    "common/cros_asyncv2",
     "common/data_model",
     "common/io_uring",
     "common/p9",
@@ -91,6 +92,12 @@ all-linux = [
     "virgl_renderer",
     "x",
     ]
+all-linux-armhf = [
+    "composite-disk",
+    "default",
+    "gdb",
+    "tpm",
+    ]
 audio = ["devices/audio"]
 audio_cras = ["devices/audio_cras"]
 chromeos = ["base/chromeos", "audio_cras", "devices/chromeos"]
@@ -101,12 +108,13 @@ direct = ["devices/direct"]
 gdb = ["gdbstub", "gdbstub_arch", "arch/gdb", "vm_control/gdb", "x86_64/gdb"]
 gfxstream = ["devices/gfxstream"]
 gpu = ["devices/gpu"]
+libvda = ["devices/libvda"]
 plugin = ["protos/plugin", "crosvm_plugin", "kvm", "kvm_sys", "protobuf"]
 power-monitor-powerd = ["arch/power-monitor-powerd"]
 tpm = ["devices/tpm"]
 usb = ["devices/usb"]
-video-decoder = ["devices/video-decoder"]
-video-encoder = ["devices/video-encoder"]
+video-decoder = ["devices/video-decoder", "libvda"]
+video-encoder = ["devices/video-encoder", "libvda"]
 virgl_renderer = ["devices/virgl_renderer"]
 virgl_renderer_next = ["rutabaga_gfx/virgl_renderer_next"]
 wl-dmabuf = ["devices/minigbm"]
@@ -141,6 +149,7 @@ protobuf = { version = "2.3", optional = true }
 protos = { path = "protos", optional = true }
 remain = "*"
 resources = { path = "resources" }
+scudo = { version = "0.1", optional = true }
 serde_json = "*"
 sync = { path = "common/sync" }
 tempfile = "3"

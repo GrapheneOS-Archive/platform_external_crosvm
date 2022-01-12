@@ -12,9 +12,10 @@ use base::{Event, MemoryMappingBuilder};
 use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::{
     Bus, BusDeviceObj, BusError, IrqChip, IrqChipAArch64, PciAddress, PciConfigMmio, PciDevice,
-    ProtectionType,
 };
-use hypervisor::{DeviceKind, Hypervisor, HypervisorCap, VcpuAArch64, VcpuFeature, VmAArch64};
+use hypervisor::{
+    DeviceKind, Hypervisor, HypervisorCap, ProtectionType, VcpuAArch64, VcpuFeature, VmAArch64,
+};
 use minijail::Minijail;
 use remain::sorted;
 use resources::SystemAllocator;
@@ -255,6 +256,7 @@ impl arch::LinuxArch for AArch64 {
     fn build_vm<V, Vcpu>(
         mut components: VmComponents,
         _exit_evt: &Event,
+        _reset_evt: &Event,
         system_allocator: &mut SystemAllocator,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
@@ -350,7 +352,7 @@ impl arch::LinuxArch for AArch64 {
         }
 
         if components.protected_vm == ProtectionType::Protected {
-            vm.enable_protected_vm(
+            vm.load_protected_vm_firmware(
                 GuestAddress(AARCH64_PROTECTED_VM_FW_START),
                 AARCH64_PROTECTED_VM_FW_MAX_SIZE,
             )
@@ -392,8 +394,9 @@ impl arch::LinuxArch for AArch64 {
             (devices::AARCH64_GIC_NR_IRQS - AARCH64_IRQ_BASE) as usize,
         )
         .map_err(Error::CreatePciRoot)?;
-        let pci_bus = Arc::new(Mutex::new(PciConfigMmio::new(pci)));
 
+        let pci_root = Arc::new(Mutex::new(pci));
+        let pci_bus = Arc::new(Mutex::new(PciConfigMmio::new(pci_root.clone(), 8)));
         let (platform_devices, _others): (Vec<_>, Vec<_>) = others
             .into_iter()
             .partition(|(dev, _)| dev.as_platform_device().is_some());
@@ -499,7 +502,7 @@ impl arch::LinuxArch for AArch64 {
             delay_rt: components.delay_rt,
             bat_control: None,
             resume_notify_devices: Vec::new(),
-            root_config: pci_bus,
+            root_config: pci_root,
             hotplug_bus: Vec::new(),
         })
     }

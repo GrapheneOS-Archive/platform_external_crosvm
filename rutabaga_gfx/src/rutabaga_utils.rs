@@ -91,10 +91,10 @@ pub struct VulkanInfo {
     pub physical_device_idx: u32,
 }
 
-/// Rutabaga context init capset id mask (not upstreamed).
+/// Rutabaga context init capset id mask.
 pub const RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK: u32 = 0x00ff;
 
-/// Rutabaga flags for creating fences (fence ctx idx info not upstreamed).
+/// Rutabaga flags for creating fences.
 pub const RUTABAGA_FLAG_FENCE: u32 = 1 << 0;
 pub const RUTABAGA_FLAG_INFO_RING_IDX: u32 = 1 << 1;
 
@@ -116,7 +116,6 @@ pub const RUTABAGA_MAP_CACHE_WC: u32 = 0x03;
 /// Rutabaga capsets.
 pub const RUTABAGA_CAPSET_VIRGL: u32 = 1;
 pub const RUTABAGA_CAPSET_VIRGL2: u32 = 2;
-/// The following capsets are not upstreamed.
 pub const RUTABAGA_CAPSET_GFXSTREAM: u32 = 3;
 pub const RUTABAGA_CAPSET_VENUS: u32 = 4;
 pub const RUTABAGA_CAPSET_CROSS_DOMAIN: u32 = 5;
@@ -287,6 +286,7 @@ const VIRGLRENDERER_USE_EXTERNAL_BLOB: u32 = 1 << 5;
 const VIRGLRENDERER_VENUS: u32 = 1 << 6;
 const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
 const VIRGLRENDERER_USE_ASYNC_FENCE_CB: u32 = 1 << 8;
+const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
 
 /// virglrenderer flag struct.
 #[derive(Copy, Clone)]
@@ -300,6 +300,7 @@ impl Default for VirglRendererFlags {
             .use_egl(true)
             .use_surfaceless(true)
             .use_gles(true)
+            .use_render_server(false)
     }
 }
 
@@ -366,6 +367,10 @@ impl VirglRendererFlags {
     /// Retire fence directly from sync thread.
     pub fn use_async_fence_cb(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_USE_ASYNC_FENCE_CB, v)
+    }
+
+    pub fn use_render_server(self, v: bool) -> VirglRendererFlags {
+        self.set_flag(VIRGLRENDERER_RENDER_SERVER, v)
     }
 }
 
@@ -505,9 +510,10 @@ pub enum RutabagaComponentType {
 pub const RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0001;
 pub const RUTABAGA_MEM_HANDLE_TYPE_DMABUF: u32 = 0x0002;
 pub const RUTABAGE_MEM_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0003;
-pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0004;
-pub const RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD: u32 = 0x0005;
-pub const RUTABAGE_FENCE_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0006;
+pub const RUTABAGA_MEM_HANDLE_TYPE_SHM: u32 = 0x0004;
+pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0010;
+pub const RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD: u32 = 0x0011;
+pub const RUTABAGE_FENCE_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0012;
 
 /// Handle to OS-specific memory or synchronization objects.
 pub struct RutabagaHandle {

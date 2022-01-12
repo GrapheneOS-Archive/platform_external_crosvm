@@ -67,8 +67,6 @@ enum PendingCommand {
 
 struct Stream<T: EncoderSession> {
     id: u32,
-    src_resource_type: ResourceType,
-    dst_resource_type: ResourceType,
     src_params: Params,
     dst_params: Params,
     dst_bitrate: Bitrate,
@@ -114,6 +112,7 @@ impl<T: EncoderSession> Stream<T> {
         let mut src_params = Params {
             min_buffers: MIN_BUFFERS,
             max_buffers: MAX_BUFFERS,
+            resource_type: src_resource_type,
             ..Default::default()
         };
 
@@ -129,7 +128,10 @@ impl<T: EncoderSession> Stream<T> {
             )
             .map_err(|_| VideoError::InvalidArgument)?;
 
-        let mut dst_params = Default::default();
+        let mut dst_params = Params {
+            resource_type: dst_resource_type,
+            ..Default::default()
+        };
 
         // In order to support requesting encoder params change, we must know the default frame
         // rate, because VEA's request_encoding_params_change requires both framerate and
@@ -153,8 +155,6 @@ impl<T: EncoderSession> Stream<T> {
 
         Ok(Self {
             id,
-            src_resource_type,
-            dst_resource_type,
             src_params,
             dst_params,
             dst_bitrate: DEFAULT_BITRATE,
@@ -261,6 +261,7 @@ impl<T: EncoderSession> Stream<T> {
                     CmdResponse::GetParams {
                         queue_type: QueueType::Input,
                         params: self.src_params.clone(),
+                        is_ext: false,
                     },
                 ),
             ));
@@ -275,6 +276,7 @@ impl<T: EncoderSession> Stream<T> {
                     CmdResponse::GetParams {
                         queue_type: QueueType::Output,
                         params: self.dst_params.clone(),
+                        is_ext: false,
                     },
                 ),
             ));
@@ -601,8 +603,8 @@ impl<T: Encoder> EncoderDevice<T> {
                     warn!("Replacing source resource with id {}", resource_id);
                 }
 
-                let resource = match stream.src_resource_type {
-                    ResourceType::Object => GuestResource::from_virtio_object_entry(
+                let resource = match stream.src_params.resource_type {
+                    ResourceType::VirtioObject => GuestResource::from_virtio_object_entry(
                         // Safe because we confirmed the correct type for the resource.
                         unsafe { resource.object },
                         &self.resource_bridge,
@@ -627,8 +629,8 @@ impl<T: Encoder> EncoderDevice<T> {
                     warn!("Replacing dest resource with id {}", resource_id);
                 }
 
-                let resource = match stream.dst_resource_type {
-                    ResourceType::Object => GuestResource::from_virtio_object_entry(
+                let resource = match stream.dst_params.resource_type {
+                    ResourceType::VirtioObject => GuestResource::from_virtio_object_entry(
                         // Safe because we confirmed the correct type for the resource.
                         unsafe { resource.object },
                         &self.resource_bridge,
@@ -880,6 +882,7 @@ impl<T: Encoder> EncoderDevice<T> {
         &mut self,
         stream_id: u32,
         queue_type: QueueType,
+        is_ext: bool,
     ) -> VideoResult<VideoCmdResponseType> {
         let stream = self
             .streams
@@ -913,6 +916,7 @@ impl<T: Encoder> EncoderDevice<T> {
             Ok(VideoCmdResponseType::Sync(CmdResponse::GetParams {
                 queue_type,
                 params,
+                is_ext,
             }))
         }
     }
@@ -927,6 +931,7 @@ impl<T: Encoder> EncoderDevice<T> {
         frame_height: u32,
         frame_rate: u32,
         plane_formats: Vec<PlaneFormat>,
+        _is_ext: bool,
     ) -> VideoResult<VideoCmdResponseType> {
         let stream = self
             .streams
@@ -1384,7 +1389,8 @@ impl<T: Encoder> Device for EncoderDevice<T> {
             VideoCmd::GetParams {
                 stream_id,
                 queue_type,
-            } => self.get_params(stream_id, queue_type),
+                is_ext,
+            } => self.get_params(stream_id, queue_type, is_ext),
             VideoCmd::SetParams {
                 stream_id,
                 queue_type,
@@ -1397,6 +1403,7 @@ impl<T: Encoder> Device for EncoderDevice<T> {
                         plane_formats,
                         ..
                     },
+                is_ext,
             } => self.set_params(
                 wait_ctx,
                 stream_id,
@@ -1406,6 +1413,7 @@ impl<T: Encoder> Device for EncoderDevice<T> {
                 frame_height,
                 frame_rate,
                 plane_formats,
+                is_ext,
             ),
             VideoCmd::QueryControl { query_ctrl_type } => self.query_control(query_ctrl_type),
             VideoCmd::GetControl {

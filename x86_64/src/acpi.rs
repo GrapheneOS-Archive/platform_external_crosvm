@@ -9,6 +9,7 @@ use acpi_tables::{facs::FACS, rsdp::RSDP, sdt::SDT};
 use arch::VcpuAffinity;
 use base::error;
 use data_model::DataInit;
+use devices::{PciAddress, PciInterruptPin};
 use vm_memory::{GuestAddress, GuestMemory};
 
 pub struct AcpiDevResource {
@@ -17,6 +18,19 @@ pub struct AcpiDevResource {
     /// Additional system descriptor tables.
     pub sdts: Vec<SDT>,
 }
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct GenericAddress {
+    _space_id: u8,
+    _bit_width: u8,
+    _bit_offset: u8,
+    _access_width: u8,
+    _address: u64,
+}
+
+// Safe as GenericAddress structure only contains raw data
+unsafe impl DataInit for GenericAddress {}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -47,6 +61,20 @@ unsafe impl DataInit for Ioapic {}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+struct IoapicInterruptSourceOverride {
+    _type: u8,
+    _length: u8,
+    _bus: u8,
+    _source: u8,
+    _gsi: u32,
+    _flags: u16,
+}
+
+// Safe as IoapicInterruptSourceOverride structure only contains raw data
+unsafe impl DataInit for IoapicInterruptSourceOverride {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct Localx2Apic {
     _type: u8,
     _length: u8,
@@ -59,6 +87,9 @@ struct Localx2Apic {
 // Safe as LocalAPIC structure only contains raw data
 unsafe impl DataInit for Localx2Apic {}
 
+// Space ID for GenericAddress
+const ADR_SPACE_SYSTEM_IO: u8 = 1;
+
 const OEM_REVISION: u32 = 1;
 //DSDT
 const DSDT_REVISION: u8 = 6;
@@ -69,6 +100,7 @@ const FADT_MINOR_REVISION: u8 = 3;
 // FADT flags
 const FADT_POWER_BUTTON: u32 = 1 << 4;
 const FADT_SLEEP_BUTTON: u32 = 1 << 5;
+const FADT_RESET_REGISTER: u32 = 1 << 10;
 // FADT fields offset
 const FADT_FIELD_FACS_ADDR32: usize = 36;
 const FADT_FIELD_DSDT_ADDR32: usize = 40;
@@ -79,6 +111,8 @@ const FADT_FIELD_PM1A_CONTROL_BLK_ADDR: usize = 64;
 const FADT_FIELD_PM1A_EVENT_BLK_LEN: usize = 88;
 const FADT_FIELD_PM1A_CONTROL_BLK_LEN: usize = 89;
 const FADT_FIELD_FLAGS: usize = 112;
+const FADT_FIELD_RESET_REGISTER: usize = 116;
+const FADT_FIELD_RESET_VALUE: usize = 128;
 const FADT_FIELD_MINOR_REVISION: usize = 131;
 const FADT_FIELD_FACS_ADDR: usize = 132;
 const FADT_FIELD_DSDT_ADDR: usize = 140;
@@ -88,6 +122,9 @@ const MADT_LEN: u32 = 44;
 const MADT_REVISION: u8 = 5;
 // MADT fields offset
 const MADT_FIELD_LAPIC_ADDR: usize = 36;
+const MADT_FIELD_FLAGS: usize = 40;
+// MADT flags
+const MADT_FLAG_PCAT_COMPAT: u32 = 1 << 0;
 // MADT structure offsets
 const MADT_STRUCTURE_TYPE: usize = 0;
 const MADT_STRUCTURE_LEN: usize = 1;
@@ -98,12 +135,21 @@ const MADT_TYPE_INTERRUPT_SOURCE_OVERRIDE: u8 = 2;
 const MADT_TYPE_LOCAL_X2APIC: u8 = 9;
 // MADT flags
 const MADT_ENABLED: u32 = 1;
+const MADT_INT_POLARITY_ACTIVE_LOW: u16 = 0b11;
+const MADT_INT_TRIGGER_LEVEL: u16 = 0b11 << 2;
 // MADT compatibility
 const MADT_MIN_LOCAL_APIC_ID: u32 = 255;
 // XSDT
 const XSDT_REVISION: u8 = 1;
 
 const CPUID_LEAF0_EBX_CPUID_SHIFT: u32 = 24; // Offset of initial apic id.
+
+// MCFG
+const MCFG_LEN: u32 = 60;
+const MCFG_REVISION: u8 = 1;
+const MCFG_FIELD_BASE_ADDRESS: usize = 44;
+const MCFG_FIELD_START_BUS_NUMBER: usize = 54;
+const MCFG_FIELD_END_BUS_NUMBER: usize = 55;
 
 fn create_dsdt_table(amls: Vec<u8>) -> SDT {
     let mut dsdt = SDT::new(
@@ -122,7 +168,7 @@ fn create_dsdt_table(amls: Vec<u8>) -> SDT {
     dsdt
 }
 
-fn create_facp_table(sci_irq: u16, pm_iobase: u32) -> SDT {
+fn create_facp_table(sci_irq: u16, pm_iobase: u32, reset_port: u32, reset_value: u8) -> SDT {
     let mut facp = SDT::new(
         *b"FACP",
         FADT_LEN,
@@ -132,7 +178,8 @@ fn create_facp_table(sci_irq: u16, pm_iobase: u32) -> SDT {
         OEM_REVISION,
     );
 
-    let fadt_flags: u32 = FADT_POWER_BUTTON | FADT_SLEEP_BUTTON; // mask POWER and SLEEP BUTTON
+    let fadt_flags: u32 = FADT_POWER_BUTTON | FADT_SLEEP_BUTTON | // mask POWER and SLEEP BUTTON
+                          FADT_RESET_REGISTER; // indicate we support FADT RESET_REG
     facp.write(FADT_FIELD_FLAGS, fadt_flags);
 
     // SCI Interrupt
@@ -158,6 +205,19 @@ fn create_facp_table(sci_irq: u16, pm_iobase: u32) -> SDT {
         FADT_FIELD_PM1A_CONTROL_BLK_LEN,
         devices::acpi::ACPIPM_RESOURCE_CONTROLBLK_LEN as u8,
     );
+
+    // Reset register.
+    facp.write(
+        FADT_FIELD_RESET_REGISTER,
+        GenericAddress {
+            _space_id: ADR_SPACE_SYSTEM_IO,
+            _bit_width: 8,
+            _bit_offset: 0,
+            _access_width: 8,
+            _address: reset_port.into(),
+        },
+    );
+    facp.write(FADT_FIELD_RESET_VALUE, reset_value);
 
     facp.write(FADT_FIELD_MINOR_REVISION, FADT_MINOR_REVISION); // FADT minor version
     facp.write(FADT_FIELD_HYPERVISOR_ID, *b"CROSVM"); // Hypervisor Vendor Identity
@@ -278,13 +338,25 @@ fn sync_acpi_id_from_cpuid(
 ///                 id and set these apic id in MADT if `--host-cpu-topology`
 ///                 option is set.
 /// * `apic_ids` - The apic id for vCPU will be sent to KVM by KVM_CREATE_VCPU ioctl.
+/// * `pci_rqs` - PCI device to IRQ number assignments as returned by
+///               `arch::generate_pci_root()` (device address, IRQ number, and PCI
+///               interrupt pin assignment).
+/// * `pcie_cfg_mmio` - Base address for the pcie enhanced configuration access mechanism
+/// *  `max_bus` - Max bus number in MCFG table
+///
+
 pub fn create_acpi_tables(
     guest_mem: &GuestMemory,
     num_cpus: u8,
     sci_irq: u32,
+    reset_port: u32,
+    reset_value: u8,
     acpi_dev_resource: AcpiDevResource,
     host_cpus: Option<VcpuAffinity>,
     apic_ids: &mut Vec<usize>,
+    pci_irqs: &[(PciAddress, u32, PciInterruptPin)],
+    pcie_cfg_mmio: u64,
+    max_bus: u8,
 ) -> Option<GuestAddress> {
     // RSDP is at the HI RSDP WINDOW
     let rsdp_offset = GuestAddress(super::ACPI_HI_RSDP_WINDOW_BASE);
@@ -332,7 +404,8 @@ pub fn create_acpi_tables(
 
     // FACP aka FADT
     let pm_iobase = acpi_dev_resource.pm_iobase as u32;
-    let mut facp = facp.unwrap_or_else(|| create_facp_table(sci_irq as u16, pm_iobase));
+    let mut facp = facp
+        .unwrap_or_else(|| create_facp_table(sci_irq as u16, pm_iobase, reset_port, reset_value));
 
     // Crosvm FACP overrides.
     facp.write(FADT_FIELD_SMI_COMMAND, 0u32);
@@ -358,6 +431,9 @@ pub fn create_acpi_tables(
         MADT_FIELD_LAPIC_ADDR,
         super::mptable::APIC_DEFAULT_PHYS_BASE as u32,
     );
+    // Our IrqChip implementations (the KVM in-kernel irqchip and the split irqchip) expose a pair
+    // of PC-compatible 8259 PICs.
+    madt.write(MADT_FIELD_FLAGS, MADT_FLAG_PCAT_COMPAT);
 
     match host_cpus {
         Some(VcpuAffinity::PerVcpu(cpus)) => {
@@ -385,6 +461,23 @@ pub fn create_acpi_tables(
         ..Default::default()
     });
 
+    // Add interrupt overrides for the PCI IRQs so that they are reported as level triggered, as
+    // required by the PCI bus. The source and system GSI are identical, so this does not actually
+    // override the mapping; we just use it to set the level-triggered flag.
+    let mut unique_pci_irqs: Vec<u32> = pci_irqs.iter().map(|(_, irq_num, _)| *irq_num).collect();
+    unique_pci_irqs.sort_unstable();
+    unique_pci_irqs.dedup();
+    for irq_num in unique_pci_irqs {
+        madt.append(IoapicInterruptSourceOverride {
+            _type: MADT_TYPE_INTERRUPT_SOURCE_OVERRIDE,
+            _length: std::mem::size_of::<IoapicInterruptSourceOverride>() as u8,
+            _bus: 0, // ISA
+            _source: irq_num as u8,
+            _gsi: irq_num,
+            _flags: MADT_INT_POLARITY_ACTIVE_LOW | MADT_INT_TRIGGER_LEVEL,
+        });
+    }
+
     if let Some(host_madt) = host_madt {
         let mut idx = MADT_LEN as usize;
         while idx + MADT_STRUCTURE_LEN < host_madt.len() {
@@ -402,6 +495,23 @@ pub fn create_acpi_tables(
     }
 
     guest_mem.write_at_addr(madt.as_slice(), offset).ok()?;
+    tables.push(offset.0);
+    offset = next_offset(offset, madt.len() as u64)?;
+
+    // MCFG
+    let mut mcfg = SDT::new(
+        *b"MCFG",
+        MCFG_LEN,
+        MCFG_REVISION,
+        *b"CROSVM",
+        *b"CROSVMDT",
+        OEM_REVISION,
+    );
+    mcfg.write(MCFG_FIELD_BASE_ADDRESS, pcie_cfg_mmio);
+    mcfg.write(MCFG_FIELD_START_BUS_NUMBER, 0_u8);
+    mcfg.write(MCFG_FIELD_END_BUS_NUMBER, max_bus);
+
+    guest_mem.write_at_addr(mcfg.as_slice(), offset).ok()?;
     tables.push(offset.0);
     offset = next_offset(offset, madt.len() as u64)?;
 

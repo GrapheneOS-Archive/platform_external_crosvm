@@ -7,7 +7,7 @@ use std::convert::TryInto;
 use std::fmt::{self, Display};
 use std::sync::{Arc, Weak};
 
-use base::RawDescriptor;
+use base::{error, Event, RawDescriptor};
 use serde::{Deserialize, Serialize};
 use sync::Mutex;
 
@@ -70,21 +70,22 @@ impl Display for PciAddress {
 }
 
 impl PciAddress {
-    const BUS_OFFSET: usize = 16;
     const BUS_MASK: u32 = 0x00ff;
-    const DEVICE_OFFSET: usize = 11;
+    const DEVICE_BITS_NUM: usize = 5;
     const DEVICE_MASK: u32 = 0x1f;
-    const FUNCTION_OFFSET: usize = 8;
+    const FUNCTION_BITS_NUM: usize = 3;
     const FUNCTION_MASK: u32 = 0x07;
     const REGISTER_OFFSET: usize = 2;
-    const REGISTER_MASK: u32 = 0x3f;
 
     /// Construct PciAddress and register tuple from CONFIG_ADDRESS value.
-    pub fn from_config_address(config_address: u32) -> (Self, usize) {
-        let bus = ((config_address >> Self::BUS_OFFSET) & Self::BUS_MASK) as u8;
-        let dev = ((config_address >> Self::DEVICE_OFFSET) & Self::DEVICE_MASK) as u8;
-        let func = ((config_address >> Self::FUNCTION_OFFSET) & Self::FUNCTION_MASK) as u8;
-        let register = ((config_address >> Self::REGISTER_OFFSET) & Self::REGISTER_MASK) as usize;
+    pub fn from_config_address(config_address: u32, register_bits_num: usize) -> (Self, usize) {
+        let bus_offset = register_bits_num + Self::FUNCTION_BITS_NUM + Self::DEVICE_BITS_NUM;
+        let bus = ((config_address >> bus_offset) & Self::BUS_MASK) as u8;
+        let dev_offset = register_bits_num + Self::FUNCTION_BITS_NUM;
+        let dev = ((config_address >> dev_offset) & Self::DEVICE_MASK) as u8;
+        let func = ((config_address >> register_bits_num) & Self::FUNCTION_MASK) as u8;
+        let register_mask: u32 = (1_u32 << (register_bits_num - Self::REGISTER_OFFSET)) - 1;
+        let register = ((config_address >> Self::REGISTER_OFFSET) & register_mask) as usize;
 
         (PciAddress { bus, dev, func }, register)
     }
@@ -105,16 +106,21 @@ impl PciAddress {
     }
 
     /// Encode PciAddress into CONFIG_ADDRESS value.
-    pub fn to_config_address(&self, register: usize) -> u32 {
-        ((Self::BUS_MASK & self.bus as u32) << Self::BUS_OFFSET)
-            | ((Self::DEVICE_MASK & self.dev as u32) << Self::DEVICE_OFFSET)
-            | ((Self::FUNCTION_MASK & self.func as u32) << Self::FUNCTION_OFFSET)
-            | ((Self::REGISTER_MASK & register as u32) << Self::REGISTER_OFFSET)
+    pub fn to_config_address(&self, register: usize, register_bits_num: usize) -> u32 {
+        let bus_offset = register_bits_num + Self::FUNCTION_BITS_NUM + Self::DEVICE_BITS_NUM;
+        let dev_offset = register_bits_num + Self::FUNCTION_BITS_NUM;
+        let register_mask: u32 = (1_u32 << (register_bits_num - Self::REGISTER_OFFSET)) - 1;
+        ((Self::BUS_MASK & self.bus as u32) << bus_offset)
+            | ((Self::DEVICE_MASK & self.dev as u32) << dev_offset)
+            | ((Self::FUNCTION_MASK & self.func as u32) << register_bits_num)
+            | ((register_mask & register as u32) << Self::REGISTER_OFFSET)
     }
 
     /// Convert B:D:F PCI address to unsigned 32 bit integer
     pub fn to_u32(&self) -> u32 {
-        self.to_config_address(0) >> Self::FUNCTION_OFFSET
+        ((Self::BUS_MASK & self.bus as u32) << (Self::FUNCTION_BITS_NUM + Self::DEVICE_BITS_NUM))
+            | ((Self::DEVICE_MASK & self.dev as u32) << Self::FUNCTION_BITS_NUM)
+            | (Self::FUNCTION_MASK & self.func as u32)
     }
 
     /// Returns true if the address points to PCI root host-bridge.
@@ -141,10 +147,13 @@ pub struct PciRoot {
     root_configuration: PciRootConfiguration,
     /// Devices attached to this bridge.
     devices: BTreeMap<PciAddress, Arc<Mutex<dyn BusDevice>>>,
+    /// pcie enhanced configuration access mmio base
+    pcie_cfg_mmio: Option<u64>,
 }
 
 pub const PCI_VENDOR_ID_INTEL: u16 = 0x8086;
 const PCI_DEVICE_ID_INTEL_82441: u16 = 0x1237;
+const PCIE_XBAR_BASE_ADDR: usize = 24;
 
 impl PciRoot {
     /// Create an empty PCI root bus.
@@ -167,7 +176,13 @@ impl PciRoot {
                 ),
             },
             devices: BTreeMap::new(),
+            pcie_cfg_mmio: None,
         }
+    }
+
+    /// enable pcie enhanced configuration access and set base mmio
+    pub fn enable_pcie_cfg_mmio(&mut self, pcie_cfg_mmio: u64) {
+        self.pcie_cfg_mmio = Some(pcie_cfg_mmio);
     }
 
     /// Add a `device` to this root PCI bus.
@@ -200,7 +215,14 @@ impl PciRoot {
 
     pub fn config_space_read(&self, address: PciAddress, register: usize) -> u32 {
         if address.is_root() {
-            self.root_configuration.config_register_read(register)
+            if register == PCIE_XBAR_BASE_ADDR && self.pcie_cfg_mmio.is_some() {
+                let pcie_mmio = self.pcie_cfg_mmio.unwrap() as u32;
+                pcie_mmio | 0x1
+            } else if register == (PCIE_XBAR_BASE_ADDR + 1) && self.pcie_cfg_mmio.is_some() {
+                (self.pcie_cfg_mmio.unwrap() >> 32) as u32
+            } else {
+                self.root_configuration.config_register_read(register)
+            }
         } else {
             self.devices
                 .get(&address)
@@ -260,16 +282,21 @@ impl PciRoot {
 /// Emulates PCI configuration access mechanism #1 (I/O ports 0xcf8 and 0xcfc).
 pub struct PciConfigIo {
     /// PCI root bridge.
-    pci_root: PciRoot,
+    pci_root: Arc<Mutex<PciRoot>>,
     /// Current address to read/write from (0xcf8 register, litte endian).
     config_address: u32,
+    /// Event to signal that the quest requested reset via writing to 0xcf9 register.
+    reset_evt: Event,
 }
 
 impl PciConfigIo {
-    pub fn new(pci_root: PciRoot) -> Self {
+    const REGISTER_BITS_NUM: usize = 8;
+
+    pub fn new(pci_root: Arc<Mutex<PciRoot>>, reset_evt: Event) -> Self {
         PciConfigIo {
             pci_root,
             config_address: 0,
+            reset_evt,
         }
     }
 
@@ -279,8 +306,9 @@ impl PciConfigIo {
             return 0xffff_ffff;
         }
 
-        let (address, register) = PciAddress::from_config_address(self.config_address);
-        self.pci_root.config_space_read(address, register)
+        let (address, register) =
+            PciAddress::from_config_address(self.config_address, Self::REGISTER_BITS_NUM);
+        self.pci_root.lock().config_space_read(address, register)
     }
 
     fn config_space_write(&mut self, offset: u64, data: &[u8]) {
@@ -289,8 +317,10 @@ impl PciConfigIo {
             return;
         }
 
-        let (address, register) = PciAddress::from_config_address(self.config_address);
+        let (address, register) =
+            PciAddress::from_config_address(self.config_address, Self::REGISTER_BITS_NUM);
         self.pci_root
+            .lock()
             .config_space_write(address, register, offset, data)
     }
 
@@ -312,11 +342,9 @@ impl PciConfigIo {
         };
         self.config_address = (self.config_address & !mask) | value;
     }
-
-    pub fn add_device(&mut self, address: PciAddress, device: Arc<Mutex<dyn BusDevice>>) {
-        self.pci_root.add_device(address, device)
-    }
 }
+
+const PCI_RESET_CPU_BIT: u8 = 1 << 2;
 
 impl BusDevice for PciConfigIo {
     fn debug_label(&self) -> String {
@@ -348,6 +376,11 @@ impl BusDevice for PciConfigIo {
     fn write(&mut self, info: BusAccessInfo, data: &[u8]) {
         // `offset` is relative to 0xcf8
         match info.offset {
+            _o @ 1 if data.len() == 1 && data[0] & PCI_RESET_CPU_BIT != 0 => {
+                if let Err(e) = self.reset_evt.write(1) {
+                    error!("failed to trigger PCI 0xcf9 reset event: {}", e);
+                }
+            }
             o @ 0..=3 => self.set_config_address(o, data),
             o @ 4..=7 => self.config_space_write(o - 4, data),
             _ => (),
@@ -358,27 +391,31 @@ impl BusDevice for PciConfigIo {
 /// Emulates PCI memory-mapped configuration access mechanism.
 pub struct PciConfigMmio {
     /// PCI root bridge.
-    pci_root: PciRoot,
+    pci_root: Arc<Mutex<PciRoot>>,
+    /// Register bit number in config address.
+    register_bit_num: usize,
 }
 
 impl PciConfigMmio {
-    pub fn new(pci_root: PciRoot) -> Self {
-        PciConfigMmio { pci_root }
+    pub fn new(pci_root: Arc<Mutex<PciRoot>>, register_bit_num: usize) -> Self {
+        PciConfigMmio {
+            pci_root,
+            register_bit_num,
+        }
     }
 
     fn config_space_read(&self, config_address: u32) -> u32 {
-        let (address, register) = PciAddress::from_config_address(config_address);
-        self.pci_root.config_space_read(address, register)
+        let (address, register) =
+            PciAddress::from_config_address(config_address, self.register_bit_num);
+        self.pci_root.lock().config_space_read(address, register)
     }
 
     fn config_space_write(&mut self, config_address: u32, offset: u64, data: &[u8]) {
-        let (address, register) = PciAddress::from_config_address(config_address);
+        let (address, register) =
+            PciAddress::from_config_address(config_address, self.register_bit_num);
         self.pci_root
+            .lock()
             .config_space_write(address, register, offset, data)
-    }
-
-    pub fn add_device(&mut self, address: PciAddress, device: Arc<Mutex<dyn BusDevice>>) {
-        self.pci_root.add_device(address, device)
     }
 }
 

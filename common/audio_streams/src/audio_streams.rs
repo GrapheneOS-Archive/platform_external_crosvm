@@ -354,15 +354,6 @@ impl<'a> AudioBuffer<'a> {
         Ok(len)
     }
 
-    /// Writes complete frames to `buf`, and return the number of bytes written.
-    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // only write complete frames.
-        let len = buf.len() / self.frame_size * self.frame_size;
-        let written = (&mut self.buffer[self.offset..]).write(&buf[..len])?;
-        self.offset += written;
-        Ok(written)
-    }
-
     /// Reads up to `size` bytes directly from this buffer inside of the given callback function.
     pub fn read_copy_cb<F: FnOnce(&[u8])>(&mut self, size: usize, cb: F) -> io::Result<usize> {
         let len = self.calc_len(size);
@@ -370,13 +361,25 @@ impl<'a> AudioBuffer<'a> {
         self.offset += len;
         Ok(len)
     }
+
+    /// Copy data from an io::Reader
+    pub fn copy_from(&mut self, reader: &mut dyn Read) -> io::Result<usize> {
+        let bytes = reader.read(&mut self.buffer[self.offset..])?;
+        self.offset += bytes;
+        Ok(bytes)
+    }
+
+    /// Copy data to an io::Write
+    pub fn copy_to(&mut self, writer: &mut dyn Write) -> io::Result<usize> {
+        let bytes = writer.write(&self.buffer[self.offset..])?;
+        self.offset += bytes;
+        Ok(bytes)
+    }
 }
 
 impl<'a> Write for AudioBuffer<'a> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // only write complete frames.
-        let len = buf.len() / self.frame_size * self.frame_size;
-        let written = (&mut self.buffer[self.offset..]).write(&buf[..len])?;
+        let written = (&mut self.buffer[self.offset..]).write(&buf[..buf.len()])?;
         self.offset += written;
         Ok(written)
     }
@@ -502,6 +505,11 @@ impl<'a> AsyncPlaybackBuffer<'a> {
     /// Writes up to `size` bytes directly to this buffer inside of the given callback function.
     pub fn copy_cb<F: FnOnce(&mut [u8])>(&mut self, size: usize, cb: F) -> io::Result<usize> {
         self.buffer.write_copy_cb(size, cb)
+    }
+
+    /// Copy data from an io::Reader
+    pub fn copy_from(&mut self, reader: &mut dyn Read) -> io::Result<usize> {
+        self.buffer.copy_from(reader)
     }
 }
 
@@ -676,6 +684,7 @@ impl StreamSource for NoopStreamSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use io::{self, Write};
 
     #[test]
     fn invalid_buffer_length() {
@@ -685,6 +694,93 @@ mod tests {
             which_buffer: false,
         };
         assert!(PlaybackBuffer::new(2, &mut pb_buf, &mut buffer_drop).is_err());
+    }
+
+    #[test]
+    fn audio_buffer_copy_from() {
+        const PERIOD_SIZE: usize = 8192;
+        const NUM_CHANNELS: usize = 6;
+        const FRAME_SIZE: usize = NUM_CHANNELS * 2;
+        let mut dst_buf = [0u8; PERIOD_SIZE * FRAME_SIZE];
+        let src_buf = [0xa5u8; PERIOD_SIZE * FRAME_SIZE];
+        let mut aud_buf = AudioBuffer {
+            buffer: &mut dst_buf,
+            offset: 0,
+            frame_size: FRAME_SIZE,
+        };
+        aud_buf
+            .copy_from(&mut &src_buf[..])
+            .expect("all data should be copied.");
+        assert_eq!(dst_buf, src_buf);
+    }
+
+    #[test]
+    fn audio_buffer_copy_from_repeat() {
+        const PERIOD_SIZE: usize = 8192;
+        const NUM_CHANNELS: usize = 6;
+        const FRAME_SIZE: usize = NUM_CHANNELS * 2;
+        let mut dst_buf = [0u8; PERIOD_SIZE * FRAME_SIZE];
+        let mut aud_buf = AudioBuffer {
+            buffer: &mut dst_buf,
+            offset: 0,
+            frame_size: FRAME_SIZE,
+        };
+        let bytes = aud_buf
+            .copy_from(&mut io::repeat(1))
+            .expect("all data should be copied.");
+        assert_eq!(bytes, PERIOD_SIZE * FRAME_SIZE);
+        assert_eq!(dst_buf, [1u8; PERIOD_SIZE * FRAME_SIZE]);
+    }
+
+    #[test]
+    fn audio_buffer_copy_to() {
+        const PERIOD_SIZE: usize = 8192;
+        const NUM_CHANNELS: usize = 6;
+        const FRAME_SIZE: usize = NUM_CHANNELS * 2;
+        let mut dst_buf = [0u8; PERIOD_SIZE * FRAME_SIZE];
+        let mut src_buf = [0xa5u8; PERIOD_SIZE * FRAME_SIZE];
+        let mut aud_buf = AudioBuffer {
+            buffer: &mut src_buf,
+            offset: 0,
+            frame_size: FRAME_SIZE,
+        };
+        aud_buf
+            .copy_to(&mut &mut dst_buf[..])
+            .expect("all data should be copied.");
+        assert_eq!(dst_buf, src_buf);
+    }
+
+    #[test]
+    fn audio_buffer_copy_to_sink() {
+        const PERIOD_SIZE: usize = 8192;
+        const NUM_CHANNELS: usize = 6;
+        const FRAME_SIZE: usize = NUM_CHANNELS * 2;
+        let mut src_buf = [0xa5u8; PERIOD_SIZE * FRAME_SIZE];
+        let mut aud_buf = AudioBuffer {
+            buffer: &mut src_buf,
+            offset: 0,
+            frame_size: FRAME_SIZE,
+        };
+        let bytes = aud_buf
+            .copy_to(&mut io::sink())
+            .expect("all data should be copied.");
+        assert_eq!(bytes, PERIOD_SIZE * FRAME_SIZE);
+    }
+
+    #[test]
+    fn io_copy_audio_buffer() {
+        const PERIOD_SIZE: usize = 8192;
+        const NUM_CHANNELS: usize = 6;
+        const FRAME_SIZE: usize = NUM_CHANNELS * 2;
+        let mut dst_buf = [0u8; PERIOD_SIZE * FRAME_SIZE];
+        let src_buf = [0xa5u8; PERIOD_SIZE * FRAME_SIZE];
+        let mut aud_buf = AudioBuffer {
+            buffer: &mut dst_buf,
+            offset: 0,
+            frame_size: FRAME_SIZE,
+        };
+        io::copy(&mut &src_buf[..], &mut aud_buf).expect("all data should be copied.");
+        assert_eq!(dst_buf, src_buf);
     }
 
     #[test]
