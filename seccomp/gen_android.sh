@@ -97,19 +97,21 @@ package {
 
 genrule_defaults {
     name: "crosvm_inline_seccomp_policy_x86_64",
-    cmd: "\$(location policy-inliner.sh) \$(location x86_64/common_device.policy) < \$(in) > \$(out)",
+    cmd: "\$(location policy-inliner.sh) \$(location x86_64/common_device.policy) \$(location x86_64/gpu_common.policy) < \$(in) > \$(out)",
     tool_files: [
         "policy-inliner.sh",
         "x86_64/common_device.policy",
+        "x86_64/gpu_common.policy",
     ],
 }
 
 genrule_defaults {
     name: "crosvm_inline_seccomp_policy_aarch64",
-    cmd: "\$(location policy-inliner.sh) \$(location aarch64/common_device.policy) < \$(in) > \$(out)",
+    cmd: "\$(location policy-inliner.sh) \$(location aarch64/common_device.policy) \$(location aarch64/gpu_common.policy) < \$(in) > \$(out)",
     tool_files: [
         "policy-inliner.sh",
         "aarch64/common_device.policy",
+        "aarch64/gpu_common.policy",
     ],
 }
 
