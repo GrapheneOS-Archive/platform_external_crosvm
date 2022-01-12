@@ -10,15 +10,19 @@ package {
     default_applicable_licenses: ["external_crosvm_license"],
 }
 
-rust_defaults {
-    name: "audio_streams_test_defaults",
+rust_test {
+    name: "audio_streams_test_src_audio_streams",
     defaults: ["crosvm_defaults"],
+    host_supported: true,
     crate_name: "audio_streams",
-    srcs: ["src/audio_streams.rs"],
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
+    srcs: ["src/audio_streams.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
+    test_options: {
+        unit_test: true,
+    },
     edition: "2018",
     rustlibs: [
         "libcros_async",
@@ -30,19 +34,6 @@ rust_defaults {
         "libasync_trait",
         "libremain",
     ],
-}
-
-rust_test_host {
-    name: "audio_streams_host_test_src_audio_streams",
-    defaults: ["audio_streams_test_defaults"],
-    test_options: {
-        unit_test: true,
-    },
-}
-
-rust_test {
-    name: "audio_streams_device_test_src_audio_streams",
-    defaults: ["audio_streams_test_defaults"],
 }
 
 rust_library {
