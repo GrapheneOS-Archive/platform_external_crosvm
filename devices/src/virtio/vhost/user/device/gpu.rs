@@ -17,19 +17,16 @@ use futures::{
     pin_mut,
 };
 use getopts::Options;
+use hypervisor::ProtectionType;
 use once_cell::sync::OnceCell;
 use sync::Mutex;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 
-use crate::{
-    virtio::{
-        self, gpu,
-        vhost::user::device::handler::{CallEvent, DeviceRequestHandler, VhostUserBackend},
-        DescriptorChain, Gpu, GpuDisplayParameters, GpuParameters, Queue, QueueReader,
-        VirtioDevice,
-    },
-    ProtectionType,
+use crate::virtio::{
+    self, gpu,
+    vhost::user::device::handler::{CallEvent, DeviceRequestHandler, VhostUserBackend},
+    DescriptorChain, Gpu, GpuDisplayParameters, GpuParameters, Queue, QueueReader, VirtioDevice,
 };
 
 static GPU_EXECUTOR: OnceCell<Executor> = OnceCell::new();
@@ -130,7 +127,10 @@ async fn run_resource_bridge(tube: Box<dyn IoSourceExt<Tube>>, state: Rc<RefCell
             break;
         }
 
-        state.borrow_mut().process_resource_bridge(tube.as_source());
+        if let Err(e) = state.borrow_mut().process_resource_bridge(tube.as_source()) {
+            error!("Failed to process resource bridge: {}", e);
+            break;
+        }
     }
 }
 
@@ -498,6 +498,7 @@ pub fn run_gpu_device(program_name: &str, args: std::env::Args) -> anyhow::Resul
         Vec::new(), // resource_bridges, handled separately by us
         display_backends,
         &gpu_parameters,
+        None,
         event_devices,
         map_request,
         external_blob,

@@ -11,11 +11,11 @@ package {
 }
 
 rust_ffi_shared {
-    name: "liblibcrosvm_control_shared",
+    name: "libcrosvm_control_shared",
     defaults: ["crosvm_defaults"],
-    stem: "liblibcrosvm_control",
+    stem: "libcrosvm_control",
     host_supported: true,
-    crate_name: "libcrosvm_control",
+    crate_name: "crosvm_control",
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
     srcs: ["src/lib.rs"],
