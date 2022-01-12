@@ -44,15 +44,12 @@ use devices::virtio::VideoBackendType;
 use devices::virtio::{self, Console, VirtioDevice};
 #[cfg(feature = "gpu")]
 use devices::virtio::{
-    gpu::{DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH},
+    gpu::{GpuRenderServerParameters, DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH},
     vhost::user::vmm::Gpu as VhostUserGpu,
     EventDevice,
 };
 #[cfg(feature = "audio")]
 use devices::Ac97Dev;
-#[cfg(feature = "direct")]
-use devices::BusRange;
-use devices::ProtectionType;
 use devices::{
     self, BusDeviceObj, HostHotPlugKey, HotPlugBus, IrqChip, IrqEventIndex, KvmKernelIrqChip,
     PciAddress, PciBridge, PciDevice, PcieRootPort, StubPciDevice, VcpuRunState, VfioContainer,
@@ -61,7 +58,7 @@ use devices::{
 #[cfg(feature = "usb")]
 use devices::{HostBackendDeviceProvider, XhciController};
 use hypervisor::kvm::{Kvm, KvmVcpu, KvmVm};
-use hypervisor::{HypervisorCap, Vcpu, VcpuExit, VcpuRunHandle, Vm, VmCap};
+use hypervisor::{HypervisorCap, ProtectionType, Vcpu, VcpuExit, VcpuRunHandle, Vm, VmCap};
 use minijail::{self, Minijail};
 use net_util::{MacAddress, Tap};
 use resources::{Alloc, MmioType, SystemAllocator};
@@ -590,70 +587,83 @@ fn create_balloon_device(cfg: &Config, tube: Tube) -> DeviceResult {
     })
 }
 
-fn create_tap_net_device(cfg: &Config, tap_fd: RawDescriptor) -> DeviceResult {
-    // Safe because we ensure that we get a unique handle to the fd.
-    let tap = unsafe {
-        Tap::from_raw_descriptor(
-            validate_raw_descriptor(tap_fd).context("failed to validate tap descriptor")?,
-        )
-        .context("failed to create tap device")?
-    };
-
+/// Generic method for creating a network device. `create_device` is a closure that takes the virtio
+/// features and number of queue pairs as parameters, and is responsible for creating the device
+/// itself.
+fn create_net_device<F, T>(cfg: &Config, policy: &str, create_device: F) -> DeviceResult
+where
+    F: Fn(u64, u16) -> Result<T>,
+    T: VirtioDevice + 'static,
+{
     let mut vq_pairs = cfg.net_vq_pairs.unwrap_or(1);
     let vcpu_count = cfg.vcpu_count.unwrap_or(1);
     if vcpu_count < vq_pairs as usize {
-        error!("net vq pairs must be smaller than vcpu count, fall back to single queue mode");
+        warn!("the number of net vq pairs must not exceed the vcpu count, falling back to single queue mode");
         vq_pairs = 1;
     }
     let features = virtio::base_features(cfg.protected_vm);
-    let dev =
-        virtio::Net::from(features, tap, vq_pairs).context("failed to set up virtio networking")?;
+
+    let dev = create_device(features, vq_pairs)?;
 
     Ok(VirtioDeviceStub {
-        dev: Box::new(dev),
-        jail: simple_jail(cfg, "net_device")?,
+        dev: Box::new(dev) as Box<dyn VirtioDevice>,
+        jail: simple_jail(cfg, policy)?,
     })
 }
 
-fn create_net_device(
+/// Returns a network device created from a new TAP interface configured with `host_ip`, `netmask`,
+/// and `mac_address`.
+fn create_net_device_from_config(
     cfg: &Config,
     host_ip: Ipv4Addr,
     netmask: Ipv4Addr,
     mac_address: MacAddress,
 ) -> DeviceResult {
-    let mut vq_pairs = cfg.net_vq_pairs.unwrap_or(1);
-    let vcpu_count = cfg.vcpu_count.unwrap_or(1);
-    if vcpu_count < vq_pairs as usize {
-        error!("net vq pairs must be smaller than vcpu count, fall back to single queue mode");
-        vq_pairs = 1;
-    }
-
-    let features = virtio::base_features(cfg.protected_vm);
-    let dev = if cfg.vhost_net {
-        let dev = virtio::vhost::Net::<Tap, vhost::Net<Tap>>::new(
-            &cfg.vhost_net_device_path,
-            features,
-            host_ip,
-            netmask,
-            mac_address,
-        )
-        .context("failed to set up vhost networking")?;
-        Box::new(dev) as Box<dyn VirtioDevice>
-    } else {
-        let dev = virtio::Net::<Tap>::new(features, host_ip, netmask, mac_address, vq_pairs)
-            .context("failed to set up virtio networking")?;
-        Box::new(dev) as Box<dyn VirtioDevice>
-    };
-
     let policy = if cfg.vhost_net {
         "vhost_net_device"
     } else {
         "net_device"
     };
 
-    Ok(VirtioDeviceStub {
-        dev,
-        jail: simple_jail(cfg, policy)?,
+    if cfg.vhost_net {
+        create_net_device(cfg, policy, |features, _vq_pairs| {
+            virtio::vhost::Net::<Tap, vhost::Net<Tap>>::new(
+                &cfg.vhost_net_device_path,
+                features,
+                host_ip,
+                netmask,
+                mac_address,
+            )
+            .context("failed to set up vhost networking")
+        })
+    } else {
+        create_net_device(cfg, policy, |features, vq_pairs| {
+            virtio::Net::<Tap>::new(features, host_ip, netmask, mac_address, vq_pairs)
+                .context("failed to create virtio network device")
+        })
+    }
+}
+
+/// Returns a network device from a file descriptor to a configured TAP interface.
+fn create_tap_net_device_from_fd(cfg: &Config, tap_fd: RawDescriptor) -> DeviceResult {
+    create_net_device(cfg, "net_device", |features, vq_pairs| {
+        // Safe because we ensure that we get a unique handle to the fd.
+        let tap = unsafe {
+            Tap::from_raw_descriptor(
+                validate_raw_descriptor(tap_fd).context("failed to validate tap descriptor")?,
+            )
+            .context("failed to create tap device")?
+        };
+
+        virtio::Net::from(features, tap, vq_pairs).context("failed to create tap net device")
+    })
+}
+
+/// Returns a network device created by opening the persistent, configured TAP interface `tap_name`.
+fn create_tap_net_device_from_name(cfg: &Config, tap_name: &[u8]) -> DeviceResult {
+    create_net_device(cfg, "net_device", |features, vq_pairs| {
+        virtio::Net::<Tap>::new_from_name(features, tap_name, vq_pairs)
+            .context("failed to create configured virtio network device")
     })
 }
 
@@ -716,6 +726,101 @@ fn create_vhost_user_gpu_device(
     })
 }
 
+/// Mirror-mount all the directories in `dirs` into `jail` on a best-effort basis.
+///
+/// This function will not return an error if any of the directories in `dirs` is missing.
+#[cfg(any(feature = "gpu", feature = "video-decoder", feature = "video-encoder"))]
+fn jail_mount_bind_if_exists<P: AsRef<std::ffi::OsStr>>(
+    jail: &mut Minijail,
+    dirs: &[P],
+) -> Result<()> {
+    for dir in dirs {
+        let dir_path = Path::new(dir);
+        if dir_path.exists() {
+            jail.mount_bind(dir_path, dir_path, false)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
+    match simple_jail(cfg, policy)? {
+        Some(mut jail) => {
+            // Create a tmpfs in the device's root directory so that we can bind mount the
+            // dri directory into it.  The size=67108864 is size=64*1024*1024 or size=64MB.
+            jail.mount_with_data(
+                Path::new("none"),
+                Path::new("/"),
+                "tmpfs",
+                (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as usize,
+                "size=67108864",
+            )?;
+
+            // Device nodes required for DRM.
+            let sys_dev_char_path = Path::new("/sys/dev/char");
+            jail.mount_bind(sys_dev_char_path, sys_dev_char_path, false)?;
+            let sys_devices_path = Path::new("/sys/devices");
+            jail.mount_bind(sys_devices_path, sys_devices_path, false)?;
+
+            let drm_dri_path = Path::new("/dev/dri");
+            if drm_dri_path.exists() {
+                jail.mount_bind(drm_dri_path, drm_dri_path, false)?;
+            }
+
+            // If the ARM specific devices exist on the host, bind mount them in.
+            let mali0_path = Path::new("/dev/mali0");
+            if mali0_path.exists() {
+                jail.mount_bind(mali0_path, mali0_path, true)?;
+            }
+
+            let pvr_sync_path = Path::new("/dev/pvr_sync");
+            if pvr_sync_path.exists() {
+                jail.mount_bind(pvr_sync_path, pvr_sync_path, true)?;
+            }
+
+            // If the udmabuf driver exists on the host, bind mount it in.
+            let udmabuf_path = Path::new("/dev/udmabuf");
+            if udmabuf_path.exists() {
+                jail.mount_bind(udmabuf_path, udmabuf_path, true)?;
+            }
+
+            // Libraries that are required when mesa drivers are dynamically loaded.
+            jail_mount_bind_if_exists(
+                &mut jail,
+                &[
+                    "/usr/lib",
+                    "/usr/lib64",
+                    "/lib",
+                    "/lib64",
+                    "/usr/share/glvnd",
+                    "/usr/share/vulkan",
+                ],
+            )?;
+
+            // pvr driver requires read access to /proc/self/task/*/comm.
+            let proc_path = Path::new("/proc");
+            jail.mount(
+                proc_path,
+                proc_path,
+                "proc",
+                (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RDONLY) as usize,
+            )?;
+
+            // To enable perfetto tracing, we need to give access to the perfetto service IPC
+            // endpoints.
+            let perfetto_path = Path::new("/run/perfetto");
+            if perfetto_path.exists() {
+                jail.mount_bind(perfetto_path, perfetto_path, true)?;
+            }
+
+            Ok(Some(jail))
+        }
+        None => Ok(None),
+    }
+}
+
 #[cfg(feature = "gpu")]
 fn create_gpu_device(
     cfg: &Config,
@@ -724,6 +829,7 @@ fn create_gpu_device(
     resource_bridges: Vec<Tube>,
     wayland_socket_path: Option<&PathBuf>,
     x_display: Option<String>,
+    render_server_fd: Option<SafeDescriptor>,
     event_devices: Vec<EventDevice>,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
 ) -> DeviceResult {
@@ -752,6 +858,7 @@ fn create_gpu_device(
         resource_bridges,
         display_backends,
         cfg.gpu_parameters.as_ref().unwrap(),
+        render_server_fd,
         event_devices,
         map_request,
         cfg.sandbox,
@@ -759,29 +866,8 @@ fn create_gpu_device(
         cfg.wayland_socket_paths.clone(),
     );
 
-    let jail = match simple_jail(cfg, "gpu_device")? {
+    let jail = match gpu_jail(cfg, "gpu_device")? {
         Some(mut jail) => {
-            // Create a tmpfs in the device's root directory so that we can bind mount the
-            // dri directory into it.  The size=67108864 is size=64*1024*1024 or size=64MB.
-            jail.mount_with_data(
-                Path::new("none"),
-                Path::new("/"),
-                "tmpfs",
-                (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as usize,
-                "size=67108864",
-            )?;
-
-            // Device nodes required for DRM.
-            let sys_dev_char_path = Path::new("/sys/dev/char");
-            jail.mount_bind(sys_dev_char_path, sys_dev_char_path, false)?;
-            let sys_devices_path = Path::new("/sys/devices");
-            jail.mount_bind(sys_devices_path, sys_devices_path, false)?;
-
-            let drm_dri_path = Path::new("/dev/dri");
-            if drm_dri_path.exists() {
-                jail.mount_bind(drm_dri_path, drm_dri_path, false)?;
-            }
-
             // Prepare GPU shader disk cache directory.
             if let Some(cache_dir) = cfg
                 .gpu_parameters
@@ -806,39 +892,6 @@ fn create_gpu_device(
                 }
             }
 
-            // If the ARM specific devices exist on the host, bind mount them in.
-            let mali0_path = Path::new("/dev/mali0");
-            if mali0_path.exists() {
-                jail.mount_bind(mali0_path, mali0_path, true)?;
-            }
-
-            let pvr_sync_path = Path::new("/dev/pvr_sync");
-            if pvr_sync_path.exists() {
-                jail.mount_bind(pvr_sync_path, pvr_sync_path, true)?;
-            }
-
-            // If the udmabuf driver exists on the host, bind mount it in.
-            let udmabuf_path = Path::new("/dev/udmabuf");
-            if udmabuf_path.exists() {
-                jail.mount_bind(udmabuf_path, udmabuf_path, true)?;
-            }
-
-            // Libraries that are required when mesa drivers are dynamically loaded.
-            let lib_dirs = &[
-                "/usr/lib",
-                "/usr/lib64",
-                "/lib",
-                "/lib64",
-                "/usr/share/glvnd",
-                "/usr/share/vulkan",
-            ];
-            for dir in lib_dirs {
-                let dir_path = Path::new(dir);
-                if dir_path.exists() {
-                    jail.mount_bind(dir_path, dir_path, false)?;
-                }
-            }
-
             // Bind mount the wayland socket's directory into jail's root. This is necessary since
             // each new wayland context must open() the socket. If the wayland socket is ever
             // destroyed and remade in the same host directory, new connections will be possible
@@ -849,22 +902,6 @@ fn create_gpu_device(
 
             add_current_user_to_jail(&mut jail)?;
 
-            // pvr driver requires read access to /proc/self/task/*/comm.
-            let proc_path = Path::new("/proc");
-            jail.mount(
-                proc_path,
-                proc_path,
-                "proc",
-                (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RDONLY) as usize,
-            )?;
-
-            // To enable perfetto tracing, we need to give access to the perfetto service IPC
-            // endpoints.
-            let perfetto_path = Path::new("/run/perfetto");
-            if perfetto_path.exists() {
-                jail.mount_bind(perfetto_path, perfetto_path, true)?;
-            }
-
             Some(jail)
         }
         None => None,
@@ -874,6 +911,52 @@ fn create_gpu_device(
         dev: Box::new(dev),
         jail,
     })
+}
+
+#[cfg(feature = "gpu")]
+fn start_gpu_render_server(
+    cfg: &Config,
+    render_server_parameters: &GpuRenderServerParameters,
+) -> Result<SafeDescriptor> {
+    let (server_socket, client_socket) =
+        UnixSeqpacket::pair().context("failed to create render server socket")?;
+
+    let jail = match gpu_jail(cfg, "gpu_render_server")? {
+        Some(mut jail) => {
+            // TODO(olv) bind mount and enable shader cache
+
+            // bind mount /dev/log for syslog
+            let log_path = Path::new("/dev/log");
+            if log_path.exists() {
+                jail.mount_bind(log_path, log_path, true)?;
+            }
+
+            // Run as root in the jail to keep capabilities after execve, which is needed for
+            // mounting to work.  All capabilities will be dropped afterwards.
+            add_current_user_as_root_to_jail(&mut jail)?;
+
+            jail
+        }
+        None => Minijail::new().context("failed to create jail")?,
+    };
+
+    let inheritable_fds = [
+        server_socket.as_raw_descriptor(),
+        libc::STDOUT_FILENO,
+        libc::STDERR_FILENO,
+    ];
+
+    let cmd = &render_server_parameters.path;
+    let cmd_str = cmd
+        .to_str()
+        .ok_or_else(|| anyhow!("invalid render server path"))?;
+    let fd_str = server_socket.as_raw_descriptor().to_string();
+    let args = [cmd_str, "--socket-fd", &fd_str];
+
+    jail.run(cmd, &inheritable_fds, &args)
+        .context("failed to start gpu render server")?;
+
+    Ok(SafeDescriptor::from(client_socket))
 }
 
 fn create_wayland_device(
@@ -954,10 +1037,21 @@ fn create_video_device(
                 "size=67108864",
             )?;
 
+            #[cfg(feature = "libvda")]
             // Render node for libvda.
-            if backend == VideoBackendType::Libvda {
-                let dev_dri_path = Path::new("/dev/dri/renderD128");
-                jail.mount_bind(dev_dri_path, dev_dri_path, false)?;
+            if backend == VideoBackendType::Libvda || backend == VideoBackendType::LibvdaVd {
+                // follow the implementation at:
+                // https://source.corp.google.com/chromeos_public/src/platform/minigbm/cros_gralloc/cros_gralloc_driver.cc;l=90;bpv=0;cl=c06cc9cccb3cf3c7f9d2aec706c27c34cd6162a0
+                const DRM_NUM_NODES: u32 = 63;
+                const DRM_RENDER_NODE_START: u32 = 128;
+                for offset in 0..DRM_NUM_NODES {
+                    let path_str = format!("/dev/dri/renderD{}", DRM_RENDER_NODE_START + offset);
+                    let dev_dri_path = Path::new(&path_str);
+                    if !dev_dri_path.exists() {
+                        break;
+                    }
+                    jail.mount_bind(dev_dri_path, dev_dri_path, false)?;
+                }
             }
 
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -969,8 +1063,7 @@ fn create_video_device(
                 jail.mount_bind(sys_devices_path, sys_devices_path, false)?;
 
                 // Required for loading dri libraries loaded by minigbm on AMD devices.
-                let lib_dir = Path::new("/usr/lib64");
-                jail.mount_bind(lib_dir, lib_dir, false)?;
+                jail_mount_bind_if_exists(&mut jail, &["/usr/lib64"])?;
             }
 
             // Device nodes required by libchrome which establishes Mojo connection in libvda.
@@ -1348,13 +1441,6 @@ fn create_virtio_devices(
 
     devs.push(create_rng_device(cfg)?);
 
-    #[cfg(feature = "audio_cras")]
-    {
-        if let Some(cras_snd) = &cfg.cras_snd {
-            devs.push(create_cras_snd_device(cfg, cras_snd.clone())?);
-        }
-    }
-
     #[cfg(feature = "tpm")]
     {
         if cfg.software_tpm {
@@ -1402,7 +1488,7 @@ fn create_virtio_devices(
 
     // We checked above that if the IP is defined, then the netmask is, too.
     for tap_fd in &cfg.tap_fd {
-        devs.push(create_tap_net_device(cfg, *tap_fd)?);
+        devs.push(create_tap_net_device_from_fd(cfg, *tap_fd)?);
     }
 
     if let (Some(host_ip), Some(netmask), Some(mac_address)) =
@@ -1411,7 +1497,16 @@ fn create_virtio_devices(
         if !cfg.vhost_user_net.is_empty() {
             bail!("vhost-user-net cannot be used with any of --host_ip, --netmask or --mac");
         }
-        devs.push(create_net_device(cfg, host_ip, netmask, mac_address)?);
+        devs.push(create_net_device_from_config(
+            cfg,
+            host_ip,
+            netmask,
+            mac_address,
+        )?);
+    }
+
+    for tap_name in &cfg.tap_name {
+        devs.push(create_tap_net_device_from_name(cfg, tap_name.as_bytes())?);
     }
 
     for net in &cfg.vhost_user_net {
@@ -1530,6 +1625,12 @@ fn create_virtio_devices(
                 });
                 event_devices.push(EventDevice::keyboard(event_device_socket));
             }
+
+            let mut render_server_fd = None;
+            if let Some(ref render_server_parameters) = gpu_parameters.render_server {
+                render_server_fd = Some(start_gpu_render_server(cfg, render_server_parameters)?);
+            }
+
             devs.push(create_gpu_device(
                 cfg,
                 _exit_evt,
@@ -1538,9 +1639,17 @@ fn create_virtio_devices(
                 // Use the unnamed socket for GPU display screens.
                 cfg.wayland_socket_paths.get(""),
                 cfg.x_display.clone(),
+                render_server_fd,
                 event_devices,
                 map_request,
             )?);
+        }
+    }
+
+    #[cfg(feature = "audio_cras")]
+    {
+        for cras_snd in &cfg.cras_snds {
+            devs.push(create_cras_snd_device(cfg, cras_snd.clone())?);
         }
     }
 
@@ -1645,8 +1754,9 @@ fn create_vfio_device(
         Tube::pair().context("failed to create tube")?;
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
-    let vfio_device = VfioDevice::new(vfio_path, vm, vfio_container.clone(), iommu_enabled)
-        .context("failed to create vfio device")?;
+    let vfio_device =
+        VfioDevice::new_passthrough(&vfio_path, vm, vfio_container.clone(), iommu_enabled)
+            .context("failed to create vfio device")?;
     let mut vfio_pci_device = Box::new(VfioPciDevice::new(
         vfio_device,
         bus_num,
@@ -1686,7 +1796,7 @@ fn create_vfio_platform_device(
         Tube::pair().context("failed to create tube")?;
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
-    let vfio_device = VfioDevice::new(vfio_path, vm, vfio_container, iommu_enabled)
+    let vfio_device = VfioDevice::new_passthrough(&vfio_path, vm, vfio_container, iommu_enabled)
         .context("Failed to create vfio device")?;
     let vfio_plat_dev = VfioPlatformDevice::new(vfio_device, vfio_device_tube_mem);
 
@@ -1842,6 +1952,20 @@ fn add_current_user_to_jail(jail: &mut Minijail) -> Result<Ids> {
     if crosvm_gid != 0 {
         jail.change_gid(crosvm_gid);
     }
+
+    Ok(Ids {
+        uid: crosvm_uid,
+        gid: crosvm_gid,
+    })
+}
+
+fn add_current_user_as_root_to_jail(jail: &mut Minijail) -> Result<Ids> {
+    let crosvm_uid = geteuid();
+    let crosvm_gid = getegid();
+    jail.uidmap(&format!("0 {0} 1", crosvm_uid))
+        .context("error setting UID map")?;
+    jail.gidmap(&format!("0 {0} 1", crosvm_gid))
+        .context("error setting GID map")?;
 
     Ok(Ids {
         uid: crosvm_uid,
@@ -2390,7 +2514,9 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         )
     } else {
         match cfg.protected_vm {
-            ProtectionType::Protected => Some(64 * 1024 * 1024),
+            ProtectionType::Protected | ProtectionType::ProtectedWithoutFirmware => {
+                Some(64 * 1024 * 1024)
+            }
             ProtectionType::Unprotected => None,
         }
     };
@@ -2439,7 +2565,12 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     })
 }
 
-pub fn run_config(cfg: Config) -> Result<()> {
+pub enum ExitState {
+    Reset,
+    Stop,
+}
+
+pub fn run_config(cfg: Config) -> Result<ExitState> {
     let components = setup_vm_components(&cfg)?;
 
     let guest_mem_layout =
@@ -2449,14 +2580,9 @@ pub fn run_config(cfg: Config) -> Result<()> {
     if components.hugepages {
         mem_policy |= MemoryPolicy::USE_HUGEPAGES;
     }
-    if components.protected_vm == ProtectionType::Protected {
-        mem_policy |= MemoryPolicy::MLOCK_ON_FAULT;
-    }
-    guest_mem
-        .set_memory_policy(mem_policy)
-        .context("failed to set guest memory policy")?;
+    guest_mem.set_memory_policy(mem_policy);
     let kvm = Kvm::new_with_path(&cfg.kvm_device_path).context("failed to create kvm")?;
-    let vm = KvmVm::new(&kvm, guest_mem).context("failed to create vm")?;
+    let vm = KvmVm::new(&kvm, guest_mem, components.protected_vm).context("failed to create vm")?;
     let vm_clone = vm.try_clone().context("failed to clone vm")?;
 
     enum KvmIrqChip {
@@ -2510,7 +2636,7 @@ fn run_vm<Vcpu, V>(
     mut vm: V,
     irq_chip: &mut dyn IrqChipArch,
     ioapic_host_tube: Option<Tube>,
-) -> Result<()>
+) -> Result<ExitState>
 where
     Vcpu: VcpuArch + 'static,
     V: VmArch + 'static,
@@ -2645,6 +2771,7 @@ where
     }
 
     let exit_evt = Event::new().context("failed to create event")?;
+    let reset_evt = Event::new().context("failed to create event")?;
     let mut sys_allocator = Arch::create_system_allocator(vm.get_memory());
 
     // Allocate the ramoops region first. AArch64::build_vm() assumes this.
@@ -2698,6 +2825,7 @@ where
     let mut linux = Arch::build_vm::<V, Vcpu>(
         components,
         &exit_evt,
+        &reset_evt,
         &mut sys_allocator,
         &cfg.serial_parameters,
         simple_jail(&cfg, "serial")?,
@@ -2738,30 +2866,22 @@ where
         for range in pmio.ranges.iter() {
             linux
                 .io_bus
-                .insert_sync(direct_io.clone(), range.0, range.1)
+                .insert_sync(direct_io.clone(), range.base, range.len)
                 .unwrap();
         }
     };
 
     #[cfg(feature = "direct")]
     if let Some(mmio) = &cfg.direct_mmio {
-        let mut ranges = Vec::new();
-        for range in mmio.ranges.iter() {
-            ranges.push(BusRange {
-                base: range.0,
-                len: range.1,
-            });
-        }
-
         let direct_mmio = Arc::new(
-            devices::DirectMmio::new(&mmio.path, false, ranges)
+            devices::DirectMmio::new(&mmio.path, false, &mmio.ranges)
                 .context("failed to open direct mmio device")?,
         );
 
         for range in mmio.ranges.iter() {
             linux
                 .mmio_bus
-                .insert_sync(direct_mmio.clone(), range.0, range.1)
+                .insert_sync(direct_mmio.clone(), range.base, range.len)
                 .unwrap();
         }
     };
@@ -2817,6 +2937,7 @@ where
         #[cfg(feature = "usb")]
         usb_control_tube,
         exit_evt,
+        reset_evt,
         sigchld_fd,
         cfg.sandbox,
         Arc::clone(&map_request),
@@ -2939,6 +3060,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     disk_host_tubes: &[Tube],
     #[cfg(feature = "usb")] usb_control_tube: Tube,
     exit_evt: Event,
+    reset_evt: Event,
     sigchld_fd: SignalFd,
     sandbox: bool,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
@@ -2946,10 +3068,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     enable_per_vm_core_scheduling: bool,
     host_cpu_topology: bool,
     kvm_vcpu_ids: Vec<usize>,
-) -> Result<()> {
+) -> Result<ExitState> {
     #[derive(PollToken)]
     enum Token {
         Exit,
+        Reset,
         Suspend,
         ChildSignal,
         IrqFd { index: IrqEventIndex },
@@ -2963,6 +3086,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 
     let wait_ctx = WaitContext::build_with(&[
         (&exit_evt, Token::Exit),
+        (&reset_evt, Token::Reset),
         (&linux.suspend_evt, Token::Suspend),
         (&sigchld_fd, Token::ChildSignal),
     ])
@@ -3082,6 +3206,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 
     vcpu_thread_barrier.wait();
 
+    let mut exit_state = ExitState::Stop;
     let mut balloon_stats_id: u64 = 0;
 
     'wait: loop {
@@ -3104,6 +3229,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             match event.token {
                 Token::Exit => {
                     info!("vcpu requested shutdown");
+                    break 'wait;
+                }
+                Token::Reset => {
+                    info!("vcpu requested reset");
+                    exit_state = ExitState::Reset;
                     break 'wait;
                 }
                 Token::Suspend => {
@@ -3376,5 +3506,5 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         .set_canon_mode()
         .expect("failed to restore canonical mode for terminal");
 
-    Ok(())
+    Ok(exit_state)
 }
