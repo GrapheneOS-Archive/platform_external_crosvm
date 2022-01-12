@@ -55,7 +55,8 @@ function scan_policy_name() {
     # pushd but no output to stdout/stderr
     # the output is taken and used by the caller
     pushd $seccomp_dir > /dev/null 2>&1
-    ls --hide=common_device.policy --hide=common_device.frequency -1
+    ls --hide=common_device.policy --hide=common_device.frequency \
+       --hide=gpu_common.policy -1
     popd > /dev/null 2>&1
   )
 }
@@ -97,19 +98,21 @@ package {
 
 genrule_defaults {
     name: "crosvm_inline_seccomp_policy_x86_64",
-    cmd: "\$(location policy-inliner.sh) \$(location x86_64/common_device.policy) < \$(in) > \$(out)",
+    cmd: "\$(location policy-inliner.sh) \$(location x86_64/common_device.policy) \$(location x86_64/gpu_common.policy) < \$(in) > \$(out)",
     tool_files: [
         "policy-inliner.sh",
         "x86_64/common_device.policy",
+        "x86_64/gpu_common.policy",
     ],
 }
 
 genrule_defaults {
     name: "crosvm_inline_seccomp_policy_aarch64",
-    cmd: "\$(location policy-inliner.sh) \$(location aarch64/common_device.policy) < \$(in) > \$(out)",
+    cmd: "\$(location policy-inliner.sh) \$(location aarch64/common_device.policy) \$(location aarch64/gpu_common.policy) < \$(in) > \$(out)",
     tool_files: [
         "policy-inliner.sh",
         "aarch64/common_device.policy",
+        "aarch64/gpu_common.policy",
     ],
 }
 
@@ -193,6 +196,20 @@ function gen_crosvm_seccomp_policy_product_packages_mk_fragment() {
   done | sort
 }
 
+function print_host_seccomp_policy_lists() {
+  local archs=("$@")
+  echo "Please update the following blocks in device/google/cuttlefish/build/Android.bp:"
+  for arch in ${archs[@]}; do
+    echo
+    echo "cvd_host_seccomp_policy_${arch} = ["
+    for file in $(scan_policy_name ${arch}); do
+      local base_name="$(basename $file)"
+      echo "    \"${file}_${arch}\","
+    done | sort
+    echo "]"
+  done
+}
+
 # main
 check_location
 gen_license >Android.bp
@@ -201,3 +218,4 @@ gen_blueprint_boilerplate >>Android.bp
 gen_blueprint_arch_policy_files "${seccomp_archs[@]}" >>Android.bp
 gen_crosvm_seccomp_policy_product_packages_mk_fragment \
   "${seccomp_archs[@]}" >>crosvm_seccomp_policy_product_packages.mk
+print_host_seccomp_policy_lists "${seccomp_archs[@]}"
