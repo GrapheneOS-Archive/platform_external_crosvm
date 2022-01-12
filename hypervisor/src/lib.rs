@@ -439,3 +439,16 @@ pub enum MPState {
     /// the vcpu is stopped (arm/arm64)
     Stopped,
 }
+
+/// Whether the VM should be run in protected mode or not.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProtectionType {
+    /// The VM should be run in the unprotected mode, where the host has access to its memory.
+    Unprotected,
+    /// The VM should be run in protected mode, so the host cannot access its memory directly. It
+    /// should be booted via the protected VM firmware, so that it can access its secrets.
+    Protected,
+    /// The VM should be run in protected mode, but booted directly without pVM firmware. The host
+    /// will still be unable to access the VM memory, but it won't be given any secrets.
+    ProtectedWithoutFirmware,
+}

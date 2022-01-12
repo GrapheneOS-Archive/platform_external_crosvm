@@ -7,7 +7,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
-use super::connection::{EndpointExt, SocketEndpoint};
+use super::connection::{socket::Endpoint as SocketEndpoint, EndpointExt};
 use super::message::*;
 use super::{Error, HandlerResult, Result};
 
@@ -145,7 +145,7 @@ impl<S: VhostUserMasterReqHandler> MasterReqHandler<S> {
         let (tx, rx) = UnixStream::pair().map_err(Error::SocketError)?;
 
         Ok(MasterReqHandler {
-            sub_sock: SocketEndpoint::<SlaveReq>::from_stream(rx),
+            sub_sock: SocketEndpoint::<SlaveReq>::from(rx),
             tx_sock: tx,
             reply_ack_negotiated: false,
             backend,

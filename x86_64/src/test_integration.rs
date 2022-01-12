@@ -5,8 +5,8 @@
 #![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 
 use arch::LinuxArch;
-use devices::{IrqChipX86_64, ProtectionType};
-use hypervisor::{HypervisorX86_64, VcpuExit, VcpuX86_64, VmX86_64};
+use devices::IrqChipX86_64;
+use hypervisor::{HypervisorX86_64, ProtectionType, VcpuExit, VcpuX86_64, VmX86_64};
 use vm_memory::{GuestAddress, GuestMemory};
 
 use super::cpuid::setup_cpuid;
@@ -16,7 +16,7 @@ use super::X8664arch;
 use super::{acpi, arch_memory_regions, bootparam, mptable, smbios};
 use super::{
     BOOT_STACK_POINTER, END_ADDR_BEFORE_32BITS, KERNEL_64BIT_ENTRY_OFFSET, KERNEL_START_OFFSET,
-    X86_64_SCI_IRQ, ZERO_PAGE_OFFSET,
+    PCIE_CFG_MMIO_SIZE, PCIE_CFG_MMIO_START, X86_64_SCI_IRQ, ZERO_PAGE_OFFSET,
 };
 
 use base::{Event, Tube};
@@ -41,7 +41,8 @@ fn simple_kvm_kernel_irqchip_test() {
     simple_vm_test::<_, _, KvmVcpu, _, _, _>(
         |guest_mem| {
             let kvm = Kvm::new().expect("failed to create kvm");
-            let vm = KvmVm::new(&kvm, guest_mem).expect("failed to create kvm vm");
+            let vm = KvmVm::new(&kvm, guest_mem, ProtectionType::Unprotected)
+                .expect("failed to create kvm vm");
             (kvm, vm)
         },
         |vm, vcpu_count, _| {
@@ -57,7 +58,8 @@ fn simple_kvm_split_irqchip_test() {
     simple_vm_test::<_, _, KvmVcpu, _, _, _>(
         |guest_mem| {
             let kvm = Kvm::new().expect("failed to create kvm");
-            let vm = KvmVm::new(&kvm, guest_mem).expect("failed to create kvm vm");
+            let vm = KvmVm::new(&kvm, guest_mem, ProtectionType::Unprotected)
+                .expect("failed to create kvm vm");
             (kvm, vm)
         },
         |vm, vcpu_count, device_tube| {
@@ -136,7 +138,8 @@ where
         4,
     )
     .unwrap();
-    let pci_bus = Arc::new(Mutex::new(PciConfigIo::new(pci)));
+    let pci = Arc::new(Mutex::new(pci));
+    let pci_bus = Arc::new(Mutex::new(PciConfigIo::new(pci, Event::new().unwrap())));
     io_bus.insert(pci_bus, 0xcf8, 0x8).unwrap();
 
     X8664arch::setup_legacy_devices(
@@ -177,6 +180,7 @@ where
     // let mut kernel_image = File::open("/mnt/host/source/src/avd/vmlinux.uncompressed").expect("failed to open kernel");
     // let (params, kernel_end) = X8664arch::load_kernel(&guest_mem, &mut kernel_image).expect("failed to load kernel");
 
+    let max_bus = (PCIE_CFG_MMIO_SIZE / 0x100000 - 1) as u8;
     let suspend_evt = Event::new().unwrap();
     let mut resume_notify_devices = Vec::new();
     let acpi_dev_resource = X8664arch::setup_acpi_devices(
@@ -191,13 +195,13 @@ where
         &mut irq_chip,
         (&None, None),
         &mmio_bus,
+        max_bus,
         &mut resume_notify_devices,
     )
     .unwrap();
 
     X8664arch::setup_system_memory(
         &guest_mem,
-        memory_size,
         &CString::new(cmdline).expect("failed to create cmdline"),
         initrd_image,
         None,
@@ -207,7 +211,7 @@ where
     .expect("failed to setup system_memory");
 
     // Note that this puts the mptable at 0x9FC00 in guest physical memory.
-    mptable::setup_mptable(&guest_mem, 1, pci_irqs).expect("failed to setup mptable");
+    mptable::setup_mptable(&guest_mem, 1, &pci_irqs).expect("failed to setup mptable");
     smbios::setup_smbios(&guest_mem, None).expect("failed to setup smbios");
 
     let mut apic_ids = Vec::new();
@@ -215,9 +219,14 @@ where
         &guest_mem,
         1,
         X86_64_SCI_IRQ,
+        0xcf9,
+        6,
         acpi_dev_resource.0,
         None,
         &mut apic_ids,
+        &pci_irqs,
+        PCIE_CFG_MMIO_START,
+        max_bus,
     );
 
     let guest_mem2 = guest_mem.clone();
