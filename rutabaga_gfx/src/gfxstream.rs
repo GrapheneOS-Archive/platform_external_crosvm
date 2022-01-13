@@ -4,7 +4,7 @@
 
 //! gfxstream: Handles 3D virtio-gpu hypercalls using gfxstream.
 //!
-//! External code found at https://android.googlesource.com/device/generic/vulkan-cereal/.
+//! External code found at <https://android.googlesource.com/device/generic/vulkan-cereal/>.
 
 #![cfg(feature = "gfxstream")]
 
@@ -46,6 +46,7 @@ extern "C" {
         renderer_cookie: *mut c_void,
         renderer_flags: i32,
         renderer_callbacks: *mut GfxstreamRendererCallbacks,
+        gfxstream_callbacks: *mut c_void,
     );
 
     // virtio-gpu-3d ioctl functions (begin)
@@ -210,6 +211,7 @@ impl Gfxstream {
 
         let cookie: *mut VirglCookie = Box::into_raw(Box::new(VirglCookie {
             fence_state: Rc::clone(&fence_state),
+            render_server_fd: None,
         }));
 
         unsafe {
@@ -220,6 +222,7 @@ impl Gfxstream {
                 cookie as *mut c_void,
                 gfxstream_flags.into(),
                 transmute(GFXSTREAM_RENDERER_CALLBACKS),
+                null_mut(),
             );
         }
 
