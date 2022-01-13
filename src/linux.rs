@@ -1754,6 +1754,8 @@ fn create_vfio_device(
         Tube::pair().context("failed to create tube")?;
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
+    let hotplug = bus_num.is_some();
+
     let vfio_device =
         VfioDevice::new_passthrough(&vfio_path, vm, vfio_container.clone(), iommu_enabled)
             .context("failed to create vfio device")?;
@@ -1777,7 +1779,11 @@ fn create_vfio_device(
         endpoints.insert(endpoint_addr.unwrap().to_u32(), vfio_container);
     }
 
-    Ok((vfio_pci_device, simple_jail(cfg, "vfio_device")?))
+    if hotplug {
+        Ok((vfio_pci_device, None))
+    } else {
+        Ok((vfio_pci_device, simple_jail(cfg, "vfio_device")?))
+    }
 }
 
 fn create_vfio_platform_device(
@@ -2065,7 +2071,7 @@ where
     }
 
     Arch::configure_vcpu(
-        vm.get_memory(),
+        &vm,
         vm.get_hypervisor(),
         irq_chip,
         &mut vcpu,
@@ -2772,7 +2778,7 @@ where
 
     let exit_evt = Event::new().context("failed to create event")?;
     let reset_evt = Event::new().context("failed to create event")?;
-    let mut sys_allocator = Arch::create_system_allocator(vm.get_memory());
+    let mut sys_allocator = Arch::create_system_allocator(&vm);
 
     // Allocate the ramoops region first. AArch64::build_vm() assumes this.
     let ramoops_region = match &components.pstore {
@@ -2783,7 +2789,7 @@ where
         None => None,
     };
 
-    let phys_max_addr = Arch::get_phys_max_addr();
+    let phys_max_addr = (1u64 << vm.get_guest_phys_addr_bits()) - 1;
     let mut devices = create_devices(
         &cfg,
         &mut vm,
@@ -3386,6 +3392,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                                     }
                                                 }
                                                 IrqSetup::Route(route) => irq_chip.route_irq(route),
+                                                IrqSetup::UnRegister(irq, ev) => irq_chip.unregister_irq_event(irq, ev),
                                             },
                                             &mut sys_allocator,
                                         )
