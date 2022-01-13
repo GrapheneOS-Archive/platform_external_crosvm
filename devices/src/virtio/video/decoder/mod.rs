@@ -170,9 +170,6 @@ enum PendingResponse {
 struct Context<S: DecoderSession> {
     stream_id: StreamId,
 
-    in_resource_type: ResourceType,
-    out_resource_type: ResourceType,
-
     in_params: Params,
     out_params: Params,
 
@@ -196,16 +193,18 @@ impl<S: DecoderSession> Context<S> {
     ) -> Self {
         Context {
             stream_id,
-            in_resource_type,
-            out_resource_type,
             in_params: Params {
                 format: Some(format),
+                resource_type: in_resource_type,
                 min_buffers: 1,
                 max_buffers: 32,
                 plane_formats: vec![Default::default()],
                 ..Default::default()
             },
-            out_params: Default::default(),
+            out_params: Params {
+                resource_type: out_resource_type,
+                ..Default::default()
+            },
             in_res: Default::default(),
             out_res: Default::default(),
             is_resetting: false,
@@ -328,6 +327,8 @@ impl<S: DecoderSession> Context<S> {
 
         self.out_params = Params {
             format,
+            // The resource type is not changed by a provide picture buffers event.
+            resource_type: self.out_params.resource_type,
             // Note that rect_width is sometimes smaller.
             frame_width: width as u32,
             frame_height: height as u32,
@@ -515,12 +516,12 @@ impl<'a, D: DecoderBackend> Decoder<D> {
 
         // Now try to resolve our resource.
         let resource_type = match queue_type {
-            QueueType::Input => ctx.in_resource_type,
-            QueueType::Output => ctx.out_resource_type,
+            QueueType::Input => ctx.in_params.resource_type,
+            QueueType::Output => ctx.out_params.resource_type,
         };
 
         let resource = match resource_type {
-            ResourceType::Object => GuestResource::from_virtio_object_entry(
+            ResourceType::VirtioObject => GuestResource::from_virtio_object_entry(
                 // Safe because we confirmed the correct type for the resource.
                 unsafe { resource.object },
                 &self.resource_bridge,
@@ -711,6 +712,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         &self,
         stream_id: StreamId,
         queue_type: QueueType,
+        is_ext: bool,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get(&stream_id)?;
         let params = match queue_type {
@@ -720,6 +722,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         Ok(VideoCmdResponseType::Sync(CmdResponse::GetParams {
             queue_type,
             params,
+            is_ext,
         }))
     }
 
@@ -728,6 +731,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         stream_id: StreamId,
         queue_type: QueueType,
         params: Params,
+        is_ext: bool,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
         match queue_type {
@@ -740,9 +744,21 @@ impl<'a, D: DecoderBackend> Decoder<D> {
                 // Only a few parameters can be changed by the guest.
                 ctx.in_params.format = params.format;
                 ctx.in_params.plane_formats = params.plane_formats;
+                // The resource type can only be changed through the SET_PARAMS_EXT command.
+                if is_ext {
+                    ctx.in_params.resource_type = params.resource_type;
+                }
             }
             QueueType::Output => {
-                // The guest cannot update parameters for output queue in the decoder.
+                // The guest can only change the resource type of the output queue if no resource
+                // has been imported yet.
+                if ctx.out_res.output_params_set {
+                    error!("parameter for output cannot be changed once resources are imported");
+                    return Err(VideoError::InvalidParameter);
+                }
+                if is_ext {
+                    ctx.out_params.resource_type = params.resource_type;
+                }
             }
         };
         Ok(VideoCmdResponseType::Sync(CmdResponse::NoData))
@@ -922,12 +938,14 @@ impl<D: DecoderBackend> Device for Decoder<D> {
             GetParams {
                 stream_id,
                 queue_type,
-            } => self.get_params(stream_id, queue_type),
+                is_ext,
+            } => self.get_params(stream_id, queue_type, is_ext),
             SetParams {
                 stream_id,
                 queue_type,
                 params,
-            } => self.set_params(stream_id, queue_type, params),
+                is_ext,
+            } => self.set_params(stream_id, queue_type, params, is_ext),
             QueryControl { query_ctrl_type } => self.query_control(query_ctrl_type),
             GetControl {
                 stream_id,

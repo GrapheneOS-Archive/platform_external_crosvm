@@ -26,19 +26,21 @@ package {
 
 genrule_defaults {
     name: "crosvm_inline_seccomp_policy_x86_64",
-    cmd: "$(location policy-inliner.sh) $(location x86_64/common_device.policy) < $(in) > $(out)",
+    cmd: "$(location policy-inliner.sh) $(location x86_64/common_device.policy) $(location x86_64/gpu_common.policy) < $(in) > $(out)",
     tool_files: [
         "policy-inliner.sh",
         "x86_64/common_device.policy",
+        "x86_64/gpu_common.policy",
     ],
 }
 
 genrule_defaults {
     name: "crosvm_inline_seccomp_policy_aarch64",
-    cmd: "$(location policy-inliner.sh) $(location aarch64/common_device.policy) < $(in) > $(out)",
+    cmd: "$(location policy-inliner.sh) $(location aarch64/common_device.policy) $(location aarch64/gpu_common.policy) < $(in) > $(out)",
     tool_files: [
         "policy-inliner.sh",
         "aarch64/common_device.policy",
+        "aarch64/gpu_common.policy",
     ],
 }
 
@@ -408,6 +410,55 @@ prebuilt_etc {
         },
         arm64: {
             src: ":vhost_vsock_device.policy_inline_aarch64",
+        },
+    },
+    target: {
+        android_arm: {
+            enabled: false,
+        },
+        android_x86: {
+            enabled: false,
+        },
+    },
+}
+
+genrule {
+    name: "gpu_render_server.policy_inline_x86_64",
+    defaults: ["crosvm_inline_seccomp_policy_x86_64"],
+    out: ["gpu_render_server.policy"],
+    srcs: ["x86_64/gpu_render_server.policy"],
+}
+
+prebuilt_usr_share_host {
+    name: "gpu_render_server.policy_x86_64",
+    filename: "gpu_render_server.policy",
+    relative_install_path: "crosvm/x86_64-linux-gnu/seccomp",
+    src: ":gpu_render_server.policy_inline_x86_64",
+}
+
+genrule {
+    name: "gpu_render_server.policy_inline_aarch64",
+    defaults: ["crosvm_inline_seccomp_policy_aarch64"],
+    out: ["gpu_render_server.policy"],
+    srcs: ["aarch64/gpu_render_server.policy"],
+}
+
+prebuilt_usr_share_host {
+    name: "gpu_render_server.policy_aarch64",
+    filename: "gpu_render_server.policy",
+    relative_install_path: "crosvm/aarch64-linux-gnu/seccomp",
+    src: ":gpu_render_server.policy_inline_aarch64",
+}
+
+prebuilt_etc {
+    name: "gpu_render_server.policy",
+    relative_install_path: "seccomp_policy/crosvm",
+    arch: {
+        x86_64: {
+            src: ":gpu_render_server.policy_inline_x86_64",
+        },
+        arm64: {
+            src: ":gpu_render_server.policy_inline_aarch64",
         },
     },
     target: {
@@ -919,6 +970,55 @@ prebuilt_etc {
         },
         arm64: {
             src: ":balloon_device.policy_inline_aarch64",
+        },
+    },
+    target: {
+        android_arm: {
+            enabled: false,
+        },
+        android_x86: {
+            enabled: false,
+        },
+    },
+}
+
+genrule {
+    name: "cras_snd_device.policy_inline_x86_64",
+    defaults: ["crosvm_inline_seccomp_policy_x86_64"],
+    out: ["cras_snd_device.policy"],
+    srcs: ["x86_64/cras_snd_device.policy"],
+}
+
+prebuilt_usr_share_host {
+    name: "cras_snd_device.policy_x86_64",
+    filename: "cras_snd_device.policy",
+    relative_install_path: "crosvm/x86_64-linux-gnu/seccomp",
+    src: ":cras_snd_device.policy_inline_x86_64",
+}
+
+genrule {
+    name: "cras_snd_device.policy_inline_aarch64",
+    defaults: ["crosvm_inline_seccomp_policy_aarch64"],
+    out: ["cras_snd_device.policy"],
+    srcs: ["aarch64/cras_snd_device.policy"],
+}
+
+prebuilt_usr_share_host {
+    name: "cras_snd_device.policy_aarch64",
+    filename: "cras_snd_device.policy",
+    relative_install_path: "crosvm/aarch64-linux-gnu/seccomp",
+    src: ":cras_snd_device.policy_inline_aarch64",
+}
+
+prebuilt_etc {
+    name: "cras_snd_device.policy",
+    relative_install_path: "seccomp_policy/crosvm",
+    arch: {
+        x86_64: {
+            src: ":cras_snd_device.policy_inline_x86_64",
+        },
+        arm64: {
+            src: ":cras_snd_device.policy_inline_aarch64",
         },
     },
     target: {

@@ -20,10 +20,10 @@ use base::{syslog, AsRawDescriptor, AsRawDescriptors, Event, Tube};
 use devices::virtio::VirtioDevice;
 use devices::{
     Bus, BusDevice, BusDeviceObj, BusError, BusResumeDevice, HotPlugBus, IrqChip, PciAddress,
-    PciDevice, PciDeviceError, PciInterruptPin, PciRoot, ProtectionType, ProxyDevice,
-    SerialHardware, SerialParameters, VfioPlatformDevice,
+    PciDevice, PciDeviceError, PciInterruptPin, PciRoot, ProxyDevice, SerialHardware,
+    SerialParameters, VfioPlatformDevice,
 };
-use hypervisor::{IoEventAddress, Vm};
+use hypervisor::{IoEventAddress, ProtectionType, Vm};
 use minijail::Minijail;
 use remain::sorted;
 use resources::{MmioType, SystemAllocator};
@@ -37,12 +37,12 @@ use gdbstub_arch::x86::reg::X86_64CoreRegs as GdbStubRegs;
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 use {
-    devices::{IrqChipAArch64 as IrqChipArch, PciConfigMmio as RootConfigArch},
+    devices::IrqChipAArch64 as IrqChipArch,
     hypervisor::{Hypervisor as HypervisorArch, VcpuAArch64 as VcpuArch, VmAArch64 as VmArch},
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use {
-    devices::{IrqChipX86_64 as IrqChipArch, PciConfigIo as RootConfigArch},
+    devices::IrqChipX86_64 as IrqChipArch,
     hypervisor::{HypervisorX86_64 as HypervisorArch, VcpuX86_64 as VcpuArch, VmX86_64 as VmArch},
 };
 
@@ -123,7 +123,7 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub gdb: Option<(u32, Tube)>,
     /// Devices to be notified before the system resumes from the S3 suspended state.
     pub resume_notify_devices: Vec<Arc<Mutex<dyn BusResumeDevice>>>,
-    pub root_config: Arc<Mutex<RootConfigArch>>,
+    pub root_config: Arc<Mutex<PciRoot>>,
     pub hotplug_bus: Vec<Arc<Mutex<dyn HotPlugBus>>>,
 }
 
@@ -162,7 +162,10 @@ pub trait LinuxArch {
     /// # Arguments
     ///
     /// * `components` - Parts to use to build the VM.
-    /// * `exit_evt` - Event used by sub-devices to request that crosvm exit.
+    /// * `exit_evt` - Event used by sub-devices to request that crosvm exit because guest
+    ///     wants to stop/shut down.
+    /// * `reset_evt` - Event used by sub-devices to request that crosvm exit because guest
+    ///     requested reset.
     /// * `system_allocator` - Allocator created by this trait's implementation of
     ///   `create_system_allocator`.
     /// * `serial_parameters` - Definitions for how the serial devices should be configured.
@@ -175,6 +178,7 @@ pub trait LinuxArch {
     fn build_vm<V, Vcpu>(
         components: VmComponents,
         exit_evt: &Event,
+        reset_evt: &Event,
         system_allocator: &mut SystemAllocator,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,

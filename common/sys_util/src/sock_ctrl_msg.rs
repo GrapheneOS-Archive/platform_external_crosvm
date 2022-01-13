@@ -17,7 +17,7 @@ use libc::{
     c_long, c_void, cmsghdr, iovec, msghdr, recvmsg, sendmsg, MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET,
 };
 
-use data_model::VolatileSlice;
+use data_model::{IoBufMut, VolatileSlice};
 
 use crate::net::UnixSeqpacket;
 use crate::{Error, Result};
@@ -251,7 +251,7 @@ pub trait ScmSocket {
     ///
     /// * `bufs` - A slice of slices of data to send on the `socket`.
     /// * `fd` - A file descriptors to be sent.
-    fn send_bufs_with_fd(&self, bufs: &[&[u8]], fd: RawFd) -> Result<usize> {
+    fn send_bufs_with_fd(&self, bufs: &[IoSlice], fd: RawFd) -> Result<usize> {
         self.send_bufs_with_fds(bufs, &[fd])
     }
 
@@ -263,9 +263,8 @@ pub trait ScmSocket {
     ///
     /// * `bufs` - A slice of slices of data to send on the `socket`.
     /// * `fds` - A list of file descriptors to be sent.
-    fn send_bufs_with_fds(&self, bufs: &[&[u8]], fd: &[RawFd]) -> Result<usize> {
-        let slices: Vec<IoSlice> = bufs.iter().map(|&b| IoSlice::new(b)).collect();
-        raw_sendmsg(self.socket_fd(), &slices, fd)
+    fn send_bufs_with_fds(&self, bufs: &[IoSlice], fd: &[RawFd]) -> Result<usize> {
+        raw_sendmsg(self.socket_fd(), bufs, fd)
     }
 
     /// Receives data and potentially a file descriptor from the socket.
@@ -398,11 +397,11 @@ unsafe impl<'a> AsIobuf for IoSliceMut<'a> {
 // pointer and size are guaranteed to be accurate.
 unsafe impl<'a> AsIobuf for VolatileSlice<'a> {
     fn as_iobuf(&self) -> iovec {
-        *self.as_iobuf()
+        *self.as_iobuf().as_ref()
     }
 
     fn as_iobuf_slice(bufs: &[Self]) -> &[iovec] {
-        VolatileSlice::as_iobufs(bufs)
+        IoBufMut::as_iobufs(VolatileSlice::as_iobufs(bufs))
     }
 }
 
@@ -420,41 +419,24 @@ mod tests {
 
     use crate::EventFd;
 
+    // Doing this as a macro makes it easier to see the line if it fails
+    macro_rules! CMSG_SPACE_TEST {
+        ($len:literal) => {
+            assert_eq!(
+                CMSG_SPACE!(size_of::<[RawFd; $len]>()) as libc::c_uint,
+                unsafe { libc::CMSG_SPACE(size_of::<[RawFd; $len]>() as libc::c_uint) }
+            );
+        };
+    }
+
     #[test]
     #[allow(clippy::erasing_op, clippy::identity_op)]
     fn buffer_len() {
-        assert_eq!(CMSG_SPACE!(0 * size_of::<RawFd>()), size_of::<cmsghdr>());
-        assert_eq!(
-            CMSG_SPACE!(1 * size_of::<RawFd>()),
-            size_of::<cmsghdr>() + size_of::<c_long>()
-        );
-        if size_of::<RawFd>() == 4 {
-            assert_eq!(
-                CMSG_SPACE!(2 * size_of::<RawFd>()),
-                size_of::<cmsghdr>() + size_of::<c_long>()
-            );
-            assert_eq!(
-                CMSG_SPACE!(3 * size_of::<RawFd>()),
-                size_of::<cmsghdr>() + size_of::<c_long>() * 2
-            );
-            assert_eq!(
-                CMSG_SPACE!(4 * size_of::<RawFd>()),
-                size_of::<cmsghdr>() + size_of::<c_long>() * 2
-            );
-        } else if size_of::<RawFd>() == 8 {
-            assert_eq!(
-                CMSG_SPACE!(2 * size_of::<RawFd>()),
-                size_of::<cmsghdr>() + size_of::<c_long>() * 2
-            );
-            assert_eq!(
-                CMSG_SPACE!(3 * size_of::<RawFd>()),
-                size_of::<cmsghdr>() + size_of::<c_long>() * 3
-            );
-            assert_eq!(
-                CMSG_SPACE!(4 * size_of::<RawFd>()),
-                size_of::<cmsghdr>() + size_of::<c_long>() * 4
-            );
-        }
+        CMSG_SPACE_TEST!(0);
+        CMSG_SPACE_TEST!(1);
+        CMSG_SPACE_TEST!(2);
+        CMSG_SPACE_TEST!(3);
+        CMSG_SPACE_TEST!(4);
     }
 
     #[test]
@@ -480,7 +462,7 @@ mod tests {
         assert_eq!(buf, [1, 1, 2, 21, 34, 55]);
 
         let write_count = s1
-            .send_bufs_with_fds(&[&send_buf[..]], &[])
+            .send_bufs_with_fds(&[IoSlice::new(&send_buf[..])], &[])
             .expect("failed to send data");
 
         assert_eq!(write_count, 6);

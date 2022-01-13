@@ -35,6 +35,7 @@ const ECX_TOPO_TYPE_SHIFT: u32 = 8; // Topology Level type.
 const ECX_TOPO_SMT_TYPE: u32 = 1; // SMT type.
 const ECX_TOPO_CORE_TYPE: u32 = 2; // CORE type.
 const EAX_CPU_CORES_SHIFT: u32 = 26; // Index of cpu cores in the same physical package.
+const EDX_HYBRID_CPU_SHIFT: u32 = 15; // Hybrid. The processor is identified as a hybrid part.
 
 fn filter_cpuid(
     vcpu_id: usize,
@@ -64,12 +65,17 @@ fn filter_cpuid(
 
                 if host_cpu_topology {
                     entry.ebx |= EBX_CLFLUSH_CACHELINE << EBX_CLFLUSH_SIZE_SHIFT;
+
+                    // Expose HT flag to Guest.
+                    let result = unsafe { __cpuid(entry.function) };
+                    entry.edx |= result.edx & (1 << EDX_HTT_SHIFT);
                     continue;
                 }
 
                 entry.ebx = (vcpu_id << EBX_CPUID_SHIFT) as u32
                     | (EBX_CLFLUSH_CACHELINE << EBX_CLFLUSH_SIZE_SHIFT);
-                if cpu_count > 1 {
+                if cpu_count > 1 && !no_smt {
+                    // This field is only valid if CPUID.1.EDX.HTT[bit 28]= 1.
                     entry.ebx |= (cpu_count as u32) << EBX_CPU_COUNT_SHIFT;
                     entry.edx |= 1 << EDX_HTT_SHIFT;
                 }
@@ -109,6 +115,26 @@ fn filter_cpuid(
             6 => {
                 // Clear X86 EPB feature.  No frequency selection in the hypervisor.
                 entry.ecx &= !(1 << ECX_EPB_SHIFT);
+            }
+            7 => {
+                if host_cpu_topology && entry.index == 0 {
+                    // Safe because we pass 7 and 0 for this call and the host supports the
+                    // `cpuid` instruction
+                    let result = unsafe { __cpuid_count(entry.function, entry.index) };
+                    entry.edx |= result.edx & (1 << EDX_HYBRID_CPU_SHIFT);
+                }
+            }
+            0x1A => {
+                // Hybrid information leaf.
+                if host_cpu_topology {
+                    // Safe because we pass 0x1A for this call and the host supports the
+                    // `cpuid` instruction
+                    let result = unsafe { __cpuid(entry.function) };
+                    entry.eax = result.eax;
+                    entry.ebx = result.ebx;
+                    entry.ecx = result.ecx;
+                    entry.edx = result.edx;
+                }
             }
             0xB | 0x1F => {
                 if host_cpu_topology {
@@ -204,7 +230,7 @@ pub fn phy_max_address_bits() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hypervisor::CpuIdEntry;
+    use hypervisor::{CpuIdEntry, ProtectionType};
 
     #[test]
     fn feature_and_vendor_name() {
@@ -212,7 +238,7 @@ mod tests {
         let guest_mem =
             vm_memory::GuestMemory::new(&[(vm_memory::GuestAddress(0), 0x10000)]).unwrap();
         let kvm = hypervisor::kvm::Kvm::new().unwrap();
-        let vm = hypervisor::kvm::KvmVm::new(&kvm, guest_mem).unwrap();
+        let vm = hypervisor::kvm::KvmVm::new(&kvm, guest_mem, ProtectionType::Unprotected).unwrap();
         let irq_chip = devices::KvmKernelIrqChip::new(vm, 1).unwrap();
 
         let entries = &mut cpuid.cpu_id_entries;

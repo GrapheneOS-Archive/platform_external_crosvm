@@ -7,7 +7,7 @@
 use std::collections::BTreeMap as Map;
 use std::sync::Arc;
 
-use base::ExternalMapping;
+use base::{ExternalMapping, SafeDescriptor};
 use data_model::VolatileSlice;
 
 use crate::cross_domain::CrossDomain;
@@ -209,8 +209,9 @@ struct RutabagaCapsetInfo {
 /// thread-safe is more difficult.
 pub struct Rutabaga {
     resources: Map<u32, RutabagaResource>,
-    components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>>,
     contexts: Map<u32, Box<dyn RutabagaContext>>,
+    // Declare components after resources and contexts such that it is dropped last.
+    components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>>,
     default_component: RutabagaComponentType,
     capset_info: Vec<RutabagaCapsetInfo>,
     fence_handler: RutabagaFenceHandler,
@@ -713,11 +714,20 @@ impl RutabagaBuilder {
     /// This should be only called once per every virtual machine instance.  Rutabaga tries to
     /// intialize all 3D components which have been built. In 2D mode, only the 2D component is
     /// initialized.
-    pub fn build(self, fence_handler: RutabagaFenceHandler) -> RutabagaResult<Rutabaga> {
+    pub fn build(
+        self,
+        fence_handler: RutabagaFenceHandler,
+        render_server_fd: Option<SafeDescriptor>,
+    ) -> RutabagaResult<Rutabaga> {
         let mut rutabaga_components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>> =
             Default::default();
 
         let mut rutabaga_capsets: Vec<RutabagaCapsetInfo> = Default::default();
+
+        #[cfg(not(feature = "virgl_renderer_next"))]
+        if render_server_fd.is_some() {
+            return Err(RutabagaError::InvalidRutabagaBuild);
+        }
 
         if self.default_component == RutabagaComponentType::Rutabaga2D {
             let rutabaga_2d = Rutabaga2D::init(fence_handler.clone())?;
@@ -729,7 +739,11 @@ impl RutabagaBuilder {
                     .virglrenderer_flags
                     .ok_or(RutabagaError::InvalidRutabagaBuild)?;
 
-                let virgl = VirglRenderer::init(virglrenderer_flags, fence_handler.clone())?;
+                let virgl = VirglRenderer::init(
+                    virglrenderer_flags,
+                    fence_handler.clone(),
+                    render_server_fd,
+                )?;
                 rutabaga_components.insert(RutabagaComponentType::VirglRenderer, virgl);
 
                 rutabaga_capsets.push(RutabagaCapsetInfo {
@@ -783,9 +797,9 @@ impl RutabagaBuilder {
         }
 
         Ok(Rutabaga {
-            components: rutabaga_components,
             resources: Default::default(),
             contexts: Default::default(),
+            components: rutabaga_components,
             default_component: self.default_component,
             capset_info: rutabaga_capsets,
             fence_handler,
