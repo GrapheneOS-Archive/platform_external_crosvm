@@ -230,6 +230,17 @@ impl VfioMsiCap {
     fn get_msi_irqfd(&self) -> Option<&Event> {
         self.irqfd.as_ref()
     }
+
+    fn destroy(&mut self) {
+        if let Some(gsi) = self.gsi {
+            if let Some(irqfd) = self.irqfd.take() {
+                let request = VmIrqRequest::ReleaseOneIrq { gsi, irqfd };
+                if self.vm_socket_irq.send(&request).is_ok() {
+                    let _ = self.vm_socket_irq.recv::<VmIrqResponse>();
+                }
+            }
+        }
+    }
 }
 
 // MSI-X registers in MSI-X capability
@@ -382,6 +393,10 @@ impl VfioMsixCap {
 
         Some(irqfds)
     }
+
+    fn destroy(&mut self) {
+        self.config.destroy()
+    }
 }
 
 struct VfioMsixAllocator {
@@ -444,7 +459,7 @@ enum DeviceData {
 pub struct VfioPciDevice {
     device: Arc<VfioDevice>,
     config: VfioPciConfig,
-    bus_number: Option<u8>,
+    hotplug_bus_number: Option<u8>, // hot plug device has bus number specified at device creation.
     pci_address: Option<PciAddress>,
     interrupt_evt: Option<Event>,
     interrupt_resample_evt: Option<Event>,
@@ -464,7 +479,7 @@ impl VfioPciDevice {
     /// Constructs a new Vfio Pci device for the give Vfio device
     pub fn new(
         device: VfioDevice,
-        bus_number: Option<u8>,
+        hotplug_bus_number: Option<u8>,
         vfio_device_socket_msi: Tube,
         vfio_device_socket_msix: Tube,
         vfio_device_socket_mem: Tube,
@@ -508,7 +523,7 @@ impl VfioPciDevice {
         VfioPciDevice {
             device: dev,
             config,
-            bus_number,
+            hotplug_bus_number,
             pci_address: None,
             interrupt_evt: None,
             interrupt_resample_evt: None,
@@ -814,15 +829,23 @@ impl VfioPciDevice {
         self.disable_bars_mmap();
 
         for mmio_info in self.mmio_regions.iter() {
-            let mut mmap_slots =
-                self.add_bar_mmap(mmio_info.bar_index() as u32, mmio_info.address());
-            self.mmap_slots.append(&mut mmap_slots);
+            if mmio_info.address() != 0 {
+                let mut mmap_slots =
+                    self.add_bar_mmap(mmio_info.bar_index() as u32, mmio_info.address());
+                self.mmap_slots.append(&mut mmap_slots);
+            }
         }
 
         self.remap = false;
     }
 
     fn close(&mut self) {
+        if let Some(msi) = self.msi_cap.as_mut() {
+            msi.destroy();
+        }
+        if let Some(msix) = self.msix_cap.as_mut() {
+            msix.destroy();
+        }
         self.disable_bars_mmap();
         self.device.close();
     }
@@ -839,7 +862,7 @@ impl PciDevice for VfioPciDevice {
     ) -> Result<PciAddress, PciDeviceError> {
         if self.pci_address.is_none() {
             let mut address = PciAddress::from_string(self.device.device_name());
-            if let Some(bus_num) = self.bus_number {
+            if let Some(bus_num) = self.hotplug_bus_number {
                 // Caller specify pcie bus number for hotplug device
                 address.bus = bus_num;
                 // devfn should be 0, otherwise pcie root port couldn't detect it
@@ -956,21 +979,26 @@ impl PciDevice for VfioPciDevice {
                     false => MmioType::Low,
                     true => MmioType::High,
                 };
-                let bar_addr = resources
-                    .mmio_allocator(mmio_type)
-                    .allocate_with_align(
-                        size,
-                        Alloc::PciBar {
-                            bus: address.bus,
-                            dev: address.dev,
-                            func: address.func,
-                            bar: i as u8,
-                        },
-                        "vfio_bar".to_string(),
-                        size,
-                    )
-                    .map_err(|e| PciDeviceError::IoAllocationFailed(size, e))?;
-                ranges.push((bar_addr, size));
+                let mut bar_addr: u64 = 0;
+                // Don't allocate mmio for hotplug device, OS will allocate it from
+                // its parent's bridge window.
+                if self.hotplug_bus_number.is_none() {
+                    bar_addr = resources
+                        .mmio_allocator(mmio_type)
+                        .allocate_with_align(
+                            size,
+                            Alloc::PciBar {
+                                bus: address.bus,
+                                dev: address.dev,
+                                func: address.func,
+                                bar: i as u8,
+                            },
+                            "vfio_bar".to_string(),
+                            size,
+                        )
+                        .map_err(|e| PciDeviceError::IoAllocationFailed(size, e))?;
+                    ranges.push((bar_addr, size));
+                }
                 self.mmio_regions.push(
                     PciBarConfiguration::new(
                         i as usize,
@@ -1168,7 +1196,7 @@ impl PciDevice for VfioPciDevice {
             let bar_idx = (start as u32 - 0x10) / 4;
             let value: [u8; 4] = [data[0], data[1], data[2], data[3]];
             let val = u32::from_le_bytes(value);
-            if val != 0xFFFFFFFF {
+            if val != 0xFFFFFFFF || val != 0 {
                 let mut mmio_clone = self.mmio_regions.clone();
                 let mut modify = false;
                 for region in mmio_clone.iter_mut() {
@@ -1208,6 +1236,12 @@ impl PciDevice for VfioPciDevice {
                 if modify {
                     self.mmio_regions.clear();
                     self.mmio_regions.append(&mut mmio_clone);
+                    // if bar is changed under memory enabled, mmap the
+                    // new bar immediately.
+                    let cmd = self.config.read_config::<u8>(PCI_COMMAND);
+                    if cmd & PCI_COMMAND_MEMORY == PCI_COMMAND_MEMORY {
+                        self.enable_bars_mmap();
+                    }
                 }
             }
         }
