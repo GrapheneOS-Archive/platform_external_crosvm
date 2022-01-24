@@ -10,6 +10,7 @@ mod encoder;
 
 use base::{error, info, warn, Tube, WaitContext};
 use std::collections::{BTreeMap, BTreeSet};
+use vm_memory::GuestMemory;
 
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
 use crate::virtio::video::command::{QueueType, VideoCmd};
@@ -474,16 +475,18 @@ pub struct EncoderDevice<T: Encoder> {
     encoder: T,
     streams: BTreeMap<u32, Stream<T::Session>>,
     resource_bridge: Tube,
+    mem: GuestMemory,
 }
 
 impl<T: Encoder> EncoderDevice<T> {
     /// Build a new encoder using the provided `backend`.
-    pub fn new(backend: T, resource_bridge: Tube) -> VideoResult<Self> {
+    pub fn new(backend: T, resource_bridge: Tube, mem: GuestMemory) -> VideoResult<Self> {
         Ok(Self {
             cros_capabilities: backend.query_capabilities()?,
             encoder: backend,
             streams: Default::default(),
             resource_bridge,
+            mem,
         })
     }
 
@@ -578,7 +581,7 @@ impl<T: Encoder> EncoderDevice<T> {
         queue_type: QueueType,
         resource_id: u32,
         plane_offsets: Vec<u32>,
-        resource: UnresolvedGuestResource,
+        plane_entries: Vec<Vec<UnresolvedResourceEntry>>,
     ) -> VideoResult<VideoCmdResponseType> {
         let stream = self
             .streams
@@ -593,9 +596,20 @@ impl<T: Encoder> EncoderDevice<T> {
 
         let num_planes = plane_offsets.len();
 
+        // We only support single-buffer resources for now.
+        let entries = if plane_entries.len() != 1 {
+            return Err(VideoError::InvalidArgument);
+        } else {
+            // unwrap() is safe because we just tested that `plane_entries` had exactly one element.
+            plane_entries.get(0).unwrap()
+        };
+
         match queue_type {
             QueueType::Input => {
-                if num_planes != stream.src_params.plane_formats.len() {
+                // We currently only support single-buffer formats, but some clients may mistake
+                // color planes with memory planes and submit several planes to us. This doesn't
+                // matter as we will only consider the first one.
+                if num_planes < 1 {
                     return Err(VideoError::InvalidParameter);
                 }
 
@@ -604,10 +618,30 @@ impl<T: Encoder> EncoderDevice<T> {
                 }
 
                 let resource = match stream.src_params.resource_type {
-                    ResourceType::VirtioObject => GuestResource::from_virtio_object_entry(
+                    ResourceType::VirtioObject => {
+                        // Virtio object resources only have one entry.
+                        if entries.len() != 1 {
+                            return Err(VideoError::InvalidArgument);
+                        }
+                        GuestResource::from_virtio_object_entry(
+                            // Safe because we confirmed the correct type for the resource.
+                            // unwrap() is also safe here because we just tested above that `entries` had
+                            // exactly one element.
+                            unsafe { entries.get(0).unwrap().object },
+                            &self.resource_bridge,
+                        )
+                        .map_err(|_| VideoError::InvalidArgument)?
+                    }
+                    ResourceType::GuestPages => GuestResource::from_virtio_guest_mem_entry(
                         // Safe because we confirmed the correct type for the resource.
-                        unsafe { resource.object },
-                        &self.resource_bridge,
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                entries.as_ptr() as *const protocol::virtio_video_mem_entry,
+                                entries.len(),
+                            )
+                        },
+                        &self.mem,
+                        &stream.src_params.plane_formats,
                     )
                     .map_err(|_| VideoError::InvalidArgument)?,
                 };
@@ -621,7 +655,8 @@ impl<T: Encoder> EncoderDevice<T> {
                 );
             }
             QueueType::Output => {
-                if num_planes != stream.dst_params.plane_formats.len() {
+                // Bitstream buffers always have only one plane.
+                if num_planes != 1 {
                     return Err(VideoError::InvalidParameter);
                 }
 
@@ -630,10 +665,30 @@ impl<T: Encoder> EncoderDevice<T> {
                 }
 
                 let resource = match stream.dst_params.resource_type {
-                    ResourceType::VirtioObject => GuestResource::from_virtio_object_entry(
+                    ResourceType::VirtioObject => {
+                        // Virtio object resources only have one entry.
+                        if entries.len() != 1 {
+                            return Err(VideoError::InvalidArgument);
+                        }
+                        GuestResource::from_virtio_object_entry(
+                            // Safe because we confirmed the correct type for the resource.
+                            // unwrap() is also safe here because we just tested above that `entries` had
+                            // exactly one element.
+                            unsafe { entries.get(0).unwrap().object },
+                            &self.resource_bridge,
+                        )
+                        .map_err(|_| VideoError::InvalidArgument)?
+                    }
+                    ResourceType::GuestPages => GuestResource::from_virtio_guest_mem_entry(
                         // Safe because we confirmed the correct type for the resource.
-                        unsafe { resource.object },
-                        &self.resource_bridge,
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                entries.as_ptr() as *const protocol::virtio_video_mem_entry,
+                                entries.len(),
+                            )
+                        },
+                        &self.mem,
+                        &stream.dst_params.plane_formats,
                     )
                     .map_err(|_| VideoError::InvalidArgument)?,
                 };
@@ -678,7 +733,10 @@ impl<T: Encoder> EncoderDevice<T> {
 
         match queue_type {
             QueueType::Input => {
-                if data_sizes.len() != stream.src_params.plane_formats.len() {
+                // We currently only support single-buffer formats, but some clients may mistake
+                // color planes with memory planes and submit several planes to us. This doesn't
+                // matter as we will only consider the first one.
+                if data_sizes.len() < 1 {
                     return Err(VideoError::InvalidParameter);
                 }
 
@@ -740,7 +798,8 @@ impl<T: Encoder> EncoderDevice<T> {
                 }))
             }
             QueueType::Output => {
-                if data_sizes.len() != stream.dst_params.plane_formats.len() {
+                // Bitstream buffers always have only one plane.
+                if data_sizes.len() != 1 {
                     return Err(VideoError::InvalidParameter);
                 }
 
@@ -1322,14 +1381,14 @@ impl<T: Encoder> Device for EncoderDevice<T> {
                 queue_type,
                 resource_id,
                 plane_offsets,
-                resource,
+                plane_entries,
             } => self.resource_create(
                 wait_ctx,
                 stream_id,
                 queue_type,
                 resource_id,
                 plane_offsets,
-                resource,
+                plane_entries,
             ),
             VideoCmd::ResourceQueue {
                 stream_id,
