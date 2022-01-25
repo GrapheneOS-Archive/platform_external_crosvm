@@ -14,11 +14,11 @@ use devices::{
     Bus, BusDeviceObj, BusError, IrqChip, IrqChipAArch64, PciAddress, PciConfigMmio, PciDevice,
 };
 use hypervisor::{
-    DeviceKind, Hypervisor, HypervisorCap, ProtectionType, VcpuAArch64, VcpuFeature, VmAArch64,
+    DeviceKind, Hypervisor, HypervisorCap, ProtectionType, VcpuAArch64, VcpuFeature, Vm, VmAArch64,
 };
 use minijail::Minijail;
 use remain::sorted;
-use resources::SystemAllocator;
+use resources::{MmioType, SystemAllocator};
 use sync::Mutex;
 use thiserror::Error;
 use vm_control::BatteryType;
@@ -27,7 +27,7 @@ use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 mod fdt;
 
 // We place the kernel at offset 8MB
-const AARCH64_KERNEL_OFFSET: u64 = 0x80000;
+const AARCH64_KERNEL_OFFSET: u64 = 0x800000;
 const AARCH64_FDT_MAX_SIZE: u64 = 0x200000;
 const AARCH64_INITRD_ALIGN: u64 = 0x1000000;
 
@@ -245,12 +245,8 @@ impl arch::LinuxArch for AArch64 {
         Ok(arch_memory_regions(components.memory_size))
     }
 
-    fn get_phys_max_addr() -> u64 {
-        u64::max_value()
-    }
-
-    fn create_system_allocator(guest_mem: &GuestMemory) -> SystemAllocator {
-        Self::get_resource_allocator(guest_mem.memory_size())
+    fn create_system_allocator<V: Vm>(vm: &V) -> SystemAllocator {
+        Self::get_resource_allocator(vm.get_memory().memory_size(), vm.get_guest_phys_addr_bits())
     }
 
     fn build_vm<V, Vcpu>(
@@ -451,8 +447,9 @@ impl arch::LinuxArch for AArch64 {
         // Use the entire high MMIO except the ramoops region for PCI.
         // Note: This assumes that the ramoops region is the first thing allocated from the high
         //       MMIO region.
-        let (high_mmio_base, high_mmio_size) =
-            Self::get_high_mmio_base_size(components.memory_size);
+        let high_mmio_alloc = system_allocator.mmio_allocator(MmioType::High);
+        let high_mmio_base = high_mmio_alloc.pool_base();
+        let high_mmio_size = high_mmio_alloc.pool_size();
         let (pci_device_base, pci_device_size) = match &ramoops_region {
             Some(r) => {
                 if r.address != high_mmio_base {
@@ -507,8 +504,8 @@ impl arch::LinuxArch for AArch64 {
         })
     }
 
-    fn configure_vcpu(
-        _guest_mem: &GuestMemory,
+    fn configure_vcpu<V: Vm>(
+        _vm: &V,
         _hypervisor: &dyn Hypervisor,
         _irq_chip: &mut dyn IrqChipAArch64,
         _vcpu: &mut dyn VcpuAArch64,
@@ -534,18 +531,6 @@ impl arch::LinuxArch for AArch64 {
 }
 
 impl AArch64 {
-    fn get_high_mmio_base_size(mem_size: u64) -> (u64, u64) {
-        let base = AARCH64_PHYS_MEM_START + mem_size + AARCH64_PLATFORM_MMIO_SIZE;
-        let size = u64::max_value() - base;
-        (base, size)
-    }
-
-    fn get_platform_mmio_base_size(mem_size: u64) -> (u64, u64) {
-        let base = AARCH64_PHYS_MEM_START + mem_size;
-        let size = AARCH64_PLATFORM_MMIO_SIZE;
-        (base, size)
-    }
-
     /// This returns a base part of the kernel command for this architecture
     fn get_base_linux_cmdline() -> kernel_cmdline::Cmdline {
         let mut cmdline = kernel_cmdline::Cmdline::new(base::pagesize());
@@ -554,13 +539,30 @@ impl AArch64 {
     }
 
     /// Returns a system resource allocator.
-    fn get_resource_allocator(mem_size: u64) -> SystemAllocator {
-        let (high_mmio_base, high_mmio_size) = Self::get_high_mmio_base_size(mem_size);
-        let (plat_mmio_base, plat_mmio_size) = Self::get_platform_mmio_base_size(mem_size);
+    ///
+    /// # Arguments
+    ///
+    /// * `mem_size` - Size of guest memory (RAM) in bytes.
+    /// * `guest_phys_addr_bits` - Size of guest physical addresses (IPA) in bits.
+    fn get_resource_allocator(mem_size: u64, guest_phys_addr_bits: u8) -> SystemAllocator {
+        let guest_phys_end = 1u64 << guest_phys_addr_bits;
+        // The platform MMIO region is immediately past the end of RAM.
+        let plat_mmio_base = AARCH64_PHYS_MEM_START + mem_size;
+        let plat_mmio_size = AARCH64_PLATFORM_MMIO_SIZE;
+        // The high MMIO region is the rest of the address space after the platform MMIO region.
+        let high_mmio_base = plat_mmio_base + plat_mmio_size;
+        let high_mmio_size = guest_phys_end
+            .checked_sub(high_mmio_base)
+            .unwrap_or_else(|| {
+                panic!(
+                    "guest_phys_end {:#x} < high_mmio_base {:#x}",
+                    guest_phys_end, high_mmio_base,
+                );
+            });
         SystemAllocator::builder()
-            .add_high_mmio_addresses(high_mmio_base, high_mmio_size)
             .add_low_mmio_addresses(AARCH64_MMIO_BASE, AARCH64_MMIO_SIZE)
             .add_platform_mmio_addresses(plat_mmio_base, plat_mmio_size)
+            .add_high_mmio_addresses(high_mmio_base, high_mmio_size)
             .create_allocator(AARCH64_IRQ_BASE)
             .unwrap()
     }
