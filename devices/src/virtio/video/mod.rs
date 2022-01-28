@@ -157,16 +157,35 @@ impl VirtioDevice for VideoDevice {
     }
 
     fn features(&self) -> u64 {
-        self.base_features
-            | 1u64 << protocol::VIRTIO_VIDEO_F_RESOURCE_NON_CONTIG
-            | 1u64 << protocol::VIRTIO_VIDEO_F_RESOURCE_VIRTIO_OBJECT
+        // We specify the type to avoid an extra compilation error in case no backend is enabled
+        // and this match statement becomes empty.
+        let backend_features: u64 = match self.backend {
+            #[cfg(feature = "libvda")]
+            VideoBackendType::Libvda | VideoBackendType::LibvdaVd => {
+                vda::supported_virtio_features()
+            }
+        };
+
+        self.base_features | backend_features
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
+        let mut device_name = [0u8; 32];
+        match self.backend {
+            #[cfg(feature = "libvda")]
+            VideoBackendType::Libvda => {
+                (&mut device_name[0..6]).copy_from_slice("libvda".as_bytes())
+            }
+            #[cfg(feature = "libvda")]
+            VideoBackendType::LibvdaVd => {
+                (&mut device_name[0..8]).copy_from_slice("libvdavd".as_bytes())
+            }
+        };
         let mut cfg = protocol::virtio_video_config {
             version: Le32::from(0),
             max_caps_length: Le32::from(1024), // Set a big number
             max_resp_length: Le32::from(1024), // Set a big number
+            device_name,
         };
         copy_config(data, 0, cfg.as_mut_slice(), offset);
     }
