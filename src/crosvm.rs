@@ -33,6 +33,7 @@ use devices::virtio::VideoBackendType;
 use devices::Ac97Parameters;
 #[cfg(feature = "direct")]
 use devices::BusRange;
+use devices::IommuDevType;
 use devices::StubPciParameters;
 use hypervisor::ProtectionType;
 use libc::{getegid, geteuid};
@@ -273,15 +274,16 @@ impl VfioCommand {
 
     fn validate_params(kind: &str, value: &str) -> Result<(), argument::Error> {
         match kind {
-            "iommu" => match value {
-                "on" | "off" => Ok(()),
-                _ => {
-                    return Err(argument::Error::InvalidValue {
+            "iommu" => {
+                if IommuDevType::from_str(value).is_ok() {
+                    Ok(())
+                } else {
+                    Err(argument::Error::InvalidValue {
                         value: format!("{}={}", kind.to_owned(), value.to_owned()),
-                        expected: String::from("option must be `iommu=on|off`"),
+                        expected: String::from("option must be `iommu=viommu|coiommu|off`"),
                     })
                 }
-            },
+            }
             _ => Err(argument::Error::InvalidValue {
                 value: format!("{}={}", kind.to_owned(), value.to_owned()),
                 expected: String::from("option must be `iommu=<val>`"),
@@ -293,8 +295,13 @@ impl VfioCommand {
         self.dev_type
     }
 
-    pub fn iommu_enabled(&self) -> bool {
-        matches!(self.params.get("iommu"), Some(value) if value.as_str() == "on")
+    pub fn iommu_dev_type(&self) -> IommuDevType {
+        if let Some(iommu) = self.params.get("iommu") {
+            if let Ok(v) = IommuDevType::from_str(iommu) {
+                return v;
+            }
+        }
+        IommuDevType::NoIommu
     }
 }
 
@@ -309,12 +316,23 @@ impl Default for VhostVsockDeviceParameter {
     }
 }
 
+#[derive(Debug)]
+pub struct FileBackedMappingParameters {
+    pub address: u64,
+    pub size: u64,
+    pub path: PathBuf,
+    pub offset: u64,
+    pub writable: bool,
+    pub sync: bool,
+}
+
 /// Aggregate of all configurable options for a running VM.
 pub struct Config {
     pub kvm_device_path: PathBuf,
     pub vhost_vsock_device: Option<VhostVsockDeviceParameter>,
     pub vhost_net_device_path: PathBuf,
     pub vcpu_count: Option<usize>,
+    pub vcpu_cgroup_path: Option<PathBuf>,
     pub rt_cpus: Vec<usize>,
     pub vcpu_affinity: Option<VcpuAffinity>,
     pub cpu_clusters: Vec<Vec<usize>>,
@@ -333,6 +351,7 @@ pub struct Config {
     pub initrd_path: Option<PathBuf>,
     pub params: Vec<String>,
     pub socket_path: Option<PathBuf>,
+    pub balloon_control: Option<PathBuf>,
     pub plugin_root: Option<PathBuf>,
     pub plugin_mounts: Vec<BindMount>,
     pub plugin_gid_maps: Vec<GidMap>,
@@ -382,6 +401,7 @@ pub struct Config {
     pub battery_type: Option<BatteryType>,
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     pub gdb: Option<u32>,
+    pub balloon: bool,
     pub balloon_bias: i64,
     pub vhost_user_blk: Vec<VhostUserOption>,
     pub vhost_user_console: Vec<VhostUserOption>,
@@ -405,6 +425,10 @@ pub struct Config {
     pub no_legacy: bool,
     pub host_cpu_topology: bool,
     pub stub_pci_devices: Vec<StubPciParameters>,
+    pub vvu_proxy: Vec<VhostUserOption>,
+    pub coiommu_param: Option<devices::CoIommuParameters>,
+    pub file_backed_mappings: Vec<FileBackedMappingParameters>,
+    pub init_memory: Option<u64>,
 }
 
 impl Default for Config {
@@ -414,6 +438,7 @@ impl Default for Config {
             vhost_vsock_device: None,
             vhost_net_device_path: PathBuf::from(VHOST_NET_PATH),
             vcpu_count: None,
+            vcpu_cgroup_path: None,
             rt_cpus: Vec::new(),
             vcpu_affinity: None,
             cpu_clusters: Vec::new(),
@@ -432,6 +457,7 @@ impl Default for Config {
             initrd_path: None,
             params: Vec::new(),
             socket_path: None,
+            balloon_control: None,
             plugin_root: None,
             plugin_mounts: Vec::new(),
             plugin_gid_maps: Vec::new(),
@@ -481,6 +507,7 @@ impl Default for Config {
             battery_type: None,
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             gdb: None,
+            balloon: true,
             balloon_bias: 0,
             vhost_user_blk: Vec::new(),
             vhost_user_console: Vec::new(),
@@ -492,6 +519,7 @@ impl Default for Config {
             vhost_user_snd: Vec::new(),
             vhost_user_vsock: Vec::new(),
             vhost_user_wl: Vec::new(),
+            vvu_proxy: Vec::new(),
             #[cfg(feature = "direct")]
             direct_pmio: None,
             #[cfg(feature = "direct")]
@@ -504,6 +532,9 @@ impl Default for Config {
             no_legacy: false,
             host_cpu_topology: false,
             stub_pci_devices: Vec::new(),
+            coiommu_param: None,
+            file_backed_mappings: Vec::new(),
+            init_memory: None,
         }
     }
 }
