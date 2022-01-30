@@ -72,7 +72,6 @@ impl PciBridge {
             &PciBridgeSubclass::PciToPciBridge,
             None,
             PciHeaderType::Bridge,
-            false,
             0,
             0,
             0,
@@ -189,9 +188,13 @@ impl PciDevice for PciBridge {
         self.device.lock().clone_interrupt(msix_config_clone);
 
         let gsi = irq_num?;
-        self.config.set_irq(gsi as u8, PciInterruptPin::IntA);
+        let pin = self.pci_address.map_or(
+            PciInterruptPin::IntA,
+            PciConfiguration::suggested_interrupt_pin,
+        );
+        self.config.set_irq(gsi as u8, pin);
 
-        Some((gsi, PciInterruptPin::IntA))
+        Some((gsi, pin))
     }
 
     fn allocate_io_bars(
