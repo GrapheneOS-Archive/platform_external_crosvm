@@ -13,7 +13,6 @@ package {
 rust_test {
     name: "devices_test_src_lib",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "devices",
     cargo_env_compat: true,
@@ -37,6 +36,7 @@ rust_test {
         "libargh",
         "libasync_task",
         "libaudio_streams",
+        "libballoon_control",
         "libbase_rust",
         "libbit_field",
         "libcros_async",
@@ -95,7 +95,6 @@ rust_test {
 rust_library {
     name: "libdevices",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "devices",
     cargo_env_compat: true,
@@ -114,6 +113,7 @@ rust_library {
         "libargh",
         "libasync_task",
         "libaudio_streams",
+        "libballoon_control",
         "libbase_rust",
         "libbit_field",
         "libcros_async",

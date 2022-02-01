@@ -2,26 +2,29 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cmp::Reverse;
-use std::collections::BTreeMap;
-use std::convert::TryFrom;
+use std::cmp::{max, Reverse};
+use std::collections::{BTreeMap, HashSet};
+use std::convert::{TryFrom, TryInto};
 #[cfg(feature = "gpu")]
 use std::env;
 use std::fs::{File, OpenOptions};
+use std::io::prelude::*;
 use std::io::stdin;
 use std::iter;
 use std::mem;
 use std::net::Ipv4Addr;
+use std::os::unix::net::UnixListener;
 use std::os::unix::{io::FromRawFd, net::UnixStream, prelude::OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
+use std::process;
 use std::thread;
 use std::thread::JoinHandle;
 
-use libc::{self, c_int, gid_t, uid_t};
+use libc::{self, c_int, c_ulong, gid_t, uid_t};
 
 use acpi_tables::sdt::SDT;
 
@@ -32,6 +35,7 @@ use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::vfio::{VfioCommonSetup, VfioCommonTrait};
 #[cfg(feature = "audio_cras")]
 use devices::virtio::snd::cras_backend::Parameters as CrasSndParameters;
+use devices::virtio::vhost::user::proxy::VirtioVhostUser;
 #[cfg(feature = "audio")]
 use devices::virtio::vhost::user::vmm::Snd as VhostUserSnd;
 use devices::virtio::vhost::user::vmm::{
@@ -55,6 +59,7 @@ use devices::{
     PciAddress, PciBridge, PciDevice, PcieRootPort, StubPciDevice, VcpuRunState, VfioContainer,
     VfioDevice, VfioPciDevice, VfioPlatformDevice, VirtioPciDevice,
 };
+use devices::{CoIommuDev, IommuDevType};
 #[cfg(feature = "usb")]
 use devices::{HostBackendDeviceProvider, XhciController};
 use hypervisor::kvm::{Kvm, KvmVcpu, KvmVm};
@@ -119,6 +124,7 @@ struct SandboxConfig<'a> {
     seccomp_policy: &'a Path,
     uid_map: Option<&'a str>,
     gid_map: Option<&'a str>,
+    remount_mode: Option<c_ulong>,
 }
 
 fn create_base_minijail(
@@ -178,6 +184,10 @@ fn create_base_minijail(
         j.use_seccomp_filter();
         // Don't do init setup.
         j.run_as_init();
+        // Set up requested remount mode instead of default MS_PRIVATE.
+        if let Some(mode) = config.remount_mode {
+            j.set_remount_mode(mode);
+        }
     }
 
     // Only pivot_root if we are not re-using the current root directory.
@@ -211,6 +221,7 @@ fn simple_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
             seccomp_policy: &policy_path,
             uid_map: None,
             gid_map: None,
+            remount_mode: None,
         };
         Ok(Some(create_base_minijail(root_path, None, Some(&config))?))
     } else {
@@ -330,6 +341,21 @@ fn create_vhost_user_snd_device(cfg: &Config, option: &VhostUserOption) -> Devic
     })
 }
 
+fn create_vvu_proxy_device(cfg: &Config, opt: &VhostUserOption) -> DeviceResult {
+    let listener = UnixListener::bind(&opt.socket).map_err(|e| {
+        error!("failed to bind listener for vvu proxy device: {}", e);
+        e
+    })?;
+
+    let dev = VirtioVhostUser::new(virtio::base_features(cfg.protected_vm), listener)
+        .context("failed to create VVU proxy device")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(cfg, "vvu_proxy_device")?,
+    })
+}
+
 fn create_rng_device(cfg: &Config) -> DeviceResult {
     let dev = virtio::Rng::new(virtio::base_features(cfg.protected_vm))
         .context("failed to set up rng")?;
@@ -380,7 +406,6 @@ fn create_cras_snd_device(cfg: &Config, cras_snd: CrasSndParameters) -> DeviceRe
 fn create_tpm_device(cfg: &Config) -> DeviceResult {
     use std::ffi::CString;
     use std::fs;
-    use std::process;
 
     let tpm_storage: PathBuf;
     let mut tpm_jail = simple_jail(cfg, "tpm_device")?;
@@ -577,9 +602,19 @@ fn create_vinput_device(cfg: &Config, dev_path: &Path) -> DeviceResult {
     })
 }
 
-fn create_balloon_device(cfg: &Config, tube: Tube) -> DeviceResult {
-    let dev = virtio::Balloon::new(virtio::base_features(cfg.protected_vm), tube)
-        .context("failed to create balloon")?;
+fn create_balloon_device(
+    cfg: &Config,
+    tube: Tube,
+    inflate_tube: Option<Tube>,
+    init_balloon_size: u64,
+) -> DeviceResult {
+    let dev = virtio::Balloon::new(
+        virtio::base_features(cfg.protected_vm),
+        tube,
+        inflate_tube,
+        init_balloon_size,
+    )
+    .context("failed to create balloon")?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
@@ -794,6 +829,7 @@ fn gpu_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
                     "/usr/lib64",
                     "/lib",
                     "/lib64",
+                    "/usr/share/drirc.d",
                     "/usr/share/glvnd",
                     "/usr/share/vulkan",
                 ],
@@ -818,6 +854,45 @@ fn gpu_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
             Ok(Some(jail))
         }
         None => Ok(None),
+    }
+}
+
+#[cfg(feature = "gpu")]
+struct GpuCacheInfo<'a> {
+    directory: Option<&'a str>,
+    environment: Vec<(&'a str, &'a str)>,
+}
+
+#[cfg(feature = "gpu")]
+fn get_gpu_cache_info<'a>(
+    cache_dir: Option<&'a String>,
+    cache_size: Option<&'a String>,
+    sandbox: bool,
+) -> GpuCacheInfo<'a> {
+    let mut dir = None;
+    let mut env = Vec::new();
+
+    if let Some(cache_dir) = cache_dir {
+        if !Path::new(cache_dir).exists() {
+            warn!("shader caching dir {} does not exist", cache_dir);
+            env.push(("MESA_GLSL_CACHE_DISABLE", "true"));
+        } else if cfg!(any(target_arch = "arm", target_arch = "aarch64")) && sandbox {
+            warn!("shader caching not yet supported on ARM with sandbox enabled");
+            env.push(("MESA_GLSL_CACHE_DISABLE", "true"));
+        } else {
+            dir = Some(cache_dir.as_str());
+
+            env.push(("MESA_GLSL_CACHE_DISABLE", "false"));
+            env.push(("MESA_GLSL_CACHE_DIR", cache_dir.as_str()));
+            if let Some(cache_size) = cache_size {
+                env.push(("MESA_GLSL_CACHE_MAX_SIZE", cache_size.as_str()));
+            }
+        }
+    }
+
+    GpuCacheInfo {
+        directory: dir,
+        environment: env,
     }
 }
 
@@ -869,27 +944,18 @@ fn create_gpu_device(
     let jail = match gpu_jail(cfg, "gpu_device")? {
         Some(mut jail) => {
             // Prepare GPU shader disk cache directory.
-            if let Some(cache_dir) = cfg
+            let (cache_dir, cache_size) = cfg
                 .gpu_parameters
                 .as_ref()
-                .and_then(|params| params.cache_path.as_ref())
-            {
-                if cfg!(any(target_arch = "arm", target_arch = "aarch64")) && cfg.sandbox {
-                    warn!("shader caching not yet supported on ARM with sandbox enabled");
-                    env::set_var("MESA_GLSL_CACHE_DISABLE", "true");
-                } else {
-                    env::set_var("MESA_GLSL_CACHE_DISABLE", "false");
-                    env::set_var("MESA_GLSL_CACHE_DIR", cache_dir);
-                    if let Some(cache_size) = cfg
-                        .gpu_parameters
-                        .as_ref()
-                        .and_then(|params| params.cache_size.as_ref())
-                    {
-                        env::set_var("MESA_GLSL_CACHE_MAX_SIZE", cache_size);
-                    }
-                    let shadercache_path = Path::new(cache_dir);
-                    jail.mount_bind(shadercache_path, shadercache_path, true)?;
-                }
+                .map(|params| (params.cache_path.as_ref(), params.cache_size.as_ref()))
+                .unwrap();
+            let cache_info = get_gpu_cache_info(cache_dir, cache_size, cfg.sandbox);
+
+            if let Some(dir) = cache_info.directory {
+                jail.mount_bind(dir, dir, true)?;
+            }
+            for (key, val) in cache_info.environment {
+                env::set_var(key, val);
             }
 
             // Bind mount the wayland socket's directory into jail's root. This is necessary since
@@ -914,16 +980,63 @@ fn create_gpu_device(
 }
 
 #[cfg(feature = "gpu")]
+fn get_gpu_render_server_environment(cache_info: &GpuCacheInfo) -> Result<Vec<String>> {
+    let mut env = Vec::new();
+
+    let mut cache_env_keys = HashSet::with_capacity(cache_info.environment.len());
+    for (key, val) in cache_info.environment.iter() {
+        env.push(format!("{}={}", key, val));
+        cache_env_keys.insert(*key);
+    }
+
+    for (key_os, val_os) in env::vars_os() {
+        // minijail should accept OsStr rather than str...
+        let into_string_err = |_| anyhow!("invalid environment key/val");
+        let key = key_os.into_string().map_err(into_string_err)?;
+        let val = val_os.into_string().map_err(into_string_err)?;
+
+        if !cache_env_keys.contains(key.as_str()) {
+            env.push(format!("{}={}", key, val));
+        }
+    }
+
+    Ok(env)
+}
+
+#[cfg(feature = "gpu")]
+struct ScopedMinijail(Minijail);
+
+#[cfg(feature = "gpu")]
+impl Drop for ScopedMinijail {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
+}
+
+#[cfg(feature = "gpu")]
 fn start_gpu_render_server(
     cfg: &Config,
     render_server_parameters: &GpuRenderServerParameters,
-) -> Result<SafeDescriptor> {
+) -> Result<(Minijail, SafeDescriptor)> {
     let (server_socket, client_socket) =
         UnixSeqpacket::pair().context("failed to create render server socket")?;
 
+    let mut env = None;
     let jail = match gpu_jail(cfg, "gpu_render_server")? {
         Some(mut jail) => {
-            // TODO(olv) bind mount and enable shader cache
+            let cache_info = get_gpu_cache_info(
+                render_server_parameters.cache_path.as_ref(),
+                render_server_parameters.cache_size.as_ref(),
+                cfg.sandbox,
+            );
+
+            if let Some(dir) = cache_info.directory {
+                jail.mount_bind(dir, dir, true)?;
+            }
+
+            if !cache_info.environment.is_empty() {
+                env = Some(get_gpu_render_server_environment(&cache_info)?);
+            }
 
             // bind mount /dev/log for syslog
             let log_path = Path::new("/dev/log");
@@ -953,10 +1066,20 @@ fn start_gpu_render_server(
     let fd_str = server_socket.as_raw_descriptor().to_string();
     let args = [cmd_str, "--socket-fd", &fd_str];
 
-    jail.run(cmd, &inheritable_fds, &args)
-        .context("failed to start gpu render server")?;
+    let mut envp: Option<Vec<&str>> = None;
+    if let Some(ref env) = env {
+        envp = Some(env.iter().map(AsRef::as_ref).collect());
+    }
 
-    Ok(SafeDescriptor::from(client_socket))
+    jail.run_command(minijail::Command::new_for_path(
+        cmd,
+        &inheritable_fds,
+        &args,
+        envp.as_deref(),
+    )?)
+    .context("failed to start gpu render server")?;
+
+    Ok((jail, SafeDescriptor::from(client_socket)))
 }
 
 fn create_wayland_device(
@@ -1151,13 +1274,11 @@ fn create_fs_device(
             gid_map: Some(gid_map),
             log_failures: cfg.seccomp_log_failures,
             seccomp_policy: &seccomp_policy,
+            // We want bind mounts from the parent namespaces to propagate into the fs device's
+            // namespace.
+            remount_mode: Some(libc::MS_SLAVE),
         };
-        let mut jail = create_base_minijail(src, Some(max_open_files), Some(&config))?;
-        // We want bind mounts from the parent namespaces to propagate into the fs device's
-        // namespace.
-        jail.set_remount_mode(libc::MS_SLAVE);
-
-        jail
+        create_base_minijail(src, Some(max_open_files), Some(&config))?
     } else {
         create_base_minijail(src, Some(max_open_files), None)?
     };
@@ -1192,12 +1313,12 @@ fn create_9p_device(
             gid_map: Some(gid_map),
             log_failures: cfg.seccomp_log_failures,
             seccomp_policy: &seccomp_policy,
+            // We want bind mounts from the parent namespaces to propagate into the 9p server's
+            // namespace.
+            remount_mode: Some(libc::MS_SLAVE),
         };
 
-        let mut jail = create_base_minijail(src, Some(max_open_files), Some(&config))?;
-        // We want bind mounts from the parent namespaces to propagate into the 9p server's
-        // namespace.
-        jail.set_remount_mode(libc::MS_SLAVE);
+        let jail = create_base_minijail(src, Some(max_open_files), Some(&config))?;
 
         //  The shared directory becomes the root of the device's file system.
         let root = Path::new("/");
@@ -1397,11 +1518,14 @@ fn create_virtio_devices(
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
     vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
-    balloon_device_tube: Tube,
+    balloon_device_tube: Option<Tube>,
+    balloon_inflate_tube: Option<Tube>,
+    init_balloon_size: u64,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     fs_device_tubes: &mut Vec<Tube>,
+    #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -1484,7 +1608,14 @@ fn create_virtio_devices(
         devs.push(create_vinput_device(cfg, dev_path)?);
     }
 
-    devs.push(create_balloon_device(cfg, balloon_device_tube)?);
+    if let Some(balloon_device_tube) = balloon_device_tube {
+        devs.push(create_balloon_device(
+            cfg,
+            balloon_device_tube,
+            balloon_inflate_tube,
+            init_balloon_size,
+        )?);
+    }
 
     // We checked above that if the IP is defined, then the netmask is, too.
     for tap_fd in &cfg.tap_fd {
@@ -1529,6 +1660,10 @@ fn create_virtio_devices(
             host_tube,
             device_tube,
         )?);
+    }
+
+    for opt in &cfg.vvu_proxy {
+        devs.push(create_vvu_proxy_device(cfg, opt)?);
     }
 
     #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
@@ -1624,11 +1759,6 @@ fn create_virtio_devices(
                     jail: simple_jail(cfg, "input_device")?,
                 });
                 event_devices.push(EventDevice::keyboard(event_device_socket));
-            }
-
-            let mut render_server_fd = None;
-            if let Some(ref render_server_parameters) = gpu_parameters.render_server {
-                render_server_fd = Some(start_gpu_render_server(cfg, render_server_parameters)?);
             }
 
             devs.push(create_gpu_device(
@@ -1735,10 +1865,11 @@ fn create_vfio_device(
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
     bus_num: Option<u8>,
-    endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
-    iommu_enabled: bool,
+    iommu_endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
+    coiommu_endpoints: Option<&mut Vec<u16>>,
+    iommu_dev: IommuDevType,
 ) -> DeviceResult<(Box<VfioPciDevice>, Option<Minijail>)> {
-    let vfio_container = VfioCommonSetup::vfio_get_container(vfio_path, iommu_enabled)
+    let vfio_container = VfioCommonSetup::vfio_get_container(iommu_dev, Some(vfio_path))
         .context("failed to get vfio container")?;
 
     // create MSI, MSI-X, and Mem request sockets for each vfio device
@@ -1755,28 +1886,46 @@ fn create_vfio_device(
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
     let hotplug = bus_num.is_some();
+    let vfio_device_tube_vm = if hotplug {
+        let (vfio_host_tube_vm, device_tube_vm) = Tube::pair().context("failed to create tube")?;
+        control_tubes.push(TaggedControlTube::Vm(vfio_host_tube_vm));
+        Some(device_tube_vm)
+    } else {
+        None
+    };
 
-    let vfio_device =
-        VfioDevice::new_passthrough(&vfio_path, vm, vfio_container.clone(), iommu_enabled)
-            .context("failed to create vfio device")?;
+    let vfio_device = VfioDevice::new_passthrough(
+        &vfio_path,
+        vm,
+        vfio_container.clone(),
+        iommu_dev != IommuDevType::NoIommu,
+    )
+    .context("failed to create vfio device")?;
     let mut vfio_pci_device = Box::new(VfioPciDevice::new(
         vfio_device,
         bus_num,
         vfio_device_tube_msi,
         vfio_device_tube_msix,
         vfio_device_tube_mem,
+        vfio_device_tube_vm,
     ));
     // early reservation for pass-through PCI devices.
-    let endpoint_addr = vfio_pci_device.allocate_address(resources);
-    if endpoint_addr.is_err() {
-        warn!(
-            "address reservation failed for vfio {}",
-            vfio_pci_device.debug_label()
-        );
-    }
+    let endpoint_addr = vfio_pci_device
+        .allocate_address(resources)
+        .context("failed to allocate resources early for vfio pci dev")?;
 
-    if iommu_enabled {
-        endpoints.insert(endpoint_addr.unwrap().to_u32(), vfio_container);
+    match iommu_dev {
+        IommuDevType::NoIommu => {}
+        IommuDevType::VirtioIommu => {
+            iommu_endpoints.insert(endpoint_addr.to_u32(), vfio_container);
+        }
+        IommuDevType::CoIommu => {
+            if let Some(endpoints) = coiommu_endpoints {
+                endpoints.push(endpoint_addr.to_u32() as u16);
+            } else {
+                bail!("Missed coiommu_endpoints vector to store the endpoint addr");
+            }
+        }
     }
 
     if hotplug {
@@ -1793,17 +1942,22 @@ fn create_vfio_platform_device(
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
     _endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
-    iommu_enabled: bool,
+    iommu_dev: IommuDevType,
 ) -> DeviceResult<(VfioPlatformDevice, Option<Minijail>)> {
-    let vfio_container = VfioCommonSetup::vfio_get_container(vfio_path, iommu_enabled)
+    let vfio_container = VfioCommonSetup::vfio_get_container(iommu_dev, Some(vfio_path))
         .context("Failed to create vfio device")?;
 
     let (vfio_host_tube_mem, vfio_device_tube_mem) =
         Tube::pair().context("failed to create tube")?;
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
-    let vfio_device = VfioDevice::new_passthrough(&vfio_path, vm, vfio_container, iommu_enabled)
-        .context("Failed to create vfio device")?;
+    let vfio_device = VfioDevice::new_passthrough(
+        &vfio_path,
+        vm,
+        vfio_container,
+        iommu_dev != IommuDevType::NoIommu,
+    )
+    .context("Failed to create vfio device")?;
     let vfio_plat_dev = VfioPlatformDevice::new(vfio_device, vfio_device_tube_mem);
 
     Ok((vfio_plat_dev, simple_jail(cfg, "vfio_platform_device")?))
@@ -1819,13 +1973,127 @@ fn create_devices(
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
     vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
-    balloon_device_tube: Tube,
+    balloon_device_tube: Option<Tube>,
+    init_balloon_size: u64,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "usb")] usb_provider: HostBackendDeviceProvider,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
+    #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
+    let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
+    let mut balloon_inflate_tube: Option<Tube> = None;
+    if !cfg.vfio.is_empty() {
+        let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> =
+            BTreeMap::new();
+        let mut coiommu_attached_endpoints = Vec::new();
+
+        for vfio_dev in cfg
+            .vfio
+            .iter()
+            .filter(|dev| dev.get_type() == VfioType::Pci)
+        {
+            let vfio_path = &vfio_dev.vfio_path;
+            let (vfio_pci_device, jail) = create_vfio_device(
+                cfg,
+                vm,
+                resources,
+                control_tubes,
+                vfio_path.as_path(),
+                None,
+                &mut iommu_attached_endpoints,
+                Some(&mut coiommu_attached_endpoints),
+                vfio_dev.iommu_dev_type(),
+            )?;
+
+            devices.push((vfio_pci_device, jail));
+        }
+
+        for vfio_dev in cfg
+            .vfio
+            .iter()
+            .filter(|dev| dev.get_type() == VfioType::Platform)
+        {
+            let vfio_path = &vfio_dev.vfio_path;
+            let (vfio_plat_dev, jail) = create_vfio_platform_device(
+                cfg,
+                vm,
+                resources,
+                control_tubes,
+                vfio_path.as_path(),
+                &mut iommu_attached_endpoints,
+                IommuDevType::NoIommu, // Virtio IOMMU is not supported yet
+            )?;
+
+            devices.push((Box::new(vfio_plat_dev), jail));
+        }
+
+        if !coiommu_attached_endpoints.is_empty() || !iommu_attached_endpoints.is_empty() {
+            let mut buf = mem::MaybeUninit::<libc::rlimit>::zeroed();
+            let res = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, buf.as_mut_ptr()) };
+            if res == 0 {
+                let limit = unsafe { buf.assume_init() };
+                let rlim_new = limit
+                    .rlim_cur
+                    .saturating_add(vm.get_memory().memory_size() as libc::rlim_t);
+                let rlim_max = max(limit.rlim_max, rlim_new);
+                if limit.rlim_cur < rlim_new {
+                    let limit_arg = libc::rlimit {
+                        rlim_cur: rlim_new as libc::rlim_t,
+                        rlim_max: rlim_max as libc::rlim_t,
+                    };
+                    let res = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit_arg) };
+                    if res != 0 {
+                        bail!("Set rlimit failed");
+                    }
+                }
+            } else {
+                bail!("Get rlimit failed");
+            }
+        }
+
+        if !iommu_attached_endpoints.is_empty() {
+            let iommu_dev = create_iommu_device(cfg, phys_max_addr, iommu_attached_endpoints)?;
+
+            let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
+            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+            let mut dev =
+                VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
+                    .context("failed to create virtio pci dev")?;
+            // early reservation for viommu.
+            dev.allocate_address(resources)
+                .context("failed to allocate resources early for virtio pci dev")?;
+            let dev = Box::new(dev);
+            devices.push((dev, iommu_dev.jail));
+        }
+
+        if !coiommu_attached_endpoints.is_empty() {
+            let vfio_container =
+                VfioCommonSetup::vfio_get_container(IommuDevType::CoIommu, None as Option<&Path>)
+                    .context("failed to get vfio container")?;
+            let (coiommu_host_tube, coiommu_device_tube) =
+                Tube::pair().context("failed to create coiommu tube")?;
+            control_tubes.push(TaggedControlTube::VmMemory(coiommu_host_tube));
+            let vcpu_count = cfg.vcpu_count.unwrap_or(1) as u64;
+            let (coiommu_tube, balloon_tube) =
+                Tube::pair().context("failed to create coiommu tube")?;
+            balloon_inflate_tube = Some(balloon_tube);
+            let dev = CoIommuDev::new(
+                vm.get_memory().clone(),
+                vfio_container,
+                coiommu_device_tube,
+                coiommu_tube,
+                coiommu_attached_endpoints,
+                vcpu_count,
+                cfg.coiommu_param.unwrap_or_default(),
+            )
+            .context("failed to create coiommu device")?;
+
+            devices.push((Box::new(dev), simple_jail(cfg, "coiommu")?));
+        }
+    }
+
     let stubs = create_virtio_devices(
         cfg,
         vm,
@@ -1835,13 +2103,15 @@ fn create_devices(
         gpu_device_tube,
         vhost_user_gpu_tubes,
         balloon_device_tube,
+        balloon_inflate_tube,
+        init_balloon_size,
         disk_device_tubes,
         pmem_device_tubes,
         map_request,
         fs_device_tubes,
+        #[cfg(feature = "gpu")]
+        render_server_fd,
     )?;
-
-    let mut devices = Vec::new();
 
     for stub in stubs {
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
@@ -1867,71 +2137,62 @@ fn create_devices(
         devices.push((usb_controller, simple_jail(cfg, "xhci")?));
     }
 
-    if !cfg.vfio.is_empty() {
-        let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> =
-            BTreeMap::new();
-
-        for vfio_dev in cfg
-            .vfio
-            .iter()
-            .filter(|dev| dev.get_type() == VfioType::Pci)
-        {
-            let vfio_path = &vfio_dev.vfio_path;
-            let (vfio_pci_device, jail) = create_vfio_device(
-                cfg,
-                vm,
-                resources,
-                control_tubes,
-                vfio_path.as_path(),
-                None,
-                &mut iommu_attached_endpoints,
-                vfio_dev.iommu_enabled(),
-            )?;
-
-            devices.push((vfio_pci_device, jail));
-        }
-
-        for vfio_dev in cfg
-            .vfio
-            .iter()
-            .filter(|dev| dev.get_type() == VfioType::Platform)
-        {
-            let vfio_path = &vfio_dev.vfio_path;
-            let (vfio_plat_dev, jail) = create_vfio_platform_device(
-                cfg,
-                vm,
-                resources,
-                control_tubes,
-                vfio_path.as_path(),
-                &mut iommu_attached_endpoints,
-                false, // Virtio IOMMU is not supported yet
-            )?;
-
-            devices.push((Box::new(vfio_plat_dev), jail));
-        }
-
-        if !iommu_attached_endpoints.is_empty() {
-            let iommu_dev = create_iommu_device(cfg, phys_max_addr, iommu_attached_endpoints)?;
-
-            let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
-            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
-            let mut dev =
-                VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
-                    .context("failed to create virtio pci dev")?;
-            // early reservation for viommu.
-            dev.allocate_address(resources)
-                .context("failed to allocate resources early for virtio pci dev")?;
-            let dev = Box::new(dev);
-            devices.push((dev, iommu_dev.jail));
-        }
-    }
-
     for params in &cfg.stub_pci_devices {
         // Stub devices don't need jailing since they don't do anything.
         devices.push((Box::new(StubPciDevice::new(params)), None));
     }
 
     Ok(devices)
+}
+
+fn create_file_backed_mappings(
+    cfg: &Config,
+    vm: &mut impl Vm,
+    resources: &mut SystemAllocator,
+) -> Result<()> {
+    for mapping in &cfg.file_backed_mappings {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(mapping.writable)
+            .custom_flags(if mapping.sync { libc::O_SYNC } else { 0 })
+            .open(&mapping.path)
+            .context("failed to open file for file-backed mapping")?;
+        let prot = if mapping.writable {
+            Protection::read_write()
+        } else {
+            Protection::read()
+        };
+        let size = mapping
+            .size
+            .try_into()
+            .context("Invalid size for file-backed mapping")?;
+        let memory_mapping = MemoryMappingBuilder::new(size)
+            .from_file(&file)
+            .offset(mapping.offset)
+            .protection(prot)
+            .build()
+            .context("failed to map backing file for file-backed mapping")?;
+
+        resources
+            .mmio_allocator_any()
+            .allocate_at(
+                mapping.address,
+                mapping.size,
+                Alloc::FileBacked(mapping.address),
+                "file-backed mapping".to_owned(),
+            )
+            .context("failed to allocate guest address for file-backed mapping")?;
+
+        vm.add_memory_region(
+            GuestAddress(mapping.address),
+            Box::new(memory_mapping),
+            !mapping.writable,
+            /* log_dirty_pages = */ false,
+        )
+        .context("failed to configure file-backed mapping")?;
+    }
+
+    Ok(())
 }
 
 #[derive(Copy, Clone)]
@@ -2040,6 +2301,7 @@ fn runnable_vcpu<V>(
     use_hypervisor_signals: bool,
     enable_per_vm_core_scheduling: bool,
     host_cpu_topology: bool,
+    vcpu_cgroup_tasks_file: Option<File>,
 ) -> Result<(V, VcpuRunHandle)>
 where
     V: VcpuArch,
@@ -2088,6 +2350,12 @@ where
         if let Err(e) = enable_core_scheduling() {
             error!("Failed to enable core scheduling: {}", e);
         }
+    }
+
+    // Move vcpu thread to cgroup
+    if let Some(mut f) = vcpu_cgroup_tasks_file {
+        f.write_all(base::gettid().to_string().as_bytes())
+            .context("failed to write vcpu tid to cgroup tasks")?;
     }
 
     if run_rt {
@@ -2208,6 +2476,8 @@ fn run_vcpu<V>(
     mut io_bus: devices::Bus,
     mut mmio_bus: devices::Bus,
     exit_evt: Event,
+    reset_evt: Event,
+    crash_evt: Event,
     requires_pvclock_ctrl: bool,
     from_main_tube: mpsc::Receiver<VcpuControl>,
     use_hypervisor_signals: bool,
@@ -2216,6 +2486,7 @@ fn run_vcpu<V>(
     >,
     enable_per_vm_core_scheduling: bool,
     host_cpu_topology: bool,
+    vcpu_cgroup_tasks_file: Option<File>,
 ) -> Result<JoinHandle<()>>
 where
     V: VcpuArch + 'static,
@@ -2223,9 +2494,10 @@ where
     thread::Builder::new()
         .name(format!("crosvm_vcpu{}", cpu_id))
         .spawn(move || {
-            // The VCPU thread must trigger the `exit_evt` in all paths, and a `ScopedEvent`'s Drop
-            // implementation accomplishes that.
-            let _scoped_exit_evt = ScopedEvent::from(exit_evt);
+            // The VCPU thread must trigger either `exit_evt` or `reset_event` in all paths. A
+            // `ScopedEvent`'s Drop implementation ensures that the `exit_evt` will be sent if
+            // anything happens before we get to writing the final event.
+            let scoped_exit_evt = ScopedEvent::from(exit_evt);
 
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             let guest_mem = vm.get_memory().clone();
@@ -2243,6 +2515,7 @@ where
                 use_hypervisor_signals,
                 enable_per_vm_core_scheduling,
                 host_cpu_topology,
+                vcpu_cgroup_tasks_file,
             );
 
             start_barrier.wait();
@@ -2255,6 +2528,7 @@ where
                 }
             };
 
+            #[allow(unused_mut)]
             let mut run_mode = VmRunMode::Running;
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             if to_gdb_tube.is_some() {
@@ -2262,225 +2536,293 @@ where
                 run_mode = VmRunMode::Breakpoint;
             }
 
-            let mut interrupted_by_signal = false;
-
             mmio_bus.set_access_id(cpu_id);
             io_bus.set_access_id(cpu_id);
 
-            'vcpu_loop: loop {
-                // Start by checking for messages to process and the run state of the CPU.
-                // An extra check here for Running so there isn't a need to call recv unless a
-                // message is likely to be ready because a signal was sent.
-                if interrupted_by_signal || run_mode != VmRunMode::Running {
-                    'state_loop: loop {
-                        // Tries to get a pending message without blocking first.
-                        let msg = match from_main_tube.try_recv() {
-                            Ok(m) => m,
-                            Err(mpsc::TryRecvError::Empty) if run_mode == VmRunMode::Running => {
-                                // If the VM is running and no message is pending, the state won't
-                                // change.
-                                break 'state_loop;
-                            }
-                            Err(mpsc::TryRecvError::Empty) => {
-                                // If the VM is not running, wait until a message is ready.
-                                match from_main_tube.recv() {
-                                    Ok(m) => m,
-                                    Err(mpsc::RecvError) => {
-                                        error!("Failed to read from main tube in vcpu");
-                                        break 'vcpu_loop;
-                                    }
-                                }
-                            }
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                error!("Failed to read from main tube in vcpu");
-                                break 'vcpu_loop;
-                            }
-                        };
+            let exit_reason = vcpu_loop(
+                run_mode,
+                cpu_id,
+                vcpu,
+                vcpu_run_handle,
+                irq_chip,
+                run_rt,
+                delay_rt,
+                io_bus,
+                mmio_bus,
+                requires_pvclock_ctrl,
+                from_main_tube,
+                use_hypervisor_signals,
+                #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+                to_gdb_tube,
+                #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+                guest_mem,
+            );
 
-                        // Collect all pending messages.
-                        let mut messages = vec![msg];
-                        messages.append(&mut from_main_tube.try_iter().collect());
-
-                        for msg in messages {
-                            match msg {
-                                VcpuControl::RunState(new_mode) => {
-                                    run_mode = new_mode;
-                                    match run_mode {
-                                        VmRunMode::Running => break 'state_loop,
-                                        VmRunMode::Suspending => {
-                                            // On KVM implementations that use a paravirtualized
-                                            // clock (e.g. x86), a flag must be set to indicate to
-                                            // the guest kernel that a vCPU was suspended. The guest
-                                            // kernel will use this flag to prevent the soft lockup
-                                            // detection from triggering when this vCPU resumes,
-                                            // which could happen days later in realtime.
-                                            if requires_pvclock_ctrl {
-                                                if let Err(e) = vcpu.pvclock_ctrl() {
-                                                    error!(
-                                                        "failed to tell hypervisor vcpu {} is suspending: {}",
-                                                        cpu_id, e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        VmRunMode::Breakpoint => {}
-                                        VmRunMode::Exiting => break 'vcpu_loop,
-                                    }
-                                }
-                                #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
-                                VcpuControl::Debug(d) => {
-                                    match &to_gdb_tube {
-                                        Some(ref ch) => {
-                                            if let Err(e) = handle_debug_msg(
-                                                cpu_id, &vcpu, &guest_mem, d, ch,
-                                            ) {
-                                                error!("Failed to handle gdb message: {}", e);
-                                            }
-                                        },
-                                        None => {
-                                            error!("VcpuControl::Debug received while GDB feature is disabled: {:?}", d);
-                                        }
-                                    }
-                                }
-                                VcpuControl::MakeRT => {
-                                    if run_rt && delay_rt {
-                                        info!("Making vcpu {} RT\n", cpu_id);
-                                        const DEFAULT_VCPU_RT_LEVEL: u16 = 6;
-                                        if let Err(e) = set_rt_prio_limit(
-                                            u64::from(DEFAULT_VCPU_RT_LEVEL))
-                                            .and_then(|_|
-                                                set_rt_round_robin(
-                                                i32::from(DEFAULT_VCPU_RT_LEVEL)
-                                            ))
-                                        {
-                                            warn!("Failed to set vcpu to real time: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                interrupted_by_signal = false;
-
-                // Vcpus may have run a HLT instruction, which puts them into a state other than
-                // VcpuRunState::Runnable. In that case, this call to wait_until_runnable blocks
-                // until either the irqchip receives an interrupt for this vcpu, or until the main
-                // thread kicks this vcpu as a result of some VmControl operation. In most IrqChip
-                // implementations HLT instructions do not make it to crosvm, and thus this is a
-                // no-op that always returns VcpuRunState::Runnable.
-                match irq_chip.wait_until_runnable(&vcpu) {
-                    Ok(VcpuRunState::Runnable) => {}
-                    Ok(VcpuRunState::Interrupted) => interrupted_by_signal = true,
-                    Err(e) => error!(
-                        "error waiting for vcpu {} to become runnable: {}",
-                        cpu_id, e
-                    ),
-                }
-
-                if !interrupted_by_signal {
-                    match vcpu.run(&vcpu_run_handle) {
-                        Ok(VcpuExit::IoIn { port, mut size }) => {
-                            let mut data = [0; 8];
-                            if size > data.len() {
-                                error!("unsupported IoIn size of {} bytes at port {:#x}", size, port);
-                                size = data.len();
-                            }
-                            io_bus.read(port as u64, &mut data[..size]);
-                            if let Err(e) = vcpu.set_data(&data[..size]) {
-                                error!("failed to set return data for IoIn at port {:#x}: {}", port, e);
-                            }
-                        }
-                        Ok(VcpuExit::IoOut {
-                            port,
-                            mut size,
-                            data,
-                        }) => {
-                            if size > data.len() {
-                                error!("unsupported IoOut size of {} bytes at port {:#x}", size, port);
-                                size = data.len();
-                            }
-                            io_bus.write(port as u64, &data[..size]);
-                        }
-                        Ok(VcpuExit::MmioRead { address, size }) => {
-                            let mut data = [0; 8];
-                            mmio_bus.read(address, &mut data[..size]);
-                            // Setting data for mmio can not fail.
-                            let _ = vcpu.set_data(&data[..size]);
-                        }
-                        Ok(VcpuExit::MmioWrite {
-                            address,
-                            size,
-                            data,
-                        }) => {
-                            mmio_bus.write(address, &data[..size]);
-                        }
-                        Ok(VcpuExit::IoapicEoi { vector }) => {
-                            if let Err(e) = irq_chip.broadcast_eoi(vector) {
-                                error!(
-                                    "failed to broadcast eoi {} on vcpu {}: {}",
-                                    vector, cpu_id, e
-                                );
-                            }
-                        }
-                        Ok(VcpuExit::IrqWindowOpen) => {}
-                        Ok(VcpuExit::Hlt) => irq_chip.halted(cpu_id),
-                        Ok(VcpuExit::Shutdown) => break,
-                        Ok(VcpuExit::FailEntry {
-                            hardware_entry_failure_reason,
-                        }) => {
-                            error!("vcpu hw run failure: {:#x}", hardware_entry_failure_reason);
-                            break;
-                        }
-                        Ok(VcpuExit::SystemEvent(_, _)) => break,
-                        Ok(VcpuExit::Debug { .. }) => {
-                            #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
-                            {
-                                let msg = VcpuDebugStatusMessage {
-                                    cpu: cpu_id as usize,
-                                    msg: VcpuDebugStatus::HitBreakPoint,
-                                };
-                                if let Some(ref ch) = to_gdb_tube {
-                                    if let Err(e) = ch.send(msg) {
-                                        error!("failed to notify breakpoint to GDB thread: {}", e);
-                                        break;
-                                    }
-                                }
-                                run_mode = VmRunMode::Breakpoint;
-                            }
-                        }
-                        Ok(r) => warn!("unexpected vcpu exit: {:?}", r),
-                        Err(e) => match e.errno() {
-                            libc::EINTR => interrupted_by_signal = true,
-                            libc::EAGAIN => {}
-                            _ => {
-                                error!("vcpu hit unknown error: {}", e);
-                                break;
-                            }
-                        },
-                    }
-                }
-
-                if interrupted_by_signal {
-                    if use_hypervisor_signals {
-                        // Try to clear the signal that we use to kick VCPU if it is pending before
-                        // attempting to handle pause requests.
-                        if let Err(e) = clear_signal(SIGRTMIN() + 0) {
-                            error!("failed to clear pending signal: {}", e);
-                            break;
-                        }
-                    } else {
-                        vcpu.set_immediate_exit(false);
-                    }
-                }
-
-                if let Err(e) = irq_chip.inject_interrupts(&vcpu) {
-                    error!("failed to inject interrupts for vcpu {}: {}", cpu_id, e);
-                }
+            let exit_evt = scoped_exit_evt.into();
+            let final_event = match exit_reason {
+                ExitState::Stop => exit_evt,
+                ExitState::Reset => reset_evt,
+                ExitState::Crash => crash_evt,
+            };
+            if let Err(e) = final_event.write(1) {
+                error!(
+                    "failed to send final event {:?} on vcpu {}: {}",
+                    final_event, cpu_id, e
+                )
             }
         })
         .context("failed to spawn VCPU thread")
+}
+
+fn vcpu_loop<V>(
+    mut run_mode: VmRunMode,
+    cpu_id: usize,
+    vcpu: V,
+    vcpu_run_handle: VcpuRunHandle,
+    irq_chip: Box<dyn IrqChipArch + 'static>,
+    run_rt: bool,
+    delay_rt: bool,
+    io_bus: devices::Bus,
+    mmio_bus: devices::Bus,
+    requires_pvclock_ctrl: bool,
+    from_main_tube: mpsc::Receiver<VcpuControl>,
+    use_hypervisor_signals: bool,
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))] to_gdb_tube: Option<
+        mpsc::Sender<VcpuDebugStatusMessage>,
+    >,
+    #[cfg(all(target_arch = "x86_64", feature = "gdb"))] guest_mem: GuestMemory,
+) -> ExitState
+where
+    V: VcpuArch + 'static,
+{
+    let mut interrupted_by_signal = false;
+
+    loop {
+        // Start by checking for messages to process and the run state of the CPU.
+        // An extra check here for Running so there isn't a need to call recv unless a
+        // message is likely to be ready because a signal was sent.
+        if interrupted_by_signal || run_mode != VmRunMode::Running {
+            'state_loop: loop {
+                // Tries to get a pending message without blocking first.
+                let msg = match from_main_tube.try_recv() {
+                    Ok(m) => m,
+                    Err(mpsc::TryRecvError::Empty) if run_mode == VmRunMode::Running => {
+                        // If the VM is running and no message is pending, the state won't
+                        // change.
+                        break 'state_loop;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // If the VM is not running, wait until a message is ready.
+                        match from_main_tube.recv() {
+                            Ok(m) => m,
+                            Err(mpsc::RecvError) => {
+                                error!("Failed to read from main tube in vcpu");
+                                return ExitState::Crash;
+                            }
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        error!("Failed to read from main tube in vcpu");
+                        return ExitState::Crash;
+                    }
+                };
+
+                // Collect all pending messages.
+                let mut messages = vec![msg];
+                messages.append(&mut from_main_tube.try_iter().collect());
+
+                for msg in messages {
+                    match msg {
+                        VcpuControl::RunState(new_mode) => {
+                            run_mode = new_mode;
+                            match run_mode {
+                                VmRunMode::Running => break 'state_loop,
+                                VmRunMode::Suspending => {
+                                    // On KVM implementations that use a paravirtualized
+                                    // clock (e.g. x86), a flag must be set to indicate to
+                                    // the guest kernel that a vCPU was suspended. The guest
+                                    // kernel will use this flag to prevent the soft lockup
+                                    // detection from triggering when this vCPU resumes,
+                                    // which could happen days later in realtime.
+                                    if requires_pvclock_ctrl {
+                                        if let Err(e) = vcpu.pvclock_ctrl() {
+                                            error!(
+                                                "failed to tell hypervisor vcpu {} is suspending: {}",
+                                                cpu_id, e
+                                            );
+                                        }
+                                    }
+                                }
+                                VmRunMode::Breakpoint => {}
+                                VmRunMode::Exiting => return ExitState::Stop,
+                            }
+                        }
+                        #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+                        VcpuControl::Debug(d) => match &to_gdb_tube {
+                            Some(ref ch) => {
+                                if let Err(e) = handle_debug_msg(cpu_id, &vcpu, &guest_mem, d, ch) {
+                                    error!("Failed to handle gdb message: {}", e);
+                                }
+                            }
+                            None => {
+                                error!("VcpuControl::Debug received while GDB feature is disabled: {:?}", d);
+                            }
+                        },
+                        VcpuControl::MakeRT => {
+                            if run_rt && delay_rt {
+                                info!("Making vcpu {} RT\n", cpu_id);
+                                const DEFAULT_VCPU_RT_LEVEL: u16 = 6;
+                                if let Err(e) = set_rt_prio_limit(u64::from(DEFAULT_VCPU_RT_LEVEL))
+                                    .and_then(|_| {
+                                        set_rt_round_robin(i32::from(DEFAULT_VCPU_RT_LEVEL))
+                                    })
+                                {
+                                    warn!("Failed to set vcpu to real time: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        interrupted_by_signal = false;
+
+        // Vcpus may have run a HLT instruction, which puts them into a state other than
+        // VcpuRunState::Runnable. In that case, this call to wait_until_runnable blocks
+        // until either the irqchip receives an interrupt for this vcpu, or until the main
+        // thread kicks this vcpu as a result of some VmControl operation. In most IrqChip
+        // implementations HLT instructions do not make it to crosvm, and thus this is a
+        // no-op that always returns VcpuRunState::Runnable.
+        match irq_chip.wait_until_runnable(&vcpu) {
+            Ok(VcpuRunState::Runnable) => {}
+            Ok(VcpuRunState::Interrupted) => interrupted_by_signal = true,
+            Err(e) => error!(
+                "error waiting for vcpu {} to become runnable: {}",
+                cpu_id, e
+            ),
+        }
+
+        if !interrupted_by_signal {
+            match vcpu.run(&vcpu_run_handle) {
+                Ok(VcpuExit::IoIn { port, mut size }) => {
+                    let mut data = [0; 8];
+                    if size > data.len() {
+                        error!(
+                            "unsupported IoIn size of {} bytes at port {:#x}",
+                            size, port
+                        );
+                        size = data.len();
+                    }
+                    io_bus.read(port as u64, &mut data[..size]);
+                    if let Err(e) = vcpu.set_data(&data[..size]) {
+                        error!(
+                            "failed to set return data for IoIn at port {:#x}: {}",
+                            port, e
+                        );
+                    }
+                }
+                Ok(VcpuExit::IoOut {
+                    port,
+                    mut size,
+                    data,
+                }) => {
+                    if size > data.len() {
+                        error!(
+                            "unsupported IoOut size of {} bytes at port {:#x}",
+                            size, port
+                        );
+                        size = data.len();
+                    }
+                    io_bus.write(port as u64, &data[..size]);
+                }
+                Ok(VcpuExit::MmioRead { address, size }) => {
+                    let mut data = [0; 8];
+                    mmio_bus.read(address, &mut data[..size]);
+                    // Setting data for mmio can not fail.
+                    let _ = vcpu.set_data(&data[..size]);
+                }
+                Ok(VcpuExit::MmioWrite {
+                    address,
+                    size,
+                    data,
+                }) => {
+                    mmio_bus.write(address, &data[..size]);
+                }
+                Ok(VcpuExit::IoapicEoi { vector }) => {
+                    if let Err(e) = irq_chip.broadcast_eoi(vector) {
+                        error!(
+                            "failed to broadcast eoi {} on vcpu {}: {}",
+                            vector, cpu_id, e
+                        );
+                    }
+                }
+                Ok(VcpuExit::IrqWindowOpen) => {}
+                Ok(VcpuExit::Hlt) => irq_chip.halted(cpu_id),
+                Ok(VcpuExit::Shutdown) => return ExitState::Stop,
+                Ok(VcpuExit::FailEntry {
+                    hardware_entry_failure_reason,
+                }) => {
+                    error!("vcpu hw run failure: {:#x}", hardware_entry_failure_reason);
+                    return ExitState::Crash;
+                }
+                Ok(VcpuExit::SystemEventShutdown) => {
+                    info!("system shutdown event on vcpu {}", cpu_id);
+                    return ExitState::Stop;
+                }
+                Ok(VcpuExit::SystemEventReset) => {
+                    info!("system reset event");
+                    return ExitState::Reset;
+                }
+                Ok(VcpuExit::SystemEventCrash) => {
+                    info!("system crash event on vcpu {}", cpu_id);
+                    return ExitState::Stop;
+                }
+                #[rustfmt::skip] Ok(VcpuExit::Debug { .. }) => {
+                    #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+                    {
+                        let msg = VcpuDebugStatusMessage {
+                            cpu: cpu_id as usize,
+                            msg: VcpuDebugStatus::HitBreakPoint,
+                        };
+                        if let Some(ref ch) = to_gdb_tube {
+                            if let Err(e) = ch.send(msg) {
+                                error!("failed to notify breakpoint to GDB thread: {}", e);
+                                return ExitState::Crash;
+                            }
+                        }
+                        run_mode = VmRunMode::Breakpoint;
+                    }
+                }
+                Ok(r) => warn!("unexpected vcpu exit: {:?}", r),
+                Err(e) => match e.errno() {
+                    libc::EINTR => interrupted_by_signal = true,
+                    libc::EAGAIN => {}
+                    _ => {
+                        error!("vcpu hit unknown error: {}", e);
+                        return ExitState::Crash;
+                    }
+                },
+            }
+        }
+
+        if interrupted_by_signal {
+            if use_hypervisor_signals {
+                // Try to clear the signal that we use to kick VCPU if it is pending before
+                // attempting to handle pause requests.
+                if let Err(e) = clear_signal(SIGRTMIN() + 0) {
+                    error!("failed to clear pending signal: {}", e);
+                    return ExitState::Crash;
+                }
+            } else {
+                vcpu.set_immediate_exit(false);
+            }
+        }
+
+        if let Err(e) = irq_chip.inject_interrupts(&vcpu) {
+            error!("failed to inject interrupts for vcpu {}: {}", cpu_id, e);
+        }
+    }
 }
 
 fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
@@ -2571,9 +2913,11 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     })
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ExitState {
     Reset,
     Stop,
+    Crash,
 }
 
 pub fn run_config(cfg: Config) -> Result<ExitState> {
@@ -2589,6 +2933,10 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
     guest_mem.set_memory_policy(mem_policy);
     let kvm = Kvm::new_with_path(&cfg.kvm_device_path).context("failed to create kvm")?;
     let vm = KvmVm::new(&kvm, guest_mem, components.protected_vm).context("failed to create vm")?;
+    // Check that the VM was actually created in protected mode as expected.
+    if cfg.protected_vm != ProtectionType::Unprotected && !vm.check_capability(VmCap::Protected) {
+        bail!("Failed to create protected VM");
+    }
     let vm_clone = vm.try_clone().context("failed to clone vm")?;
 
     enum KvmIrqChip {
@@ -2699,12 +3047,28 @@ where
 
     let (wayland_host_tube, wayland_device_tube) = Tube::pair().context("failed to create tube")?;
     control_tubes.push(TaggedControlTube::VmMemory(wayland_host_tube));
-    // Balloon gets a special socket so balloon requests can be forwarded from the main process.
-    let (balloon_host_tube, balloon_device_tube) = Tube::pair().context("failed to create tube")?;
-    // Set recv timeout to avoid deadlock on sending BalloonControlCommand before guest is ready.
-    balloon_host_tube
-        .set_recv_timeout(Some(Duration::from_millis(100)))
-        .context("failed to create tube")?;
+
+    let (balloon_host_tube, balloon_device_tube) = if cfg.balloon {
+        if let Some(ref path) = cfg.balloon_control {
+            (
+                None,
+                Some(Tube::new(
+                    UnixSeqpacket::connect(path).context("failed to create balloon control")?,
+                )),
+            )
+        } else {
+            // Balloon gets a special socket so balloon requests can be forwarded
+            // from the main process.
+            let (host, device) = Tube::pair().context("failed to create tube")?;
+            // Set recv timeout to avoid deadlock on sending BalloonControlCommand
+            // before the guest is ready.
+            host.set_recv_timeout(Some(Duration::from_millis(100)))
+                .context("failed to set timeout")?;
+            (Some(host), Some(device))
+        }
+    } else {
+        (None, None)
+    };
 
     // Create one control socket per disk.
     let mut disk_device_tubes = Vec::new();
@@ -2778,6 +3142,7 @@ where
 
     let exit_evt = Event::new().context("failed to create event")?;
     let reset_evt = Event::new().context("failed to create event")?;
+    let crash_evt = Event::new().context("failed to create event")?;
     let mut sys_allocator = Arch::create_system_allocator(&vm);
 
     // Allocate the ramoops region first. AArch64::build_vm() assumes this.
@@ -2789,7 +3154,31 @@ where
         None => None,
     };
 
+    create_file_backed_mappings(&cfg, &mut vm, &mut sys_allocator)?;
+
     let phys_max_addr = (1u64 << vm.get_guest_phys_addr_bits()) - 1;
+
+    #[cfg(feature = "gpu")]
+    // Hold on to the render server jail so it keeps running until we exit run_vm()
+    let mut _render_server_jail = None;
+    #[cfg(feature = "gpu")]
+    let mut render_server_fd = None;
+    #[cfg(feature = "gpu")]
+    if let Some(gpu_parameters) = &cfg.gpu_parameters {
+        if let Some(ref render_server_parameters) = gpu_parameters.render_server {
+            let (jail, fd) = start_gpu_render_server(&cfg, render_server_parameters)?;
+            _render_server_jail = Some(ScopedMinijail(jail));
+            render_server_fd = Some(fd);
+        }
+    }
+
+    let init_balloon_size = components
+        .memory_size
+        .checked_sub(cfg.init_memory.map_or(components.memory_size, |m| {
+            m.checked_mul(1024 * 1024).unwrap_or(u64::MAX)
+        }))
+        .context("failed to calculate init balloon size")?;
+
     let mut devices = create_devices(
         &cfg,
         &mut vm,
@@ -2801,12 +3190,15 @@ where
         gpu_device_tube,
         vhost_user_gpu_tubes,
         balloon_device_tube,
+        init_balloon_size,
         &mut disk_device_tubes,
         &mut pmem_device_tubes,
         &mut fs_device_tubes,
         #[cfg(feature = "usb")]
         usb_provider,
         Arc::clone(&map_request),
+        #[cfg(feature = "gpu")]
+        render_server_fd,
     )?;
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -2936,6 +3328,7 @@ where
     run_control(
         linux,
         sys_allocator,
+        cfg,
         control_server_socket,
         control_tubes,
         balloon_host_tube,
@@ -2944,12 +3337,10 @@ where
         usb_control_tube,
         exit_evt,
         reset_evt,
+        crash_evt,
         sigchld_fd,
-        cfg.sandbox,
         Arc::clone(&map_request),
         gralloc,
-        cfg.per_vm_core_scheduling,
-        cfg.host_cpu_topology,
         kvm_vcpu_ids,
     )
 }
@@ -2966,7 +3357,6 @@ fn get_hp_bus<V: VmArch, Vcpu: VcpuArch>(
     Err(anyhow!("Failed to find a suitable hotplug bus"))
 }
 
-#[allow(dead_code)]
 fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     linux: &mut RunnableLinuxVm<V, Vcpu>,
     sys_allocator: &mut SystemAllocator,
@@ -2993,7 +3383,8 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
         vfio_path,
         Some(bus_num),
         &mut endpoints,
-        false,
+        None,
+        IommuDevType::NoIommu,
     )?;
 
     let pci_address = Arch::register_pci_device(linux, vfio_pci_device, jail, sys_allocator)
@@ -3013,7 +3404,6 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn remove_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     linux: &RunnableLinuxVm<V, Vcpu>,
     sys_allocator: &mut SystemAllocator,
@@ -3039,6 +3429,30 @@ fn remove_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     Err(anyhow!("HotPlugBus hasn't been implemented"))
 }
 
+fn handle_vfio_command<V: VmArch, Vcpu: VcpuArch>(
+    linux: &mut RunnableLinuxVm<V, Vcpu>,
+    sys_allocator: &mut SystemAllocator,
+    cfg: &Config,
+    add_tubes: &mut Vec<TaggedControlTube>,
+    vfio_path: &Path,
+    add: bool,
+) -> VmResponse {
+    let ret = if add {
+        add_vfio_device(linux, sys_allocator, cfg, add_tubes, vfio_path)
+    } else {
+        remove_vfio_device(linux, sys_allocator, vfio_path)
+    };
+
+    match ret {
+        Ok(()) => VmResponse::Ok,
+        Err(e) => {
+            error!("hanlde_vfio_command failure: {}", e);
+            add_tubes.clear();
+            VmResponse::Err(base::Error::new(libc::EINVAL))
+        }
+    }
+}
+
 /// Signals all running VCPUs to vmexit, sends VcpuControl message to each VCPU tube, and tells
 /// `irq_chip` to stop blocking halted VCPUs. The channel message is set first because both the
 /// signal and the irq_chip kick could cause the VCPU thread to continue through the VCPU run
@@ -3060,25 +3474,25 @@ fn kick_all_vcpus(
 fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     mut linux: RunnableLinuxVm<V, Vcpu>,
     mut sys_allocator: SystemAllocator,
+    cfg: Config,
     control_server_socket: Option<UnlinkUnixSeqpacketListener>,
     mut control_tubes: Vec<TaggedControlTube>,
-    balloon_host_tube: Tube,
+    balloon_host_tube: Option<Tube>,
     disk_host_tubes: &[Tube],
     #[cfg(feature = "usb")] usb_control_tube: Tube,
     exit_evt: Event,
     reset_evt: Event,
+    crash_evt: Event,
     sigchld_fd: SignalFd,
-    sandbox: bool,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     mut gralloc: RutabagaGralloc,
-    enable_per_vm_core_scheduling: bool,
-    host_cpu_topology: bool,
     kvm_vcpu_ids: Vec<usize>,
 ) -> Result<ExitState> {
     #[derive(PollToken)]
     enum Token {
         Exit,
         Reset,
+        Crash,
         Suspend,
         ChildSignal,
         IrqFd { index: IrqEventIndex },
@@ -3093,6 +3507,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     let wait_ctx = WaitContext::build_with(&[
         (&exit_evt, Token::Exit),
         (&reset_evt, Token::Reset),
+        (&crash_evt, Token::Crash),
         (&linux.suspend_evt, Token::Suspend),
         (&sigchld_fd, Token::ChildSignal),
     ])
@@ -3120,7 +3535,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             .context("failed to add descriptor to wait context")?;
     }
 
-    if sandbox {
+    if cfg.sandbox {
         // Before starting VCPUs, in case we started with some capabilities, drop them all.
         drop_capabilities().context("failed to drop process capabilities")?;
     }
@@ -3139,7 +3554,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     let use_hypervisor_signals = !linux
         .vm
         .get_hypervisor()
-        .check_capability(&HypervisorCap::ImmediateExit);
+        .check_capability(HypervisorCap::ImmediateExit);
     setup_vcpu_signal_handler::<Vcpu>(use_hypervisor_signals)?;
 
     let vcpus: Vec<Option<_>> = match linux.vcpus.take() {
@@ -3150,11 +3565,20 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     // shared by all vCPU threads.
     // TODO(b/199312402): Avoid enabling core scheduling for the crosvm process
     // itself for even better performance. Only vCPUs need the feature.
-    if enable_per_vm_core_scheduling {
+    if cfg.per_vm_core_scheduling {
         if let Err(e) = enable_core_scheduling() {
             error!("Failed to enable core scheduling: {}", e);
         }
     }
+    let vcpu_cgroup_tasks_file = match &cfg.vcpu_cgroup_path {
+        None => None,
+        Some(cgroup_path) => {
+            // Move main process to cgroup_path
+            let mut f = File::create(&cgroup_path.join("tasks"))?;
+            f.write_all(process::id().to_string().as_bytes())?;
+            Some(f)
+        }
+    };
     for (cpu_id, vcpu) in vcpus.into_iter().enumerate() {
         let (to_vcpu_channel, from_main_channel) = mpsc::channel();
         let vcpu_affinity = match linux.vcpu_affinity.clone() {
@@ -3181,13 +3605,22 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             (*linux.io_bus).clone(),
             (*linux.mmio_bus).clone(),
             exit_evt.try_clone().context("failed to clone event")?,
+            reset_evt.try_clone().context("failed to clone event")?,
+            crash_evt.try_clone().context("failed to clone event")?,
             linux.vm.check_capability(VmCap::PvClockSuspend),
             from_main_channel,
             use_hypervisor_signals,
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             to_gdb_channel.clone(),
-            enable_per_vm_core_scheduling,
-            host_cpu_topology,
+            cfg.per_vm_core_scheduling,
+            cfg.host_cpu_topology,
+            match vcpu_cgroup_tasks_file {
+                None => None,
+                Some(ref f) => Some(
+                    f.try_clone()
+                        .context("failed to clone vcpu cgroup tasks file")?,
+                ),
+            },
         )?;
         vcpu_handles.push((handle, to_vcpu_channel));
     }
@@ -3242,6 +3675,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     exit_state = ExitState::Reset;
                     break 'wait;
                 }
+                Token::Crash => {
+                    info!("vcpu crashed");
+                    exit_state = ExitState::Crash;
+                    break 'wait;
+                }
                 Token::Suspend => {
                     info!("VM requested suspend");
                     linux.suspend_evt.read().unwrap();
@@ -3292,23 +3730,37 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     }
                 }
                 Token::VmControl { index } => {
+                    let mut add_tubes = Vec::new();
                     if let Some(socket) = control_tubes.get(index) {
                         match socket {
                             TaggedControlTube::Vm(tube) => match tube.recv::<VmRequest>() {
                                 Ok(request) => {
                                     let mut run_mode_opt = None;
-                                    let response = request.execute(
-                                        &mut run_mode_opt,
-                                        &balloon_host_tube,
-                                        &mut balloon_stats_id,
-                                        disk_host_tubes,
-                                        #[cfg(feature = "usb")]
-                                        Some(&usb_control_tube),
-                                        #[cfg(not(feature = "usb"))]
-                                        None,
-                                        &mut linux.bat_control,
-                                        &vcpu_handles,
-                                    );
+                                    let response = match request {
+                                        VmRequest::VfioCommand { vfio_path, add } => {
+                                            handle_vfio_command(
+                                                &mut linux,
+                                                &mut sys_allocator,
+                                                &cfg,
+                                                &mut add_tubes,
+                                                &vfio_path,
+                                                add,
+                                            )
+                                        }
+                                        _ => request.execute(
+                                            &mut run_mode_opt,
+                                            balloon_host_tube.as_ref(),
+                                            &mut balloon_stats_id,
+                                            disk_host_tubes,
+                                            #[cfg(feature = "usb")]
+                                            Some(&usb_control_tube),
+                                            #[cfg(not(feature = "usb"))]
+                                            None,
+                                            &mut linux.bat_control,
+                                            &vcpu_handles,
+                                        ),
+                                    };
+
                                     if let Err(e) = tube.send(&response) {
                                         error!("failed to send VmResponse: {}", e);
                                     }
@@ -3443,6 +3895,21 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                 }
                             },
                         }
+                    }
+                    if !add_tubes.is_empty() {
+                        for (idx, socket) in add_tubes.iter().enumerate() {
+                            wait_ctx
+                                .add(
+                                    socket.as_ref(),
+                                    Token::VmControl {
+                                        index: idx + control_tubes.len(),
+                                    },
+                                )
+                                .context(
+                                    "failed to add hotplug vfio-pci descriptor ot wait context",
+                                )?;
+                        }
+                        control_tubes.append(&mut add_tubes);
                     }
                 }
             }

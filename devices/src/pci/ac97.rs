@@ -136,7 +136,6 @@ impl Ac97Dev {
             &PciMultimediaSubclass::AudioDevice,
             None, // No Programming interface.
             PciHeaderType::Device,
-            false,  // Multifunction
             0x8086, // Subsystem Vendor ID
             0x1,    // Subsystem ID.
             0,      //  Revision ID.
@@ -312,8 +311,12 @@ impl PciDevice for Ac97Dev {
         self.irq_evt = Some(irq_evt.try_clone().ok()?);
         self.irq_resample_evt = Some(irq_resample_evt.try_clone().ok()?);
         let gsi = irq_num?;
-        self.config_regs.set_irq(gsi as u8, PciInterruptPin::IntA);
-        Some((gsi, PciInterruptPin::IntA))
+        let pin = self.pci_address.map_or(
+            PciInterruptPin::IntA,
+            PciConfiguration::suggested_interrupt_pin,
+        );
+        self.config_regs.set_irq(gsi as u8, pin);
+        Some((gsi, pin))
     }
 
     fn allocate_io_bars(&mut self, resources: &mut SystemAllocator) -> Result<Vec<(u64, u64)>> {
