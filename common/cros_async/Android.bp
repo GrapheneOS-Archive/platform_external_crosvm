@@ -14,7 +14,7 @@ rust_test {
     name: "cros_async_test_src_lib",
     defaults: ["crosvm_defaults"],
     // has rustc warnings
-    host_supported: true,
+    host_supported: false,
     crate_name: "cros_async",
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
