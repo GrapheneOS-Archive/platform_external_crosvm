@@ -74,6 +74,10 @@ impl RutabagaContext for VirglRendererContext {
             virgl_renderer_ctx_detach_resource(self.ctx_id as i32, resource.resource_id as i32);
         }
     }
+
+    fn component_type(&self) -> RutabagaComponentType {
+        RutabagaComponentType::VirglRenderer
+    }
 }
 
 impl Drop for VirglRendererContext {
@@ -518,6 +522,7 @@ impl RutabagaComponent for VirglRenderer {
         resource_id: u32,
         resource_create_blob: ResourceCreateBlob,
         mut iovec_opt: Option<Vec<RutabagaIovec>>,
+        _handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
         #[cfg(feature = "virgl_renderer_next")]
         {
