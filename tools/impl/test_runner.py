@@ -19,6 +19,7 @@ import test_target
 from test_target import TestTarget
 import testvm
 from test_config import CRATE_OPTIONS, TestOption, BUILD_FEATURES
+from check_code_hygiene import has_platform_dependent_code
 
 USAGE = """\
 Runs tests for crosvm locally, in a vm or on a remote device.
@@ -49,8 +50,8 @@ Arch = test_target.Arch
 # Print debug info. Overriden by -v
 VERBOSE = False
 
-# Kill a test after 60 seconds to prevent frozen tests from running too long.
-TEST_TIMEOUT_SECS = 60
+# Kill a test after 120 seconds to prevent frozen tests from running too long.
+TEST_TIMEOUT_SECS = 120
 
 # Number of parallel processes for executing tests.
 PARALLELISM = 4
@@ -74,6 +75,7 @@ class Executable(NamedTuple):
     binary_path: Path
     crate_name: str
     cargo_target: str
+    kind: str
     is_test: bool
     is_fresh: bool
 
@@ -86,11 +88,9 @@ def get_workspace_excludes(target_arch: Arch):
     for crate, options in CRATE_OPTIONS.items():
         if TestOption.DO_NOT_BUILD in options:
             yield crate
-        elif TestOption.BUILD_ARM_ONLY in options and (
-            target_arch != "aarch64" and target_arch != "armhf"
-        ):
+        elif TestOption.DO_NOT_BUILD_X86_64 in options and target_arch == "x86_64":
             yield crate
-        elif TestOption.BUILD_X86_ONLY in options and target_arch != "x86_64":
+        elif TestOption.DO_NOT_BUILD_AARCH64 in options and target_arch == "aarch64":
             yield crate
         elif TestOption.DO_NOT_BUILD_ARMHF in options and target_arch == "armhf":
             yield crate
@@ -100,10 +100,10 @@ def should_run_executable(executable: Executable, target_arch: Arch):
     options = CRATE_OPTIONS.get(executable.crate_name, [])
     if TestOption.DO_NOT_RUN in options:
         return False
-    if TestOption.RUN_ARM_ONLY in options:
-        return target_arch == "aarch64" or target_arch == "armhf"
-    if TestOption.RUN_X86_ONLY in options:
-        return target_arch == "x86_64"
+    if TestOption.DO_NOT_RUN_X86_64 in options and target_arch == "x86_64":
+        return False
+    if TestOption.DO_NOT_RUN_AARCH64 in options and target_arch == "aarch64":
+        return False
     if TestOption.DO_NOT_RUN_ARMHF in options and target_arch == "armhf":
         return False
     return True
@@ -168,6 +168,7 @@ def cargo(
                 Path(json_line.get("executable")),
                 crate_name=json_line.get("package_id", "").split(" ")[0],
                 cargo_target=json_line.get("target").get("name"),
+                kind=json_line.get("target").get("kind")[0],
                 is_test=json_line.get("profile", {}).get("test", False),
                 is_fresh=json_line.get("fresh", False),
             )
@@ -245,8 +246,12 @@ def execute_test(target: TestTarget, executable: Executable):
     if TestOption.SINGLE_THREADED in options:
         args += ["--test-threads=1"]
 
+    # proc-macros and their tests are executed on the host.
+    if executable.kind == "proc-macro":
+        target = TestTarget("host")
+
     if VERBOSE:
-        print(f"Running test {executable.name}...")
+        print(f"Running test {executable.name} on {target}...")
     try:
         # Pipe stdout/err to be printed in the main process if needed.
         test_process = test_target.exec_file_on_target(
@@ -361,6 +366,13 @@ def main():
     if target.vm:
         testvm.build_if_needed(target.vm)
         testvm.up(target.vm)
+
+    is_hygiene, error = has_platform_dependent_code(
+        Path("common/sys_util_core"))
+    if not is_hygiene:
+        print("Error: Platform dependent code not allowed in sys_util_core crate.")
+        print("Offending line: " + error)
+        sys.exit(-1)
 
     executables = list(build_all_binaries(target, arch))
 

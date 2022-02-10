@@ -20,6 +20,8 @@ use std::time::Duration;
 
 use arch::{set_default_serial_parameters, Pstore, VcpuAffinity};
 use base::{debug, error, getpid, info, kill_process_group, pagesize, reap_child, syslog, warn};
+#[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+use crosvm::platform::GpuRenderServerParameters;
 #[cfg(feature = "direct")]
 use crosvm::DirectIoOption;
 use crosvm::{
@@ -29,8 +31,6 @@ use crosvm::{
     VhostUserWlOption, VhostVsockDeviceParameter, DISK_ID_LEN,
 };
 use devices::serial_device::{SerialHardware, SerialParameters, SerialType};
-#[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
-use devices::virtio::gpu::GpuRenderServerParameters;
 #[cfg(feature = "audio_cras")]
 use devices::virtio::snd::cras_backend::Error as CrasSndError;
 #[cfg(feature = "audio_cras")]
@@ -554,10 +554,7 @@ fn parse_gpu_display_options(
 }
 
 #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
-fn parse_gpu_render_server_options(
-    s: Option<&str>,
-    gpu_params: &mut GpuParameters,
-) -> argument::Result<()> {
+fn parse_gpu_render_server_options(s: Option<&str>) -> argument::Result<GpuRenderServerParameters> {
     let mut path: Option<PathBuf> = None;
     let mut cache_path = None;
     let mut cache_size = None;
@@ -593,12 +590,11 @@ fn parse_gpu_render_server_options(
     }
 
     if let Some(p) = path {
-        gpu_params.render_server = Some(GpuRenderServerParameters {
+        Ok(GpuRenderServerParameters {
             path: p,
             cache_path,
             cache_size,
-        });
-        Ok(())
+        })
     } else {
         Err(argument::Error::InvalidValue {
             value: s.unwrap_or("").to_string(),
@@ -1907,7 +1903,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             let reader = BufReader::new(file);
             for l in reader.lines() {
                 let line = l.unwrap();
-                let trimmed_line = line.splitn(2, '#').next().unwrap().trim();
+                let trimmed_line = line.split_once('#').map_or(&*line, |x| x.0).trim();
                 if !trimmed_line.is_empty() {
                     let mount = parse_plugin_mount_option(trimmed_line)?;
                     cfg.plugin_mounts.push(mount);
@@ -1926,7 +1922,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             let reader = BufReader::new(file);
             for l in reader.lines() {
                 let line = l.unwrap();
-                let trimmed_line = line.splitn(2, '#').next().unwrap().trim();
+                let trimmed_line = line.split_once('#').map_or(&*line, |x| x.0).trim();
                 if !trimmed_line.is_empty() {
                     let map = parse_plugin_gid_map_option(trimmed_line)?;
                     cfg.plugin_gid_maps.push(map);
@@ -1962,8 +1958,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
         "gpu-render-server" => {
-            let gpu_parameters = cfg.gpu_parameters.get_or_insert_with(Default::default);
-            parse_gpu_render_server_options(value, gpu_parameters)?;
+            cfg.gpu_render_server_parameters = Some(parse_gpu_render_server_options(value)?);
         }
         "software-tpm" => {
             cfg.software_tpm = true;
@@ -2076,13 +2071,19 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         "protected-vm" => {
             cfg.protected_vm = ProtectionType::Protected;
-            // Balloon device only works for unprotected VMs.
+            // Balloon and USB devices only work for unprotected VMs.
             cfg.balloon = false;
+            cfg.usb = false;
+            // Protected VMs can't trust the RNG device, so don't provide it.
+            cfg.rng = false;
         }
         "protected-vm-without-firmware" => {
             cfg.protected_vm = ProtectionType::ProtectedWithoutFirmware;
-            // Balloon device only works for unprotected VMs.
+            // Balloon and USB devices only work for unprotected VMs.
             cfg.balloon = false;
+            cfg.usb = false;
+            // Protected VMs can't trust the RNG device, so don't provide it.
+            cfg.rng = false;
         }
         "battery" => {
             let params = parse_battery_options(value)?;
@@ -2101,6 +2102,12 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         "no-balloon" => {
             cfg.balloon = false;
+        }
+        "no-rng" => {
+            cfg.rng = false;
+        }
+        "no-usb" => {
+            cfg.usb = false;
         }
         "balloon_bias_mib" => {
             cfg.balloon_bias =
@@ -2336,6 +2343,24 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                             expected: String::from("this value for `init-mem` needs to be integer"),
                         })?,
                 )
+        }
+        #[cfg(feature = "direct")]
+        "pcie-root-port" => {
+            let pcie_path = PathBuf::from(value.unwrap());
+            if !pcie_path.exists() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("the pcie root port path does not exist"),
+                });
+            }
+            if !pcie_path.is_dir() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("the pcie root port path should be directory"),
+                });
+            }
+
+            cfg.pcie_rp.push(pcie_path);
         }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
@@ -2659,6 +2684,9 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
                               type=goldfish - type of battery emulation, defaults to goldfish"),
           Argument::value("gdb", "PORT", "(EXPERIMENTAL) gdb on the given port"),
           Argument::flag("no-balloon", "Don't use virtio-balloon device in the guest"),
+          #[cfg(feature = "usb")]
+          Argument::flag("no-usb", "Don't use usb devices in the guest"),
+          Argument::flag("no-rng", "Don't create RNG device in the guest"),
           Argument::value("balloon_bias_mib", "N", "Amount to bias balance of memory between host and guest as the balloon inflates, in MiB."),
           Argument::value("vhost-user-blk", "SOCKET_PATH", "Path to a socket for vhost-user block"),
           Argument::value("vhost-user-console", "SOCKET_PATH", "Path to a socket for vhost-user console"),
@@ -2710,6 +2738,8 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
                               rw - make the mapping writable
                               sync - open backing file with O_SYNC
                               align - whether to adjust addr and size to page boundaries implicitly"),
+          #[cfg(feature = "direct")]
+          Argument::value("pcie-root-port", "PATH", "Path to sysfs of host pcie root port"),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
