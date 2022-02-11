@@ -192,18 +192,34 @@ impl<S: DecoderSession> Context<S> {
         in_resource_type: ResourceType,
         out_resource_type: ResourceType,
     ) -> Self {
+        const DEFAULT_WIDTH: u32 = 640;
+        const DEFAULT_HEIGHT: u32 = 480;
+        const DEFAULT_INPUT_BUFFER_SIZE: u32 = 1024 * 1024;
+
+        let out_plane_formats =
+            PlaneFormat::get_plane_layout(Format::NV12, DEFAULT_WIDTH, DEFAULT_HEIGHT).unwrap();
+
         Context {
             stream_id,
             in_params: Params {
                 format: Some(format),
+                frame_width: DEFAULT_WIDTH,
+                frame_height: DEFAULT_HEIGHT,
                 resource_type: in_resource_type,
                 min_buffers: 1,
                 max_buffers: 32,
-                plane_formats: vec![Default::default()],
+                plane_formats: vec![PlaneFormat {
+                    plane_size: DEFAULT_INPUT_BUFFER_SIZE,
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             out_params: Params {
+                format: Some(Format::NV12),
+                frame_width: DEFAULT_WIDTH,
+                frame_height: DEFAULT_HEIGHT,
                 resource_type: out_resource_type,
+                plane_formats: out_plane_formats,
                 ..Default::default()
             },
             in_res: Default::default(),
@@ -308,20 +324,11 @@ impl<S: DecoderSession> Context<S> {
         // We only support NV12.
         let format = Some(Format::NV12);
 
-        let plane_formats = vec![
-            // Y plane, 1 sample per pixel.
-            PlaneFormat {
-                plane_size: (width * height) as u32,
-                stride: width as u32,
-            },
-            // UV plane, 1 sample per group of 4 pixels for U and V.
-            PlaneFormat {
-                // Add one vertical line so odd resolutions result in an extra UV line to cover all the
-                // Y samples.
-                plane_size: (width * ((height + 1) / 2)) as u32,
-                stride: width as u32,
-            },
-        ];
+        let plane_formats =
+            PlaneFormat::get_plane_layout(Format::NV12, width as u32, height as u32).unwrap();
+
+        self.in_params.frame_width = width as u32;
+        self.in_params.frame_height = height as u32;
 
         self.out_params = Params {
             format,

@@ -13,7 +13,6 @@ package {
 rust_test {
     name: "disk_test_src_disk",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "disk",
     cargo_env_compat: true,
@@ -44,7 +43,6 @@ rust_test {
 rust_library {
     name: "libdisk",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "disk",
     cargo_env_compat: true,

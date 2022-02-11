@@ -3,57 +3,45 @@
 // found in the LICENSE file.
 
 use super::{
-    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt,
-    VirtioDevice, Writer, TYPE_IOMMU,
+    async_utils, copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader,
+    SignalableInterrupt, VirtioDevice, Writer, TYPE_IOMMU,
 };
 use crate::pci::PciAddress;
 use crate::vfio::{VfioContainer, VfioError};
 use acpi_tables::sdt::SDT;
+use anyhow::Context;
 use base::{
-    error, pagesize, warn, AsRawDescriptor, Error as SysError, Event, PollToken, RawDescriptor,
-    Result as SysResult, WaitContext,
+    error, pagesize, warn, AsRawDescriptor, Error as SysError, Event, RawDescriptor,
+    Result as SysResult,
 };
-use data_model::DataInit;
+use cros_async::{AsyncError, EventAsync, Executor};
+use data_model::{DataInit, Le64};
+use futures::{select, FutureExt};
 use remain::sorted;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::mem::size_of;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::{result, thread};
 use sync::Mutex;
 use thiserror::Error;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
+pub mod protocol;
+use crate::virtio::iommu::protocol::*;
+pub mod ipc_memory_mapper;
+pub mod memory_mapper;
+pub mod vfio_wrapper;
+
 const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: usize = 2;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
 
-/// Virtio IOMMU features
-const VIRTIO_IOMMU_F_INPUT_RANGE: u32 = 0;
-const VIRTIO_IOMMU_F_MAP_UNMAP: u32 = 2;
-const VIRTIO_IOMMU_F_PROBE: u32 = 4;
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-struct VirtioIommuRange64 {
-    start: u64,
-    end: u64,
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioIommuRange64 {}
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-struct VirtioIommuConfig {
-    page_size_mask: u64,
-    input_range: VirtioIommuRange64,
-    domain_range: [u32; 2],
-    probe_size: u32,
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioIommuConfig {}
+// Size of struct virtio_iommu_probe_property
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const IOMMU_PROBE_SIZE: usize = size_of::<virtio_iommu_probe_resv_mem>();
 
 const VIRTIO_IOMMU_VIOT_NODE_PCI_RANGE: u8 = 1;
 const VIRTIO_IOMMU_VIOT_NODE_VIRTIO_IOMMU_PCI: u8 = 3;
@@ -102,122 +90,13 @@ struct VirtioIommuViotPciRangeNode {
 // Safe because it only has data and has no implicit padding.
 unsafe impl DataInit for VirtioIommuViotPciRangeNode {}
 
-/// Virtio IOMMU request type
-const VIRTIO_IOMMU_T_ATTACH: u8 = 1;
-const VIRTIO_IOMMU_T_DETACH: u8 = 2;
-const VIRTIO_IOMMU_T_MAP: u8 = 3;
-const VIRTIO_IOMMU_T_UNMAP: u8 = 4;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const VIRTIO_IOMMU_T_PROBE: u8 = 5;
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-struct VirtioIommuReqHead {
-    type_: u8,
-    reserved: [u8; 3],
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioIommuReqHead {}
-
-const VIRTIO_IOMMU_S_OK: u8 = 0;
-const VIRTIO_IOMMU_S_UNSUPP: u8 = 2;
-const VIRTIO_IOMMU_S_INVAL: u8 = 4;
-const VIRTIO_IOMMU_S_RANGE: u8 = 5;
-const VIRTIO_IOMMU_S_NOENT: u8 = 6;
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-struct VirtioIommuReqTail {
-    status: u8,
-    reserved: [u8; 3],
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioIommuReqTail {}
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-struct VirtioIommuReqAttach {
-    domain: u32,
-    endpoint: u32,
-    reserved: [u8; 8],
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioIommuReqAttach {}
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-struct VirtioIommuReqDetach {
-    domain: u32,
-    endpoint: u32,
-    reserved: [u8; 8],
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioIommuReqDetach {}
-
-const VIRTIO_IOMMU_MAP_F_READ: u32 = 1;
-const VIRTIO_IOMMU_MAP_F_WRITE: u32 = 2;
-const VIRTIO_IOMMU_MAP_F_MASK: u32 = VIRTIO_IOMMU_MAP_F_READ | VIRTIO_IOMMU_MAP_F_WRITE;
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-struct VirtioIommuReqMap {
-    domain: u32,
-    virt_start: u64,
-    virt_end: u64,
-    phys_start: u64,
-    flags: u32,
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioIommuReqMap {}
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-struct VirtioIommuReqUnmap {
-    domain: u32,
-    virt_start: u64,
-    virt_end: u64,
-    reserved: [u8; 4],
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioIommuReqUnmap {}
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-struct VirtioIommuReqProbe {
-    endpoint: u32,
-    reserved: [u64; 8],
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioIommuReqProbe {}
-
-// Size of struct virtio_iommu_probe_property
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const IOMMU_PROBE_SIZE: usize = size_of::<VirtioIommuProbeResvMem>();
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-struct VirtioIommuProbeResvMem {
-    type_: u16,
-    length: u16,
-    subtype: u8,
-    reserved: [u8; 3],
-    start: u64,
-    end: u64,
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioIommuProbeResvMem {}
+type Result<T> = result::Result<T, IommuError>;
 
 #[sorted]
 #[derive(Error, Debug)]
 pub enum IommuError {
+    #[error("async executor error: {0}")]
+    AsyncExec(AsyncError),
     #[error("failed to create reader: {0}")]
     CreateReader(DescriptorError),
     #[error("failed to create wait context: {0}")]
@@ -230,6 +109,8 @@ pub enum IommuError {
     GuestMemoryRead(io::Error),
     #[error("failed to write to guest address: {0}")]
     GuestMemoryWrite(io::Error),
+    #[error("Failed to read descriptor asynchronously: {0}")]
+    ReadAsyncDesc(AsyncError),
     #[error("failed to read from virtio queue Event: {0}")]
     ReadQueueEvent(SysError),
     #[error("unexpected descriptor error")]
@@ -243,7 +124,6 @@ pub enum IommuError {
 }
 
 struct Worker {
-    interrupt: Interrupt,
     mem: GuestMemory,
     page_mask: u64,
     // contains all pass-through endpoints that attach to the IOMMU device
@@ -298,9 +178,10 @@ impl Worker {
     fn process_attach_request(
         &mut self,
         reader: &mut Reader,
-        tail: &mut VirtioIommuReqTail,
-    ) -> result::Result<usize, IommuError> {
-        let req: VirtioIommuReqAttach = reader.read_obj().map_err(IommuError::GuestMemoryRead)?;
+        tail: &mut virtio_iommu_req_tail,
+    ) -> Result<usize> {
+        let req: virtio_iommu_req_attach =
+            reader.read_obj().map_err(IommuError::GuestMemoryRead)?;
 
         // If the reserved field of an ATTACH request is not zero,
         // the device MUST reject the request and set status to
@@ -313,8 +194,8 @@ impl Worker {
         // If the endpoint identified by endpoint doesn’t exist,
         // the device MUST reject the request and set status to
         // VIRTIO_IOMMU_S_NOENT.
-        let domain = req.domain;
-        let endpoint = req.endpoint;
+        let domain: u32 = req.domain.into();
+        let endpoint: u32 = req.endpoint.into();
         if !self.endpoints.contains_key(&endpoint) {
             tail.status = VIRTIO_IOMMU_S_NOENT;
             return Ok(0);
@@ -344,16 +225,16 @@ impl Worker {
     fn process_dma_map_request(
         &mut self,
         reader: &mut Reader,
-        tail: &mut VirtioIommuReqTail,
-    ) -> result::Result<usize, IommuError> {
-        let req: VirtioIommuReqMap = reader.read_obj().map_err(IommuError::GuestMemoryRead)?;
+        tail: &mut virtio_iommu_req_tail,
+    ) -> Result<usize> {
+        let req: virtio_iommu_req_map = reader.read_obj().map_err(IommuError::GuestMemoryRead)?;
 
         // If virt_start, phys_start or (virt_end + 1) is not aligned
         // on the page granularity, the device SHOULD reject the
         // request and set status to VIRTIO_IOMMU_S_RANGE
-        if self.page_mask & req.phys_start != 0
-            || self.page_mask & req.virt_start != 0
-            || self.page_mask & (req.virt_end + 1) != 0
+        if self.page_mask & u64::from(req.phys_start) != 0
+            || self.page_mask & u64::from(req.virt_start) != 0
+            || self.page_mask & (u64::from(req.virt_end) + 1) != 0
         {
             tail.status = VIRTIO_IOMMU_S_RANGE;
             return Ok(0);
@@ -361,12 +242,12 @@ impl Worker {
 
         // If the device doesn’t recognize a flags bit, it MUST reject
         // the request and set status to VIRTIO_IOMMU_S_INVAL.
-        if req.flags & !VIRTIO_IOMMU_MAP_F_MASK != 0 {
+        if u32::from(req.flags) & !VIRTIO_IOMMU_MAP_F_MASK != 0 {
             tail.status = VIRTIO_IOMMU_S_INVAL;
             return Ok(0);
         }
 
-        let domain = req.domain;
+        let domain: u32 = req.domain.into();
         if !self.domain_map.contains_key(&domain) {
             // If domain does not exist, the device SHOULD reject
             // the request and set status to VIRTIO_IOMMU_S_NOENT.
@@ -376,20 +257,20 @@ impl Worker {
 
         // The device MUST NOT allow writes to a range mapped
         // without the VIRTIO_IOMMU_MAP_F_WRITE flag.
-        let write_en = req.flags & VIRTIO_IOMMU_MAP_F_WRITE != 0;
+        let write_en = u32::from(req.flags) & VIRTIO_IOMMU_MAP_F_WRITE != 0;
 
         if let Some(vfio_container) = self.domain_map.get(&domain) {
-            let size = req.virt_end - req.virt_start + 1u64;
+            let size = u64::from(req.virt_end) - u64::from(req.virt_start) + 1u64;
             let host_addr = self
                 .mem
-                .get_host_address_range(GuestAddress(req.phys_start), size as usize)
+                .get_host_address_range(GuestAddress(u64::from(req.phys_start)), size as usize)
                 .map_err(IommuError::GetHostAddress)?;
 
             // Safe because both guest and host address are guaranteed by
             // get_host_address_range() to be valid
             let vfio_map_result = unsafe {
                 vfio_container.1.lock().vfio_dma_map(
-                    req.virt_start,
+                    req.virt_start.into(),
                     size,
                     host_addr as u64,
                     write_en,
@@ -417,17 +298,17 @@ impl Worker {
     fn process_dma_unmap_request(
         &mut self,
         reader: &mut Reader,
-        tail: &mut VirtioIommuReqTail,
-    ) -> result::Result<usize, IommuError> {
-        let req: VirtioIommuReqUnmap = reader.read_obj().map_err(IommuError::GuestMemoryRead)?;
+        tail: &mut virtio_iommu_req_tail,
+    ) -> Result<usize> {
+        let req: virtio_iommu_req_unmap = reader.read_obj().map_err(IommuError::GuestMemoryRead)?;
 
-        let domain = req.domain;
+        let domain: u32 = req.domain.into();
         if let Some(vfio_container) = self.domain_map.get(&domain) {
-            let size = req.virt_end - req.virt_start + 1;
+            let size = u64::from(req.virt_end) - u64::from(req.virt_start) + 1;
             vfio_container
                 .1
                 .lock()
-                .vfio_dma_unmap(req.virt_start, size)
+                .vfio_dma_unmap(u64::from(req.virt_start), size)
                 .map_err(IommuError::VfioContainerError)?;
         } else {
             // If domain does not exist, the device SHOULD set the
@@ -443,10 +324,10 @@ impl Worker {
         &mut self,
         reader: &mut Reader,
         writer: &mut Writer,
-        tail: &mut VirtioIommuReqTail,
-    ) -> result::Result<usize, IommuError> {
-        let req: VirtioIommuReqProbe = reader.read_obj().map_err(IommuError::GuestMemoryRead)?;
-        let endpoint = req.endpoint;
+        tail: &mut virtio_iommu_req_tail,
+    ) -> Result<usize> {
+        let req: virtio_iommu_req_probe = reader.read_obj().map_err(IommuError::GuestMemoryRead)?;
+        let endpoint: u32 = req.endpoint.into();
 
         // If the endpoint identified by endpoint doesn’t exist,
         // then the device SHOULD reject the request and set status
@@ -455,7 +336,7 @@ impl Worker {
             tail.status = VIRTIO_IOMMU_S_NOENT;
         }
 
-        let properties_size = writer.available_bytes() - size_of::<VirtioIommuReqTail>();
+        let properties_size = writer.available_bytes() - size_of::<virtio_iommu_req_tail>();
 
         // It's OK if properties_size is larger than probe_size
         // We are good even if properties_size is 0
@@ -471,12 +352,14 @@ impl Worker {
             const X86_MSI_IOVA_START: u64 = 0xfee0_0000;
             const X86_MSI_IOVA_END: u64 = 0xfeef_ffff;
 
-            let properties = VirtioIommuProbeResvMem {
-                type_: VIRTIO_IOMMU_PROBE_T_RESV_MEM,
-                length: IOMMU_PROBE_SIZE as u16 - PROBE_PROPERTY_SIZE,
+            let properties = virtio_iommu_probe_resv_mem {
+                head: virtio_iommu_probe_property {
+                    type_: VIRTIO_IOMMU_PROBE_T_RESV_MEM.into(),
+                    length: (IOMMU_PROBE_SIZE as u16 - PROBE_PROPERTY_SIZE).into(),
+                },
                 subtype: VIRTIO_IOMMU_RESV_MEM_T_MSI,
-                start: X86_MSI_IOVA_START,
-                end: X86_MSI_IOVA_END,
+                start: X86_MSI_IOVA_START.into(),
+                end: X86_MSI_IOVA_END.into(),
                 ..Default::default()
             };
             writer
@@ -486,7 +369,7 @@ impl Worker {
 
         // If the device doesn’t fill all probe_size bytes with properties,
         // it SHOULD fill the remaining bytes of properties with zeroes.
-        let remaining_bytes = writer.available_bytes() - size_of::<VirtioIommuReqTail>();
+        let remaining_bytes = writer.available_bytes() - size_of::<virtio_iommu_req_tail>();
 
         if remaining_bytes > 0 {
             let buffer: Vec<u8> = vec![0; remaining_bytes];
@@ -498,24 +381,21 @@ impl Worker {
         Ok(properties_size)
     }
 
-    fn execute_request(
-        &mut self,
-        avail_desc: &DescriptorChain,
-    ) -> result::Result<usize, IommuError> {
+    fn execute_request(&mut self, avail_desc: &DescriptorChain) -> Result<usize> {
         let mut reader =
             Reader::new(self.mem.clone(), avail_desc.clone()).map_err(IommuError::CreateReader)?;
         let mut writer =
             Writer::new(self.mem.clone(), avail_desc.clone()).map_err(IommuError::CreateWriter)?;
 
         // at least we need space to write VirtioIommuReqTail
-        if writer.available_bytes() < size_of::<VirtioIommuReqTail>() {
+        if writer.available_bytes() < size_of::<virtio_iommu_req_tail>() {
             return Err(IommuError::WriteBufferTooSmall);
         }
 
-        let req_head: VirtioIommuReqHead =
+        let req_head: virtio_iommu_req_head =
             reader.read_obj().map_err(IommuError::GuestMemoryRead)?;
 
-        let mut tail = VirtioIommuReqTail {
+        let mut tail = virtio_iommu_req_tail {
             status: VIRTIO_IOMMU_S_OK,
             ..Default::default()
         };
@@ -551,12 +431,20 @@ impl Worker {
         writer
             .write_all(tail.as_slice())
             .map_err(IommuError::GuestMemoryWrite)?;
-        Ok((reply_len as usize) + size_of::<VirtioIommuReqTail>())
+        Ok((reply_len as usize) + size_of::<virtio_iommu_req_tail>())
     }
 
-    fn request_queue(&mut self, req_queue: &mut Queue) -> bool {
-        let mut needs_interrupt = false;
-        while let Some(avail_desc) = req_queue.pop(&self.mem) {
+    async fn request_queue<I: SignalableInterrupt>(
+        &mut self,
+        mut queue: Queue,
+        mut queue_event: EventAsync,
+        interrupt: &I,
+    ) -> Result<()> {
+        loop {
+            let avail_desc = queue
+                .next_async(&self.mem, &mut queue_event)
+                .await
+                .map_err(IommuError::ReadAsyncDesc)?;
             let desc_index = avail_desc.index;
 
             let len = match self.execute_request(&avail_desc) {
@@ -570,56 +458,46 @@ impl Worker {
                 }
             };
 
-            req_queue.add_used(&self.mem, desc_index, len as u32);
-            needs_interrupt = true;
+            queue.add_used(&self.mem, desc_index, len as u32);
+            queue.trigger_interrupt(&self.mem, interrupt);
         }
-
-        needs_interrupt
     }
 
     fn run(
         &mut self,
         mut queues: Vec<Queue>,
-        mut queue_evts: Vec<Event>,
+        queue_evts: Vec<Event>,
         kill_evt: Event,
-    ) -> Result<(), IommuError> {
-        #[derive(PollToken)]
-        enum Token {
-            RequestQueue,
-            InterruptResample,
-            Kill,
-        }
+        interrupt: Interrupt,
+    ) -> Result<()> {
+        let ex = Executor::new().expect("Failed to create an executor");
 
-        let (mut req_queue, req_evt) = (queues.remove(0), queue_evts.remove(0));
-        let wait_ctx: WaitContext<Token> =
-            WaitContext::build_with(&[(&req_evt, Token::RequestQueue), (&kill_evt, Token::Kill)])
-                .map_err(IommuError::CreateWaitContext)?;
+        let mut evts_async: Vec<EventAsync> = queue_evts
+            .into_iter()
+            .map(|e| EventAsync::new(e.0, &ex).expect("Failed to create async event for queue"))
+            .collect();
+        let interrupt = Rc::new(RefCell::new(interrupt));
+        let interrupt_ref = &*interrupt.borrow();
 
-        if let Some(resample_evt) = self.interrupt.get_resample_evt() {
-            wait_ctx
-                .add(resample_evt, Token::InterruptResample)
-                .map_err(IommuError::CreateWaitContext)?;
-        }
+        let (req_queue, req_evt) = (queues.remove(0), evts_async.remove(0));
 
-        'wait: loop {
-            let mut needs_interrupt = false;
-            let events = wait_ctx.wait().map_err(IommuError::WaitError)?;
-            for event in events.iter().filter(|e| e.is_readable) {
-                match event.token {
-                    Token::RequestQueue => {
-                        req_evt.read().map_err(IommuError::ReadQueueEvent)?;
-                        needs_interrupt |= self.request_queue(&mut req_queue);
-                    }
-                    Token::InterruptResample => {
-                        self.interrupt.interrupt_resample();
-                    }
-                    Token::Kill => break 'wait,
-                }
+        let f_request = self.request_queue(req_queue, req_evt, interrupt_ref);
+        let f_resample = async_utils::handle_irq_resample(&ex, interrupt.clone());
+        let f_kill = async_utils::await_and_exit(&ex, kill_evt);
+
+        let done = async {
+            select! {
+                res = f_request.fuse() => res.context("error in handling request queue"),
+                res = f_resample.fuse() => res.context("error in handle_irq_resample"),
+                res = f_kill.fuse() => res.context("error in await_and_exit"),
             }
-            if needs_interrupt {
-                req_queue.trigger_interrupt(&self.mem, &self.interrupt);
-            }
+        };
+        match ex.run_until(done) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("Error in worker: {}", e),
+            Err(e) => return Err(IommuError::AsyncExec(e)),
         }
+
         Ok(())
     }
 }
@@ -628,7 +506,7 @@ impl Worker {
 pub struct Iommu {
     kill_evt: Option<Event>,
     worker_thread: Option<thread::JoinHandle<Worker>>,
-    config: VirtioIommuConfig,
+    config: virtio_iommu_config,
     avail_features: u64,
     endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
 }
@@ -654,16 +532,16 @@ impl Iommu {
             page_size_mask = (pagesize() as u64) - 1;
         }
 
-        let input_range = VirtioIommuRange64 {
-            start: 0_u64,
-            end: phys_max_addr,
+        let input_range = virtio_iommu_range_64 {
+            start: Le64::from(0),
+            end: phys_max_addr.into(),
         };
 
-        let config = VirtioIommuConfig {
-            page_size_mask,
+        let config = virtio_iommu_config {
+            page_size_mask: page_size_mask.into(),
             input_range,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            probe_size: IOMMU_PROBE_SIZE as u32,
+            probe_size: (IOMMU_PROBE_SIZE as u32).into(),
             ..Default::default()
         };
 
@@ -746,20 +624,19 @@ impl VirtioDevice for Iommu {
 
         // The least significant bit of page_size_masks defines the page
         // granularity of IOMMU mappings
-        let page_mask = (1u64 << self.config.page_size_mask.trailing_zeros()) - 1;
+        let page_mask = (1u64 << u64::from(self.config.page_size_mask).trailing_zeros()) - 1;
         let eps = self.endpoints.clone();
         let worker_result = thread::Builder::new()
             .name("virtio_iommu".to_string())
             .spawn(move || {
                 let mut worker = Worker {
-                    interrupt,
                     mem,
                     page_mask,
                     endpoints: eps,
                     endpoint_map: BTreeMap::new(),
                     domain_map: BTreeMap::new(),
                 };
-                let result = worker.run(queues, queue_evts, kill_evt);
+                let result = worker.run(queues, queue_evts, kill_evt, interrupt);
                 if let Err(e) = result {
                     error!("virtio-iommu worker thread exited with error: {}", e);
                 }

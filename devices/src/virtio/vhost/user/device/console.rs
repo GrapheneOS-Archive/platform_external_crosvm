@@ -26,7 +26,7 @@ use crate::virtio::console::{
     handle_input, process_transmit_queue, spawn_input_thread, virtio_console_config, ConsoleError,
 };
 use crate::virtio::vhost::user::device::handler::{
-    CallEvent, DeviceRequestHandler, VhostUserBackend,
+    DeviceRequestHandler, Doorbell, VhostUserBackend,
 };
 use crate::virtio::{self, copy_config};
 
@@ -35,7 +35,7 @@ static CONSOLE_EXECUTOR: OnceCell<Executor> = OnceCell::new();
 async fn run_tx_queue(
     mut queue: virtio::Queue,
     mem: GuestMemory,
-    call_evt: Arc<Mutex<CallEvent>>,
+    doorbell: Arc<Mutex<Doorbell>>,
     kick_evt: EventAsync,
     mut output: Box<dyn io::Write>,
 ) {
@@ -44,14 +44,14 @@ async fn run_tx_queue(
             error!("Failed to read kick event for tx queue: {}", e);
             break;
         }
-        process_transmit_queue(&mem, &call_evt, &mut queue, &mut output);
+        process_transmit_queue(&mem, &doorbell, &mut queue, &mut output);
     }
 }
 
 async fn run_rx_queue(
     mut queue: virtio::Queue,
     mem: GuestMemory,
-    call_evt: Arc<Mutex<CallEvent>>,
+    doorbell: Arc<Mutex<Doorbell>>,
     kick_evt: EventAsync,
     in_buffer: Arc<Mutex<VecDeque<u8>>>,
     in_avail_evt: EventAsync,
@@ -61,7 +61,7 @@ async fn run_rx_queue(
             error!("Failed reading in_avail_evt: {}", e);
             break;
         }
-        match handle_input(&mem, &call_evt, in_buffer.lock().deref_mut(), &mut queue) {
+        match handle_input(&mem, &doorbell, in_buffer.lock().deref_mut(), &mut queue) {
             Ok(()) => {}
             Err(ConsoleError::RxDescriptorsExhausted) => {
                 if let Err(e) = kick_evt.next_val().await {
@@ -108,7 +108,6 @@ impl VhostUserBackend for ConsoleBackend {
     const MAX_QUEUE_NUM: usize = 2; /* transmit and receive queues */
     const MAX_VRING_LEN: u16 = 256;
 
-    type Doorbell = CallEvent;
     type Error = anyhow::Error;
 
     fn features(&self) -> u64 {
@@ -165,7 +164,7 @@ impl VhostUserBackend for ConsoleBackend {
         idx: usize,
         mut queue: virtio::Queue,
         mem: GuestMemory,
-        call_evt: Arc<Mutex<CallEvent>>,
+        doorbell: Arc<Mutex<Doorbell>>,
         kick_evt: Event,
     ) -> anyhow::Result<()> {
         if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
@@ -211,7 +210,7 @@ impl VhostUserBackend for ConsoleBackend {
                     run_rx_queue(
                         queue,
                         mem,
-                        call_evt,
+                        doorbell,
                         kick_evt,
                         in_buffer,
                         in_avail_async_evt,
@@ -229,7 +228,7 @@ impl VhostUserBackend for ConsoleBackend {
                     .take()
                     .ok_or_else(|| anyhow!("no output available"))?;
                 ex.spawn_local(Abortable::new(
-                    run_tx_queue(queue, mem, call_evt, kick_evt, output_unwrapped),
+                    run_tx_queue(queue, mem, doorbell, kick_evt, output_unwrapped),
                     registration,
                 ))
                 .detach();
@@ -267,10 +266,8 @@ fn run_console(params: &SerialParameters, socket: &str) -> anyhow::Result<()> {
 
     let _ = CONSOLE_EXECUTOR.set(ex.clone());
 
-    if let Err(e) = ex.run_until(handler.run(socket, &ex)) {
-        bail!(e);
-    }
-    Ok(())
+    // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
+    ex.run_until(handler.run(socket, &ex))?
 }
 
 #[derive(FromArgs)]
@@ -326,14 +323,16 @@ pub fn run_console_device(program_name: &str, args: &[&str]) -> anyhow::Result<(
         stdin: true,
     };
 
-    if let Err(e) = run_console(&params, &socket) {
-        bail!("error occurred: {:#}", e);
-    }
+    let res = run_console(&params, &socket);
 
     // Restore terminal capabilities back to what they were before
     stdin()
         .set_canon_mode()
         .context("Failed to restore canonical mode for terminal")?;
+
+    if let Err(e) = res {
+        bail!("error occurred: {:#}", e);
+    }
 
     Ok(())
 }

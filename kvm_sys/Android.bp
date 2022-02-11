@@ -13,7 +13,6 @@ package {
 rust_test {
     name: "kvm_sys_test_src_lib",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "kvm_sys",
     cargo_env_compat: true,
@@ -34,7 +33,6 @@ rust_test {
 rust_test {
     name: "kvm_sys_test_tests_basic",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "basic",
     cargo_env_compat: true,
@@ -56,7 +54,6 @@ rust_test {
 rust_library {
     name: "libkvm_sys",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "kvm_sys",
     cargo_env_compat: true,
