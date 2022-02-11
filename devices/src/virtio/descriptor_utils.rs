@@ -12,6 +12,7 @@ use std::ptr::copy_nonoverlapping;
 use std::result;
 use std::sync::Arc;
 
+use anyhow::Context;
 use base::{FileReadWriteAtVolatile, FileReadWriteVolatile};
 use cros_async::MemRegion;
 use data_model::{DataInit, Le16, Le32, Le64, VolatileMemoryError, VolatileSlice};
@@ -30,8 +31,8 @@ pub enum Error {
     DescriptorChainOverflow,
     #[error("descriptor guest memory error: {0}")]
     GuestMemoryError(vm_memory::GuestMemoryError),
-    #[error("invalid descriptor chain")]
-    InvalidChain,
+    #[error("invalid descriptor chain: {0:#}")]
+    InvalidChain(anyhow::Error),
     #[error("descriptor I/O error: {0}")]
     IoError(io::Error),
     #[error("`DescriptorChain` split is out of bounds: {0}")]
@@ -802,18 +803,20 @@ pub fn create_descriptor_chain(
         let offset = size + spaces_between_regions;
         buffers_start_addr = buffers_start_addr
             .checked_add(offset as u64)
-            .ok_or(Error::InvalidChain)?;
+            .context("Invalid buffers_start_addr)")
+            .map_err(Error::InvalidChain)?;
 
         let _ = memory.write_obj_at_addr(
             desc,
             descriptor_array_addr
                 .checked_add(index as u64 * std::mem::size_of::<virtq_desc>() as u64)
-                .ok_or(Error::InvalidChain)?,
+                .context("Invalid descriptor_array_addr")
+                .map_err(Error::InvalidChain)?,
         );
     }
 
     DescriptorChain::checked_new(memory, descriptor_array_addr, 0x100, 0, 0)
-        .ok_or(Error::InvalidChain)
+        .map_err(Error::InvalidChain)
 }
 
 #[cfg(test)]
@@ -830,7 +833,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -845,14 +848,14 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut reader = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain).expect("failed to create Reader");
         assert_eq!(reader.available_bytes(), 106);
         assert_eq!(reader.bytes_read(), 0);
 
-        let mut buffer = [0 as u8; 64];
-        if let Err(_) = reader.read_exact(&mut buffer) {
-            panic!("read_exact should not fail here");
-        }
+        let mut buffer = [0u8; 64];
+        reader
+            .read_exact(&mut buffer)
+            .expect("read_exact should not fail here");
 
         assert_eq!(reader.available_bytes(), 42);
         assert_eq!(reader.bytes_read(), 64);
@@ -871,7 +874,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -886,19 +889,19 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut writer = Writer::new(memory.clone(), chain).expect("failed to create Writer");
+        let mut writer = Writer::new(memory, chain).expect("failed to create Writer");
         assert_eq!(writer.available_bytes(), 106);
         assert_eq!(writer.bytes_written(), 0);
 
-        let mut buffer = [0 as u8; 64];
-        if let Err(_) = writer.write_all(&mut buffer) {
-            panic!("write_all should not fail here");
-        }
+        let buffer = [0; 64];
+        writer
+            .write_all(&buffer)
+            .expect("write_all should not fail here");
 
         assert_eq!(writer.available_bytes(), 42);
         assert_eq!(writer.bytes_written(), 64);
 
-        match writer.write(&mut buffer) {
+        match writer.write(&buffer) {
             Err(_) => panic!("write should not fail here"),
             Ok(length) => assert_eq!(length, 42),
         }
@@ -912,7 +915,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -922,7 +925,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut reader = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain).expect("failed to create Reader");
         assert_eq!(reader.available_bytes(), 0);
         assert_eq!(reader.bytes_read(), 0);
 
@@ -937,7 +940,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -947,7 +950,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut writer = Writer::new(memory.clone(), chain).expect("failed to create Writer");
+        let mut writer = Writer::new(memory, chain).expect("failed to create Writer");
         assert_eq!(writer.available_bytes(), 0);
         assert_eq!(writer.bytes_written(), 0);
 
@@ -962,7 +965,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -973,7 +976,7 @@ mod tests {
         )
         .expect("create_descriptor_chain failed");
 
-        let mut reader = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain).expect("failed to create Reader");
 
         // Open a file in read-only mode so writes to it to trigger an I/O error.
         let mut ro_file = File::open("/dev/zero").expect("failed to open /dev/zero");
@@ -992,7 +995,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1003,7 +1006,7 @@ mod tests {
         )
         .expect("create_descriptor_chain failed");
 
-        let mut writer = Writer::new(memory.clone(), chain).expect("failed to create Writer");
+        let mut writer = Writer::new(memory, chain).expect("failed to create Writer");
 
         let mut file = tempfile().unwrap();
 
@@ -1022,7 +1025,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1041,7 +1044,7 @@ mod tests {
         .expect("create_descriptor_chain failed");
         let mut reader =
             Reader::new(memory.clone(), chain.clone()).expect("failed to create Reader");
-        let mut writer = Writer::new(memory.clone(), chain).expect("failed to create Writer");
+        let mut writer = Writer::new(memory, chain).expect("failed to create Writer");
 
         assert_eq!(reader.bytes_read(), 0);
         assert_eq!(writer.bytes_written(), 0);
@@ -1071,7 +1074,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let secret: Le32 = 0x12345678.into();
 
@@ -1086,9 +1089,9 @@ mod tests {
         .expect("create_descriptor_chain failed");
         let mut writer =
             Writer::new(memory.clone(), chain_writer).expect("failed to create Writer");
-        if let Err(_) = writer.write_obj(secret) {
-            panic!("write_obj should not fail here");
-        }
+        writer
+            .write_obj(secret)
+            .expect("write_obj should not fail here");
 
         // Now create new descriptor chain pointing to the same memory and try to read it.
         let chain_reader = create_descriptor_chain(
@@ -1099,8 +1102,7 @@ mod tests {
             123,
         )
         .expect("create_descriptor_chain failed");
-        let mut reader =
-            Reader::new(memory.clone(), chain_reader).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain_reader).expect("failed to create Reader");
         match reader.read_obj::<Le32>() {
             Err(_) => panic!("read_obj should not fail here"),
             Ok(read_secret) => assert_eq!(read_secret, secret),
@@ -1112,7 +1114,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1123,10 +1125,9 @@ mod tests {
         )
         .expect("create_descriptor_chain failed");
 
-        let mut reader = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain).expect("failed to create Reader");
 
-        let mut buf = Vec::with_capacity(1024);
-        buf.resize(1024, 0);
+        let mut buf = vec![0; 1024];
 
         assert_eq!(
             reader
@@ -1142,7 +1143,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1159,7 +1160,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut reader = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain).expect("failed to create Reader");
 
         let other = reader.split_at(32);
         assert_eq!(reader.available_bytes(), 32);
@@ -1171,7 +1172,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1188,7 +1189,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut reader = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain).expect("failed to create Reader");
 
         let other = reader.split_at(24);
         assert_eq!(reader.available_bytes(), 24);
@@ -1200,7 +1201,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1217,7 +1218,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut reader = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain).expect("failed to create Reader");
 
         let other = reader.split_at(128);
         assert_eq!(reader.available_bytes(), 128);
@@ -1229,7 +1230,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1246,7 +1247,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut reader = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain).expect("failed to create Reader");
 
         let other = reader.split_at(0);
         assert_eq!(reader.available_bytes(), 0);
@@ -1258,7 +1259,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1275,7 +1276,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut reader = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain).expect("failed to create Reader");
 
         let other = reader.split_at(256);
         assert_eq!(
@@ -1290,7 +1291,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1300,7 +1301,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut reader = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, chain).expect("failed to create Reader");
 
         let mut buf = vec![0u8; 64];
         assert_eq!(
@@ -1314,7 +1315,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1324,7 +1325,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut writer = Writer::new(memory.clone(), chain).expect("failed to create Writer");
+        let mut writer = Writer::new(memory, chain).expect("failed to create Writer");
 
         let buf = vec![0xdeu8; 64];
         assert_eq!(
@@ -1338,7 +1339,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
         let vs: Vec<Le64> = vec![
             0x0101010101010101.into(),
             0x0202020202020202.into(),
@@ -1366,7 +1367,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut reader = Reader::new(memory.clone(), read_chain).expect("failed to create Reader");
+        let mut reader = Reader::new(memory, read_chain).expect("failed to create Reader");
         let vs_read = reader
             .collect::<io::Result<Vec<Le64>>, _>()
             .expect("failed to collect() values");
@@ -1378,7 +1379,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1399,7 +1400,7 @@ mod tests {
         let Reader {
             mem: _,
             mut regions,
-        } = Reader::new(memory.clone(), chain).expect("failed to create Reader");
+        } = Reader::new(memory, chain).expect("failed to create Reader");
 
         let drain = regions
             .get_remaining_regions_with_count(::std::usize::MAX)
@@ -1436,7 +1437,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1497,7 +1498,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
@@ -1533,7 +1534,7 @@ mod tests {
         use DescriptorType::*;
 
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
 
         let chain = create_descriptor_chain(
             &memory,
