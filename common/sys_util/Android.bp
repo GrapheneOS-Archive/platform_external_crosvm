@@ -25,6 +25,7 @@ rust_library {
         "libserde",
         "libserde_json",
         "libsync_rust",
+        "libsys_util_core",
         "libtempfile",
         "libthiserror",
     ],

@@ -4,8 +4,6 @@
 
 //! Provides utilities to bind and open a VFIO PCI device.
 
-#![allow(dead_code)]
-
 use std::fs::write;
 use std::sync::Arc;
 
@@ -97,7 +95,7 @@ impl PciSlot {
         write(format!("/sys/bus/pci/devices/{}/driver_override", self), "")
             .context("failed to clear driver_override")?;
 
-        let vfio_path = format!("/sys/bus/pci/devices/{}", self.to_string());
+        let vfio_path = format!("/sys/bus/pci/devices/{}", self);
         // TODO(b/202151642): Use `VfioContainer::new()` once virtio-iommu for VFIO is implemented.
         let vfio_container = Arc::new(Mutex::new(VfioContainer::new_noiommu()?));
         let vfio = VfioDevice::new(&vfio_path, vfio_container)

@@ -13,7 +13,6 @@ package {
 rust_library {
     name: "libvirtio_sys",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "virtio_sys",
     cargo_env_compat: true,
@@ -28,7 +27,6 @@ rust_library {
 rust_test {
     name: "virtio_sys_test_src_lib",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "virtio_sys",
     cargo_env_compat: true,
