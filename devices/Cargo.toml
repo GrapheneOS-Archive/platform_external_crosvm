@@ -18,7 +18,6 @@ minigbm = ["rutabaga_gfx/minigbm"]
 x = ["gpu_display/x"]
 virgl_renderer = ["gpu", "rutabaga_gfx/virgl_renderer"]
 gfxstream = ["gpu", "rutabaga_gfx/gfxstream"]
-vvu = []
 
 [dependencies]
 argh = "0.1.7"
@@ -43,6 +42,7 @@ libc = "*"
 libcras = { path = "../libcras_stub", optional = true }
 libvda = { path = "../libvda", optional = true }
 linux_input_sys = { path = "../linux_input_sys" }
+memoffset = { version = "0.6" }
 minijail = { path = "../../minijail/rust/minijail" } # ignored by ebuild
 net_sys = { path = "../net_sys" }
 net_util = { path = "../net_util" }
@@ -64,7 +64,7 @@ tpm2 = { path = "../tpm2", optional = true }
 usb_util = { path = "../usb_util" }
 vfio_sys = { path = "../vfio_sys" }
 vhost = { path = "../vhost" }
-vmm_vhost = { path = "../third_party/vmm_vhost", features = ["vmm", "device"] }
+vmm_vhost = { path = "../third_party/vmm_vhost", features = ["vmm", "device", "vfio-device"] }
 virtio_sys = { path = "../virtio_sys" }
 vm_control = { path = "../vm_control" }
 vm_memory = { path = "../vm_memory" }

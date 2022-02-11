@@ -24,8 +24,9 @@ use vm_memory::GuestMemory;
 
 use crate::virtio::block::asynchronous::{flush_disk, process_one_chain};
 use crate::virtio::block::*;
-use crate::virtio::vhost::user::device::handler::{
-    CallEvent, DeviceRequestHandler, VhostUserBackend,
+use crate::virtio::vhost::user::device::{
+    handler::{DeviceRequestHandler, Doorbell, VhostUserBackend},
+    vvu::pci::VvuPciDevice,
 };
 use crate::virtio::{self, base_features, copy_config, Queue};
 
@@ -159,7 +160,6 @@ impl VhostUserBackend for BlockBackend {
     const MAX_QUEUE_NUM: usize = NUM_QUEUES as usize;
     const MAX_VRING_LEN: u16 = QUEUE_SIZE;
 
-    type Doorbell = CallEvent;
     type Error = anyhow::Error;
 
     fn features(&self) -> u64 {
@@ -214,7 +214,7 @@ impl VhostUserBackend for BlockBackend {
         idx: usize,
         mut queue: virtio::Queue,
         mem: GuestMemory,
-        call_evt: Arc<Mutex<CallEvent>>,
+        doorbell: Arc<Mutex<Doorbell>>,
         kick_evt: Event,
     ) -> anyhow::Result<()> {
         if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
@@ -241,7 +241,7 @@ impl VhostUserBackend for BlockBackend {
                 disk_state,
                 Rc::new(RefCell::new(queue)),
                 kick_evt,
-                call_evt,
+                doorbell,
                 timer,
                 timer_armed,
             ),
@@ -268,7 +268,7 @@ async fn handle_queue(
     disk_state: Rc<AsyncMutex<DiskState>>,
     queue: Rc<RefCell<Queue>>,
     evt: EventAsync,
-    interrupt: Arc<Mutex<CallEvent>>,
+    interrupt: Arc<Mutex<Doorbell>>,
     flush_timer: Rc<RefCell<TimerAsync>>,
     flush_timer_armed: Rc<RefCell<bool>>,
 ) {
@@ -312,8 +312,14 @@ struct Options {
         arg_name = "PATH<:read-only>"
     )]
     file: String,
-    #[argh(option, description = "path to a socket", arg_name = "PATH")]
-    socket: String,
+    #[argh(option, description = "path to a vhost-user socket", arg_name = "PATH")]
+    socket: Option<String>,
+    #[argh(
+        option,
+        description = "VFIO-PCI device name (e.g. '0000:00:07.0')",
+        arg_name = "STRING"
+    )]
+    vfio: Option<String>,
 }
 
 /// Starts a vhost-user block device.
@@ -331,6 +337,10 @@ pub fn run_block_device(program_name: &str, args: &[&str]) -> anyhow::Result<()>
         }
     };
 
+    if !(opts.socket.is_some() ^ opts.vfio.is_some()) {
+        bail!("Exactly one of `--socket` or `--vfio` is required");
+    }
+
     let ex = Executor::new().context("failed to create executor")?;
     BLOCK_EXECUTOR
         .set(ex.clone())
@@ -341,10 +351,15 @@ pub fn run_block_device(program_name: &str, args: &[&str]) -> anyhow::Result<()>
 
     let block = BlockBackend::new(BLOCK_EXECUTOR.clone(), filename, fileopts)?;
     let handler = DeviceRequestHandler::new(block);
-
-    if let Err(e) = ex.run_until(handler.run(opts.socket, &ex)) {
-        bail!("error occurred: {}", e);
+    match (opts.socket, opts.vfio) {
+        (Some(socket), None) => {
+            // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
+            ex.run_until(handler.run(socket, &ex))?
+        }
+        (None, Some(device_name)) => {
+            let device = VvuPciDevice::new(device_name.as_str(), BlockBackend::MAX_QUEUE_NUM)?;
+            ex.run_until(handler.run_vvu(device, &ex))?
+        }
+        _ => unreachable!("Must be checked above"),
     }
-
-    Ok(())
 }

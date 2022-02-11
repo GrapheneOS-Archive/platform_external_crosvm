@@ -28,7 +28,7 @@ pub use self::msix::{MsixCap, MsixConfig, MsixStatus};
 pub use self::pci_configuration::{
     PciBarConfiguration, PciBarIndex, PciBarPrefetchable, PciBarRegionType, PciCapability,
     PciCapabilityID, PciClassCode, PciConfiguration, PciDisplaySubclass, PciHeaderType,
-    PciProgrammingInterface, PciSerialBusSubClass, PciSubclass,
+    PciProgrammingInterface, PciSerialBusSubClass, PciSubclass, CAPABILITY_LIST_HEAD_OFFSET,
 };
 pub use self::pci_device::Error as PciDeviceError;
 pub use self::pci_device::PciDevice;
@@ -51,3 +51,5 @@ impl PciInterruptPin {
         self as u32
     }
 }
+
+pub const PCI_VENDOR_ID_INTEL: u16 = 0x8086;

@@ -8,7 +8,7 @@
 pub mod argument;
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 pub mod gdb;
-#[path = "linux.rs"]
+#[path = "linux/mod.rs"]
 pub mod platform;
 #[cfg(feature = "plugin")]
 pub mod plugin;
@@ -37,6 +37,8 @@ use devices::IommuDevType;
 use devices::StubPciParameters;
 use hypervisor::ProtectionType;
 use libc::{getegid, geteuid};
+#[cfg(feature = "gpu")]
+use platform::GpuRenderServerParameters;
 use vm_control::BatteryType;
 
 static KVM_PATH: &str = "/dev/kvm";
@@ -374,6 +376,8 @@ pub struct Config {
     pub seccomp_log_failures: bool,
     #[cfg(feature = "gpu")]
     pub gpu_parameters: Option<GpuParameters>,
+    #[cfg(feature = "gpu")]
+    pub gpu_render_server_parameters: Option<GpuRenderServerParameters>,
     pub software_tpm: bool,
     pub display_window_keyboard: bool,
     pub display_window_mouse: bool,
@@ -383,6 +387,7 @@ pub struct Config {
     pub sound: Option<PathBuf>,
     pub serial_parameters: BTreeMap<(SerialHardware, u8), SerialParameters>,
     pub syslog_tag: Option<String>,
+    pub usb: bool,
     pub virtio_single_touch: Vec<TouchDeviceOption>,
     pub virtio_multi_touch: Vec<TouchDeviceOption>,
     pub virtio_trackpad: Vec<TouchDeviceOption>,
@@ -429,6 +434,9 @@ pub struct Config {
     pub coiommu_param: Option<devices::CoIommuParameters>,
     pub file_backed_mappings: Vec<FileBackedMappingParameters>,
     pub init_memory: Option<u64>,
+    #[cfg(feature = "direct")]
+    pub pcie_rp: Vec<PathBuf>,
+    pub rng: bool,
 }
 
 impl Default for Config {
@@ -474,6 +482,8 @@ impl Default for Config {
             cid: None,
             #[cfg(feature = "gpu")]
             gpu_parameters: None,
+            #[cfg(feature = "gpu")]
+            gpu_render_server_parameters: None,
             software_tpm: false,
             wayland_socket_paths: BTreeMap::new(),
             x_display: None,
@@ -489,6 +499,7 @@ impl Default for Config {
             sound: None,
             serial_parameters: BTreeMap::new(),
             syslog_tag: None,
+            usb: true,
             virtio_single_touch: Vec::new(),
             virtio_multi_touch: Vec::new(),
             virtio_trackpad: Vec::new(),
@@ -535,6 +546,9 @@ impl Default for Config {
             coiommu_param: None,
             file_backed_mappings: Vec::new(),
             init_memory: None,
+            #[cfg(feature = "direct")]
+            pcie_rp: Vec::new(),
+            rng: true,
         }
     }
 }
