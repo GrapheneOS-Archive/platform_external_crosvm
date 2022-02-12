@@ -51,6 +51,7 @@ rust_library {
     edition: "2018",
     features: [
         "device",
+        "vfio-device",
         "vmm",
     ],
     rustlibs: [
@@ -81,6 +82,7 @@ rust_test {
     edition: "2018",
     features: [
         "device",
+        "vfio-device",
         "vmm",
     ],
     rustlibs: [

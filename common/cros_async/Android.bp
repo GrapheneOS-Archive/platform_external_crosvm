@@ -13,7 +13,6 @@ package {
 rust_test {
     name: "cros_async_test_src_lib",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "cros_async",
     cargo_env_compat: true,
@@ -52,7 +51,6 @@ rust_test {
 rust_library {
     name: "libcros_async",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "cros_async",
     cargo_env_compat: true,

@@ -9,7 +9,9 @@ use std::os::unix::io::AsRawFd;
 use data_model::DataInit;
 use libc::EINVAL;
 
-use crate::{errno_result, Error, FromRawDescriptor, LayoutAllocation, Result, SafeDescriptor};
+use sys_util_core::LayoutAllocation;
+
+use crate::{errno_result, Error, FromRawDescriptor, Result, SafeDescriptor};
 
 // Custom nlmsghdr struct that can be declared DataInit.
 #[repr(C)]
@@ -22,6 +24,25 @@ struct NlMsgHdr {
     pub nlmsg_pid: u32,
 }
 unsafe impl DataInit for NlMsgHdr {}
+
+/// Netlink attribute struct, can be used by netlink consumer
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct NlAttr {
+    pub len: u16,
+    pub _type: u16,
+}
+unsafe impl DataInit for NlAttr {}
+
+/// Generic netlink header struct, can be used by netlink consumer
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct GenlMsgHdr {
+    pub cmd: u8,
+    pub version: u8,
+    pub reserved: u16,
+}
+unsafe impl DataInit for GenlMsgHdr {}
 
 /// A single netlink message, including its header and data.
 pub struct NetlinkMessage<'a> {

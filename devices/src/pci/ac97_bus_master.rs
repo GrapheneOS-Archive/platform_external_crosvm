@@ -657,7 +657,6 @@ impl Ac97BusMaster {
 
 #[derive(Debug)]
 struct GuestBuffer {
-    index: u8,
     offset: usize,
     frames: usize,
 }
@@ -734,11 +733,7 @@ fn next_guest_buffer(
         .map_err(|_| AudioError::InvalidBufferOffset)?;
     let frames = get_buffer_samples(func_regs, mem, index)? / regs.tube_count(func);
 
-    Ok(Some(GuestBuffer {
-        index,
-        offset,
-        frames,
-    }))
+    Ok(Some(GuestBuffer { offset, frames }))
 }
 
 // Marks the current buffer completed and moves to the next buffer for the given
@@ -1083,7 +1078,7 @@ mod test {
                 mem.write_obj_at_addr(GUEST_ADDR_BASE + FRAGMENT_SIZE as u32, pointer_addr)
                     .expect("Writing guest memory failed.");
             };
-            mem.write_obj_at_addr(IOC_MASK | (FRAGMENT_SIZE as u32) / 2, control_addr)
+            mem.write_obj_at_addr(IOC_MASK | ((FRAGMENT_SIZE as u32) / 2), control_addr)
                 .expect("Writing guest memory failed.");
         }
 
@@ -1221,8 +1216,7 @@ mod test {
                 GS_MINT,
             ),
             _ => {
-                assert!(false, "Invalid Ac97Function.");
-                (0, 0, 0, 0, 0, 0, 0)
+                panic!("Invalid Ac97Function.");
             }
         };
 
@@ -1236,7 +1230,7 @@ mod test {
             let control_addr = GuestAddress(GUEST_ADDR_BASE as u64 + i as u64 * 8 + 4);
             mem.write_obj_at_addr(GUEST_ADDR_BASE + FRAGMENT_SIZE as u32, pointer_addr)
                 .expect("Writing guest memory failed.");
-            mem.write_obj_at_addr(IOC_MASK | (FRAGMENT_SIZE as u32) / 2, control_addr)
+            mem.write_obj_at_addr(IOC_MASK | ((FRAGMENT_SIZE as u32) / 2), control_addr)
                 .expect("Writing guest memory failed.");
         }
 

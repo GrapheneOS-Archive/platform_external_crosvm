@@ -14,7 +14,6 @@ rust_library {
     name: "libx86_64_rust",
     defaults: ["crosvm_defaults"],
     stem: "libx86_64",
-    // has rustc warnings
     host_supported: true,
     crate_name: "x86_64",
     cargo_env_compat: true,
@@ -64,7 +63,6 @@ rust_library {
 rust_test {
     name: "x86_64_test_src_lib",
     defaults: ["crosvm_defaults"],
-    // has rustc warnings
     host_supported: true,
     crate_name: "x86_64",
     cargo_env_compat: true,
