@@ -21,6 +21,7 @@ use base::{
     FromRawDescriptor, SafeDescriptor,
 };
 
+use crate::generated::virgl_debug_callback_bindings::*;
 use crate::generated::virgl_renderer_bindings::*;
 use crate::renderer_utils::*;
 use crate::rutabaga_core::{RutabagaComponent, RutabagaContext, RutabagaResource};
@@ -89,21 +90,19 @@ impl Drop for VirglRendererContext {
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-extern "C" fn debug_callback(fmt: *const ::std::os::raw::c_char, ap: *mut __va_list_tag) {
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "arm"))]
+extern "C" fn debug_callback(fmt: *const ::std::os::raw::c_char, ap: stdio::va_list) {
     const BUF_LEN: usize = 256;
     let mut v = [b' '; BUF_LEN];
 
     let printed_len = unsafe {
-        let mut varargs = __va_list_tag {
-            gp_offset: (*ap).gp_offset,
-            fp_offset: (*ap).fp_offset,
-            overflow_arg_area: (*ap).overflow_arg_area,
-            reg_save_area: (*ap).reg_save_area,
-        };
+        let ptr = v.as_mut_ptr() as *mut ::std::os::raw::c_char;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let size = BUF_LEN as ::std::os::raw::c_ulong;
+        #[cfg(target_arch = "arm")]
+        let size = BUF_LEN as ::std::os::raw::c_uint;
 
-        let ptr = v.as_mut_ptr() as *mut i8;
-        vsnprintf(ptr, BUF_LEN as u64, fmt, &mut varargs)
+        stdio::vsnprintf(ptr, size, fmt, ap)
     };
 
     if printed_len < 0 {
@@ -221,7 +220,7 @@ impl VirglRenderer {
             render_server_fd,
         });
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(any(target_arch = "arm", target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
             virgl_set_debug_callback(Some(debug_callback))
         };
