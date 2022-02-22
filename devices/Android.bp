@@ -26,8 +26,6 @@ rust_test {
     edition: "2018",
     features: [
         "audio",
-        "gfxstream",
-        "gpu",
         "usb",
     ],
     rustlibs: [
@@ -44,7 +42,6 @@ rust_test {
         "libdisk",
         "libfuse_rust",
         "libfutures",
-        "libgpu_display",
         "libhypervisor",
         "libkvm_sys",
         "liblibc",
@@ -57,7 +54,6 @@ rust_test {
         "libp9",
         "libpower_monitor",
         "libresources",
-        "librutabaga_gfx",
         "libserde",
         "libserde_json",
         "libsmallvec",
@@ -79,7 +75,15 @@ rust_test {
     ],
     target: {
         host: {
-            shared_libs: ["libvirglrenderer"],
+            features: [
+                "gfxstream",
+                "gpu",
+            ],
+            rustlibs: [
+                "libgpu_display",
+                "librutabaga_gfx",
+            ],
+            shared_libs: ["libvirglrenderer", "libgfxstream_backend"],
         },
         android: {
             shared_libs: ["libdrm"],
@@ -90,7 +94,6 @@ rust_test {
             ],
         },
     },
-    shared_libs: ["libgfxstream_backend"],
 }
 
 rust_library {
@@ -104,8 +107,6 @@ rust_library {
     edition: "2018",
     features: [
         "audio",
-        "gfxstream",
-        "gpu",
         "usb",
     ],
     rustlibs: [
@@ -122,7 +123,6 @@ rust_library {
         "libdisk",
         "libfuse_rust",
         "libfutures",
-        "libgpu_display",
         "libhypervisor",
         "libkvm_sys",
         "liblibc",
@@ -135,7 +135,6 @@ rust_library {
         "libp9",
         "libpower_monitor",
         "libresources",
-        "librutabaga_gfx",
         "libserde",
         "libserde_json",
         "libsmallvec",
@@ -154,5 +153,17 @@ rust_library {
         "libenumn",
         "libremain",
     ],
-    shared_libs: ["libgfxstream_backend"],
+    target: {
+        host: {
+            features: [
+                "gfxstream",
+                "gpu",
+            ],
+            rustlibs: [
+                "libgpu_display",
+                "librutabaga_gfx",
+            ],
+            shared_libs: ["libgfxstream_backend"],
+        },
+    },
 }

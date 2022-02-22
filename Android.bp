@@ -43,9 +43,6 @@ rust_binary {
     edition: "2018",
     features: [
         "audio",
-        "default",
-        "gfxstream",
-        "gpu",
         "usb",
     ],
     rustlibs: [
@@ -91,6 +88,12 @@ rust_binary {
         },
     },
     target: {
+        host: {
+            features: [
+                "gfxstream",
+                "gpu",
+            ],
+        },
         linux_bionic_arm64: {
             relative_install_path: "aarch64-linux-bionic",
         },
@@ -131,9 +134,6 @@ rust_test {
     edition: "2018",
     features: [
         "audio",
-        "default",
-        "gfxstream",
-        "gpu",
         "usb",
     ],
     rustlibs: [
@@ -178,6 +178,12 @@ rust_test {
         },
     },
     target: {
+        host: {
+            features: [
+                "gfxstream",
+                "gpu",
+            ],
+        },
         linux_glibc_x86_64: {
             features: [
                 "gdb",
@@ -211,9 +217,6 @@ rust_test {
     edition: "2018",
     features: [
         "audio",
-        "default",
-        "gfxstream",
-        "gpu",
         "usb",
     ],
     rustlibs: [
@@ -259,6 +262,12 @@ rust_test {
         },
     },
     target: {
+        host: {
+            features: [
+                "gfxstream",
+                "gpu",
+            ],
+        },
         linux_glibc_x86_64: {
             features: [
                 "gdb",
@@ -287,9 +296,6 @@ rust_library {
     edition: "2018",
     features: [
         "audio",
-        "default",
-        "gfxstream",
-        "gpu",
         "usb",
     ],
     rustlibs: [
@@ -334,6 +340,12 @@ rust_library {
         },
     },
     target: {
+        host: {
+            features: [
+                "gfxstream",
+                "gpu",
+            ],
+        },
         linux_glibc_x86_64: {
             features: [
                 "gdb",

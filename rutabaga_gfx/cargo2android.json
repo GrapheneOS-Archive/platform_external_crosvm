@@ -1,7 +1,7 @@
 {
   "add_workspace": true,
   "device": true,
-  "features": "gfxstream,virgl_renderer,virgl_renderer_next",
+  "features": "virgl_renderer,virgl_renderer_next",
   "global_defaults": "crosvm_defaults",
   "patch": "patches/Android.bp.patch",
   "run": true,
