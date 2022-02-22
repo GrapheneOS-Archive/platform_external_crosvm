@@ -7,6 +7,12 @@ arch: {
     },
 },
 target: {
+    host: {
+        features: [
+            "gfxstream",
+            "gpu",
+        ],
+    },
     linux_glibc_x86_64: {
         features: [
             "gdb",
