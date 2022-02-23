@@ -1,39 +1,13 @@
 diff --git a/devices/Android.bp b/devices/Android.bp
-index 40ee2404..097f777d 100644
+index a1ac9363..ae2fdde5 100644
 --- a/devices/Android.bp
 +++ b/devices/Android.bp
-@@ -26,6 +26,8 @@ rust_test {
-     edition: "2018",
-     features: [
-         "audio",
-+        "gfxstream",
-+        "gpu",
-         "usb",
-     ],
-     rustlibs: [
-@@ -42,6 +44,7 @@ rust_test {
-         "libdisk",
-         "libfuse_rust",
-         "libfutures",
-+        "libgpu_display",
-         "libhypervisor",
-         "libkvm_sys",
-         "liblibc",
-@@ -52,6 +55,7 @@ rust_test {
-         "libp9",
-         "libpower_monitor",
-         "libresources",
-+        "librutabaga_gfx",
-         "libserde",
-         "libserde_json",
-         "libsmallvec",
-@@ -71,6 +75,19 @@ rust_test {
-         "libenumn",
-         "libremain",
-     ],
-+    target: {
-+        host: {
-+            shared_libs: ["libvirglrenderer"],
+@@ -83,7 +83,15 @@ rust_test {
+                 "libgpu_display",
+                 "librutabaga_gfx",
+             ],
+-            shared_libs: ["libgfxstream_backend"],
++            shared_libs: ["libvirglrenderer", "libgfxstream_backend"],
 +        },
 +        android: {
 +            shared_libs: ["libdrm"],
@@ -42,33 +16,6 @@ index 40ee2404..097f777d 100644
 +                "libgbm",
 +                "libvirglrenderer",
 +            ],
-+        },
-+    },
-     shared_libs: ["libgfxstream_backend"],
+         },
+     },
  }
- 
-@@ -85,6 +102,8 @@ rust_library {
-     edition: "2018",
-     features: [
-         "audio",
-+        "gfxstream",
-+        "gpu",
-         "usb",
-     ],
-     rustlibs: [
-@@ -102,6 +121,7 @@ rust_library {
-         "libdisk",
-         "libfuse_rust",
-         "libfutures",
-+        "libgpu_display",
-         "libhypervisor",
-         "libkvm_sys",
-         "liblibc",
-@@ -111,6 +131,7 @@ rust_library {
-         "libp9",
-         "libpower_monitor",
-         "libresources",
-+        "librutabaga_gfx",
-         "libserde",
-         "libserde_json",
-         "libsmallvec",
