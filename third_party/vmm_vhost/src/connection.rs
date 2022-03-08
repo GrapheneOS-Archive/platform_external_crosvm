@@ -8,10 +8,10 @@ pub mod socket;
 #[cfg(feature = "vfio-device")]
 pub mod vfio;
 
+use base::RawDescriptor;
 use std::fs::File;
 use std::io::{IoSlice, IoSliceMut};
 use std::mem;
-use std::os::unix::io::RawFd;
 use std::path::Path;
 
 use data_model::DataInit;
@@ -47,7 +47,7 @@ pub trait Endpoint<R: Req>: Sized {
     ///
     /// # Return:
     /// * - number of bytes sent on success
-    fn send_iovec(&mut self, iovs: &[IoSlice], fds: Option<&[RawFd]>) -> Result<usize>;
+    fn send_iovec(&mut self, iovs: &[IoSlice], fds: Option<&[RawDescriptor]>) -> Result<usize>;
 
     /// Reads bytes into the given scatter/gather vectors with optional attached file.
     ///
@@ -56,7 +56,8 @@ pub trait Endpoint<R: Req>: Sized {
     /// * `allow_fd` - Indicates whether we can receive FDs.
     ///
     /// # Return:
-    /// * - (number of bytes received, [received files]) on success
+    /// * - (number of bytes received, [received files]) on success.
+    /// * - `Error::Disconnect` if the client closed.
     fn recv_into_bufs(
         &mut self,
         bufs: &mut [IoSliceMut],
@@ -120,7 +121,7 @@ pub trait EndpointExt<R: Req>: Endpoint<R> {
     fn send_iovec_all(
         &mut self,
         mut iovs: &mut [&[u8]],
-        mut fds: Option<&[RawFd]>,
+        mut fds: Option<&[RawDescriptor]>,
     ) -> Result<usize> {
         // Guarantee that `iovs` becomes empty if it doesn't contain any data.
         advance_slices(&mut iovs, 0);
@@ -151,7 +152,7 @@ pub trait EndpointExt<R: Req>: Endpoint<R> {
     /// # Return:
     /// * - number of bytes sent on success
     #[cfg(test)]
-    fn send_slice(&mut self, data: IoSlice, fds: Option<&[RawFd]>) -> Result<usize> {
+    fn send_slice(&mut self, data: IoSlice, fds: Option<&[RawDescriptor]>) -> Result<usize> {
         self.send_iovec(&[data], fds)
     }
 
@@ -161,7 +162,11 @@ pub trait EndpointExt<R: Req>: Endpoint<R> {
     /// * - number of bytes sent on success
     /// * - PartialMessage: received a partial message.
     /// * - backend specific errors
-    fn send_header(&mut self, hdr: &VhostUserMsgHeader<R>, fds: Option<&[RawFd]>) -> Result<()> {
+    fn send_header(
+        &mut self,
+        hdr: &VhostUserMsgHeader<R>,
+        fds: Option<&[RawDescriptor]>,
+    ) -> Result<()> {
         let mut iovs = [hdr.as_slice()];
         let bytes = self.send_iovec_all(&mut iovs[..], fds)?;
         if bytes != mem::size_of::<VhostUserMsgHeader<R>>() {
@@ -182,7 +187,7 @@ pub trait EndpointExt<R: Req>: Endpoint<R> {
         &mut self,
         hdr: &VhostUserMsgHeader<R>,
         body: &T,
-        fds: Option<&[RawFd]>,
+        fds: Option<&[RawDescriptor]>,
     ) -> Result<()> {
         if mem::size_of::<T>() > MAX_MSG_SIZE {
             return Err(Error::OversizedMsg);
@@ -209,7 +214,7 @@ pub trait EndpointExt<R: Req>: Endpoint<R> {
         hdr: &VhostUserMsgHeader<R>,
         body: &T,
         payload: &[u8],
-        fds: Option<&[RawFd]>,
+        fds: Option<&[RawDescriptor]>,
     ) -> Result<()> {
         let len = payload.len();
         if mem::size_of::<T>() > MAX_MSG_SIZE {
@@ -250,8 +255,7 @@ pub trait EndpointExt<R: Req>: Endpoint<R> {
     ///
     /// # Return:
     /// * - (number of bytes received, [received fds]) on success
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
+    /// * - `Disconnect` - client is closed
     ///
     /// # TODO
     /// This function takes a slice of `&mut [u8]` instead of `IoSliceMut` because the internal
@@ -308,6 +312,7 @@ pub trait EndpointExt<R: Req>: Endpoint<R> {
     ///
     /// # Return:
     /// * - (message header, [received files]) on success.
+    /// * - Disconnect: the client closed the connection.
     /// * - PartialMessage: received a partial message.
     /// * - InvalidMessage: received a invalid message.
     /// * - backend specific errors
