@@ -8,7 +8,6 @@ use remain::sorted;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use crate::address_allocator::AddressAllocator;
 pub use crate::system_allocator::{MemRegion, MmioType, SystemAllocator, SystemAllocatorConfig};
 
 mod address_allocator;
@@ -50,6 +49,8 @@ pub enum Error {
     ExistingAlloc(Alloc),
     #[error("Invalid Alloc: {0:?}")]
     InvalidAlloc(Alloc),
+    #[error("IO port out of range: base:{0} size:{1}")]
+    IOPortOutOfRange(u64, u64),
     #[error("Platform MMIO address range not specified")]
     MissingPlatformMMIOAddresses,
     #[error("No IO address range specified")]
