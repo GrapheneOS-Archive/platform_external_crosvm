@@ -8,9 +8,9 @@ use std::convert::TryInto;
 use std::fmt;
 
 use base::{
-    self, FromRawDescriptor, IntoRawDescriptor, MemoryMappingArena, MmapError, SafeDescriptor,
+    self, FromRawDescriptor, IntoRawDescriptor, MemoryMappingArena, MemoryMappingBuilder,
+    MemoryMappingBuilderUnix, MmapError, SafeDescriptor,
 };
-use sys_util::MemoryMapping;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
 use thiserror::Error as ThisError;
@@ -135,7 +135,11 @@ impl BufferHandle for VirtioObjectHandle {
     }
 
     fn get_mapping(&self, offset: usize, size: usize) -> Result<MemoryMappingArena, MmapError> {
-        MemoryMapping::from_fd_offset(&self.desc, size, offset as u64).map(MemoryMappingArena::from)
+        MemoryMappingBuilder::new(size)
+            .from_descriptor(&self.desc)
+            .offset(offset as u64)
+            .build()
+            .map(MemoryMappingArena::from)
     }
 }
 
@@ -216,7 +220,7 @@ impl GuestResource {
         };
 
         let mem_areas = mem_entries
-            .into_iter()
+            .iter()
             .map(|entry| {
                 let addr: u64 = entry.addr.into();
                 let length: u32 = entry.length.into();
@@ -315,10 +319,8 @@ impl GuestResource {
 
 #[cfg(test)]
 mod tests {
-    use base::{MappedRegion, SafeDescriptor};
-    use sys_util::{MemoryMapping, SharedMemory};
-
     use super::*;
+    use base::{MappedRegion, SafeDescriptor, SharedMemory};
 
     /// Creates a sparse guest memory handle using as many pages as there are entries in
     /// `page_order`. The page with index `0` will be the first page, `1` will be the second page,
@@ -345,14 +347,18 @@ mod tests {
         }
 
         // Copy the initialized vector's content into an anonymous shared memory.
-        let mut mem = SharedMemory::anon().unwrap();
-        mem.set_size(data.len() as u64).unwrap();
-        let mapping = MemoryMapping::from_fd(&mem, mem.size() as usize).unwrap();
+        let mem = SharedMemory::anon(data.len() as u64).unwrap();
+        let mapping = MemoryMappingBuilder::new(mem.size() as usize)
+            .from_shared_memory(&mem)
+            .build()
+            .unwrap();
         assert_eq!(mapping.write_slice(&data, 0).unwrap(), data.len());
 
         // Create the `GuestMemHandle` we will try to map and retrieve the data from.
         let mem_handle = GuestResourceHandle::GuestPages(GuestMemHandle {
-            desc: unsafe { SafeDescriptor::from_raw_descriptor(base::clone_fd(&mem).unwrap()) },
+            desc: unsafe {
+                SafeDescriptor::from_raw_descriptor(base::clone_descriptor(&mem).unwrap())
+            },
             mem_areas: page_order
                 .iter()
                 .map(|&page| GuestMemArea {
