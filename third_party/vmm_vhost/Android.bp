@@ -56,10 +56,10 @@ rust_library {
     ],
     rustlibs: [
         "libanyhow",
+        "libbase_rust",
         "libbitflags",
         "libdata_model",
         "liblibc",
-        "libsys_util",
         "libtempfile",
         "libthiserror",
     ],
@@ -87,10 +87,10 @@ rust_test {
     ],
     rustlibs: [
         "libanyhow",
+        "libbase_rust",
         "libbitflags",
         "libdata_model",
         "liblibc",
-        "libsys_util",
         "libtempfile",
         "libthiserror",
     ],
