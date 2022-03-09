@@ -894,7 +894,6 @@ impl<'a, D: DecoderBackend> Decoder<D> {
                 }))
             }
             QueueType::Output => {
-                session.clear_output_buffers()?;
                 ctx.out_res.queued_res_ids.clear();
                 Ok(VideoCmdResponseType::Sync(CmdResponse::NoData))
             }

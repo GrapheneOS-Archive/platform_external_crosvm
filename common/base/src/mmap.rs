@@ -2,10 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::{
-    wrap_descriptor, AsRawDescriptor, MappedRegion, MemoryMappingArena, MmapError, Protection,
-    SharedMemory,
-};
+use crate::{wrap_descriptor, AsRawDescriptor, MappedRegion, MmapError, Protection, SharedMemory};
 use data_model::volatile_memory::*;
 use data_model::DataInit;
 use std::fs::File;
@@ -233,11 +230,5 @@ unsafe impl MappedRegion for MemoryMapping {
 
     fn size(&self) -> usize {
         self.mapping.size()
-    }
-}
-
-impl From<MemoryMapping> for MemoryMappingArena {
-    fn from(mmap: MemoryMapping) -> Self {
-        MemoryMappingArena::from(mmap.mapping)
     }
 }

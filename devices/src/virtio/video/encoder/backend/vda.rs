@@ -5,9 +5,10 @@
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
-use anyhow::{anyhow, Context};
-use base::{error, warn, AsRawDescriptor, IntoRawDescriptor};
 use libvda::encode::{EncodeCapabilities, VeaImplType, VeaInstance};
+use thiserror::Error as ThisError;
+
+use base::{error, warn, AsRawDescriptor, IntoRawDescriptor};
 
 use super::*;
 use crate::virtio::video::format::{
@@ -35,6 +36,10 @@ impl From<Bitrate> for libvda::encode::Bitrate {
         }
     }
 }
+
+#[derive(Debug, ThisError)]
+#[error("VDA backend only supports virtio object resources!")]
+struct UnsupportedMemoryType;
 
 /// A VDA encoder backend that can be passed to `EncoderDevice::new` in order to create a working
 /// encoder.
@@ -289,11 +294,7 @@ impl EncoderSession for LibvdaEncoderSession {
         let input_buffer_id = self.next_input_buffer_id;
         let desc = match resource.handle {
             GuestResourceHandle::VirtioObject(handle) => handle.desc,
-            _ => {
-                return Err(VideoError::BackendFailure(anyhow!(
-                    "VDA backend only supports virtio object resources"
-                )))
-            }
+            _ => return Err(VideoError::backend_failure(UnsupportedMemoryType)),
         };
 
         let libvda_planes = resource
@@ -328,11 +329,7 @@ impl EncoderSession for LibvdaEncoderSession {
         let output_buffer_id = self.next_output_buffer_id;
         let desc = match resource {
             GuestResourceHandle::VirtioObject(handle) => handle.desc,
-            _ => {
-                return Err(VideoError::BackendFailure(anyhow!(
-                    "VDA backend only supports virtio object resources"
-                )))
-            }
+            _ => return Err(VideoError::backend_failure(UnsupportedMemoryType)),
         };
 
         self.session.use_output_buffer(
@@ -349,10 +346,7 @@ impl EncoderSession for LibvdaEncoderSession {
     }
 
     fn flush(&mut self) -> VideoResult<()> {
-        self.session
-            .flush()
-            .context("while flushing")
-            .map_err(VideoError::BackendFailure)
+        self.session.flush().map_err(VideoError::from)
     }
 
     fn request_encoding_params_change(
@@ -362,8 +356,7 @@ impl EncoderSession for LibvdaEncoderSession {
     ) -> VideoResult<()> {
         self.session
             .request_encoding_params_change(bitrate.into(), framerate)
-            .context("while requesting encoder parameter change")
-            .map_err(VideoError::BackendFailure)
+            .map_err(VideoError::from)
     }
 
     fn event_pipe(&self) -> &dyn AsRawDescriptor {
@@ -401,7 +394,7 @@ impl EncoderSession for LibvdaEncoderSession {
             },
             FlushResponse { flush_done } => EncoderEvent::FlushResponse { flush_done },
             NotifyError(err) => EncoderEvent::NotifyError {
-                error: VideoError::BackendFailure(anyhow!(err)),
+                error: VideoError::backend_failure(err),
             },
         };
 

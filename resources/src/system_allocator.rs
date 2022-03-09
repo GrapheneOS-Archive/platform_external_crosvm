@@ -6,14 +6,13 @@ use std::collections::BTreeMap;
 use base::pagesize;
 
 use crate::address_allocator::{AddressAllocator, AddressAllocatorSet};
-use crate::{Alloc, Error, Result};
+use crate::{Alloc, Result};
 
 /// Manages allocating system resources such as address space and interrupt numbers.
 
 /// MMIO address Type
 ///    Low: address allocated from low_address_space
 ///    High: address allocated from high_address_space
-#[derive(Copy, Clone)]
 pub enum MmioType {
     Low,
     High,
@@ -26,7 +25,7 @@ pub struct MemRegion {
 }
 
 pub struct SystemAllocatorConfig {
-    /// IO ports. Only for x86_64.
+    /// IO memory. Only for x86_64.
     pub io: Option<MemRegion>,
     /// Low (<=4GB) MMIO region.
     pub low_mmio: MemRegion,
@@ -53,20 +52,15 @@ pub struct SystemAllocator {
 }
 
 impl SystemAllocator {
-    /// Creates a new `SystemAllocator` for managing addresses and irq numbers.
-    /// Will return an error if `base` + `size` overflows u64 (or allowed
-    /// maximum for the specific type), or if alignment isn't a power of two.
+    /// Creates a new `SystemAllocator` for managing addresses and irq numvers.
+    /// Can return `None` if `base` + `size` overflows a u64 or if alignment isn't a power
+    /// of two.
     ///
     pub fn new(config: SystemAllocatorConfig) -> Result<Self> {
         let page_size = pagesize() as u64;
 
         Ok(SystemAllocator {
             io_address_space: if let Some(io) = config.io {
-                // TODO make sure we don't overlap with existing well known
-                // ports such as 0xcf8 (serial ports).
-                if io.base > 0x1_0000 || io.size + io.base > 0x1_0000 {
-                    return Err(Error::IOPortOutOfRange(io.base, io.size));
-                }
                 Some(AddressAllocator::new(io.base, io.size, Some(0x400), None)?)
             } else {
                 None
@@ -247,7 +241,7 @@ mod tests {
         let mut a = SystemAllocator::new(SystemAllocatorConfig {
             io: Some(MemRegion {
                 base: 0x1000,
-                size: 0xf000,
+                size: 0x1_0000,
             }),
             low_mmio: MemRegion {
                 base: 0x3000_0000,

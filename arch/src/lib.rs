@@ -19,9 +19,9 @@ use acpi_tables::sdt::SDT;
 use base::{syslog, AsRawDescriptor, AsRawDescriptors, Event, Tube};
 use devices::virtio::VirtioDevice;
 use devices::{
-    BarRange, Bus, BusDevice, BusDeviceObj, BusError, BusResumeDevice, HotPlugBus, IrqChip,
-    PciAddress, PciBridge, PciDevice, PciDeviceError, PciInterruptPin, PciRoot, ProxyDevice,
-    SerialHardware, SerialParameters, VfioPlatformDevice,
+    Bus, BusDevice, BusDeviceObj, BusError, BusResumeDevice, HotPlugBus, IrqChip, PciAddress,
+    PciDevice, PciDeviceError, PciInterruptPin, PciRoot, ProxyDevice, SerialHardware,
+    SerialParameters, VfioPlatformDevice,
 };
 use hypervisor::{IoEventAddress, ProtectionType, Vm};
 use minijail::Minijail;
@@ -99,8 +99,6 @@ pub struct VmComponents {
     pub dmi_path: Option<PathBuf>,
     pub no_legacy: bool,
     pub host_cpu_topology: bool,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    pub force_s2idle: bool,
 }
 
 /// Holds the elements needed to run a Linux VM. Created by `build_vm`.
@@ -290,9 +288,6 @@ pub enum DeviceRegistrationError {
     /// Appending to kernel command line failed.
     #[error("unable to add device to kernel command line: {0}")]
     Cmdline(kernel_cmdline::Error),
-    /// Configure window size failed.
-    #[error("failed to configure window size: {0}")]
-    ConfigureWindowSize(PciDeviceError),
     // Unable to create a pipe.
     #[error("failed to create pipe: {0}")]
     CreatePipe(base::Error),
@@ -404,14 +399,14 @@ pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
     for range in &mmio_ranges {
         linux
             .mmio_bus
-            .insert(arced_dev.clone(), range.addr, range.size)
+            .insert(arced_dev.clone(), range.0, range.1)
             .map_err(DeviceRegistrationError::MmioInsert)?;
     }
 
     for range in &device_ranges {
         linux
             .mmio_bus
-            .insert(arced_dev.clone(), range.addr, range.size)
+            .insert(arced_dev.clone(), range.0, range.1)
             .map_err(DeviceRegistrationError::MmioInsert)?;
     }
 
@@ -496,68 +491,32 @@ pub fn generate_pci_root(
 > {
     let mut root = PciRoot::new(Arc::downgrade(&mmio_bus), Arc::downgrade(&io_bus));
     let mut pid_labels = BTreeMap::new();
-    // The map of (dev_idx, bus), find bus number through dev_idx in devices
-    let mut devid_buses: BTreeMap<usize, u8> = BTreeMap::new();
-    // The map of (bridge secondary bus number, Vec<sub device BarRange>)
-    let mut bridge_bar_ranges: BTreeMap<u8, Vec<BarRange>> = BTreeMap::new();
 
     // Allocate PCI device address before allocating BARs.
     let mut device_addrs = Vec::<PciAddress>::new();
-    for (dev_idx, (device, _jail)) in devices.iter_mut().enumerate() {
+    for (device, _jail) in devices.iter_mut() {
         let address = device
             .allocate_address(resources)
             .map_err(DeviceRegistrationError::AllocateDeviceAddrs)?;
         device_addrs.push(address);
-
-        if address.bus > 0 {
-            devid_buses.insert(dev_idx, address.bus);
-        }
-
-        if PciBridge::is_pci_bridge(device) {
-            let sec_bus = PciBridge::get_secondary_bus_num(device);
-            bridge_bar_ranges.insert(sec_bus, Vec::<BarRange>::new());
-        }
     }
 
     // Allocate ranges that may need to be in the low MMIO region (MmioType::Low).
     let mut io_ranges = BTreeMap::new();
     for (dev_idx, (device, _jail)) in devices.iter_mut().enumerate() {
-        let mut ranges = device
+        let ranges = device
             .allocate_io_bars(resources)
             .map_err(DeviceRegistrationError::AllocateIoAddrs)?;
-        io_ranges.insert(dev_idx, ranges.clone());
-
-        if let Some(bus) = devid_buses.get(&dev_idx) {
-            if let Some(bridge_bar) = bridge_bar_ranges.get_mut(bus) {
-                bridge_bar.append(&mut ranges);
-            }
-        }
+        io_ranges.insert(dev_idx, ranges);
     }
 
     // Allocate device ranges that may be in low or high MMIO after low-only ranges.
     let mut device_ranges = BTreeMap::new();
     for (dev_idx, (device, _jail)) in devices.iter_mut().enumerate() {
-        let mut ranges = device
+        let ranges = device
             .allocate_device_bars(resources)
             .map_err(DeviceRegistrationError::AllocateDeviceAddrs)?;
-        device_ranges.insert(dev_idx, ranges.clone());
-
-        if let Some(bus) = devid_buses.get(&dev_idx) {
-            if let Some(bridge_bar) = bridge_bar_ranges.get_mut(bus) {
-                bridge_bar.append(&mut ranges);
-            }
-        }
-    }
-
-    for (device, _jail) in devices.iter_mut() {
-        if PciBridge::is_pci_bridge(device) {
-            let sec_bus = PciBridge::get_secondary_bus_num(device);
-            if let Some(bridge_bar) = bridge_bar_ranges.get(&sec_bus) {
-                device
-                    .configure_bridge_window(resources, bridge_bar)
-                    .map_err(DeviceRegistrationError::ConfigureWindowSize)?;
-            }
-        }
+        device_ranges.insert(dev_idx, ranges);
     }
 
     // Allocate legacy INTx
@@ -623,13 +582,13 @@ pub fn generate_pci_root(
         root.add_device(address, arced_dev.clone());
         for range in &ranges {
             mmio_bus
-                .insert(arced_dev.clone(), range.addr, range.size)
+                .insert(arced_dev.clone(), range.0, range.1)
                 .map_err(DeviceRegistrationError::MmioInsert)?;
         }
 
         for range in &device_ranges {
             mmio_bus
-                .insert(arced_dev.clone(), range.addr, range.size)
+                .insert(arced_dev.clone(), range.0, range.1)
                 .map_err(DeviceRegistrationError::MmioInsert)?;
         }
     }
