@@ -8,9 +8,10 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
-use base::{error, syscall, Event, PollToken, SafeDescriptor, Tube, WaitContext};
+use base::{error, Event, PollToken, SafeDescriptor, Tube, WaitContext};
 use fuse::filesystem::{FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use sync::Mutex;
+use sys_util::syscall;
 use vm_control::{FsMappingRequest, VmResponse};
 use vm_memory::GuestMemory;
 

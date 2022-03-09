@@ -14,7 +14,7 @@ use libc::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{errno_result, Error, Result};
+use crate::{errno, errno_result, Result};
 
 /// A shared memory file descriptor and its size.
 #[derive(Serialize, Deserialize)]
@@ -118,7 +118,9 @@ impl SharedMemory {
     /// Note that the given name may not have NUL characters anywhere in it, or this will return an
     /// error.
     pub fn named<T: Into<Vec<u8>>>(name: T) -> Result<SharedMemory> {
-        Self::new(Some(&CString::new(name).map_err(|_| Error::new(EINVAL))?))
+        Self::new(Some(
+            &CString::new(name).map_err(|_| errno::Error::new(EINVAL))?,
+        ))
     }
 
     /// Convenience function for `SharedMemory::new` that has an arbitrary and unspecified name.
@@ -219,7 +221,7 @@ impl SharedMemory {
                     .trim_end_matches(" (deleted)")
                     .to_owned()
             })
-            .ok_or_else(|| Error::new(EINVAL))
+            .ok_or_else(|| errno::Error::new(EINVAL))
     }
 }
 
@@ -298,7 +300,7 @@ pub fn kernel_has_memfd() -> bool {
     unsafe {
         let fd = memfd_create(b"/test_memfd_create\0".as_ptr() as *const c_char, 0);
         if fd < 0 {
-            if Error::last().errno() == libc::ENOSYS {
+            if errno::Error::last().errno() == libc::ENOSYS {
                 return false;
             }
             return true;

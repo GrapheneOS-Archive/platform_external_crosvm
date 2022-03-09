@@ -28,7 +28,7 @@ use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
     platform, BindMount, Config, DiskOption, Executable, FileBackedMappingParameters, GidMap,
     SharedDir, TouchDeviceOption, VfioCommand, VhostUserFsOption, VhostUserOption,
-    VhostUserWlOption, VhostVsockDeviceParameter, VvuOption, DISK_ID_LEN,
+    VhostUserWlOption, VhostVsockDeviceParameter, DISK_ID_LEN,
 };
 use devices::serial_device::{SerialHardware, SerialParameters, SerialType};
 #[cfg(feature = "audio_cras")]
@@ -987,10 +987,7 @@ fn parse_stub_pci_parameters(s: Option<&str>) -> argument::Result<StubPciParamet
         )))?
         .key();
     let mut params = StubPciParameters {
-        address: PciAddress::from_string(addr).map_err(|e| argument::Error::InvalidValue {
-            value: addr.to_owned(),
-            expected: format!("stub-pci-device: expected PCI address: {}", e),
-        })?,
+        address: PciAddress::from_string(addr),
         vendor_id: 0,
         device_id: 0,
         class: PciClassCode::Other,
@@ -2047,9 +2044,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             let vfio_dev = VfioCommand::new(vfio_type, value.unwrap())?;
             cfg.vfio.push(vfio_dev);
         }
-        "virtio-iommu" => {
-            cfg.virtio_iommu = true;
-        }
         #[cfg(feature = "video-decoder")]
         "video-decoder" => {
             cfg.video_dec = Some(parse_video_options(value)?);
@@ -2266,40 +2260,12 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "host-cpu-topology" => {
             cfg.host_cpu_topology = true;
         }
-        "privileged-vm" => {
-            cfg.privileged_vm = true;
-        }
         "stub-pci-device" => {
             cfg.stub_pci_devices.push(parse_stub_pci_parameters(value)?);
         }
-        "vvu-proxy" => {
-            let opts: Vec<_> = value.unwrap().split(',').collect();
-            let socket = PathBuf::from(opts[0]);
-            let addr = match opts.get(1) {
-                Some(opt) => {
-                    let kvs = argument::parse_key_value_options("vvu-proxy", opt, ',')
-                        .collect::<Vec<_>>();
-                    if kvs.len() != 1 || kvs[0].key() != "addr" {
-                        return Err(argument::Error::InvalidValue {
-                            value: opt.to_string(),
-                            expected: String::from(
-                                "Please specify PCI address for VVU: addr=BUS:DEVICE.FUNCTION",
-                            ),
-                        });
-                    }
-                    let pci_address = kvs[0].value()?;
-                    Some(PciAddress::from_string(pci_address).map_err(|e| {
-                        argument::Error::InvalidValue {
-                            value: pci_address.to_string(),
-                            expected: format!("vvu-proxy PCI address: {}", e),
-                        }
-                    })?)
-                }
-                None => None,
-            };
-
-            cfg.vvu_proxy.push(VvuOption { socket, addr });
-        }
+        "vvu-proxy" => cfg.vvu_proxy.push(VhostUserOption {
+            socket: PathBuf::from(value.unwrap()),
+        }),
         "coiommu" => {
             let mut params: devices::CoIommuParameters = Default::default();
             if let Some(v) = value {
@@ -2395,16 +2361,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
 
             cfg.pcie_rp.push(pcie_path);
-        }
-        "pivot-root" => {
-            cfg.pivot_root = Some(PathBuf::from(value.unwrap()));
-        }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        "s2idle" => {
-            cfg.force_s2idle = true;
-        }
-        "strict-balloon" => {
-            cfg.strict_balloon = true;
         }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
@@ -2520,7 +2476,6 @@ enum CommandStatus {
     VmReset,
     VmStop,
     VmCrash,
-    GuestPanic,
 }
 
 fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
@@ -2711,7 +2666,6 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
           Argument::value("vfio", "PATH[,iommu=on|off]", "Path to sysfs of PCI pass through or mdev device.
 iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("vfio-platform", "PATH", "Path to sysfs of platform pass through"),
-          Argument::flag("virtio-iommu", "Add a virtio-iommu device"),
           #[cfg(feature = "video-decoder")]
           Argument::flag_or_value("video-decoder", "[backend]", "(EXPERIMENTAL) enable virtio-video decoder device
                               Possible backend values: libvda"),
@@ -2745,9 +2699,7 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("vhost-user-wl", "SOCKET_PATH:TUBE_PATH", "Paths to a vhost-user socket for wayland and a Tube socket for additional wayland-specific messages"),
           Argument::value("vhost-user-fs", "SOCKET_PATH:TAG",
                           "Path to a socket path for vhost-user fs, and tag for the shared dir"),
-          Argument::value("vvu-proxy", "SOCKET_PATH[,addr=DOMAIN:BUS:DEVICE.FUNCTION]", "Socket path for the Virtio Vhost User proxy device.
-                              Parameters
-                              addr=BUS:DEVICE.FUNCTION - PCI address that the proxy device will be allocated"),
+          Argument::value("vvu-proxy", "SOCKET_PATH", "Socket path for the Virtio Vhost User proxy device"),
           #[cfg(feature = "direct")]
           Argument::value("direct-pmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct port mapped I/O access. RANGE may be decimal or hex (starting with 0x)."),
           #[cfg(feature = "direct")]
@@ -2760,7 +2712,6 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::flag("no-legacy", "Don't use legacy KBD/RTC devices emulation"),
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("host-cpu-topology", "Use mirror cpu topology of Host for Guest VM"),
-          Argument::flag("privileged-vm", "Grant this Guest VM certian privileges to manage Host resources, such as power management."),
           Argument::value("stub-pci-device", "DOMAIN:BUS:DEVICE.FUNCTION[,vendor=NUM][,device=NUM][,class=NUM][,subsystem_vendor=NUM][,subsystem_device=NUM][,revision=NUM]", "Comma-separated key=value pairs for setting up a stub PCI device that just enumerates. The first option in the list must specify a PCI address to claim.
                               Optional further parameters
                               vendor=NUM - PCI vendor ID
@@ -2789,10 +2740,6 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
                               align - whether to adjust addr and size to page boundaries implicitly"),
           #[cfg(feature = "direct")]
           Argument::value("pcie-root-port", "PATH", "Path to sysfs of host pcie root port"),
-          Argument::value("pivot-root", "PATH", "Path to empty directory to use for sandbox pivot root."),
-          #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-          Argument::flag("s2idle", "Set Low Power S0 Idle Capable Flag for guest Fixed ACPI Description Table"),
-          Argument::flag("strict-balloon", "Don't allow guest to use pages from the balloon"),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -2827,10 +2774,6 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
             Ok(platform::ExitState::Crash) => {
                 info!("crosvm has exited due to a VM crash");
                 Ok(CommandStatus::VmCrash)
-            }
-            Ok(platform::ExitState::GuestPanic) => {
-                info!("crosvm has exited due to a kernel panic in guest");
-                Ok(CommandStatus::GuestPanic)
             }
             Err(e) => {
                 error!("crosvm has exited with error: {:#}", e);
@@ -3488,7 +3431,6 @@ fn main() {
         Ok(CommandStatus::Success | CommandStatus::VmStop) => 0,
         Ok(CommandStatus::VmReset) => 32,
         Ok(CommandStatus::VmCrash) => 33,
-        Ok(CommandStatus::GuestPanic) => 34,
         Err(_) => 1,
     };
     std::process::exit(exit_code);

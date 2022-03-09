@@ -111,14 +111,11 @@ pub(super) fn create_base_minijail(
 
 pub(super) fn simple_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
     if cfg.sandbox {
-        let default_pivot_root: &str = option_env!("DEFAULT_PIVOT_ROOT").unwrap_or("/var/empty");
+        let pivot_root: &str = option_env!("DEFAULT_PIVOT_ROOT").unwrap_or("/var/empty");
         // A directory for a jailed device's pivot root.
-        let root_path = cfg
-            .pivot_root
-            .as_deref()
-            .unwrap_or_else(|| Path::new(default_pivot_root));
+        let root_path = Path::new(pivot_root);
         if !root_path.exists() {
-            bail!("{:?} doesn't exist, can't jail devices", root_path);
+            bail!("{} doesn't exist, can't jail devices", pivot_root);
         }
         let policy_path: PathBuf = cfg.seccomp_policy_dir.join(policy);
         let config = SandboxConfig {

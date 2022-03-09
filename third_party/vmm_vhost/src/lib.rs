@@ -77,13 +77,6 @@ pub use self::slave_fs_cache::SlaveFsCacheReq;
 #[sorted]
 #[derive(Debug, ThisError)]
 pub enum Error {
-    /// client exited properly.
-    #[error("client exited properly")]
-    ClientExit,
-    /// client disconnected.
-    /// If connection is closed properly, use `ClientExit` instead.
-    #[error("client closed the connection")]
-    Disconnect,
     /// Virtio/protocol features mismatch.
     #[error("virtio features mismatch")]
     FeatureMismatch,
@@ -131,10 +124,34 @@ pub enum Error {
     VfioDeviceError(anyhow::Error),
 }
 
-impl std::convert::From<base::Error> for Error {
+impl Error {
+    /// Determine whether to rebuild the underline communication channel.
+    pub fn should_reconnect(&self) -> bool {
+        match *self {
+            // Should reconnect because it may be caused by temporary network errors.
+            Error::PartialMessage => true,
+            // Should reconnect because the underline socket is broken.
+            Error::SocketBroken(_) => true,
+            // Slave internal error, hope it recovers on reconnect.
+            Error::SlaveInternalError => true,
+            // Master internal error, hope it recovers on reconnect.
+            Error::MasterInternalError => true,
+            // Should just retry the IO operation instead of rebuilding the underline connection.
+            Error::SocketRetry(_) => false,
+            Error::InvalidParam | Error::InvalidOperation => false,
+            Error::InvalidMessage | Error::IncorrectFds | Error::OversizedMsg => false,
+            Error::SocketError(_) | Error::SocketConnect(_) => false,
+            Error::FeatureMismatch => false,
+            Error::ReqHandlerError(_) => false,
+            Error::VfioDeviceError(_) => false,
+        }
+    }
+}
+
+impl std::convert::From<sys_util::Error> for Error {
     /// Convert raw socket errors into meaningful vhost-user errors.
     ///
-    /// The base::Error is a simple wrapper over the raw errno, which doesn't means
+    /// The sys_util::Error is a simple wrapper over the raw errno, which doesn't means
     /// much to the vhost-user connection manager. So convert it into meaningful errors to simplify
     /// the connection manager logic.
     ///
@@ -143,7 +160,7 @@ impl std::convert::From<base::Error> for Error {
     /// * - Error::SocketBroken: the underline socket is broken.
     /// * - Error::SocketError: other socket related errors.
     #[allow(unreachable_patterns)] // EWOULDBLOCK equals to EGAIN on linux
-    fn from(err: base::Error) -> Self {
+    fn from(err: sys_util::Error) -> Self {
         match err.errno() {
             // Retry:
             // * EAGAIN, EWOULDBLOCK: The socket is marked nonblocking and the requested operation
@@ -192,18 +209,17 @@ mod dummy_slave;
 
 #[cfg(all(test, feature = "vmm", feature = "device"))]
 mod tests {
+    use std::os::unix::io::AsRawFd;
     use std::path::Path;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
     use super::connection::socket::{Endpoint, Listener};
-
     use super::dummy_slave::{DummySlaveReqHandler, VIRTIO_FEATURES};
     use super::message::*;
     use super::*;
     use crate::backend::VhostBackend;
     use crate::{VhostUserMemoryRegionInfo, VringConfigData};
-    use base::AsRawDescriptor;
     use tempfile::{tempfile, Builder, TempDir};
 
     fn temp_dir() -> TempDir {
@@ -395,19 +411,19 @@ mod tests {
             .unwrap();
         // Set the buffer back to the backend
         master
-            .set_inflight_fd(&inflight_info, inflight_file.as_raw_descriptor())
+            .set_inflight_fd(&inflight_info, inflight_file.as_raw_fd())
             .unwrap();
 
         let num = master.get_queue_num().unwrap();
         assert_eq!(num, 2);
 
-        let eventfd = base::Event::new().unwrap();
+        let eventfd = sys_util::EventFd::new().unwrap();
         let mem = [VhostUserMemoryRegionInfo {
             guest_phys_addr: 0,
             memory_size: 0x10_0000,
             userspace_addr: 0,
             mmap_offset: 0,
-            mmap_handle: eventfd.as_raw_descriptor(),
+            mmap_handle: eventfd.as_raw_fd(),
         }];
         master.set_mem_table(&mem).unwrap();
 
@@ -426,10 +442,8 @@ mod tests {
         master.set_vring_enable(0, true).unwrap();
 
         // unimplemented yet
-        master
-            .set_log_base(0, Some(eventfd.as_raw_descriptor()))
-            .unwrap();
-        master.set_log_fd(eventfd.as_raw_descriptor()).unwrap();
+        master.set_log_base(0, Some(eventfd.as_raw_fd())).unwrap();
+        master.set_log_fd(eventfd.as_raw_fd()).unwrap();
 
         master.set_vring_num(0, 256).unwrap();
         master.set_vring_base(0, 0).unwrap();
@@ -456,7 +470,7 @@ mod tests {
             memory_size: 0x10_0000,
             userspace_addr: 0,
             mmap_offset: 0,
-            mmap_handle: region_file.as_raw_descriptor(),
+            mmap_handle: region_file.as_raw_fd(),
         };
         master.add_mem_region(&region).unwrap();
 
@@ -472,8 +486,8 @@ mod tests {
     }
 
     #[test]
-    fn test_error_from_base_error() {
-        let e: Error = base::Error::new(libc::EAGAIN).into();
+    fn test_error_from_sys_util_error() {
+        let e: Error = sys_util::Error::new(libc::EAGAIN).into();
         if let Error::SocketRetry(e1) = e {
             assert_eq!(e1.raw_os_error().unwrap(), libc::EAGAIN);
         } else {

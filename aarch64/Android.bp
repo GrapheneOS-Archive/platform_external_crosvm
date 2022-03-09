@@ -29,7 +29,6 @@ rust_library {
         "libkvm",
         "libkvm_sys",
         "liblibc",
-        "libmemoffset",
         "libminijail_rust",
         "libresources",
         "libsync_rust",
