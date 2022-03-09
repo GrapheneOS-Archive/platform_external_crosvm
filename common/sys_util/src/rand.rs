@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use libc::{c_uint, c_void};
 
-use crate::{errno_result, handle_eintr_errno, Result};
+use crate::{
+    errno::{errno_result, Result},
+    handle_eintr_errno,
+};
 
 /// How long to wait before calling getrandom again if it does not return
 /// enough bytes.

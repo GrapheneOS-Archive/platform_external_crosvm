@@ -3,25 +3,16 @@
 // found in the LICENSE file.
 
 use std::cmp::min;
-use std::convert::TryInto;
 use std::num::Wrapping;
 use std::sync::atomic::{fence, Ordering};
-use std::sync::Arc;
-use sync::Mutex;
 
 use anyhow::{bail, Context};
 use base::error;
 use cros_async::{AsyncError, EventAsync};
-use data_model::{DataInit, Le16, Le32, Le64};
 use virtio_sys::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{GuestAddress, GuestMemory};
 
 use super::{SignalableInterrupt, VIRTIO_MSI_NO_VECTOR};
-use crate::virtio::ipc_memory_mapper::IpcMemoryMapper;
-use crate::virtio::memory_mapper::{MemRegion, Permission, Translate};
-use crate::virtio::memory_util::{
-    is_valid_wrapper, read_obj_from_addr_wrapper, write_obj_at_addr_wrapper,
-};
 
 const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 const VIRTQ_DESC_F_WRITE: u16 = 0x2;
@@ -74,8 +65,7 @@ pub struct DescriptorChain {
     /// Index into the descriptor table
     pub index: u16,
 
-    /// Guest physical address of device specific data, or IO virtual address
-    /// if iommu is used
+    /// Guest physical address of device specific data
     pub addr: GuestAddress,
 
     /// Length of device specific data
@@ -87,21 +77,7 @@ pub struct DescriptorChain {
     /// Index into the descriptor table of the next descriptor if flags has
     /// the next bit set
     pub next: u16,
-
-    /// Translates `addr` to guest physical address
-    iommu: Option<Arc<Mutex<IpcMemoryMapper>>>,
 }
-
-#[derive(Copy, Clone, Debug)]
-#[repr(C)]
-pub struct Desc {
-    pub addr: Le64,
-    pub len: Le32,
-    pub flags: Le16,
-    pub next: Le16,
-}
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for Desc {}
 
 impl DescriptorChain {
     pub(crate) fn checked_new(
@@ -110,28 +86,31 @@ impl DescriptorChain {
         queue_size: u16,
         index: u16,
         required_flags: u16,
-        iommu: Option<Arc<Mutex<IpcMemoryMapper>>>,
     ) -> anyhow::Result<DescriptorChain> {
         if index >= queue_size {
             bail!("index ({}) >= queue_size ({})", index, queue_size);
         }
 
-        let desc_head = desc_table
-            .checked_add((index as u64) * 16)
-            .context("integer overflow")?;
-        let desc: Desc = read_obj_from_addr_wrapper::<Desc>(mem, &iommu, desc_head)
-            .context("failed to read desc")?;
+        let desc_head = mem
+            .checked_offset(desc_table, (index as u64) * 16)
+            .context("desc_table checked_offset failed")?;
+        // These reads can't fail unless Guest memory is hopelessly broken.
+        let addr = GuestAddress(mem.read_obj_from_addr::<u64>(desc_head).unwrap() as u64);
+        mem.checked_offset(desc_head, 16)
+            .context("desc_head checked_offset failed")?;
+        let len: u32 = mem.read_obj_from_addr(desc_head.unchecked_add(8)).unwrap();
+        let flags: u16 = mem.read_obj_from_addr(desc_head.unchecked_add(12)).unwrap();
+        let next: u16 = mem.read_obj_from_addr(desc_head.unchecked_add(14)).unwrap();
         let chain = DescriptorChain {
             mem: mem.clone(),
             desc_table,
             queue_size,
             ttl: queue_size,
             index,
-            addr: GuestAddress(desc.addr.into()),
-            len: desc.len.into(),
-            flags: desc.flags.into(),
-            next: desc.next.into(),
-            iommu,
+            addr,
+            len,
+            flags,
+            next,
         };
 
         if chain.is_valid() && chain.flags & required_flags == required_flags {
@@ -141,43 +120,20 @@ impl DescriptorChain {
         }
     }
 
-    /// Get the mem region(s), regardless if the `DescriptorChain`s contain gpa (guest physical
-    /// address), or iova (io virtual address) and iommu.
-    pub fn get_mem_regions(&self) -> anyhow::Result<Vec<MemRegion>> {
-        if let Some(iommu) = &self.iommu {
-            iommu
-                .lock()
-                .translate(self.addr.offset(), self.len as u64)
-                .context("failed to get mem regions")
-        } else {
-            Ok(vec![MemRegion {
-                gpa: self.addr,
-                len: self.len.try_into().expect("u32 doesn't fit in usize"),
-                perm: Permission::RW,
-            }])
-        }
-    }
-
+    #[allow(clippy::if_same_then_else, clippy::needless_bool)]
     fn is_valid(&self) -> bool {
-        if self.len > 0 {
-            match self.get_mem_regions() {
-                Ok(regions) => {
-                    if regions.iter().any(|r| {
-                        self.mem
-                            .checked_offset(r.gpa, r.len as u64 - 1u64)
-                            .is_none()
-                    }) {
-                        return false;
-                    }
-                }
-                Err(e) => {
-                    error!("{:#}", e);
-                    return false;
-                }
-            }
+        if self.len > 0
+            && self
+                .mem
+                .checked_offset(self.addr, self.len as u64 - 1u64)
+                .is_none()
+        {
+            false
+        } else if self.has_next() && self.next >= self.queue_size {
+            false
+        } else {
+            true
         }
-
-        !self.has_next() || self.next < self.queue_size
     }
 
     /// Gets if this descriptor chain has another descriptor chain linked after it.
@@ -209,14 +165,12 @@ impl DescriptorChain {
         if self.has_next() {
             // Once we see a write-only descriptor, all subsequent descriptors must be write-only.
             let required_flags = self.flags & VIRTQ_DESC_F_WRITE;
-            let iommu = self.iommu.as_ref().map(Arc::clone);
             match DescriptorChain::checked_new(
                 &self.mem,
                 self.desc_table,
                 self.queue_size,
                 self.next,
                 required_flags,
-                iommu,
             ) {
                 Ok(mut c) => {
                     c.ttl = self.ttl - 1;
@@ -287,8 +241,6 @@ pub struct Queue {
     // processing requests. This is the count of how many are in flight(could be several contexts
     // handling requests in parallel). When this count is zero, notifications are re-enabled.
     notification_disable_count: usize,
-
-    iommu: Option<Arc<Mutex<IpcMemoryMapper>>>,
 }
 
 impl Queue {
@@ -307,7 +259,6 @@ impl Queue {
             features: 0,
             last_used: Wrapping(0),
             notification_disable_count: 0,
-            iommu: None,
         }
     }
 
@@ -341,38 +292,44 @@ impl Queue {
         let used_ring_size = 6 + 8 * queue_size;
         if !self.ready {
             error!("attempt to use virtio queue that is not marked ready");
-            return false;
+            false
         } else if self.size > self.max_size || self.size == 0 || (self.size & (self.size - 1)) != 0
         {
             error!("virtio queue with invalid size: {}", self.size);
-            return false;
+            false
+        } else if desc_table
+            .checked_add(desc_table_size as u64)
+            .map_or(true, |v| !mem.address_in_range(v))
+        {
+            error!(
+                "virtio queue descriptor table goes out of bounds: start:0x{:08x} size:0x{:08x}",
+                desc_table.offset(),
+                desc_table_size
+            );
+            false
+        } else if avail_ring
+            .checked_add(avail_ring_size as u64)
+            .map_or(true, |v| !mem.address_in_range(v))
+        {
+            error!(
+                "virtio queue available ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
+                avail_ring.offset(),
+                avail_ring_size
+            );
+            false
+        } else if used_ring
+            .checked_add(used_ring_size as u64)
+            .map_or(true, |v| !mem.address_in_range(v))
+        {
+            error!(
+                "virtio queue used ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
+                used_ring.offset(),
+                used_ring_size
+            );
+            false
+        } else {
+            true
         }
-
-        let iommu = self.iommu.as_ref().map(|i| i.lock());
-        for (addr, size, name) in [
-            (desc_table, desc_table_size, "descriptor table"),
-            (avail_ring, avail_ring_size, "available ring"),
-            (used_ring, used_ring_size, "used ring"),
-        ] {
-            match is_valid_wrapper(mem, &iommu, addr, size as u64) {
-                Ok(valid) => {
-                    if !valid {
-                        error!(
-                            "virtio queue {} goes out of bounds: start:0x{:08x} size:0x{:08x}",
-                            name,
-                            addr.offset(),
-                            size,
-                        );
-                        return false;
-                    }
-                }
-                Err(e) => {
-                    error!("is_valid failed: {:#}", e);
-                    return false;
-                }
-            }
-        }
-        true
     }
 
     // Get the index of the first available descriptor chain in the available ring
@@ -384,8 +341,7 @@ impl Queue {
         fence(Ordering::SeqCst);
 
         let avail_index_addr = self.avail_ring.unchecked_add(2);
-        let avail_index: u16 =
-            read_obj_from_addr_wrapper(mem, &self.iommu, avail_index_addr).unwrap();
+        let avail_index: u16 = mem.read_obj_from_addr(avail_index_addr).unwrap();
 
         Wrapping(avail_index)
     }
@@ -402,7 +358,8 @@ impl Queue {
         let avail_event_addr = self
             .used_ring
             .unchecked_add(4 + 8 * u64::from(self.actual_size()));
-        write_obj_at_addr_wrapper(mem, &self.iommu, avail_index.0, avail_event_addr).unwrap();
+        mem.write_obj_at_addr(avail_index.0, avail_event_addr)
+            .unwrap();
     }
 
     // Query the value of a single-bit flag in the available ring.
@@ -411,8 +368,7 @@ impl Queue {
     fn get_avail_flag(&self, mem: &GuestMemory, flag: u16) -> bool {
         fence(Ordering::SeqCst);
 
-        let avail_flags: u16 =
-            read_obj_from_addr_wrapper(mem, &self.iommu, self.avail_ring).unwrap();
+        let avail_flags: u16 = mem.read_obj_from_addr(self.avail_ring).unwrap();
 
         avail_flags & flag == flag
     }
@@ -430,8 +386,7 @@ impl Queue {
         let used_event_addr = self
             .avail_ring
             .unchecked_add(4 + 2 * u64::from(self.actual_size()));
-        let used_event: u16 =
-            read_obj_from_addr_wrapper(mem, &self.iommu, used_event_addr).unwrap();
+        let used_event: u16 = mem.read_obj_from_addr(used_event_addr).unwrap();
 
         Wrapping(used_event)
     }
@@ -444,7 +399,8 @@ impl Queue {
         fence(Ordering::SeqCst);
 
         let used_index_addr = self.used_ring.unchecked_add(2);
-        write_obj_at_addr_wrapper(mem, &self.iommu, used_index.0, used_index_addr).unwrap();
+        mem.write_obj_at_addr(used_index.0, used_index_addr)
+            .unwrap();
     }
 
     // Set a single-bit flag in the used ring.
@@ -453,14 +409,13 @@ impl Queue {
     fn set_used_flag(&mut self, mem: &GuestMemory, flag: u16, value: bool) {
         fence(Ordering::SeqCst);
 
-        let mut used_flags: u16 =
-            read_obj_from_addr_wrapper(mem, &self.iommu, self.used_ring).unwrap();
+        let mut used_flags: u16 = mem.read_obj_from_addr(self.used_ring).unwrap();
         if value {
             used_flags |= flag;
         } else {
             used_flags &= !flag;
         }
-        write_obj_at_addr_wrapper(mem, &self.iommu, used_flags, self.used_ring).unwrap();
+        mem.write_obj_at_addr(used_flags, self.used_ring).unwrap();
     }
 
     /// Get the first available descriptor chain without removing it from the queue.
@@ -479,14 +434,12 @@ impl Queue {
         }
 
         let desc_idx_addr_offset = 4 + (u64::from(self.next_avail.0 % queue_size) * 2);
-        let desc_idx_addr = self.avail_ring.checked_add(desc_idx_addr_offset)?;
+        let desc_idx_addr = mem.checked_offset(self.avail_ring, desc_idx_addr_offset)?;
 
         // This index is checked below in checked_new.
-        let descriptor_index: u16 =
-            read_obj_from_addr_wrapper(mem, &self.iommu, desc_idx_addr).unwrap();
+        let descriptor_index: u16 = mem.read_obj_from_addr(desc_idx_addr).unwrap();
 
-        let iommu = self.iommu.as_ref().map(Arc::clone);
-        DescriptorChain::checked_new(mem, self.desc_table, queue_size, descriptor_index, 0, iommu)
+        DescriptorChain::checked_new(mem, self.desc_table, queue_size, descriptor_index, 0)
             .map_err(|e| {
                 error!("{:#}", e);
                 e
@@ -548,8 +501,8 @@ impl Queue {
         let used_elem = used_ring.unchecked_add((4 + next_used * 8) as u64);
 
         // These writes can't fail as we are guaranteed to be within the descriptor ring.
-        write_obj_at_addr_wrapper(mem, &self.iommu, desc_index as u32, used_elem).unwrap();
-        write_obj_at_addr_wrapper(mem, &self.iommu, len as u32, used_elem.unchecked_add(4))
+        mem.write_obj_at_addr(desc_index as u32, used_elem).unwrap();
+        mem.write_obj_at_addr(len as u32, used_elem.unchecked_add(4))
             .unwrap();
 
         self.next_used += Wrapping(1);
@@ -611,10 +564,6 @@ impl Queue {
     pub fn ack_features(&mut self, features: u64) {
         self.features |= features;
     }
-
-    pub fn set_iommu(&mut self, iommu: Arc<Mutex<IpcMemoryMapper>>) {
-        self.iommu = Some(iommu);
-    }
 }
 
 #[cfg(test)]
@@ -622,6 +571,7 @@ mod tests {
     use super::super::Interrupt;
     use super::*;
     use base::Event;
+    use data_model::{DataInit, Le16, Le32, Le64};
     use std::convert::TryInto;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
@@ -633,6 +583,17 @@ mod tests {
     const QUEUE_SIZE: usize = 0x10;
     const BUFFER_OFFSET: u64 = 0x8000;
     const BUFFER_LEN: u32 = 0x400;
+
+    #[derive(Copy, Clone, Debug)]
+    #[repr(C)]
+    struct Desc {
+        addr: Le64,
+        len: Le32,
+        flags: Le16,
+        next: Le16,
+    }
+    // Safe as this only runs in test
+    unsafe impl DataInit for Desc {}
 
     #[derive(Copy, Clone, Debug)]
     #[repr(C)]

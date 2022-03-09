@@ -1,7 +1,6 @@
 // Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use base::{AsRawDescriptor, RawDescriptor};
 use std::fs::File;
 use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -10,6 +9,7 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 
 use data_model::DataInit;
+use sys_util::{AsRawDescriptor, RawDescriptor};
 
 use super::connection::{socket::Endpoint as SocketEndpoint, Endpoint, EndpointExt};
 use super::message::*;
@@ -655,7 +655,7 @@ impl<S: VhostUserSlaveReqHandler, E: Endpoint<MasterReq>> SlaveReqHandler<S, E> 
                 self.slave_req_helper.endpoint.send_message(
                     &reply_hdr,
                     &inflight,
-                    Some(&[file.as_raw_descriptor()]),
+                    Some(&[file.as_raw_fd()]),
                 )?;
             }
             MasterReq::SET_INFLIGHT_FD => {
@@ -914,17 +914,17 @@ impl<S: VhostUserSlaveReqHandler, E: Endpoint<MasterReq>> SlaveReqHandler<S, E> 
     }
 }
 
-impl<S: VhostUserSlaveReqHandler, E: AsRawDescriptor + Endpoint<MasterReq>> AsRawDescriptor
+impl<S: VhostUserSlaveReqHandler, E: AsRawFd + Endpoint<MasterReq>> AsRawFd
     for SlaveReqHandler<S, E>
 {
-    fn as_raw_descriptor(&self) -> RawDescriptor {
-        self.slave_req_helper.endpoint.as_raw_descriptor()
+    fn as_raw_fd(&self) -> RawFd {
+        self.slave_req_helper.endpoint.as_raw_fd()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use base::INVALID_DESCRIPTOR;
+    use std::os::unix::io::AsRawFd;
 
     use super::*;
     use crate::dummy_slave::DummySlaveReqHandler;
@@ -939,6 +939,6 @@ mod tests {
         handler.check_state().unwrap();
         handler.set_failed(libc::EAGAIN);
         handler.check_state().unwrap_err();
-        assert!(handler.as_raw_descriptor() != INVALID_DESCRIPTOR);
+        assert!(handler.as_raw_fd() >= 0);
     }
 }

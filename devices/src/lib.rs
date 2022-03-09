@@ -49,9 +49,8 @@ pub use self::irqchip::*;
 #[cfg(feature = "audio")]
 pub use self::pci::{Ac97Backend, Ac97Dev, Ac97Parameters};
 pub use self::pci::{
-    BarRange, CoIommuDev, CoIommuParameters, CoIommuUnpinPolicy, PciAddress, PciBridge,
-    PciClassCode, PciConfigIo, PciConfigMmio, PciDevice, PciDeviceError, PciInterruptPin, PciRoot,
-    PciVirtualConfigMmio, PcieHostRootPort, PcieRootPort, PvPanicCode, PvPanicPciDevice,
+    CoIommuDev, CoIommuParameters, CoIommuUnpinPolicy, PciAddress, PciBridge, PciClassCode,
+    PciConfigIo, PciConfigMmio, PciDevice, PciDeviceError, PciInterruptPin, PciRoot, PcieRootPort,
     StubPciDevice, StubPciParameters, VfioPciDevice,
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -69,7 +68,7 @@ pub use self::usb::host_backend::host_backend_device_provider::HostBackendDevice
 #[cfg(feature = "usb")]
 pub use self::usb::xhci::xhci_controller::XhciController;
 pub use self::vfio::{VfioContainer, VfioDevice};
-pub use self::virtio::{vfio_wrapper, VirtioPciDevice};
+pub use self::virtio::VirtioPciDevice;
 
 /// Request CoIOMMU to unpin a specific range.
 use serde::{Deserialize, Serialize};

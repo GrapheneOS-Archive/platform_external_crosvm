@@ -53,7 +53,7 @@ The full source for this example can be executed directly:
 Networking support is easiest set up with a TAP device on the host, which can be done with:
 
 ```bash
-./tools/examples/setup_network
+./tools/examples/setup_networking
 ```
 
 The script will create a TAP device called `crosvm_tap` and sets up routing. For details, see the
