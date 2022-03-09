@@ -43,7 +43,7 @@ use crate::pci::pci_configuration::{
     PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration,
     PciHeaderType, PciOtherSubclass, COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK,
 };
-use crate::pci::pci_device::{BarRange, PciDevice, Result as PciResult};
+use crate::pci::pci_device::{PciDevice, Result as PciResult};
 use crate::pci::{PciAddress, PciDeviceError};
 use crate::vfio::VfioContainer;
 use crate::{UnpinRequest, UnpinResponse};
@@ -1437,13 +1437,13 @@ impl PciDevice for CoIommuDev {
         self.pci_address.ok_or(PciDeviceError::PciAllocationFailed)
     }
 
-    fn allocate_io_bars(&mut self, resources: &mut SystemAllocator) -> PciResult<Vec<BarRange>> {
+    fn allocate_io_bars(&mut self, resources: &mut SystemAllocator) -> PciResult<Vec<(u64, u64)>> {
         let address = self
             .pci_address
             .expect("allocate_address must be called prior to allocate_io_bars");
 
         // Allocate one bar for the structures pointed to by the capability structures.
-        let mut ranges: Vec<BarRange> = Vec::new();
+        let mut ranges = Vec::new();
 
         let mmio_addr = self.allocate_bar_address(
             resources,
@@ -1453,11 +1453,7 @@ impl PciDevice for CoIommuDev {
             "coiommu-mmiobar",
         )?;
 
-        ranges.push(BarRange {
-            addr: mmio_addr,
-            size: COIOMMU_MMIO_BAR_SIZE,
-            prefetchable: false,
-        });
+        ranges.push((mmio_addr, COIOMMU_MMIO_BAR_SIZE));
 
         Ok(ranges)
     }
@@ -1465,12 +1461,12 @@ impl PciDevice for CoIommuDev {
     fn allocate_device_bars(
         &mut self,
         resources: &mut SystemAllocator,
-    ) -> PciResult<Vec<BarRange>> {
+    ) -> PciResult<Vec<(u64, u64)>> {
         let address = self
             .pci_address
             .expect("allocate_address must be called prior to allocate_device_bars");
 
-        let mut ranges: Vec<BarRange> = Vec::new();
+        let mut ranges = Vec::new();
 
         let topologymap_addr = self.allocate_bar_address(
             resources,
@@ -1480,11 +1476,7 @@ impl PciDevice for CoIommuDev {
             "coiommu-topology",
         )?;
         self.topologymap_addr = Some(topologymap_addr);
-        ranges.push(BarRange {
-            addr: topologymap_addr,
-            size: COIOMMU_TOPOLOGYMAP_SIZE as u64,
-            prefetchable: false,
-        });
+        ranges.push((topologymap_addr, COIOMMU_TOPOLOGYMAP_SIZE as u64));
 
         let notifymap_addr = self.allocate_bar_address(
             resources,
@@ -1494,11 +1486,7 @@ impl PciDevice for CoIommuDev {
             "coiommu-notifymap",
         )?;
         self.notifymap_addr = Some(notifymap_addr);
-        ranges.push(BarRange {
-            addr: notifymap_addr,
-            size: COIOMMU_NOTIFYMAP_SIZE as u64,
-            prefetchable: false,
-        });
+        ranges.push((notifymap_addr, COIOMMU_NOTIFYMAP_SIZE as u64));
 
         Ok(ranges)
     }

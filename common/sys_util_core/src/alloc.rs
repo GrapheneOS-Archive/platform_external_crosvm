@@ -16,7 +16,7 @@ use std::cmp::min;
 /// ```
 /// use std::alloc::Layout;
 /// use std::mem;
-/// use sys_util_core::LayoutAllocation;
+/// use sys_util::LayoutAllocation;
 ///
 /// #[repr(C)]
 /// struct Header {

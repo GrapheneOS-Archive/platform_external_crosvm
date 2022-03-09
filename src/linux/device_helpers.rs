@@ -6,27 +6,18 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs::{File, OpenOptions};
 use std::net::Ipv4Addr;
-use std::ops::RangeInclusive;
 use std::os::unix::net::UnixListener;
 use std::os::unix::{io::FromRawFd, net::UnixStream, prelude::OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::Arc;
 
-use crate::{
-    Config, DiskOption, TouchDeviceOption, VhostUserFsOption, VhostUserOption, VhostUserWlOption,
-    VhostVsockDeviceParameter, VvuOption,
-};
 use anyhow::{anyhow, bail, Context, Result};
-use arch::{self, VirtioDeviceStub};
 use base::*;
 use devices::serial_device::SerialParameters;
 use devices::vfio::{VfioCommonSetup, VfioCommonTrait};
-use devices::virtio::ipc_memory_mapper::{create_ipc_mapper, CreateIpcMapperRet};
-use devices::virtio::memory_mapper::{BasicMemoryMapper, MemoryMapperTrait};
 #[cfg(feature = "audio_cras")]
 use devices::virtio::snd::cras_backend::Parameters as CrasSndParameters;
-use devices::virtio::vfio_wrapper::VfioWrapper;
 use devices::virtio::vhost::user::proxy::VirtioVhostUser;
 #[cfg(feature = "audio")]
 use devices::virtio::vhost::user::vmm::Snd as VhostUserSnd;
@@ -37,15 +28,21 @@ use devices::virtio::vhost::user::vmm::{
 };
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::VideoBackendType;
-use devices::virtio::{self, BalloonMode, Console, VirtioDevice};
+use devices::virtio::{self, Console, VirtioDevice};
 use devices::IommuDevType;
-use devices::{self, BusDeviceObj, PciDevice, VfioDevice, VfioPciDevice, VfioPlatformDevice};
+use devices::{self, PciDevice, VfioContainer, VfioDevice, VfioPciDevice, VfioPlatformDevice};
 use hypervisor::Vm;
 use minijail::{self, Minijail};
 use net_util::{MacAddress, Tap};
 use resources::{Alloc, MmioType, SystemAllocator};
 use sync::Mutex;
 use vm_memory::GuestAddress;
+
+use crate::{
+    Config, DiskOption, TouchDeviceOption, VhostUserFsOption, VhostUserOption, VhostUserWlOption,
+    VhostVsockDeviceParameter,
+};
+use arch::{self, VirtioDeviceStub};
 
 use super::jail_helpers::*;
 
@@ -217,19 +214,14 @@ pub fn create_vhost_user_snd_device(cfg: &Config, option: &VhostUserOption) -> D
     })
 }
 
-pub fn create_vvu_proxy_device(cfg: &Config, opt: &VvuOption, tube: Tube) -> DeviceResult {
+pub fn create_vvu_proxy_device(cfg: &Config, opt: &VhostUserOption, tube: Tube) -> DeviceResult {
     let listener = UnixListener::bind(&opt.socket).map_err(|e| {
         error!("failed to bind listener for vvu proxy device: {}", e);
         e
     })?;
 
-    let dev = VirtioVhostUser::new(
-        virtio::base_features(cfg.protected_vm),
-        listener,
-        tube,
-        opt.addr,
-    )
-    .context("failed to create VVU proxy device")?;
+    let dev = VirtioVhostUser::new(virtio::base_features(cfg.protected_vm), listener, tube)
+        .context("failed to create VVU proxy device")?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
@@ -499,11 +491,6 @@ pub fn create_balloon_device(
         tube,
         inflate_tube,
         init_balloon_size,
-        if cfg.strict_balloon {
-            BalloonMode::Strict
-        } else {
-            BalloonMode::Relaxed
-        },
     )
     .context("failed to create balloon")?;
 
@@ -993,20 +980,12 @@ pub fn create_pmem_device(
 pub fn create_iommu_device(
     cfg: &Config,
     phys_max_addr: u64,
-    endpoints: BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>>,
-    hp_endpoints_ranges: Vec<RangeInclusive<u32>>,
-    translate_response_senders: Option<BTreeMap<u32, Tube>>,
-    translate_request_rx: Option<Tube>,
-    iommu_device_tube: Tube,
+    endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
 ) -> DeviceResult {
     let dev = virtio::Iommu::new(
         virtio::base_features(cfg.protected_vm),
         endpoints,
         phys_max_addr,
-        hp_endpoints_ranges,
-        translate_response_senders,
-        translate_request_rx,
-        Some(iommu_device_tube),
     )
     .context("failed to create IOMMU device")?;
 
@@ -1069,7 +1048,7 @@ pub fn create_vfio_device(
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
     bus_num: Option<u8>,
-    iommu_endpoints: &mut BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>>,
+    iommu_endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
     coiommu_endpoints: Option<&mut Vec<u16>>,
     iommu_dev: IommuDevType,
 ) -> DeviceResult<(Box<VfioPciDevice>, Option<Minijail>)> {
@@ -1121,13 +1100,7 @@ pub fn create_vfio_device(
     match iommu_dev {
         IommuDevType::NoIommu => {}
         IommuDevType::VirtioIommu => {
-            iommu_endpoints.insert(
-                endpoint_addr.to_u32(),
-                Arc::new(Mutex::new(Box::new(VfioWrapper::new(
-                    vfio_container,
-                    vm.get_memory().clone(),
-                )))),
-            );
+            iommu_endpoints.insert(endpoint_addr.to_u32(), vfio_container);
         }
         IommuDevType::CoIommu => {
             if let Some(endpoints) = coiommu_endpoints {
@@ -1151,7 +1124,7 @@ pub fn create_vfio_platform_device(
     _resources: &mut SystemAllocator,
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
-    _endpoints: &mut BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>>,
+    _endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
     iommu_dev: IommuDevType,
 ) -> DeviceResult<(VfioPlatformDevice, Option<Minijail>)> {
     let vfio_container = VfioCommonSetup::vfio_get_container(iommu_dev, Some(vfio_path))
@@ -1171,48 +1144,4 @@ pub fn create_vfio_platform_device(
     let vfio_plat_dev = VfioPlatformDevice::new(vfio_device, vfio_device_tube_mem);
 
     Ok((vfio_plat_dev, simple_jail(cfg, "vfio_platform_device")?))
-}
-
-/// Setup for devices with VIRTIO_F_ACCESS_PLATFORM
-pub fn setup_virtio_access_platform(
-    resources: &mut SystemAllocator,
-    iommu_attached_endpoints: &mut BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>>,
-    devices: &mut Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
-) -> DeviceResult<(Option<BTreeMap<u32, Tube>>, Option<Tube>)> {
-    let mut translate_response_senders: Option<
-        BTreeMap<
-            u32, // endpoint id
-            Tube,
-        >,
-    > = None;
-    let mut tube_pair: Option<(Tube, Tube)> = None;
-
-    for dev in devices.iter_mut() {
-        if let Some(pci_dev) = dev.0.as_pci_device_mut() {
-            if pci_dev.supports_iommu() {
-                let endpoint_id = pci_dev
-                    .allocate_address(resources)
-                    .context("failed to allocate resources for pci dev")?
-                    .to_u32();
-                let mapper: Arc<Mutex<Box<dyn MemoryMapperTrait>>> =
-                    Arc::new(Mutex::new(Box::new(BasicMemoryMapper::new(u64::MAX))));
-                let (request_tx, _request_rx) =
-                    tube_pair.get_or_insert_with(|| Tube::pair().unwrap());
-                let CreateIpcMapperRet {
-                    mapper: ipc_mapper,
-                    response_tx,
-                } = create_ipc_mapper(endpoint_id, request_tx.try_clone()?);
-                translate_response_senders
-                    .get_or_insert_with(BTreeMap::new)
-                    .insert(endpoint_id, response_tx);
-                iommu_attached_endpoints.insert(endpoint_id, mapper);
-                pci_dev.set_iommu(ipc_mapper)?;
-            }
-        }
-    }
-
-    Ok((
-        translate_response_senders,
-        tube_pair.map(|(_request_tx, request_rx)| request_rx),
-    ))
 }

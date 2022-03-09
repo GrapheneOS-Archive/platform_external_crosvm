@@ -11,7 +11,7 @@ use sync::Mutex;
 use vm_memory::{GuestAddress, GuestMemory};
 
 use crate::virtio::iommu::memory_mapper::{
-    Error as MemoryMapperError, MappingInfo, MemRegion, MemoryMapper, Permission, Translate,
+    Error as MemoryMapperError, MappingInfo, MemoryMapper, Permission,
 };
 use crate::VfioContainer;
 
@@ -23,10 +23,6 @@ pub struct VfioWrapper {
 impl VfioWrapper {
     pub fn new(container: Arc<Mutex<VfioContainer>>, mem: GuestMemory) -> Self {
         Self { container, mem }
-    }
-
-    pub fn as_vfio_container(&self) -> Arc<Mutex<VfioContainer>> {
-        self.container.clone()
     }
 }
 
@@ -47,15 +43,7 @@ impl MemoryMapper for VfioWrapper {
                 (map.perm as u8 & Permission::Write as u8) != 0,
             )
         }
-        .map_err(|e| {
-            match base::Error::last() {
-                err if err.errno() == libc::EEXIST => {
-                    // A mapping already exists in the requested range,
-                    return MemoryMapperError::IovaRegionOverlap;
-                }
-                _ => MemoryMapperError::Vfio(e),
-            }
-        })
+        .map_err(MemoryMapperError::Vfio)
     }
 
     fn remove_map(&mut self, iova_start: u64, size: u64) -> Result<(), MemoryMapperError> {
@@ -75,19 +63,7 @@ impl MemoryMapper for VfioWrapper {
             .map_err(MemoryMapperError::Vfio)
     }
 
-    fn as_vfio_wrapper(&self) -> Option<&VfioWrapper> {
-        Some(self)
-    }
-    fn as_vfio_wrapper_mut(&mut self) -> Option<&mut VfioWrapper> {
-        Some(self)
-    }
-    fn into_vfio_wrapper(self: Box<Self>) -> Option<Box<VfioWrapper>> {
-        Some(self)
-    }
-}
-
-impl Translate for VfioWrapper {
-    fn translate(&self, _iova: u64, _size: u64) -> Result<Vec<MemRegion>, MemoryMapperError> {
+    fn translate(&self, _iova: u64, _size: u64) -> Result<GuestAddress, MemoryMapperError> {
         Err(MemoryMapperError::Unimplemented)
     }
 }

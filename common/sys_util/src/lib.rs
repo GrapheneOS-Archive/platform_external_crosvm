@@ -28,6 +28,7 @@ mod capabilities;
 mod clock;
 mod descriptor;
 mod descriptor_reflection;
+mod errno;
 mod eventfd;
 mod file_flags;
 pub mod file_traits;
@@ -44,6 +45,7 @@ pub mod read_dir;
 mod sched;
 pub mod scoped_path;
 pub mod scoped_signal_handler;
+mod seek_hole;
 mod shm;
 pub mod signal;
 mod signalfd;
@@ -57,6 +59,7 @@ pub use crate::acpi_event::*;
 pub use crate::capabilities::drop_capabilities;
 pub use crate::clock::{Clock, FakeClock};
 pub use crate::descriptor::*;
+pub use crate::errno::{errno_result, Error, Result};
 pub use crate::eventfd::*;
 pub use crate::file_flags::*;
 pub use crate::fork::*;
@@ -80,13 +83,14 @@ pub use descriptor_reflection::{
     SerializeDescriptors,
 };
 pub use poll_token_derive::*;
-pub use sys_util_core::{Error, Result, *};
+pub use sys_util_core::*;
 
 pub use crate::file_traits::{
     AsRawFds, FileAllocate, FileGetLen, FileReadWriteAtVolatile, FileReadWriteVolatile, FileSetLen,
     FileSync,
 };
 pub use crate::mmap::Error as MmapError;
+pub use crate::seek_hole::SeekHole;
 pub use crate::signalfd::Error as SignalFdError;
 pub use crate::write_zeroes::{PunchHole, WriteZeroes, WriteZeroesAt};
 
