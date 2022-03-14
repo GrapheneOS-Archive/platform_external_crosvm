@@ -94,14 +94,10 @@ rust_binary {
                 "gpu",
             ],
         },
-        linux_bionic_arm64: {
-            relative_install_path: "aarch64-linux-bionic",
-        },
         darwin: {
             enabled: false,
         },
-        linux_glibc_x86_64: {
-            relative_install_path: "x86_64-linux-gnu",
+        host_linux: {
             features: [
                 "gdb",
                 "gdbstub",
@@ -111,6 +107,15 @@ rust_binary {
                 "libgdbstub_arch",
                 "libthiserror",
             ],
+        },
+        linux_bionic_arm64: {
+            relative_install_path: "aarch64-linux-bionic",
+        },
+        linux_glibc_x86_64: {
+            relative_install_path: "x86_64-linux-gnu",
+        },
+        linux_musl_x86_64: {
+            relative_install_path: "x86_64-linux-musl",
         },
     },
     ld_flags: [
@@ -184,7 +189,7 @@ rust_test {
                 "gpu",
             ],
         },
-        linux_glibc_x86_64: {
+        host_linux: {
             features: [
                 "gdb",
                 "gdbstub",
@@ -268,7 +273,7 @@ rust_test {
                 "gpu",
             ],
         },
-        linux_glibc_x86_64: {
+        host_linux: {
             features: [
                 "gdb",
                 "gdbstub",
@@ -346,7 +351,7 @@ rust_library {
                 "gpu",
             ],
         },
-        linux_glibc_x86_64: {
+        host_linux: {
             features: [
                 "gdb",
                 "gdbstub",
@@ -370,6 +375,9 @@ rust_defaults {
     enabled: false,
     target: {
         linux_glibc_x86_64: {
+            enabled: true,
+        },
+        linux_musl_x86_64: {
             enabled: true,
         },
         android64: {

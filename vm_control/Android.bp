@@ -35,7 +35,7 @@ rust_library {
     ],
     proc_macros: ["libremain"],
     target: {
-        linux_glibc_x86_64: {
+        host_linux: {
             features: [
                 "gdb",
             ],
