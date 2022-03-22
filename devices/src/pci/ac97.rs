@@ -22,7 +22,7 @@ use crate::pci::pci_configuration::{
     PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration,
     PciHeaderType, PciMultimediaSubclass,
 };
-use crate::pci::pci_device::{self, PciDevice, Result};
+use crate::pci::pci_device::{self, BarRange, PciDevice, Result};
 use crate::pci::{PciAddress, PciDeviceError, PciInterruptPin};
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use crate::virtio::snd::vios_backend::Error as VioSError;
@@ -319,11 +319,11 @@ impl PciDevice for Ac97Dev {
         Some((gsi, pin))
     }
 
-    fn allocate_io_bars(&mut self, resources: &mut SystemAllocator) -> Result<Vec<(u64, u64)>> {
+    fn allocate_io_bars(&mut self, resources: &mut SystemAllocator) -> Result<Vec<BarRange>> {
         let address = self
             .pci_address
             .expect("allocate_address must be called prior to allocate_io_bars");
-        let mut ranges = Vec::new();
+        let mut ranges: Vec<BarRange> = Vec::new();
         let mixer_regs_addr = resources
             .mmio_allocator(MmioType::Low)
             .allocate_with_align(
@@ -348,7 +348,11 @@ impl PciDevice for Ac97Dev {
         self.config_regs
             .add_pci_bar(mixer_config)
             .map_err(|e| pci_device::Error::IoRegistrationFailed(mixer_regs_addr, e))?;
-        ranges.push((mixer_regs_addr, MIXER_REGS_SIZE));
+        ranges.push(BarRange {
+            addr: mixer_regs_addr,
+            size: MIXER_REGS_SIZE,
+            prefetchable: false,
+        });
 
         let master_regs_addr = resources
             .mmio_allocator(MmioType::Low)
@@ -374,7 +378,11 @@ impl PciDevice for Ac97Dev {
         self.config_regs
             .add_pci_bar(master_config)
             .map_err(|e| pci_device::Error::IoRegistrationFailed(master_regs_addr, e))?;
-        ranges.push((master_regs_addr, MASTER_REGS_SIZE));
+        ranges.push(BarRange {
+            addr: master_regs_addr,
+            size: MASTER_REGS_SIZE,
+            prefetchable: false,
+        });
         Ok(ranges)
     }
 
@@ -449,8 +457,8 @@ mod tests {
             Ac97Dev::new(mem, Ac97Backend::NULL, Box::new(MockShmStreamSource::new()));
         let mut allocator = SystemAllocator::new(SystemAllocatorConfig {
             io: Some(MemRegion {
-                base: 0x1000_0000,
-                size: 0x1000_0000,
+                base: 0xc000,
+                size: 0x4000,
             }),
             low_mmio: MemRegion {
                 base: 0x2000_0000,
