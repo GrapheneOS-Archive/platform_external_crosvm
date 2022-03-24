@@ -4,12 +4,10 @@
 
 use std::collections::BTreeMap;
 use std::convert::TryInto;
-use std::fmt::{self, Display};
 use std::ops::Bound::Included;
 use std::sync::{Arc, Weak};
 
 use base::{error, Event, RawDescriptor};
-use serde::{Deserialize, Serialize};
 use sync::Mutex;
 
 use crate::pci::pci_configuration::{
@@ -17,7 +15,7 @@ use crate::pci::pci_configuration::{
     HEADER_TYPE_MULTIFUNCTION_MASK, HEADER_TYPE_REG,
 };
 use crate::pci::pci_device::{Error, PciDevice};
-use crate::pci::PCI_VENDOR_ID_INTEL;
+use crate::pci::{PciAddress, PCI_VENDOR_ID_INTEL};
 use crate::{Bus, BusAccessInfo, BusDevice, BusType};
 use resources::SystemAllocator;
 
@@ -55,87 +53,6 @@ impl PciDevice for PciRootConfiguration {
 
     fn get_bar_configuration(&self, bar_num: usize) -> Option<PciBarConfiguration> {
         self.config.get_bar_configuration(bar_num)
-    }
-}
-
-/// PCI Device Address, AKA Bus:Device.Function
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PciAddress {
-    pub bus: u8,
-    pub dev: u8,  /* u5 */
-    pub func: u8, /* u3 */
-}
-
-impl Display for PciAddress {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:04x}:{:02x}.{:0x}", self.bus, self.dev, self.func)
-    }
-}
-
-impl PciAddress {
-    const BUS_MASK: u32 = 0x00ff;
-    const DEVICE_BITS_NUM: usize = 5;
-    const DEVICE_MASK: u32 = 0x1f;
-    const FUNCTION_BITS_NUM: usize = 3;
-    const FUNCTION_MASK: u32 = 0x07;
-    const REGISTER_OFFSET: usize = 2;
-
-    /// Construct PciAddress and register tuple from CONFIG_ADDRESS value.
-    pub fn from_config_address(config_address: u32, register_bits_num: usize) -> (Self, usize) {
-        let bus_offset = register_bits_num + Self::FUNCTION_BITS_NUM + Self::DEVICE_BITS_NUM;
-        let bus = ((config_address >> bus_offset) & Self::BUS_MASK) as u8;
-        let dev_offset = register_bits_num + Self::FUNCTION_BITS_NUM;
-        let dev = ((config_address >> dev_offset) & Self::DEVICE_MASK) as u8;
-        let func = ((config_address >> register_bits_num) & Self::FUNCTION_MASK) as u8;
-        let register_mask: u32 = (1_u32 << (register_bits_num - Self::REGISTER_OFFSET)) - 1;
-        let register = ((config_address >> Self::REGISTER_OFFSET) & register_mask) as usize;
-
-        (PciAddress { bus, dev, func }, register)
-    }
-
-    /// Construct PciAddress from string domain:bus:device.function.
-    pub fn from_string(address: &str) -> Self {
-        let mut func_dev_bus_domain = address
-            .split(|c| c == ':' || c == '.')
-            .map(|v| u8::from_str_radix(v, 16).unwrap_or_default())
-            .rev()
-            .collect::<Vec<u8>>();
-        func_dev_bus_domain.resize(4, 0);
-        PciAddress {
-            bus: func_dev_bus_domain[2],
-            dev: func_dev_bus_domain[1],
-            func: func_dev_bus_domain[0],
-        }
-    }
-
-    /// Encode PciAddress into CONFIG_ADDRESS value.
-    pub fn to_config_address(&self, register: usize, register_bits_num: usize) -> u32 {
-        let bus_offset = register_bits_num + Self::FUNCTION_BITS_NUM + Self::DEVICE_BITS_NUM;
-        let dev_offset = register_bits_num + Self::FUNCTION_BITS_NUM;
-        let register_mask: u32 = (1_u32 << (register_bits_num - Self::REGISTER_OFFSET)) - 1;
-        ((Self::BUS_MASK & self.bus as u32) << bus_offset)
-            | ((Self::DEVICE_MASK & self.dev as u32) << dev_offset)
-            | ((Self::FUNCTION_MASK & self.func as u32) << register_bits_num)
-            | ((register_mask & register as u32) << Self::REGISTER_OFFSET)
-    }
-
-    /// Convert B:D:F PCI address to unsigned 32 bit integer
-    pub fn to_u32(&self) -> u32 {
-        ((Self::BUS_MASK & self.bus as u32) << (Self::FUNCTION_BITS_NUM + Self::DEVICE_BITS_NUM))
-            | ((Self::DEVICE_MASK & self.dev as u32) << Self::FUNCTION_BITS_NUM)
-            | (Self::FUNCTION_MASK & self.func as u32)
-    }
-
-    /// Returns true if the address points to PCI root host-bridge.
-    fn is_root(&self) -> bool {
-        matches!(
-            &self,
-            PciAddress {
-                bus: 0,
-                dev: 0,
-                func: 0
-            }
-        )
     }
 }
 
@@ -302,6 +219,24 @@ impl PciRoot {
 
             for remove_pci_device in res.removed_pci_devices.iter() {
                 self.remove_device(*remove_pci_device);
+            }
+        }
+    }
+
+    pub fn virtual_config_space_read(&self, address: PciAddress, register: usize) -> u32 {
+        if address.is_root() {
+            0u32
+        } else {
+            self.devices
+                .get(&address)
+                .map_or(0u32, |d| d.lock().virtual_config_register_read(register))
+        }
+    }
+
+    pub fn virtual_config_space_write(&mut self, address: PciAddress, register: usize, value: u32) {
+        if !address.is_root() {
+            if let Some(d) = self.devices.get(&address) {
+                d.lock().virtual_config_register_write(register, value);
             }
         }
     }
@@ -474,5 +409,77 @@ impl BusDevice for PciConfigMmio {
             return;
         }
         self.config_space_write(info.offset as u32, info.offset % 4, data)
+    }
+}
+
+/// Inspired by PCI configuration space, CrosVM provides 1024 dword virtual registers (4KiB in
+/// total) for each PCI device. The guest can use these registers to exchange device-specific
+/// information with CrosVM.
+/// All these virtual registers from all PCI devices locate in a contiguous memory region.
+/// The base address of this memory region is provided by an IntObj named VCFG in the ACPI DSDT.
+/// The offset of each register is calculated in the same way as PCIe ECAM;
+/// i.e. offset = (bus << 20) | (device << 15) | (function << 12) | (register_index << 2)
+pub struct PciVirtualConfigMmio {
+    /// PCI root bridge.
+    pci_root: Arc<Mutex<PciRoot>>,
+    /// Register bit number in config address.
+    register_bit_num: usize,
+}
+
+impl PciVirtualConfigMmio {
+    pub fn new(pci_root: Arc<Mutex<PciRoot>>, register_bit_num: usize) -> Self {
+        PciVirtualConfigMmio {
+            pci_root,
+            register_bit_num,
+        }
+    }
+}
+
+impl BusDevice for PciVirtualConfigMmio {
+    fn debug_label(&self) -> String {
+        "pci virtual config mmio".to_owned()
+    }
+
+    fn read(&mut self, info: BusAccessInfo, data: &mut [u8]) {
+        let value = if info.offset % 4 != 0 || data.len() != 4 {
+            error!(
+                "{} unexpected read at offset = {}, len = {}",
+                self.debug_label(),
+                info.offset,
+                data.len()
+            );
+            0u32
+        } else {
+            let (address, register) =
+                PciAddress::from_config_address(info.offset as u32, self.register_bit_num);
+            self.pci_root
+                .lock()
+                .virtual_config_space_read(address, register)
+        };
+        data[0] = value as u8;
+        data[1] = (value >> (1 * 8)) as u8;
+        data[2] = (value >> (2 * 8)) as u8;
+        data[3] = (value >> (3 * 8)) as u8;
+    }
+
+    fn write(&mut self, info: BusAccessInfo, data: &[u8]) {
+        if info.offset % 4 != 0 || data.len() != 4 {
+            error!(
+                "{} unexpected write at offset = {}, len = {}",
+                self.debug_label(),
+                info.offset,
+                data.len()
+            );
+            return;
+        }
+        let value = (data[0] as u32)
+            | ((data[1] as u32) << (1 * 8))
+            | ((data[2] as u32) << (2 * 8))
+            | ((data[3] as u32) << (3 * 8));
+        let (address, register) =
+            PciAddress::from_config_address(info.offset as u32, self.register_bit_num);
+        self.pci_root
+            .lock()
+            .virtual_config_space_write(address, register, value)
     }
 }

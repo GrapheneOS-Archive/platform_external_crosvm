@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+
 mod fdt;
 
 const SETUP_DTB: u32 = 2;
@@ -58,7 +60,7 @@ use base::Event;
 use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::{
     BusDeviceObj, BusResumeDevice, IrqChip, IrqChipX86_64, PciAddress, PciConfigIo, PciConfigMmio,
-    PciDevice,
+    PciDevice, PciVirtualConfigMmio,
 };
 use hypervisor::{HypervisorX86_64, ProtectionType, VcpuX86_64, Vm, VmX86_64};
 use minijail::Minijail;
@@ -213,6 +215,8 @@ const RESERVED_MEM_SIZE: u64 = 0x800_0000;
 // Reserve 64MB for pcie enhanced configuration
 const PCIE_CFG_MMIO_SIZE: u64 = 0x400_0000;
 const PCIE_CFG_MMIO_START: u64 = FIRST_ADDR_PAST_32BITS - RESERVED_MEM_SIZE - PCIE_CFG_MMIO_SIZE;
+// Reserve memory region for pcie virtual configuration
+const PCIE_VCFG_MMIO_SIZE: u64 = PCIE_CFG_MMIO_SIZE;
 const END_ADDR_BEFORE_32BITS: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
 const PCI_MMIO_SIZE: u64 = MEM_32BIT_GAP_SIZE - RESERVED_MEM_SIZE - PCIE_CFG_MMIO_SIZE;
 // Linux (with 4-level paging) has a physical memory limit of 46 bits (64 TiB).
@@ -314,6 +318,13 @@ fn configure_system(
         E820Type::Reserved,
     )?;
 
+    add_e820_entry(
+        &mut params,
+        X8664arch::get_pcie_vcfg_mmio_base(guest_mem),
+        PCIE_VCFG_MMIO_SIZE,
+        E820Type::Reserved,
+    )?;
+
     let zero_page_addr = GuestAddress(ZERO_PAGE_OFFSET);
     guest_mem
         .checked_offset(zero_page_addr, mem::size_of::<boot_params>() as u64)
@@ -397,7 +408,7 @@ impl arch::LinuxArch for X8664arch {
         SystemAllocator::new(SystemAllocatorConfig {
             io: Some(MemRegion {
                 base: 0xc000,
-                size: 0x1_0000,
+                size: 0x4000,
             }),
             low_mmio: MemRegion {
                 base: END_ADDR_BEFORE_32BITS,
@@ -477,6 +488,15 @@ impl arch::LinuxArch for X8664arch {
         let pcie_cfg_mmio = Arc::new(Mutex::new(PciConfigMmio::new(pci.clone(), 12)));
         mmio_bus
             .insert(pcie_cfg_mmio, PCIE_CFG_MMIO_START, PCIE_CFG_MMIO_SIZE)
+            .unwrap();
+
+        let pcie_vcfg_mmio = Arc::new(Mutex::new(PciVirtualConfigMmio::new(pci.clone(), 12)));
+        mmio_bus
+            .insert(
+                pcie_vcfg_mmio,
+                Self::get_pcie_vcfg_mmio_base(&mem),
+                PCIE_VCFG_MMIO_SIZE,
+            )
             .unwrap();
 
         // Event used to notify crosvm that guest OS is trying to suspend.
@@ -559,6 +579,7 @@ impl arch::LinuxArch for X8664arch {
             &pci_irqs,
             PCIE_CFG_MMIO_START,
             max_bus,
+            components.force_s2idle,
         )
         .ok_or(Error::CreateAcpi)?;
 
@@ -1129,15 +1150,19 @@ impl X8664arch {
         Ok(())
     }
 
+    fn get_pcie_vcfg_mmio_base(mem: &GuestMemory) -> u64 {
+        // Put PCIe VCFG region at a 2MB boundary after physical memory or 4gb, whichever is greater.
+        let ram_end_round_2mb = (mem.end_addr().offset() + 2 * MB - 1) / (2 * MB) * (2 * MB);
+        std::cmp::max(ram_end_round_2mb, 4 * GB)
+    }
+
     /// This returns the start address of high mmio
     ///
     /// # Arguments
     ///
     /// * mem: The memory to be used by the guest
     fn get_high_mmio_base(mem: &GuestMemory) -> u64 {
-        // Put device memory at a 2MB boundary after physical memory or 4gb, whichever is greater.
-        let ram_end_round_2mb = (mem.end_addr().offset() + 2 * MB - 1) / (2 * MB) * (2 * MB);
-        std::cmp::max(ram_end_round_2mb, 4 * GB)
+        Self::get_pcie_vcfg_mmio_base(mem) + PCIE_VCFG_MMIO_SIZE
     }
 
     /// This returns the size of high mmio
@@ -1261,6 +1286,9 @@ impl X8664arch {
                 .map_err(Error::AllocateIOResouce)?,
             None => 0x600,
         };
+
+        let pcie_vcfg = aml::Name::new("VCFG".into(), &Self::get_pcie_vcfg_mmio_base(mem));
+        Aml::to_aml_bytes(&pcie_vcfg, &mut amls);
 
         let pmresource = devices::ACPIPMResource::new(suspend_evt, exit_evt);
         Aml::to_aml_bytes(&pmresource, &mut amls);
