@@ -4,7 +4,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -14,7 +13,7 @@ use thiserror::Error as ThisError;
 
 use balloon_control::{BalloonStats, BalloonTubeCommand, BalloonTubeResult};
 use base::{self, error, warn, AsRawDescriptor, AsyncTube, Event, RawDescriptor, Tube};
-use cros_async::{select6, EventAsync, Executor};
+use cros_async::{block_on, select6, select7, sync::Mutex as AsyncMutex, EventAsync, Executor};
 use data_model::{DataInit, Le16, Le32, Le64};
 use vm_memory::{GuestAddress, GuestMemory};
 
@@ -27,21 +26,27 @@ use crate::{UnpinRequest, UnpinResponse};
 #[sorted]
 #[derive(ThisError, Debug)]
 pub enum BalloonError {
+    /// Failed an async await
+    #[error("failed async await: {0}")]
+    AsyncAwait(cros_async::AsyncError),
     /// Failed to create async message receiver.
     #[error("failed to create async message receiver: {0}")]
     CreatingMessageReceiver(base::TubeError),
     /// Failed to receive command message.
     #[error("failed to receive command message: {0}")]
     ReceivingCommand(base::TubeError),
+    /// Failed to send command response.
+    #[error("failed to send command response: {0}")]
+    SendResponse(base::TubeError),
     /// Failed to write config event.
     #[error("failed to write config event: {0}")]
     WritingConfigEvent(base::Error),
 }
 pub type Result<T> = std::result::Result<T, BalloonError>;
 
-// Balloon has three virt IO queues: Inflate, Deflate, and Stats.
+// Balloon implements four virt IO queues: Inflate, Deflate, Stats, Event.
 const QUEUE_SIZE: u16 = 128;
-const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE, QUEUE_SIZE, QUEUE_SIZE];
+const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE, QUEUE_SIZE, QUEUE_SIZE, QUEUE_SIZE];
 
 const VIRTIO_BALLOON_PFN_SHIFT: u32 = 12;
 const VIRTIO_BALLOON_PF_SIZE: u64 = 1 << VIRTIO_BALLOON_PFN_SHIFT;
@@ -50,6 +55,11 @@ const VIRTIO_BALLOON_PF_SIZE: u64 = 1 << VIRTIO_BALLOON_PFN_SHIFT;
 const VIRTIO_BALLOON_F_MUST_TELL_HOST: u32 = 0; // Tell before reclaiming pages
 const VIRTIO_BALLOON_F_STATS_VQ: u32 = 1; // Stats reporting enabled
 const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u32 = 2; // Deflate balloon on OOM
+
+// These feature bits are part of the proposal:
+//  https://lists.oasis-open.org/archives/virtio-comment/202201/msg00139.html
+const VIRTIO_BALLOON_F_RESPONSIVE_DEVICE: u32 = 6; // Device actively watching guest memory
+const VIRTIO_BALLOON_F_EVENTS_VQ: u32 = 7; // Event vq is enabled
 
 // virtio_balloon_config is the balloon device configuration space defined by the virtio spec.
 #[derive(Copy, Clone, Debug, Default)]
@@ -62,11 +72,15 @@ struct virtio_balloon_config {
 // Safe because it only has data and has no implicit padding.
 unsafe impl DataInit for virtio_balloon_config {}
 
-// BalloonConfig is modified by the worker and read from the device thread.
+// BalloonState is shared by the worker and device thread.
 #[derive(Default)]
-struct BalloonConfig {
-    num_pages: AtomicUsize,
-    actual_pages: AtomicUsize,
+struct BalloonState {
+    num_pages: u32,
+    actual_pages: u32,
+    // Flag indicating that the balloon is in the process of a failable update. This
+    // is set by an Adjust command that has allow_failure set, and is cleared when the
+    // Adjusted success/failure response is sent.
+    failable_update: bool,
 }
 
 // The constants defining stats types in virtio_baloon_stat
@@ -113,6 +127,24 @@ impl BalloonStat {
         }
     }
 }
+
+const VIRTIO_BALLOON_EVENT_PRESSURE: u32 = 1;
+const VIRTIO_BALLOON_EVENT_PUFF_FAILURE: u32 = 2;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct virtio_balloon_event_header {
+    evt_type: Le32,
+}
+
+fn send_adjusted_response(tube: &Tube, num_pages: u32) -> std::result::Result<(), base::TubeError> {
+    let num_bytes = (num_pages as u64) << VIRTIO_BALLOON_PFN_SHIFT;
+    let result = BalloonTubeResult::Adjusted { num_bytes };
+    tube.send(&result)
+}
+
+// Safe because it only has data and has no implicit padding.
+unsafe impl DataInit for virtio_balloon_event_header {}
 
 fn invoke_desc_handler<F>(ranges: Vec<(u64, u64)>, desc_handler: &mut F)
 where
@@ -230,6 +262,20 @@ async fn handle_queue<F>(
     }
 }
 
+fn parse_balloon_stats(reader: &mut Reader) -> BalloonStats {
+    let mut stats: BalloonStats = Default::default();
+    for res in reader.iter::<BalloonStat>() {
+        match res {
+            Ok(stat) => stat.update_stats(&mut stats),
+            Err(e) => {
+                error!("error while reading stats: {}", e);
+                break;
+            }
+        };
+    }
+    stats
+}
+
 // Async task that handles the stats queue. Note that the cadence of this is driven by requests for
 // balloon stats from the control pipe.
 // The guests queues an initial buffer on boot, which is read and then this future will block until
@@ -240,7 +286,7 @@ async fn handle_stats_queue(
     mut queue_event: EventAsync,
     mut stats_rx: mpsc::Receiver<u64>,
     command_tube: &Tube,
-    config: Arc<BalloonConfig>,
+    state: Arc<AsyncMutex<BalloonState>>,
     interrupt: Rc<RefCell<Interrupt>>,
 ) {
     // Consume the first stats buffer sent from the guest at startup. It was not
@@ -281,17 +327,9 @@ async fn handle_stats_queue(
                 continue;
             }
         };
-        let mut stats: BalloonStats = Default::default();
-        for res in reader.iter::<BalloonStat>() {
-            match res {
-                Ok(stat) => stat.update_stats(&mut stats),
-                Err(e) => {
-                    error!("error while reading stats: {}", e);
-                    break;
-                }
-            };
-        }
-        let actual_pages = config.actual_pages.load(Ordering::Relaxed) as u64;
+        let stats = parse_balloon_stats(&mut reader);
+
+        let actual_pages = state.lock().await.actual_pages as u64;
         let result = BalloonTubeResult::Stats {
             balloon_actual: actual_pages << VIRTIO_BALLOON_PFN_SHIFT,
             stats,
@@ -303,22 +341,93 @@ async fn handle_stats_queue(
     }
 }
 
+async fn handle_event(
+    state: Arc<AsyncMutex<BalloonState>>,
+    interrupt: Rc<RefCell<Interrupt>>,
+    r: &mut Reader,
+    command_tube: &Tube,
+) -> Result<()> {
+    match r.read_obj::<virtio_balloon_event_header>() {
+        Ok(hdr) => match hdr.evt_type.to_native() {
+            VIRTIO_BALLOON_EVENT_PRESSURE => {
+                // TODO(b/213962590): See how this can be integrated this into memory rebalancing
+            }
+            VIRTIO_BALLOON_EVENT_PUFF_FAILURE => {
+                let mut state = state.lock().await;
+                if state.failable_update {
+                    state.num_pages = state.actual_pages;
+                    interrupt.borrow().signal_config_changed();
+
+                    state.failable_update = false;
+                    return send_adjusted_response(command_tube, state.actual_pages)
+                        .map_err(BalloonError::SendResponse);
+                }
+            }
+            _ => {
+                warn!("Unknown event {}", hdr.evt_type.to_native());
+            }
+        },
+        Err(e) => error!("Failed to parse event header {:?}", e),
+    }
+    Ok(())
+}
+
+// Async task that handles the events queue.
+async fn handle_events_queue(
+    mem: &GuestMemory,
+    mut queue: Queue,
+    mut queue_event: EventAsync,
+    state: Arc<AsyncMutex<BalloonState>>,
+    interrupt: Rc<RefCell<Interrupt>>,
+    command_tube: &Tube,
+) -> Result<()> {
+    loop {
+        let avail_desc = queue
+            .next_async(mem, &mut queue_event)
+            .await
+            .map_err(BalloonError::AsyncAwait)?;
+        let index = avail_desc.index;
+        match Reader::new(mem.clone(), avail_desc) {
+            Ok(mut r) => {
+                handle_event(state.clone(), interrupt.clone(), &mut r, command_tube).await?
+            }
+            Err(e) => error!("balloon: failed to CREATE Reader: {}", e),
+        };
+
+        queue.add_used(mem, index, 0);
+        queue.trigger_interrupt(mem, &*interrupt.borrow());
+    }
+}
+
 // Async task that handles the command socket. The command socket handles messages from the host
 // requesting that the guest balloon be adjusted or to report guest memory statistics.
 async fn handle_command_tube(
     command_tube: &AsyncTube,
     interrupt: Rc<RefCell<Interrupt>>,
-    config: Arc<BalloonConfig>,
+    state: Arc<AsyncMutex<BalloonState>>,
     mut stats_tx: mpsc::Sender<u64>,
 ) -> Result<()> {
     loop {
         match command_tube.next().await {
             Ok(command) => match command {
-                BalloonTubeCommand::Adjust { num_bytes } => {
-                    let num_pages = (num_bytes >> VIRTIO_BALLOON_PFN_SHIFT) as usize;
+                BalloonTubeCommand::Adjust {
+                    num_bytes,
+                    allow_failure,
+                } => {
+                    let num_pages = (num_bytes >> VIRTIO_BALLOON_PFN_SHIFT) as u32;
+                    let mut state = state.lock().await;
 
-                    config.num_pages.store(num_pages, Ordering::Relaxed);
+                    state.num_pages = num_pages;
                     interrupt.borrow().signal_config_changed();
+
+                    if allow_failure {
+                        if num_pages == state.actual_pages {
+                            send_adjusted_response(command_tube, num_pages)
+                                .map_err(BalloonError::SendResponse)?;
+                        } else {
+                            state.failable_update = true;
+                        }
+                    }
                 }
                 BalloonTubeCommand::Stats { id } => {
                     if let Err(e) = stats_tx.try_send(id) {
@@ -343,8 +452,8 @@ fn run_worker(
     interrupt: Interrupt,
     kill_evt: Event,
     mem: GuestMemory,
-    config: Arc<BalloonConfig>,
-) -> (Tube, Option<Tube>) {
+    state: Arc<AsyncMutex<BalloonState>>,
+) -> Option<Tube> {
     // Wrap the interrupt in a `RefCell` so it can be shared between async functions.
     let interrupt = Rc::new(RefCell::new(interrupt));
 
@@ -395,39 +504,72 @@ fn run_worker(
             stats_event,
             stats_rx,
             &command_tube,
-            config.clone(),
+            state.clone(),
             interrupt.clone(),
         );
         pin_mut!(stats);
 
         // Future to handle command messages that resize the balloon.
-        let command = handle_command_tube(&command_tube, interrupt.clone(), config, stats_tx);
+        let command =
+            handle_command_tube(&command_tube, interrupt.clone(), state.clone(), stats_tx);
         pin_mut!(command);
 
         // Process any requests to resample the irq value.
-        let resample = async_utils::handle_irq_resample(&ex, interrupt);
+        let resample = async_utils::handle_irq_resample(&ex, interrupt.clone());
         pin_mut!(resample);
 
         // Exit if the kill event is triggered.
         let kill = async_utils::await_and_exit(&ex, kill_evt);
         pin_mut!(kill);
 
-        if let Err(e) = ex.run_until(select6(inflate, deflate, stats, command, resample, kill)) {
+        let res = if !queues.is_empty() {
+            let events_event = EventAsync::new(queue_evts.remove(0).0, &ex)
+                .expect("failed to set up the events event");
+            let events = handle_events_queue(
+                &mem,
+                queues.remove(0),
+                events_event,
+                state,
+                interrupt,
+                &command_tube,
+            );
+            pin_mut!(events);
+
+            ex.run_until(select7(
+                inflate, deflate, stats, command, resample, kill, events,
+            ))
+            .map(|_| ())
+        } else {
+            ex.run_until(select6(inflate, deflate, stats, command, resample, kill))
+                .map(|_| ())
+        };
+
+        if let Err(e) = res {
             error!("error happened in executor: {}", e);
         }
     }
 
-    (command_tube.into(), inflate_tube)
+    inflate_tube
 }
 
 /// Virtio device for memory balloon inflation/deflation.
 pub struct Balloon {
-    command_tube: Option<Tube>,
+    command_tube: Tube,
     inflate_tube: Option<Tube>,
-    config: Arc<BalloonConfig>,
+    state: Arc<AsyncMutex<BalloonState>>,
     features: u64,
+    acked_features: u64,
     kill_evt: Option<Event>,
-    worker_thread: Option<thread::JoinHandle<(Tube, Option<Tube>)>>,
+    worker_thread: Option<thread::JoinHandle<Option<Tube>>>,
+}
+
+/// Operation mode of the balloon.
+#[derive(PartialEq)]
+pub enum BalloonMode {
+    /// The driver can access pages in the balloon (i.e. F_DEFLATE_ON_OOM)
+    Relaxed,
+    /// The driver cannot access pages in the balloon. Implies F_RESPONSIVE_DEVICE.
+    Strict,
 }
 
 impl Balloon {
@@ -441,32 +583,43 @@ impl Balloon {
         command_tube: Tube,
         inflate_tube: Option<Tube>,
         init_balloon_size: u64,
+        mode: BalloonMode,
     ) -> Result<Balloon> {
+        let features = base_features
+            | 1 << VIRTIO_BALLOON_F_MUST_TELL_HOST
+            | 1 << VIRTIO_BALLOON_F_STATS_VQ
+            | 1 << VIRTIO_BALLOON_F_EVENTS_VQ
+            | if mode == BalloonMode::Strict {
+                1 << VIRTIO_BALLOON_F_RESPONSIVE_DEVICE
+            } else {
+                1 << VIRTIO_BALLOON_F_DEFLATE_ON_OOM
+            };
+
         Ok(Balloon {
-            command_tube: Some(command_tube),
+            command_tube,
             inflate_tube,
-            config: Arc::new(BalloonConfig {
-                num_pages: AtomicUsize::new(
-                    (init_balloon_size >> VIRTIO_BALLOON_PFN_SHIFT) as usize,
-                ),
-                actual_pages: AtomicUsize::new(0),
-            }),
+            state: Arc::new(AsyncMutex::new(BalloonState {
+                num_pages: (init_balloon_size >> VIRTIO_BALLOON_PFN_SHIFT) as u32,
+                actual_pages: 0,
+                failable_update: false,
+            })),
             kill_evt: None,
             worker_thread: None,
-            features: base_features
-                | 1 << VIRTIO_BALLOON_F_MUST_TELL_HOST
-                | 1 << VIRTIO_BALLOON_F_STATS_VQ
-                | 1 << VIRTIO_BALLOON_F_DEFLATE_ON_OOM,
+            features,
+            acked_features: 0,
         })
     }
 
     fn get_config(&self) -> virtio_balloon_config {
-        let num_pages = self.config.num_pages.load(Ordering::Relaxed) as u32;
-        let actual_pages = self.config.actual_pages.load(Ordering::Relaxed) as u32;
+        let state = block_on(self.state.lock());
         virtio_balloon_config {
-            num_pages: num_pages.into(),
-            actual: actual_pages.into(),
+            num_pages: state.num_pages.into(),
+            actual: state.actual_pages.into(),
         }
+    }
+
+    fn event_queue_enabled(&self) -> bool {
+        (self.acked_features & ((1 << VIRTIO_BALLOON_F_EVENTS_VQ) as u64)) != 0
     }
 }
 
@@ -485,10 +638,7 @@ impl Drop for Balloon {
 
 impl VirtioDevice for Balloon {
     fn keep_rds(&self) -> Vec<RawDescriptor> {
-        let mut rds = Vec::new();
-        if let Some(command_tube) = &self.command_tube {
-            rds.push(command_tube.as_raw_descriptor());
-        }
+        let mut rds = vec![self.command_tube.as_raw_descriptor()];
         if let Some(inflate_tube) = &self.inflate_tube {
             rds.push(inflate_tube.as_raw_descriptor());
         }
@@ -510,17 +660,27 @@ impl VirtioDevice for Balloon {
     fn write_config(&mut self, offset: u64, data: &[u8]) {
         let mut config = self.get_config();
         copy_config(config.as_mut_slice(), offset, data, 0);
-        self.config
-            .actual_pages
-            .store(config.actual.to_native() as usize, Ordering::Relaxed);
+        let mut state = block_on(self.state.lock());
+        state.actual_pages = config.actual.to_native();
+
+        if state.failable_update && state.actual_pages == state.num_pages {
+            state.failable_update = false;
+            if let Err(e) = send_adjusted_response(&self.command_tube, state.num_pages) {
+                error!("Failed to send response {:?}", e);
+            }
+        }
     }
 
     fn features(&self) -> u64 {
         self.features
     }
 
-    fn ack_features(&mut self, value: u64) {
-        self.features &= value;
+    fn ack_features(&mut self, mut value: u64) {
+        if value & !self.features != 0 {
+            warn!("virtio_balloon got unknown feature ack {:x}", value);
+            value &= self.features;
+        }
+        self.acked_features |= value;
     }
 
     fn activate(
@@ -530,7 +690,8 @@ impl VirtioDevice for Balloon {
         queues: Vec<Queue>,
         queue_evts: Vec<Event>,
     ) {
-        if queues.len() != QUEUE_SIZES.len() || queue_evts.len() != QUEUE_SIZES.len() {
+        let expected_queues = if self.event_queue_enabled() { 4 } else { 3 };
+        if queues.len() != expected_queues || queue_evts.len() != expected_queues {
             return;
         }
 
@@ -543,8 +704,14 @@ impl VirtioDevice for Balloon {
         };
         self.kill_evt = Some(self_kill_evt);
 
-        let config = self.config.clone();
-        let command_tube = self.command_tube.take().unwrap();
+        let state = self.state.clone();
+        let command_tube = match self.command_tube.try_clone() {
+            Ok(tube) => tube,
+            Err(e) => {
+                error!("failed to clone command tube {:?}", e);
+                return;
+            }
+        };
         let inflate_tube = self.inflate_tube.take();
         let worker_result = thread::Builder::new()
             .name("virtio_balloon".to_string())
@@ -557,7 +724,7 @@ impl VirtioDevice for Balloon {
                     interrupt,
                     kill_evt,
                     mem,
-                    config,
+                    state,
                 )
             });
 
@@ -585,8 +752,7 @@ impl VirtioDevice for Balloon {
                     error!("{}: failed to get back resources", self.debug_label());
                     return false;
                 }
-                Ok((command_tube, inflate_tube)) => {
-                    self.command_tube = Some(command_tube);
+                Ok(inflate_tube) => {
                     self.inflate_tube = inflate_tube;
                     return true;
                 }

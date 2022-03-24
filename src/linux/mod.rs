@@ -10,6 +10,7 @@ use std::io::prelude::*;
 use std::io::stdin;
 use std::iter;
 use std::mem;
+use std::ops::RangeInclusive;
 #[cfg(feature = "gpu")]
 use std::os::unix::net::UnixStream;
 use std::os::unix::prelude::OpenOptionsExt;
@@ -30,13 +31,15 @@ use base::net::{UnixSeqpacket, UnixSeqpacketListener, UnlinkUnixSeqpacketListene
 use base::*;
 use devices::serial_device::SerialHardware;
 use devices::vfio::{VfioCommonSetup, VfioCommonTrait};
+use devices::virtio::memory_mapper::MemoryMapperTrait;
 #[cfg(feature = "gpu")]
 use devices::virtio::{self, EventDevice};
 #[cfg(feature = "audio")]
 use devices::Ac97Dev;
 use devices::{
     self, BusDeviceObj, HostHotPlugKey, HotPlugBus, IrqEventIndex, KvmKernelIrqChip, PciAddress,
-    PciBridge, PciDevice, PcieRootPort, StubPciDevice, VfioContainer, VirtioPciDevice,
+    PciBridge, PciDevice, PcieHostRootPort, PcieRootPort, PvPanicCode, PvPanicPciDevice,
+    StubPciDevice, VirtioPciDevice,
 };
 use devices::{CoIommuDev, IommuDevType};
 #[cfg(feature = "usb")]
@@ -445,7 +448,8 @@ fn create_devices(
     vm: &mut impl Vm,
     resources: &mut SystemAllocator,
     exit_evt: &Event,
-    phys_max_addr: u64,
+    panic_wrtube: Tube,
+    iommu_attached_endpoints: &mut BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>>,
     control_tubes: &mut Vec<TaggedControlTube>,
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
@@ -463,8 +467,6 @@ fn create_devices(
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     let mut balloon_inflate_tube: Option<Tube> = None;
     if !cfg.vfio.is_empty() {
-        let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> =
-            BTreeMap::new();
         let mut coiommu_attached_endpoints = Vec::new();
 
         for vfio_dev in cfg
@@ -480,7 +482,7 @@ fn create_devices(
                 control_tubes,
                 vfio_path.as_path(),
                 None,
-                &mut iommu_attached_endpoints,
+                iommu_attached_endpoints,
                 Some(&mut coiommu_attached_endpoints),
                 vfio_dev.iommu_dev_type(),
             )?;
@@ -500,7 +502,7 @@ fn create_devices(
                 resources,
                 control_tubes,
                 vfio_path.as_path(),
-                &mut iommu_attached_endpoints,
+                iommu_attached_endpoints,
                 IommuDevType::NoIommu, // Virtio IOMMU is not supported yet
             )?;
 
@@ -529,21 +531,6 @@ fn create_devices(
             } else {
                 bail!("Get rlimit failed");
             }
-        }
-
-        if !iommu_attached_endpoints.is_empty() {
-            let iommu_dev = create_iommu_device(cfg, phys_max_addr, iommu_attached_endpoints)?;
-
-            let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
-            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
-            let mut dev =
-                VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
-                    .context("failed to create virtio pci dev")?;
-            // early reservation for viommu.
-            dev.allocate_address(resources)
-                .context("failed to allocate resources early for virtio pci dev")?;
-            let dev = Box::new(dev);
-            devices.push((dev, iommu_dev.jail));
         }
 
         if !coiommu_attached_endpoints.is_empty() {
@@ -621,6 +608,7 @@ fn create_devices(
         devices.push((Box::new(StubPciDevice::new(params)), None));
     }
 
+    devices.push((Box::new(PvPanicPciDevice::new(panic_wrtube)), None));
     Ok(devices)
 }
 
@@ -680,17 +668,52 @@ fn create_pcie_root_port(
     control_tubes: &mut Vec<TaggedControlTube>,
     devices: &mut Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
     hp_vec: &mut Vec<Arc<Mutex<dyn HotPlugBus>>>,
+    hp_endpoints_ranges: &mut Vec<RangeInclusive<u32>>,
 ) -> Result<()> {
     if host_pcie_rp.is_empty() {
         // user doesn't specify host pcie root port which link to this virtual pcie rp,
         // find the empty bus and create a total virtual pcie rp
-        let sec_bus = (1..255)
-            .find(|&bus_num| sys_allocator.pci_bus_empty(bus_num))
-            .context("failed to find empty bus for Pci hotplug")?;
-        let pcie_root_port = Arc::new(Mutex::new(PcieRootPort::new(sec_bus)));
+        let mut hp_sec_bus = 0u8;
+        // Create Pcie Root Port for non-root buses, each non-root bus device will be
+        // connected behind a virtual pcie root port.
+        for i in 1..255 {
+            if sys_allocator.pci_bus_empty(i) {
+                if hp_sec_bus == 0 {
+                    hp_sec_bus = i;
+                }
+                continue;
+            }
+            let pcie_root_port = Arc::new(Mutex::new(PcieRootPort::new(i, false)));
+            let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
+            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+            let pci_bridge = Box::new(PciBridge::new(pcie_root_port.clone(), msi_device_tube));
+            // no ipc is used if the root port disables hotplug
+            devices.push((pci_bridge, None));
+        }
+
+        // Create Pcie Root Port for hot-plug
+        if hp_sec_bus == 0 {
+            return Err(anyhow!("no more addresses are available"));
+        }
+        let pcie_root_port = Arc::new(Mutex::new(PcieRootPort::new(hp_sec_bus, true)));
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
         control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
         let pci_bridge = Box::new(PciBridge::new(pcie_root_port.clone(), msi_device_tube));
+
+        hp_endpoints_ranges.push(RangeInclusive::new(
+            PciAddress {
+                bus: pci_bridge.get_secondary_num(),
+                dev: 0,
+                func: 0,
+            }
+            .to_u32(),
+            PciAddress {
+                bus: pci_bridge.get_subordinate_num(),
+                dev: 32,
+                func: 8,
+            }
+            .to_u32(),
+        ));
 
         devices.push((pci_bridge, None));
         hp_vec.push(pcie_root_port as Arc<Mutex<dyn HotPlugBus>>);
@@ -698,8 +721,22 @@ fn create_pcie_root_port(
         // user specify host pcie root port which link to this virtual pcie rp,
         // reserve the host pci BDF and create a virtual pcie RP with some attrs same as host
         for pcie_sysfs in host_pcie_rp.iter() {
-            let pcie_host = PcieRootPort::new_from_host(pcie_sysfs.as_path())?;
-            let pcie_root_port = Arc::new(Mutex::new(pcie_host));
+            let pcie_host = PcieHostRootPort::new(pcie_sysfs.as_path())?;
+            let bus_range = pcie_host.get_bus_range();
+            let mut slot_implemented = true;
+            for i in bus_range.secondary..=bus_range.subordinate {
+                // if this bus is occupied by one vfio-pci device, this vfio-pci device is
+                // connected to a pci bridge on host statically, then it should be connected
+                // to a virtual pci bridge in guest statically, this bridge won't have
+                // hotplug capability and won't use slot.
+                if !sys_allocator.pci_bus_empty(i) {
+                    slot_implemented = false;
+                }
+            }
+            let pcie_root_port = Arc::new(Mutex::new(PcieRootPort::new_from_host(
+                pcie_host,
+                slot_implemented,
+            )?));
 
             let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
             control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
@@ -712,6 +749,21 @@ fn create_pcie_root_port(
                     pci_bridge.debug_label()
                 );
             }
+
+            hp_endpoints_ranges.push(RangeInclusive::new(
+                PciAddress {
+                    bus: pci_bridge.get_secondary_num(),
+                    dev: 0,
+                    func: 0,
+                }
+                .to_u32(),
+                PciAddress {
+                    bus: pci_bridge.get_subordinate_num(),
+                    dev: 32,
+                    func: 8,
+                }
+                .to_u32(),
+            ));
 
             devices.push((pci_bridge, None));
             hp_vec.push(pcie_root_port as Arc<Mutex<dyn HotPlugBus>>);
@@ -806,6 +858,8 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         dmi_path: cfg.dmi_path.clone(),
         no_legacy: cfg.no_legacy,
         host_cpu_topology: cfg.host_cpu_topology,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        force_s2idle: cfg.force_s2idle,
     })
 }
 
@@ -814,6 +868,7 @@ pub enum ExitState {
     Reset,
     Stop,
     Crash,
+    GuestPanic,
 }
 
 pub fn run_config(cfg: Config) -> Result<ExitState> {
@@ -1047,6 +1102,7 @@ where
     let exit_evt = Event::new().context("failed to create event")?;
     let reset_evt = Event::new().context("failed to create event")?;
     let crash_evt = Event::new().context("failed to create event")?;
+    let (panic_rdtube, panic_wrtube) = Tube::pair().context("failed to create tube")?;
     let mut sys_allocator = Arch::create_system_allocator(&vm);
 
     // Allocate the ramoops region first. AArch64::build_vm() assumes this.
@@ -1059,8 +1115,6 @@ where
     };
 
     create_file_backed_mappings(&cfg, &mut vm, &mut sys_allocator)?;
-
-    let phys_max_addr = (1u64 << vm.get_guest_phys_addr_bits()) - 1;
 
     #[cfg(feature = "gpu")]
     // Hold on to the render server jail so it keeps running until we exit run_vm()
@@ -1079,12 +1133,15 @@ where
         }))
         .context("failed to calculate init balloon size")?;
 
+    let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>> =
+        BTreeMap::new();
     let mut devices = create_devices(
         &cfg,
         &mut vm,
         &mut sys_allocator,
         &exit_evt,
-        phys_max_addr,
+        panic_wrtube,
+        &mut iommu_attached_endpoints,
         &mut control_tubes,
         wayland_device_tube,
         gpu_device_tube,
@@ -1102,6 +1159,8 @@ where
         &mut vvu_proxy_device_tubes,
     )?;
 
+    let mut hp_endpoints_ranges: Vec<RangeInclusive<u32>> = Vec::new();
+
     let mut hotplug_buses: Vec<Arc<Mutex<dyn HotPlugBus>>> = Vec::new();
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -1117,8 +1176,41 @@ where
             &mut control_tubes,
             &mut devices,
             &mut hotplug_buses,
+            &mut hp_endpoints_ranges,
         )?;
     }
+
+    let (translate_response_senders, request_rx) = setup_virtio_access_platform(
+        &mut sys_allocator,
+        &mut iommu_attached_endpoints,
+        &mut devices,
+    )?;
+
+    let iommu_host_tube = if !iommu_attached_endpoints.is_empty() || cfg.virtio_iommu {
+        let (iommu_host_tube, iommu_device_tube) = Tube::pair().context("failed to create tube")?;
+        let iommu_dev = create_iommu_device(
+            &cfg,
+            (1u64 << vm.get_guest_phys_addr_bits()) - 1,
+            iommu_attached_endpoints,
+            hp_endpoints_ranges,
+            translate_response_senders,
+            request_rx,
+            iommu_device_tube,
+        )?;
+
+        let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
+        control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+        let mut dev = VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
+            .context("failed to create virtio pci dev")?;
+        // early reservation for viommu.
+        dev.allocate_address(&mut sys_allocator)
+            .context("failed to allocate resources early for virtio pci dev")?;
+        let dev = Box::new(dev);
+        devices.push((dev, iommu_dev.jail));
+        Some(iommu_host_tube)
+    } else {
+        None
+    };
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     for device in devices
@@ -1244,10 +1336,12 @@ where
         exit_evt,
         reset_evt,
         crash_evt,
+        panic_rdtube,
         sigchld_fd,
         Arc::clone(&map_request),
         gralloc,
         kvm_vcpu_ids,
+        iommu_host_tube,
     )
 }
 
@@ -1268,6 +1362,7 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     sys_allocator: &mut SystemAllocator,
     cfg: &Config,
     control_tubes: &mut Vec<TaggedControlTube>,
+    iommu_host_tube: &Option<Tube>,
     vfio_path: &Path,
 ) -> Result<()> {
     let host_os_str = vfio_path
@@ -1276,11 +1371,12 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     let host_str = host_os_str
         .to_str()
         .ok_or_else(|| anyhow!("failed to parse or find vfio path"))?;
-    let host_addr = PciAddress::from_string(host_str);
+    let host_addr =
+        PciAddress::from_string(host_str).context("failed to parse vfio pci address")?;
 
     let (hp_bus, bus_num) = get_hp_bus(linux, host_addr)?;
 
-    let mut endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> = BTreeMap::new();
+    let mut endpoints: BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>> = BTreeMap::new();
     let (vfio_pci_device, jail) = create_vfio_device(
         cfg,
         &linux.vm,
@@ -1290,19 +1386,39 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
         Some(bus_num),
         &mut endpoints,
         None,
-        IommuDevType::NoIommu,
+        if iommu_host_tube.is_some() {
+            IommuDevType::VirtioIommu
+        } else {
+            IommuDevType::NoIommu
+        },
     )?;
 
     let pci_address = Arch::register_pci_device(linux, vfio_pci_device, jail, sys_allocator)
         .context("Failed to configure pci hotplug device")?;
 
-    let host_os_str = vfio_path
-        .file_name()
-        .ok_or_else(|| anyhow!("failed to parse or find vfio path"))?;
-    let host_str = host_os_str
-        .to_str()
-        .ok_or_else(|| anyhow!("failed to parse or find vfio path"))?;
-    let host_addr = PciAddress::from_string(host_str);
+    if let Some(iommu_host_tube) = iommu_host_tube {
+        let &endpoint_addr = endpoints.iter().next().unwrap().0;
+        let mapper = endpoints.remove(&endpoint_addr).unwrap();
+        if let Some(vfio_wrapper) = mapper.lock().as_vfio_wrapper() {
+            let vfio_container = vfio_wrapper.as_vfio_container();
+            let descriptor = vfio_container.lock().into_raw_descriptor()?;
+            let request = VirtioIOMMURequest::VfioCommand(VirtioIOMMUVfioCommand::VfioDeviceAdd {
+                endpoint_addr,
+                container: {
+                    // Safe because the descriptor is uniquely owned by `descriptor`.
+                    unsafe { File::from_raw_descriptor(descriptor) }
+                },
+            });
+
+            match virtio_iommu_request(iommu_host_tube, &request)
+                .map_err(|_| VirtioIOMMUVfioError::SocketFailed)?
+            {
+                VirtioIOMMUResponse::VfioResponse(VirtioIOMMUVfioResult::Ok) => (),
+                resp => bail!("Unexpected message response: {:?}", resp),
+            }
+        };
+    }
+
     let host_key = HostHotPlugKey::Vfio { host_addr };
     let mut hp_bus = hp_bus.lock();
     hp_bus.add_hotplug_device(host_key, pci_address);
@@ -1313,6 +1429,7 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
 fn remove_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     linux: &RunnableLinuxVm<V, Vcpu>,
     sys_allocator: &mut SystemAllocator,
+    iommu_host_tube: &Option<Tube>,
     vfio_path: &Path,
 ) -> Result<()> {
     let host_os_str = vfio_path
@@ -1321,11 +1438,25 @@ fn remove_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     let host_str = host_os_str
         .to_str()
         .ok_or_else(|| anyhow!("failed to parse or find vfio path"))?;
-    let host_addr = PciAddress::from_string(host_str);
+    let host_addr =
+        PciAddress::from_string(host_str).context("failed to parse vfio pci address")?;
     let host_key = HostHotPlugKey::Vfio { host_addr };
     for hp_bus in linux.hotplug_bus.iter() {
         let mut hp_bus_lock = hp_bus.lock();
         if let Some(pci_addr) = hp_bus_lock.get_hotplug_device(host_key) {
+            if let Some(iommu_host_tube) = iommu_host_tube {
+                let request =
+                    VirtioIOMMURequest::VfioCommand(VirtioIOMMUVfioCommand::VfioDeviceDel {
+                        endpoint_addr: pci_addr.to_u32(),
+                    });
+                match virtio_iommu_request(iommu_host_tube, &request)
+                    .map_err(|_| VirtioIOMMUVfioError::SocketFailed)?
+                {
+                    VirtioIOMMUResponse::VfioResponse(VirtioIOMMUVfioResult::Ok) => (),
+                    resp => bail!("Unexpected message response: {:?}", resp),
+                }
+            }
+
             hp_bus_lock.hot_unplug(pci_addr);
             sys_allocator.release_pci(pci_addr.bus, pci_addr.dev, pci_addr.func);
             return Ok(());
@@ -1340,13 +1471,21 @@ fn handle_vfio_command<V: VmArch, Vcpu: VcpuArch>(
     sys_allocator: &mut SystemAllocator,
     cfg: &Config,
     add_tubes: &mut Vec<TaggedControlTube>,
+    iommu_host_tube: &Option<Tube>,
     vfio_path: &Path,
     add: bool,
 ) -> VmResponse {
     let ret = if add {
-        add_vfio_device(linux, sys_allocator, cfg, add_tubes, vfio_path)
+        add_vfio_device(
+            linux,
+            sys_allocator,
+            cfg,
+            add_tubes,
+            iommu_host_tube,
+            vfio_path,
+        )
     } else {
-        remove_vfio_device(linux, sys_allocator, vfio_path)
+        remove_vfio_device(linux, sys_allocator, iommu_host_tube, vfio_path)
     };
 
     match ret {
@@ -1371,16 +1510,19 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     exit_evt: Event,
     reset_evt: Event,
     crash_evt: Event,
+    panic_rdtube: Tube,
     sigchld_fd: SignalFd,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     mut gralloc: RutabagaGralloc,
     kvm_vcpu_ids: Vec<usize>,
+    iommu_host_tube: Option<Tube>,
 ) -> Result<ExitState> {
     #[derive(PollToken)]
     enum Token {
         Exit,
         Reset,
         Crash,
+        Panic,
         Suspend,
         ChildSignal,
         IrqFd { index: IrqEventIndex },
@@ -1396,6 +1538,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         (&exit_evt, Token::Exit),
         (&reset_evt, Token::Reset),
         (&crash_evt, Token::Crash),
+        (&panic_rdtube, Token::Panic),
         (&linux.suspend_evt, Token::Suspend),
         (&sigchld_fd, Token::ChildSignal),
     ])
@@ -1502,6 +1645,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             to_gdb_channel.clone(),
             cfg.per_vm_core_scheduling,
             cfg.host_cpu_topology,
+            cfg.privileged_vm,
             match vcpu_cgroup_tasks_file {
                 None => None,
                 Some(ref f) => Some(
@@ -1568,6 +1712,26 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     exit_state = ExitState::Crash;
                     break 'wait;
                 }
+                Token::Panic => {
+                    let mut break_to_wait: bool = true;
+                    match panic_rdtube.recv::<u8>() {
+                        Ok(panic_code) => {
+                            let panic_code = PvPanicCode::from_u8(panic_code);
+                            info!("Guest reported panic [Code: {}]", panic_code);
+                            if panic_code == PvPanicCode::CrashLoaded {
+                                // VM is booting to crash kernel.
+                                break_to_wait = false;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("failed to recv panic event: {} ", e);
+                        }
+                    }
+                    if break_to_wait {
+                        exit_state = ExitState::GuestPanic;
+                        break 'wait;
+                    }
+                }
                 Token::Suspend => {
                     info!("VM requested suspend");
                     linux.suspend_evt.read().unwrap();
@@ -1631,6 +1795,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                                 &mut sys_allocator,
                                                 &cfg,
                                                 &mut add_tubes,
+                                                &iommu_host_tube,
                                                 &vfio_path,
                                                 add,
                                             )
