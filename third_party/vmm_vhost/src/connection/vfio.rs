@@ -3,16 +3,40 @@
 
 //! Structs for VFIO listener and endpoint.
 
+use std::convert::From;
 use std::fs::File;
 use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::path::Path;
 
-use sys_util::EventFd;
+use base::{AsRawDescriptor, EventFd, RawDescriptor};
+use remain::sorted;
+use thiserror::Error as ThisError;
 
 use super::{Error, Result};
 use crate::connection::{Endpoint as EndpointTrait, Listener as ListenerTrait, Req};
+
+/// Errors for `Device::recv_into_bufs()`.
+#[sorted]
+#[derive(Debug, ThisError)]
+pub enum RecvIntoBufsError {
+    /// Connection is closed.
+    #[error("connection is closed")]
+    Disconnect,
+    /// Fatal error while receiving data.
+    #[error("failed to receive data via VFIO: {0:#}")]
+    Fatal(anyhow::Error),
+}
+
+impl From<RecvIntoBufsError> for Error {
+    fn from(e: RecvIntoBufsError) -> Self {
+        match e {
+            RecvIntoBufsError::Disconnect => Error::Disconnect,
+            RecvIntoBufsError::Fatal(e) => Error::VfioDeviceError(e),
+        }
+    }
+}
 
 /// VFIO device which can be used as virtio-vhost-user device backend.
 pub trait Device {
@@ -29,11 +53,11 @@ pub trait Device {
         fds: Option<&[RawFd]>,
     ) -> std::result::Result<usize, anyhow::Error>;
 
-    /// Receives data into the given slice of slices.
+    /// Receives data into the given slice of slices and returns the size of the received data.
     fn recv_into_bufs(
         &mut self,
         iovs: &mut [IoSliceMut],
-    ) -> std::result::Result<(usize, Option<Vec<File>>), anyhow::Error>;
+    ) -> std::result::Result<usize, RecvIntoBufsError>;
 }
 
 /// Listener for accepting incoming connections from virtio-vhost-user device through VFIO.
@@ -101,14 +125,18 @@ impl<R: Req, D: Device> EndpointTrait<R> for Endpoint<R, D> {
         bufs: &mut [IoSliceMut],
         _allow_fd: bool, /* ignore, as VFIO doesn't receive FDs */
     ) -> Result<(usize, Option<Vec<File>>)> {
-        self.device
+        let size = self
+            .device
             .recv_into_bufs(bufs)
-            .map_err(Error::VfioDeviceError)
+            .map_err::<Error, _>(From::<RecvIntoBufsError>::from)?;
+
+        // VFIO backend doesn't receive any files.
+        Ok((size, None))
     }
 }
 
-impl<R: Req, D: Device> AsRawFd for Endpoint<R, D> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.device.event().as_raw_fd()
+impl<R: Req, D: Device> AsRawDescriptor for Endpoint<R, D> {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
+        self.device.event().as_raw_descriptor()
     }
 }

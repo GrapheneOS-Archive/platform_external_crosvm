@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cmp::{max, min};
+use std::cmp::{max, min, Reverse};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::thread;
 use std::u32;
 
-use base::{error, pagesize, AsRawDescriptor, Event, PollToken, RawDescriptor, Tube, WaitContext};
+use base::{
+    error, pagesize, warn, AsRawDescriptor, Event, PollToken, RawDescriptor, Tube, WaitContext,
+};
 use hypervisor::{Datamatch, MemSlot};
 
 use resources::{Alloc, MmioType, SystemAllocator};
@@ -24,7 +26,7 @@ use crate::pci::msix::{
     MsixConfig, BITS_PER_PBA_ENTRY, MSIX_PBA_ENTRIES_MODULO, MSIX_TABLE_ENTRIES_MODULO,
 };
 
-use crate::pci::pci_device::{Error as PciDeviceError, PciDevice};
+use crate::pci::pci_device::{BarRange, Error as PciDeviceError, PciDevice};
 use crate::pci::{
     PciAddress, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciClassCode,
     PciInterruptPin,
@@ -402,40 +404,86 @@ impl VfioMsixCap {
     }
 }
 
-struct VfioMsixAllocator {
-    // memory regions unoccupied by MSIX registers
+struct VfioResourceAllocator {
+    // memory regions unoccupied by VFIO resources
     // stores sets of (start, end) tuples, where `end` is the address of the
     // last byte in the region
     regions: BTreeSet<(u64, u64)>,
 }
 
-impl VfioMsixAllocator {
-    // Creates a new `VfioMsixAllocator` for managing a range of MSIX addresses.
+impl VfioResourceAllocator {
+    // Creates a new `VfioResourceAllocator` for managing VFIO resources.
     // Can return `Err` if `base` + `size` overflows a u64.
     //
     // * `base` - The starting address of the range to manage.
     // * `size` - The size of the address range in bytes.
     fn new(base: u64, size: u64) -> Result<Self, PciDeviceError> {
         if size == 0 {
-            return Err(PciDeviceError::MsixAllocatorSizeZero);
+            return Err(PciDeviceError::SizeZero);
         }
         let end = base
             .checked_add(size - 1)
-            .ok_or(PciDeviceError::MsixAllocatorOverflow { base, size })?;
+            .ok_or(PciDeviceError::Overflow(base, size))?;
         let mut regions = BTreeSet::new();
         regions.insert((base, end));
-        Ok(VfioMsixAllocator { regions })
+        Ok(VfioResourceAllocator { regions })
+    }
+
+    /// Allocates a range of addresses from the managed region with a minimal alignment.
+    /// Returns allocated_address.
+    pub fn allocate_with_align(
+        &mut self,
+        size: u64,
+        alignment: u64,
+    ) -> Result<u64, PciDeviceError> {
+        if size == 0 {
+            return Err(PciDeviceError::SizeZero);
+        }
+        if !alignment.is_power_of_two() {
+            return Err(PciDeviceError::BadAlignment);
+        }
+
+        // finds first region matching alignment and size.
+        match self
+            .regions
+            .iter()
+            .find(|range| {
+                match range.0 % alignment {
+                    0 => range.0.checked_add(size - 1),
+                    r => range.0.checked_add(size - 1 + alignment - r),
+                }
+                .map_or(false, |end| end <= range.1)
+            })
+            .cloned()
+        {
+            Some(slot) => {
+                self.regions.remove(&slot);
+                let start = match slot.0 % alignment {
+                    0 => slot.0,
+                    r => slot.0 + alignment - r,
+                };
+                let end = start + size - 1;
+                if slot.0 < start {
+                    self.regions.insert((slot.0, start - 1));
+                }
+                if slot.1 > end {
+                    self.regions.insert((end + 1, slot.1));
+                }
+                Ok(start)
+            }
+            None => Err(PciDeviceError::OutOfSpace),
+        }
     }
 
     // Allocates a range of addresses from the managed region with a required location.
     // Returns a new range of addresses excluding the required range.
     fn allocate_at(&mut self, start: u64, size: u64) -> Result<(), PciDeviceError> {
         if size == 0 {
-            return Err(PciDeviceError::MsixAllocatorSizeZero);
+            return Err(PciDeviceError::SizeZero);
         }
         let end = start
             .checked_add(size - 1)
-            .ok_or(PciDeviceError::MsixAllocatorOutOfSpace)?;
+            .ok_or(PciDeviceError::OutOfSpace)?;
         while let Some(slot) = self
             .regions
             .iter()
@@ -789,7 +837,7 @@ impl VfioPciDevice {
         for mmap in bar_mmaps.iter() {
             let mmap_offset = mmap.offset as u64;
             let mmap_size = mmap.size as u64;
-            let mut to_mmap = match VfioMsixAllocator::new(mmap_offset, mmap_size) {
+            let mut to_mmap = match VfioResourceAllocator::new(mmap_offset, mmap_size) {
                 Ok(a) => a,
                 Err(e) => {
                     error!("{} add_bar_mmap_msix failed: {}", self.debug_label(), e);
@@ -975,6 +1023,255 @@ impl VfioPciDevice {
             }
         }
     }
+
+    fn collect_bars(&mut self) -> Vec<PciBarConfiguration> {
+        let mut i = VFIO_PCI_BAR0_REGION_INDEX;
+        let mut mem_bars: Vec<PciBarConfiguration> = Vec::new();
+
+        while i <= VFIO_PCI_ROM_REGION_INDEX {
+            let mut low: u32 = 0xffffffff;
+            let offset: u32 = if i == VFIO_PCI_ROM_REGION_INDEX {
+                0x30
+            } else {
+                0x10 + i * 4
+            };
+            self.config.write_config(low, offset);
+            low = self.config.read_config(offset);
+
+            let low_flag = low & 0xf;
+            let is_64bit = low_flag & 0x4 == 0x4;
+            if (low_flag & 0x1 == 0 || i == VFIO_PCI_ROM_REGION_INDEX) && low != 0 {
+                let mut upper: u32 = 0xffffffff;
+                if is_64bit {
+                    self.config.write_config(upper, offset + 4);
+                    upper = self.config.read_config(offset + 4);
+                }
+
+                low &= 0xffff_fff0;
+                let mut size: u64 = u64::from(upper);
+                size <<= 32;
+                size |= u64::from(low);
+                size = !size + 1;
+                let region_type = if is_64bit {
+                    PciBarRegionType::Memory64BitRegion
+                } else {
+                    PciBarRegionType::Memory32BitRegion
+                };
+                let prefetch = if low_flag & 0x8 == 0x8 {
+                    PciBarPrefetchable::Prefetchable
+                } else {
+                    PciBarPrefetchable::NotPrefetchable
+                };
+                mem_bars.push(PciBarConfiguration::new(
+                    i as usize,
+                    size,
+                    region_type,
+                    prefetch,
+                ));
+            } else if low_flag & 0x1 == 0x1 {
+                let size = !(low & 0xffff_fffc) + 1;
+                self.io_regions.push(PciBarConfiguration::new(
+                    i as usize,
+                    size.into(),
+                    PciBarRegionType::IoRegion,
+                    PciBarPrefetchable::NotPrefetchable,
+                ));
+            }
+
+            if is_64bit {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        mem_bars
+    }
+
+    fn configure_barmem(&mut self, bar_info: &PciBarConfiguration, bar_addr: u64) {
+        let offset: u32 = bar_info.reg_index() as u32 * 4;
+        let mmio_region = *bar_info;
+        self.mmio_regions.push(mmio_region.set_address(bar_addr));
+
+        let val: u32 = self.config.read_config(offset);
+        let low = ((bar_addr & !0xf) as u32) | (val & 0xf);
+        self.config.write_config(low, offset);
+        if bar_info.is_64bit_memory() {
+            let upper = (bar_addr >> 32) as u32;
+            self.config.write_config(upper, offset + 4);
+        }
+    }
+
+    fn allocate_root_barmem(
+        &mut self,
+        mem_bars: &[PciBarConfiguration],
+        resources: &mut SystemAllocator,
+    ) -> Result<Vec<BarRange>, PciDeviceError> {
+        let address = self.pci_address.unwrap();
+        let mut ranges: Vec<BarRange> = Vec::new();
+        for mem_bar in mem_bars {
+            let mmio_type = if mem_bar.is_64bit_memory() {
+                MmioType::High
+            } else {
+                MmioType::Low
+            };
+            let bar_size = mem_bar.size();
+            let mut bar_addr: u64 = 0;
+            // Don't allocate mmio for hotplug device, OS will allocate it from
+            // its parent's bridge window.
+            if self.hotplug_bus_number.is_none() {
+                bar_addr = resources
+                    .mmio_allocator(mmio_type)
+                    .allocate_with_align(
+                        bar_size,
+                        Alloc::PciBar {
+                            bus: address.bus,
+                            dev: address.dev,
+                            func: address.func,
+                            bar: mem_bar.bar_index() as u8,
+                        },
+                        "vfio_bar".to_string(),
+                        bar_size,
+                    )
+                    .map_err(|e| PciDeviceError::IoAllocationFailed(bar_size, e))?;
+                ranges.push(BarRange {
+                    addr: bar_addr,
+                    size: bar_size,
+                    prefetchable: mem_bar.is_prefetchable(),
+                });
+            }
+            self.configure_barmem(mem_bar, bar_addr);
+        }
+        Ok(ranges)
+    }
+
+    fn allocate_nonroot_barmem(
+        &mut self,
+        mem_bars: &mut [PciBarConfiguration],
+        resources: &mut SystemAllocator,
+    ) -> Result<Vec<BarRange>, PciDeviceError> {
+        const NON_PREFETCHABLE: usize = 0;
+        const PREFETCHABLE: usize = 1;
+        const ARRAY_SIZE: usize = 2;
+        let mut membars: [Vec<PciBarConfiguration>; ARRAY_SIZE] = [Vec::new(), Vec::new()];
+        let mut allocator: [VfioResourceAllocator; ARRAY_SIZE] = [
+            match VfioResourceAllocator::new(0, u32::MAX as u64) {
+                Ok(a) => a,
+                Err(e) => {
+                    error!(
+                        "{} init nonroot VfioResourceAllocator failed: {}",
+                        self.debug_label(),
+                        e
+                    );
+                    return Err(e);
+                }
+            },
+            match VfioResourceAllocator::new(0, u64::MAX) {
+                Ok(a) => a,
+                Err(e) => {
+                    error!(
+                        "{} init nonroot VfioResourceAllocator failed: {}",
+                        self.debug_label(),
+                        e
+                    );
+                    return Err(e);
+                }
+            },
+        ];
+        let mut memtype: [MmioType; ARRAY_SIZE] = [MmioType::Low, MmioType::High];
+        // the window must be 1M-aligned as per the PCI spec
+        let mut window_sz: [u64; ARRAY_SIZE] = [0; 2];
+        let mut alignment: [u64; ARRAY_SIZE] = [0x100000; 2];
+
+        // Descend by bar size, this could reduce allocated size for all the bars.
+        mem_bars.sort_by_key(|a| Reverse(a.size()));
+        for mem_bar in mem_bars {
+            let prefetchable = mem_bar.is_prefetchable();
+            let is_64bit = mem_bar.is_64bit_memory();
+
+            // if one prefetchable bar is 32bit, all the prefetchable bars should be in Low MMIO,
+            // as all the prefetchable bars should be in one region
+            if prefetchable && !is_64bit {
+                memtype[PREFETCHABLE] = MmioType::Low;
+            }
+            let i = if prefetchable {
+                PREFETCHABLE
+            } else {
+                NON_PREFETCHABLE
+            };
+            let bar_size = mem_bar.size();
+            let start = match allocator[i].allocate_with_align(bar_size, bar_size) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(
+                        "{} nonroot allocate_wit_align failed: {}",
+                        self.debug_label(),
+                        e
+                    );
+                    return Err(e);
+                }
+            };
+            window_sz[i] = max(window_sz[i], start + bar_size);
+            alignment[i] = max(alignment[i], bar_size);
+            let mem_info = (*mem_bar).set_address(start);
+            membars[i].push(mem_info);
+        }
+
+        let address = self.pci_address.unwrap();
+        let mut ranges: Vec<BarRange> = Vec::new();
+        for (index, bars) in membars.iter().enumerate() {
+            if bars.is_empty() {
+                continue;
+            }
+
+            let i = if index == 1 {
+                PREFETCHABLE
+            } else {
+                NON_PREFETCHABLE
+            };
+            let mut window_addr: u64 = 0;
+            // Don't allocate mmio for hotplug device, OS will allocate it from
+            // its parent's bridge window.
+            if self.hotplug_bus_number.is_none() {
+                window_sz[i] = (window_sz[i] + 0xfffff) & !0xfffff;
+                let alloc = if i == NON_PREFETCHABLE {
+                    Alloc::PciBridgeWindow {
+                        bus: address.bus,
+                        dev: address.dev,
+                        func: address.func,
+                    }
+                } else {
+                    Alloc::PciBridgePrefetchWindow {
+                        bus: address.bus,
+                        dev: address.dev,
+                        func: address.func,
+                    }
+                };
+                window_addr = resources
+                    .mmio_allocator(memtype[i])
+                    .allocate_with_align(
+                        window_sz[i],
+                        alloc,
+                        "vfio_bar_window".to_string(),
+                        alignment[i],
+                    )
+                    .map_err(|e| PciDeviceError::IoAllocationFailed(window_sz[i], e))?;
+                for mem_info in bars {
+                    let bar_addr = window_addr + mem_info.address();
+                    ranges.push(BarRange {
+                        addr: bar_addr,
+                        size: mem_info.size(),
+                        prefetchable: mem_info.is_prefetchable(),
+                    });
+                }
+            }
+
+            for mem_info in bars {
+                let bar_addr = window_addr + mem_info.address();
+                self.configure_barmem(mem_info, bar_addr);
+            }
+        }
+        Ok(ranges)
+    }
 }
 
 impl PciDevice for VfioPciDevice {
@@ -987,7 +1284,9 @@ impl PciDevice for VfioPciDevice {
         resources: &mut SystemAllocator,
     ) -> Result<PciAddress, PciDeviceError> {
         if self.pci_address.is_none() {
-            let mut address = PciAddress::from_string(self.device.device_name());
+            let mut address = PciAddress::from_string(self.device.device_name()).map_err(|e| {
+                PciDeviceError::PciAddressParseFailure(self.device.device_name().clone(), e)
+            })?;
             if let Some(bus_num) = self.hotplug_bus_number {
                 // Caller specify pcie bus number for hotplug device
                 address.bus = bus_num;
@@ -1068,104 +1367,18 @@ impl PciDevice for VfioPciDevice {
     fn allocate_io_bars(
         &mut self,
         resources: &mut SystemAllocator,
-    ) -> Result<Vec<(u64, u64)>, PciDeviceError> {
-        let mut ranges = Vec::new();
-        let mut i = VFIO_PCI_BAR0_REGION_INDEX;
+    ) -> Result<Vec<BarRange>, PciDeviceError> {
         let address = self
             .pci_address
-            .expect("allocate_address must be called prior to allocate_io_bars");
+            .expect("allocate_address must be called prior to allocate_device_bars");
 
-        while i <= VFIO_PCI_ROM_REGION_INDEX {
-            let mut low: u32 = 0xffffffff;
-            let offset: u32;
-            if i == VFIO_PCI_ROM_REGION_INDEX {
-                offset = 0x30;
-            } else {
-                offset = 0x10 + i * 4;
-            }
-            self.config.write_config(low, offset);
-            low = self.config.read_config(offset);
+        let mut mem_bars = self.collect_bars();
 
-            let low_flag = low & 0xf;
-            let is_64bit = low_flag & 0x4 == 0x4;
-            let prefetchable = low_flag & 0x8 == 0x8;
-            if (low_flag & 0x1 == 0 || i == VFIO_PCI_ROM_REGION_INDEX) && low != 0 {
-                let mut upper: u32 = 0xffffffff;
-                if is_64bit {
-                    self.config.write_config(upper, offset + 4);
-                    upper = self.config.read_config(offset + 4);
-                }
-
-                low &= 0xffff_fff0;
-                let mut size: u64 = u64::from(upper);
-                size <<= 32;
-                size |= u64::from(low);
-                size = !size + 1;
-                let mmio_type = match is_64bit {
-                    false => MmioType::Low,
-                    true => MmioType::High,
-                };
-                let mut bar_addr: u64 = 0;
-                // Don't allocate mmio for hotplug device, OS will allocate it from
-                // its parent's bridge window.
-                if self.hotplug_bus_number.is_none() {
-                    bar_addr = resources
-                        .mmio_allocator(mmio_type)
-                        .allocate_with_align(
-                            size,
-                            Alloc::PciBar {
-                                bus: address.bus,
-                                dev: address.dev,
-                                func: address.func,
-                                bar: i as u8,
-                            },
-                            "vfio_bar".to_string(),
-                            size,
-                        )
-                        .map_err(|e| PciDeviceError::IoAllocationFailed(size, e))?;
-                    ranges.push((bar_addr, size));
-                }
-                self.mmio_regions.push(
-                    PciBarConfiguration::new(
-                        i as usize,
-                        size,
-                        if is_64bit {
-                            PciBarRegionType::Memory64BitRegion
-                        } else {
-                            PciBarRegionType::Memory32BitRegion
-                        },
-                        if prefetchable {
-                            PciBarPrefetchable::Prefetchable
-                        } else {
-                            PciBarPrefetchable::NotPrefetchable
-                        },
-                    )
-                    .set_address(bar_addr),
-                );
-
-                low = bar_addr as u32;
-                low |= low_flag;
-                self.config.write_config(low, offset);
-                if is_64bit {
-                    upper = (bar_addr >> 32) as u32;
-                    self.config.write_config(upper, offset + 4);
-                }
-            } else if low_flag & 0x1 == 0x1 {
-                let size = !(low & 0xffff_fffc) + 1;
-                self.io_regions.push(PciBarConfiguration::new(
-                    i as usize,
-                    u64::from(size),
-                    PciBarRegionType::IoRegion,
-                    PciBarPrefetchable::NotPrefetchable,
-                ));
-            }
-
-            if is_64bit {
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
+        let ranges = if address.bus == 0 {
+            self.allocate_root_barmem(&mem_bars, resources)?
+        } else {
+            self.allocate_nonroot_barmem(&mut mem_bars, resources)?
+        };
 
         // Quirk, enable igd memory for guest vga arbitrate, otherwise kernel vga arbitrate
         // driver doesn't claim this vga device, then xorg couldn't boot up.
@@ -1174,15 +1387,14 @@ impl PciDevice for VfioPciDevice {
             cmd |= PCI_COMMAND_MEMORY;
             self.config.write_config(cmd, PCI_COMMAND);
         }
-
         Ok(ranges)
     }
 
     fn allocate_device_bars(
         &mut self,
         resources: &mut SystemAllocator,
-    ) -> Result<Vec<(u64, u64)>, PciDeviceError> {
-        let mut ranges = Vec::new();
+    ) -> Result<Vec<BarRange>, PciDeviceError> {
+        let mut ranges: Vec<BarRange> = Vec::new();
 
         if !self.is_intel_gfx() {
             return Ok(ranges);
@@ -1210,7 +1422,11 @@ impl PciDevice for VfioPciDevice {
                     "vfio_bar".to_string(),
                 )
                 .map_err(|e| PciDeviceError::IoAllocationFailed(size, e))?;
-            ranges.push((bar_addr, size));
+            ranges.push(BarRange {
+                addr: bar_addr,
+                size,
+                prefetchable: false,
+            });
             self.device_data = Some(DeviceData::IntelGfxData {
                 opregion_index: index,
             });
@@ -1378,6 +1594,23 @@ impl PciDevice for VfioPciDevice {
         }
     }
 
+    fn read_virtual_config_register(&self, reg_idx: usize) -> u32 {
+        warn!(
+            "{} read unsupported register {}",
+            self.debug_label(),
+            reg_idx
+        );
+        0
+    }
+
+    fn write_virtual_config_register(&mut self, reg_idx: usize, _value: u32) {
+        warn!(
+            "{} write unsupported register {}",
+            self.debug_label(),
+            reg_idx
+        )
+    }
+
     fn read_bar(&mut self, addr: u64, data: &mut [u8]) {
         if let Some(mmio_info) = self.find_region(addr) {
             let offset = addr - mmio_info.address();
@@ -1444,12 +1677,12 @@ impl Drop for VfioPciDevice {
 
 #[cfg(test)]
 mod tests {
-    use super::VfioMsixAllocator;
+    use super::VfioResourceAllocator;
 
     #[test]
     fn no_overlap() {
         // regions [32, 95]
-        let mut memory = VfioMsixAllocator::new(32, 64).unwrap();
+        let mut memory = VfioResourceAllocator::new(32, 64).unwrap();
         memory.allocate_at(0, 16).unwrap();
         memory.allocate_at(100, 16).unwrap();
 
@@ -1460,7 +1693,7 @@ mod tests {
     #[test]
     fn full_overlap() {
         // regions [32, 95]
-        let mut memory = VfioMsixAllocator::new(32, 64).unwrap();
+        let mut memory = VfioResourceAllocator::new(32, 64).unwrap();
         // regions [32, 47], [64, 95]
         memory.allocate_at(48, 16).unwrap();
         // regions [64, 95]
@@ -1473,7 +1706,7 @@ mod tests {
     #[test]
     fn partial_overlap_one() {
         // regions [32, 95]
-        let mut memory = VfioMsixAllocator::new(32, 64).unwrap();
+        let mut memory = VfioResourceAllocator::new(32, 64).unwrap();
         // regions [32, 47], [64, 95]
         memory.allocate_at(48, 16).unwrap();
         // regions [32, 39], [64, 95]
@@ -1487,7 +1720,7 @@ mod tests {
     #[test]
     fn partial_overlap_two() {
         // regions [32, 95]
-        let mut memory = VfioMsixAllocator::new(32, 64).unwrap();
+        let mut memory = VfioResourceAllocator::new(32, 64).unwrap();
         // regions [32, 47], [64, 95]
         memory.allocate_at(48, 16).unwrap();
         // regions [32, 39], [72, 95]
@@ -1501,7 +1734,7 @@ mod tests {
     #[test]
     fn partial_overlap_three() {
         // regions [32, 95]
-        let mut memory = VfioMsixAllocator::new(32, 64).unwrap();
+        let mut memory = VfioResourceAllocator::new(32, 64).unwrap();
         // regions [32, 39], [48, 95]
         memory.allocate_at(40, 8).unwrap();
         // regions [32, 39], [48, 63], [72, 95]
