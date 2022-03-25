@@ -45,6 +45,7 @@
 // VhostUserSlaveReqHandlerMut trait methods. These dispatch back to the supplied VhostUserBackend
 // implementation (this is what our devices implement).
 
+use base::AsRawDescriptor;
 use std::convert::{From, TryFrom};
 use std::fs::File;
 use std::num::Wrapping;
@@ -53,14 +54,13 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base::{
-    error, Event, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor, SharedMemory,
-    SharedMemoryUnix, UnlinkUnixListener,
+    clear_fd_flags, error, info, Event, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor,
+    SharedMemory, SharedMemoryUnix, UnlinkUnixListener,
 };
 use cros_async::{AsyncWrapper, Executor};
 use sync::Mutex;
-use sys_util::clear_fd_flags;
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 use vmm_vhost::{
     connection::vfio::{Endpoint as VfioEndpoint, Listener as VfioListener},
@@ -175,7 +175,7 @@ pub fn create_vvu_guest_memory(
 
     let mut vmm_maps = Vec::with_capacity(contexts.len());
     let mut regions = Vec::with_capacity(contexts.len());
-    let page_size = sys_util::pagesize() as u64;
+    let page_size = base::pagesize() as u64;
     for region in contexts {
         let offset = file_offset + region.mmap_offset;
         assert_eq!(offset % page_size, 0);
@@ -403,7 +403,7 @@ where
             .await?;
         let mut req_handler =
             SlaveReqHandler::from_stream(socket, Arc::new(std::sync::Mutex::new(self)));
-        let h = SafeDescriptor::try_from(&req_handler as &dyn AsRawFd)
+        let h = SafeDescriptor::try_from(&req_handler as &dyn AsRawDescriptor)
             .map(AsyncWrapper::new)
             .expect("failed to get safe descriptor for handler");
         let handler_source = ex
@@ -415,9 +415,17 @@ where
                 .wait_readable()
                 .await
                 .context("failed to wait for the handler socket to become readable")?;
-            req_handler
-                .handle_request()
-                .context("failed to handle a vhost-user request")?;
+            match req_handler.handle_request() {
+                Ok(()) => (),
+                Err(VhostError::ClientExit) => {
+                    info!("vhost-user connection closed");
+                    // Exit as the client closed the connection.
+                    return Ok(());
+                }
+                Err(e) => {
+                    bail!("failed to handle a vhost-user request: {}", e);
+                }
+            };
         }
     }
 
@@ -443,7 +451,7 @@ where
             .map_err(|e| anyhow!("failed to accept VFIO connection: {}", e))?
             .expect("vvu proxy is unavailable via VFIO");
 
-        let h = SafeDescriptor::try_from(&req_handler as &dyn AsRawFd)
+        let h = SafeDescriptor::try_from(&req_handler as &dyn AsRawDescriptor)
             .map(AsyncWrapper::new)
             .expect("failed to get safe descriptor for handler");
         let handler_source = ex
