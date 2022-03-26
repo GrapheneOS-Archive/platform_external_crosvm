@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::mem::size_of;
 use std::sync::Arc;
 
 use arch::{get_serial_cmdline, GetSerialCmdlineError, RunnableLinuxVm, VmComponents, VmImage};
@@ -16,7 +15,8 @@ use devices::{
     Bus, BusDeviceObj, BusError, IrqChip, IrqChipAArch64, PciAddress, PciConfigMmio, PciDevice,
 };
 use hypervisor::{
-    DeviceKind, Hypervisor, HypervisorCap, ProtectionType, VcpuAArch64, VcpuFeature, Vm, VmAArch64,
+    arm64_core_reg, DeviceKind, Hypervisor, HypervisorCap, ProtectionType, VcpuAArch64,
+    VcpuFeature, Vm, VmAArch64,
 };
 use minijail::Minijail;
 use remain::sorted;
@@ -69,46 +69,6 @@ const PSR_I_BIT: u64 = 0x00000080;
 const PSR_A_BIT: u64 = 0x00000100;
 const PSR_D_BIT: u64 = 0x00000200;
 
-macro_rules! offset__of {
-    ($type:path, $field:tt) => {{
-        // Check that the field actually exists. This will generate a compiler error if the field is
-        // accessed through a Deref impl.
-        #[allow(clippy::unneeded_field_pattern)]
-        let $type { $field: _, .. };
-
-        // Get a pointer to the uninitialized field.  This is taken from the docs for `addr_of_mut`.
-        let mut uninit = ::std::mem::MaybeUninit::<$type>::uninit();
-        let field_ptr = unsafe { ::std::ptr::addr_of_mut!((*uninit.as_mut_ptr()).$field) };
-
-        // Now get the offset.
-        (field_ptr as usize) - (uninit.as_mut_ptr() as usize)
-    }};
-}
-
-const KVM_REG_ARM64: u64 = 0x6000000000000000;
-const KVM_REG_SIZE_U64: u64 = 0x0030000000000000;
-const KVM_REG_ARM_COPROC_SHIFT: u64 = 16;
-const KVM_REG_ARM_CORE: u64 = 0x0010 << KVM_REG_ARM_COPROC_SHIFT;
-
-/// Gives the ID for a register to be used with `set_one_reg`.
-///
-/// Pass the name of a field in `user_pt_regs` to get the corresponding register
-/// ID, e.g. `arm64_core_reg!(pstate)`
-///
-/// To get ID for registers `x0`-`x31`, refer to the `regs` field along with the
-/// register number, e.g. `arm64_core_reg!(regs, 5)` for `x5`. This is different
-/// to work around `offset__of!(kvm_sys::user_pt_regs, regs[$x])` not working.
-macro_rules! arm64_core_reg {
-    ($reg: tt) => {{
-        let off = (offset__of!(kvm_sys::user_pt_regs, $reg) / 4) as u64;
-        KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | off
-    }};
-    (regs, $x: literal) => {{
-        let off = ((offset__of!(kvm_sys::user_pt_regs, regs) + ($x * size_of::<u64>())) / 4) as u64;
-        KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | off
-    }};
-}
-
 fn get_kernel_addr() -> GuestAddress {
     GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_KERNEL_OFFSET)
 }
@@ -138,9 +98,9 @@ const AARCH64_PCI_CFG_BASE: u64 = 0x10000;
 // PCI MMIO configuration region size.
 const AARCH64_PCI_CFG_SIZE: u64 = 0x1000000;
 // This is the base address of MMIO devices.
-const AARCH64_MMIO_BASE: u64 = 0x1010000;
+const AARCH64_MMIO_BASE: u64 = 0x2000000;
 // Size of the whole MMIO region.
-const AARCH64_MMIO_SIZE: u64 = 0x100000;
+const AARCH64_MMIO_SIZE: u64 = 0x2000000;
 // Virtio devices start at SPI interrupt number 3
 const AARCH64_IRQ_BASE: u32 = 3;
 
@@ -389,7 +349,7 @@ impl arch::LinuxArch for AArch64 {
             io_bus.clone(),
             system_allocator,
             &mut vm,
-            (devices::AARCH64_GIC_NR_IRQS - AARCH64_IRQ_BASE) as usize,
+            (devices::AARCH64_GIC_NR_SPIS - AARCH64_IRQ_BASE) as usize,
         )
         .map_err(Error::CreatePciRoot)?;
 
@@ -465,16 +425,38 @@ impl arch::LinuxArch for AArch64 {
             None => (high_mmio_base, high_mmio_size),
         };
 
+        let pci_cfg = fdt::PciConfigRegion {
+            base: AARCH64_PCI_CFG_BASE,
+            size: AARCH64_PCI_CFG_SIZE,
+        };
+
+        let pci_ranges = &[
+            fdt::PciRange {
+                space: fdt::PciAddressSpace::Memory64,
+                bus_address: AARCH64_MMIO_BASE,
+                cpu_physical_address: AARCH64_MMIO_BASE,
+                size: AARCH64_MMIO_SIZE,
+                prefetchable: false,
+            },
+            fdt::PciRange {
+                space: fdt::PciAddressSpace::Memory64,
+                bus_address: pci_device_base,
+                cpu_physical_address: pci_device_base,
+                size: pci_device_size,
+                prefetchable: false,
+            },
+        ];
+
         fdt::create_fdt(
             AARCH64_FDT_MAX_SIZE as usize,
             &mem,
             pci_irqs,
+            pci_cfg,
+            pci_ranges,
             vcpu_count as u32,
             components.cpu_clusters,
             components.cpu_capacity,
             fdt_offset(components.memory_size, has_bios),
-            pci_device_base,
-            pci_device_size,
             cmdline.as_str(),
             initrd,
             components.android_fstab,

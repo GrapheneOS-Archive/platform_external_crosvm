@@ -4,7 +4,6 @@
 
 //! Implement a struct that works as a `vmm_vhost`'s backend.
 
-use std::fs::File;
 use std::io::{IoSlice, IoSliceMut};
 use std::mem;
 use std::os::unix::io::RawFd;
@@ -12,12 +11,12 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base::{error, Event};
 use cros_async::{EventAsync, Executor};
 use futures::{pin_mut, select, FutureExt};
 use sync::Mutex;
-use vmm_vhost::connection::vfio::Device as VfioDeviceTrait;
+use vmm_vhost::connection::vfio::{Device as VfioDeviceTrait, RecvIntoBufsError};
 
 use crate::vfio::VfioDevice;
 use crate::virtio::vhost::user::device::vvu::{
@@ -123,7 +122,7 @@ impl VvuDevice {
 }
 
 impl VfioDeviceTrait for VvuDevice {
-    fn event(&self) -> &sys_util::EventFd {
+    fn event(&self) -> &base::EventFd {
         &self.rxq_evt.0
     }
 
@@ -204,10 +203,12 @@ impl VfioDeviceTrait for VvuDevice {
         Ok(size)
     }
 
-    fn recv_into_bufs(&mut self, bufs: &mut [IoSliceMut]) -> Result<(usize, Option<Vec<File>>)> {
+    fn recv_into_bufs(&mut self, bufs: &mut [IoSliceMut]) -> Result<usize, RecvIntoBufsError> {
         let (rxq_receiver, rxq_notifier, rxq_buf, vfio) = match &mut self.state {
             DeviceState::Initialized { .. } => {
-                bail!("VvuDevice hasn't started yet");
+                return Err(RecvIntoBufsError::Fatal(anyhow!(
+                    "VvuDevice hasn't started yet"
+                )));
             }
             DeviceState::Running {
                 rxq_receiver,
@@ -223,7 +224,10 @@ impl VfioDeviceTrait for VvuDevice {
             let len = buf.len();
 
             while rxq_buf.len() < len {
-                let mut data = rxq_receiver.recv().context("failed to receive data")?;
+                let mut data = rxq_receiver
+                    .recv()
+                    .context("failed to receive data")
+                    .map_err(RecvIntoBufsError::Fatal)?;
                 rxq_buf.append(&mut data);
             }
 
@@ -235,6 +239,10 @@ impl VfioDeviceTrait for VvuDevice {
             rxq_notifier.lock().notify(vfio, QueueType::Rx as u16);
         }
 
-        Ok((size, None))
+        if size == 0 {
+            // TODO(b/216407443): We should change `self.state` and exit gracefully.
+            return Err(RecvIntoBufsError::Disconnect);
+        }
+        Ok(size)
     }
 }
