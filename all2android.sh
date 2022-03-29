@@ -6,11 +6,14 @@
 set -e
 
 cargo2android() {
+  local C2A=${C2A:-cargo2android.py}
+  echo "Using $C2A to run this script."
+
   # Some crates need special options to cargo2android.py, if there's a config file then use it.
   if [[ -f "cargo2android.json" ]]; then
-    cargo2android.py --config cargo2android.json
+    $C2A --config cargo2android.json
   else
-    cargo2android.py --run --device --tests $@
+    $C2A --run --device --tests $@
   fi
   rm -f cargo.out
   rm -rf target.tmp || /bin/true
