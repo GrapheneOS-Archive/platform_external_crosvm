@@ -10,6 +10,16 @@ index d3d46248..bc1191a5 100644
      crate_name: "crosvm",
      cargo_env_compat: true,
      srcs: ["src/main.rs"],
+@@ -94,6 +94,9 @@ rust_binary {
+                 "gpu",
+             ],  
+         },
++        darwin: {
++            enabled: false,
++        },
+         host_linux: {
+             features: [
+                 "gdb",
 @@ -107,6 +108,15 @@ rust_binary {
                  "libthiserror",
              ],
