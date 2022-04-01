@@ -89,23 +89,24 @@ mod tests {
 
     const TEST_SIZE: usize = 64;
 
-    #[test]
-    fn randbytes_success() {
-        let mut rand = vec![0u8; TEST_SIZE];
-        rand_bytes(&mut rand, Source::Pseudorandom).unwrap();
-        assert_ne!(&rand, &[0u8; TEST_SIZE]);
-    }
+    // ANDROID: b/227794338
+//    #[test]
+//    fn randbytes_success() {
+//        let mut rand = vec![0u8; TEST_SIZE];
+//        rand_bytes(&mut rand, Source::Pseudorandom).unwrap();
+//        assert_ne!(&rand, &[0u8; TEST_SIZE]);
+//    }
 
-    #[test]
-    fn randvec_success() {
-        let rand = rand_vec(TEST_SIZE, Source::Pseudorandom).unwrap();
-        assert_eq!(rand.len(), TEST_SIZE);
-        assert_ne!(&rand, &[0u8; TEST_SIZE]);
-    }
+//    #[test]
+//    fn randvec_success() {
+//        let rand = rand_vec(TEST_SIZE, Source::Pseudorandom).unwrap();
+//        assert_eq!(rand.len(), TEST_SIZE);
+//        assert_ne!(&rand, &[0u8; TEST_SIZE]);
+//    }
 
-    #[test]
-    fn sourcerandom_success() {
-        let rand = rand_vec(TEST_SIZE, Source::Random).unwrap();
-        assert_ne!(&rand, &[0u8; TEST_SIZE]);
-    }
+//    #[test]
+//    fn sourcerandom_success() {
+//        let rand = rand_vec(TEST_SIZE, Source::Random).unwrap();
+//        assert_ne!(&rand, &[0u8; TEST_SIZE]);
+//    }
 }

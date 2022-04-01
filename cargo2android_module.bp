@@ -1,0 +1,31 @@
+arch: {
+    x86_64: {
+        rustlibs: ["libx86_64_rust"],
+    },
+    arm64: {
+        rustlibs: ["libaarch64"],
+    },
+},
+target: {
+    host: {
+        features: [
+            "gfxstream",
+            "gpu",
+        ],
+    },
+    host_linux: {
+        features: [
+            "gdb",
+            "gdbstub",
+        ],
+        rustlibs: [
+            "libgdbstub",
+            "libgdbstub_arch",
+            "libthiserror",
+        ],
+    },
+},
+ld_flags: [
+    "-Wl,--rpath,\\$$ORIGIN",
+    "-Wl,--rpath,\\$$ORIGIN/../../lib64",
+]

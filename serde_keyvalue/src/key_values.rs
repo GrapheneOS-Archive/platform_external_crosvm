@@ -242,7 +242,7 @@ impl<'de> KeyValueDeserializer<'de> {
             Some(_) => {
                 let s = self
                     .input
-                    .split(&[',', '"', '\''])
+                    .split(&[',', '"', '\''][..])
                     .next()
                     .unwrap_or(self.input);
                 self.input = &self.input[s.len()..];

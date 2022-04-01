@@ -106,7 +106,7 @@ pub const FENCE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 pub const GPU_BAR_NUM: u8 = 4;
 pub const GPU_BAR_OFFSET: u64 = 0;
-pub const GPU_BAR_SIZE: u64 = 1 << 33;
+pub const GPU_BAR_SIZE: u64 = 1 << 28;
 
 impl Default for GpuParameters {
     fn default() -> Self {

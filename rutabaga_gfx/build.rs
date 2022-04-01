@@ -18,9 +18,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[cfg(feature = "virgl_renderer")]
-const MINIGBM_SRC: &str = "../third_party/minigbm";
+const MINIGBM_SRC: &str = "../../minigbm";
 #[cfg(feature = "virgl_renderer")]
-const VIRGLRENDERER_SRC: &str = "../third_party/virglrenderer";
+const VIRGLRENDERER_SRC: &str = "../../virglrenderer";
 
 #[cfg(feature = "virgl_renderer")]
 fn is_native_build() -> bool {

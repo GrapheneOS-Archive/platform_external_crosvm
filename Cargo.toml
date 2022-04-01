@@ -1,3 +1,5 @@
+cargo-features = ["named-profiles"]
+
 [package]
 name = "crosvm"
 version = "0.1.0"
@@ -151,7 +153,7 @@ anyhow = "1.0.32"
 arch = { path = "arch" }
 assertions = { path = "common/assertions" }
 audio_streams = "*"
-base = "*"
+base = { path = "base" }
 bit_field = { path = "bit_field" }
 crosvm_plugin = { path = "crosvm_plugin", optional = true }
 data_model = "*"
@@ -194,7 +196,7 @@ x86_64 = { path = "x86_64" }
 aarch64 = { path = "aarch64" }
 
 [dev-dependencies]
-base = "*"
+base = { path = "base" }
 
 [patch.crates-io]
 assertions = { path = "common/assertions" }
@@ -210,4 +212,4 @@ sync = { path = "common/sync" }
 sys_util = { path = "common/sys_util" }
 system_api = { path = "system_api_stub" } # ignored by ebuild
 wire_format_derive = { path = "common/p9/wire_format_derive" } # ignored by ebuild
-minijail = { path = "third_party/minijail/rust/minijail" } # ignored by ebuild
+minijail = { path = "../minijail/rust/minijail" } # ignored by ebuild

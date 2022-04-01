@@ -480,7 +480,9 @@ impl VirtioPciDevice {
 
 impl PciDevice for VirtioPciDevice {
     fn supports_iommu(&self) -> bool {
-        (self.device.features() & (1 << VIRTIO_F_ACCESS_PLATFORM)) != 0
+        // ANDROID: b/226445312
+        // (self.device.features() & (1 << VIRTIO_F_ACCESS_PLATFORM)) != 0
+        false
     }
 
     fn debug_label(&self) -> String {
@@ -598,7 +600,7 @@ impl PciDevice for VirtioPciDevice {
         let mut ranges: Vec<BarRange> = Vec::new();
         for config in self.device.get_device_bars(address) {
             let device_addr = resources
-                .mmio_allocator(MmioType::High)
+                .mmio_allocator_any()
                 .allocate_with_align(
                     config.size(),
                     Alloc::PciBar {

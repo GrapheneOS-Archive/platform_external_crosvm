@@ -11,7 +11,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/input-event-codes.h>
+// Android edit:
+// #include <linux/input-event-codes.h>
+#ifndef BTN_LEFT
+#define BTN_LEFT 0x110
+#endif
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -24,7 +28,11 @@
 #include "aura-shell.h"
 #include "linux-dmabuf-unstable-v1.h"
 #include "viewporter.h"
+#ifdef ANDROID
+#include "xdg-shell-client-protocol.h"
+#else
 #include "xdg-shell.h"
+#endif
 #include "virtio-gpu-metadata-v1.h"
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
