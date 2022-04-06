@@ -26,10 +26,10 @@ use devices::{
 use hypervisor::{IoEventAddress, ProtectionType, Vm};
 use minijail::Minijail;
 use remain::sorted;
-use resources::{MmioType, SystemAllocator};
+use resources::{MmioType, SystemAllocator, SystemAllocatorConfig};
 use sync::Mutex;
 use thiserror::Error;
-use vm_control::{BatControl, BatteryType};
+use vm_control::{BatControl, BatteryType, PmResource};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
@@ -101,6 +101,8 @@ pub struct VmComponents {
     pub host_cpu_topology: bool,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub force_s2idle: bool,
+    #[cfg(feature = "direct")]
+    pub direct_gpe: Vec<u32>,
 }
 
 /// Holds the elements needed to run a Linux VM. Created by `build_vm`.
@@ -123,6 +125,7 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub bat_control: Option<BatControl>,
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     pub gdb: Option<(u32, Tube)>,
+    pub pm: Option<Arc<Mutex<dyn PmResource>>>,
     /// Devices to be notified before the system resumes from the S3 suspended state.
     pub resume_notify_devices: Vec<Arc<Mutex<dyn BusResumeDevice>>>,
     pub root_config: Arc<Mutex<PciRoot>>,
@@ -150,12 +153,16 @@ pub trait LinuxArch {
         components: &VmComponents,
     ) -> std::result::Result<Vec<(GuestAddress, u64)>, Self::Error>;
 
-    /// Creates a new `SystemAllocator` that fits the given `Vm`'s memory layout.
+    /// Gets the configuration for a new `SystemAllocator` that fits the given `Vm`'s memory layout.
+    ///
+    /// This is the per-architecture template for constructing the `SystemAllocator`. Platform
+    /// agnostic modifications may be made to this configuration, but the final `SystemAllocator`
+    /// will be at least as strict as this configuration.
     ///
     /// # Arguments
     ///
     /// * `vm` - The virtual machine to be used as a template for the `SystemAllocator`.
-    fn create_system_allocator<V: Vm>(vm: &V) -> SystemAllocator;
+    fn get_system_allocator_config<V: Vm>(vm: &V) -> SystemAllocatorConfig;
 
     /// Takes `VmComponents` and generates a `RunnableLinuxVm`.
     ///
@@ -167,7 +174,7 @@ pub trait LinuxArch {
     /// * `reset_evt` - Event used by sub-devices to request that crosvm exit because guest
     ///     requested reset.
     /// * `system_allocator` - Allocator created by this trait's implementation of
-    ///   `create_system_allocator`.
+    ///   `get_system_allocator_config`.
     /// * `serial_parameters` - Definitions for how the serial devices should be configured.
     /// * `serial_jail` - Jail used for serial devices created here.
     /// * `battery` - Defines what battery device will be created.
@@ -692,7 +699,7 @@ pub fn add_goldfish_battery(
         create_monitor,
     )
     .map_err(DeviceRegistrationError::RegisterBattery)?;
-    Aml::to_aml_bytes(&goldfish_bat, amls);
+    goldfish_bat.to_aml_bytes(amls);
 
     match battery_jail.as_ref() {
         Some(jail) => {

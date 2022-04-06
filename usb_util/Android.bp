@@ -18,7 +18,7 @@ rust_library {
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
     srcs: ["src/lib.rs"],
-    edition: "2018",
+    edition: "2021",
     rustlibs: [
         "libassertions",
         "libbase_rust",
@@ -43,7 +43,7 @@ rust_test {
     test_options: {
         unit_test: true,
     },
-    edition: "2018",
+    edition: "2021",
     rustlibs: [
         "libassertions",
         "libbase_rust",

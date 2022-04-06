@@ -2,18 +2,20 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::mem;
-use std::ops::Deref;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::ptr;
-use std::time::Duration;
+use std::{
+    mem,
+    ops::Deref,
+    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
+    ptr,
+    time::Duration,
+};
 
 use libc::{c_void, eventfd, read, write, POLLIN};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    duration_to_timespec, errno_result, AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor,
-    RawDescriptor, Result, SafeDescriptor,
+use super::{
+    duration_to_timespec, errno_result, generate_scoped_event, AsRawDescriptor, FromRawDescriptor,
+    IntoRawDescriptor, RawDescriptor, Result, SafeDescriptor,
 };
 
 /// A safe wrapper around a Linux eventfd (man 2 eventfd).
@@ -90,7 +92,7 @@ impl EventFd {
     /// a timeout does not occur then the count is returned as a EventReadResult::Count(count),
     /// and the count is reset to 0. If a timeout does occur then this function will return
     /// EventReadResult::Timeout.
-    pub fn read_timeout(&mut self, timeout: Duration) -> Result<EventReadResult> {
+    pub fn read_timeout(&self, timeout: Duration) -> Result<EventReadResult> {
         let mut pfd = libc::pollfd {
             fd: self.as_raw_descriptor(),
             events: POLLIN,
@@ -172,49 +174,7 @@ impl From<EventFd> for SafeDescriptor {
     }
 }
 
-/// An `EventFd` wrapper which triggers when it goes out of scope.
-///
-/// If the underlying `EventFd` fails to trigger during drop, a panic is triggered instead.
-pub struct ScopedEvent(EventFd);
-
-impl ScopedEvent {
-    /// Creates a new `ScopedEvent` which triggers when it goes out of scope.
-    pub fn new() -> Result<ScopedEvent> {
-        Ok(EventFd::new()?.into())
-    }
-}
-
-impl From<EventFd> for ScopedEvent {
-    fn from(e: EventFd) -> Self {
-        Self(e)
-    }
-}
-
-impl From<ScopedEvent> for EventFd {
-    fn from(scoped_event: ScopedEvent) -> Self {
-        // Rust doesn't allow moving out of types with a Drop implementation, so we have to use
-        // something that copies instead of moves. This is safe because we prevent the drop of
-        // `scoped_event` using `mem::forget`, so the underlying `EventFd` will not experience a
-        // double-drop.
-        let evt = unsafe { ptr::read(&scoped_event.0) };
-        mem::forget(scoped_event);
-        evt
-    }
-}
-
-impl Deref for ScopedEvent {
-    type Target = EventFd;
-
-    fn deref(&self) -> &EventFd {
-        &self.0
-    }
-}
-
-impl Drop for ScopedEvent {
-    fn drop(&mut self) {
-        self.write(1).expect("failed to trigger scoped event");
-    }
-}
+generate_scoped_event!(EventFd);
 
 #[cfg(test)]
 mod tests {
@@ -257,7 +217,7 @@ mod tests {
 
     #[test]
     fn timeout() {
-        let mut evt = EventFd::new().expect("failed to create eventfd");
+        let evt = EventFd::new().expect("failed to create eventfd");
         assert_eq!(
             evt.read_timeout(Duration::from_millis(1))
                 .expect("failed to read from eventfd with timeout"),
