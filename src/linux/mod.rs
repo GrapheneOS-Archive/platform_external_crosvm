@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 use std::cmp::{max, Reverse};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
@@ -14,7 +14,7 @@ use std::ops::RangeInclusive;
 #[cfg(feature = "gpu")]
 use std::os::unix::net::UnixStream;
 use std::os::unix::prelude::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
@@ -27,8 +27,8 @@ use libc;
 use acpi_tables::sdt::SDT;
 
 use anyhow::{anyhow, bail, Context, Result};
-use base::net::{UnixSeqpacket, UnixSeqpacketListener, UnlinkUnixSeqpacketListener};
 use base::*;
+use base::{UnixSeqpacket, UnixSeqpacketListener, UnlinkUnixSeqpacketListener};
 use devices::serial_device::SerialHardware;
 use devices::vfio::{VfioCommonSetup, VfioCommonTrait};
 use devices::virtio::memory_mapper::MemoryMapperTrait;
@@ -38,8 +38,7 @@ use devices::virtio::{self, EventDevice};
 use devices::Ac97Dev;
 use devices::{
     self, BusDeviceObj, HostHotPlugKey, HotPlugBus, IrqEventIndex, KvmKernelIrqChip, PciAddress,
-    PciBridge, PciDevice, PcieHostRootPort, PcieRootPort, PvPanicCode, PvPanicPciDevice,
-    StubPciDevice, VirtioPciDevice,
+    PciDevice, PvPanicCode, PvPanicPciDevice, StubPciDevice, VirtioPciDevice,
 };
 use devices::{CoIommuDev, IommuDevType};
 #[cfg(feature = "usb")]
@@ -55,22 +54,25 @@ use vm_memory::{GuestAddress, GuestMemory, MemoryPolicy};
 
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use crate::gdb::{gdb_thread, GdbStub};
-use crate::{Config, Executable, SharedDir, SharedDirKind, VfioType};
+use crate::{Config, Executable, FileBackedMappingParameters, SharedDir, SharedDirKind, VfioType};
 use arch::{
     self, LinuxArch, RunnableLinuxVm, VcpuAffinity, VirtioDeviceStub, VmComponents, VmImage,
 };
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use {
+    crate::HostPcieRootPortParameters,
+    devices::{
+        IrqChipX86_64 as IrqChipArch, KvmSplitIrqChip, PciBridge, PcieHostRootPort, PcieRootPort,
+    },
+    hypervisor::{VcpuX86_64 as VcpuArch, VmX86_64 as VmArch},
+    x86_64::X8664arch as Arch,
+};
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 use {
     aarch64::AArch64 as Arch,
     devices::IrqChipAArch64 as IrqChipArch,
     hypervisor::{VcpuAArch64 as VcpuArch, VmAArch64 as VmArch},
-};
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use {
-    devices::{IrqChipX86_64 as IrqChipArch, KvmSplitIrqChip},
-    hypervisor::{VcpuX86_64 as VcpuArch, VmX86_64 as VmArch},
-    x86_64::X8664arch as Arch,
 };
 
 mod device_helpers;
@@ -95,7 +97,7 @@ fn create_virtio_devices(
     _exit_evt: &Event,
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
-    vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
+    vhost_user_gpu_tubes: Vec<(Tube, Tube, Tube)>,
     balloon_device_tube: Option<Tube>,
     balloon_inflate_tube: Option<Tube>,
     init_balloon_size: u64,
@@ -109,12 +111,14 @@ fn create_virtio_devices(
     let mut devs = Vec::new();
 
     #[cfg(feature = "gpu")]
-    for (opt, (host_tube, device_tube)) in cfg.vhost_user_gpu.iter().zip(vhost_user_gpu_tubes) {
+    for (opt, (host_gpu_tube, device_gpu_tube, device_control_tube)) in
+        cfg.vhost_user_gpu.iter().zip(vhost_user_gpu_tubes)
+    {
         devs.push(create_vhost_user_gpu_device(
             cfg,
             opt,
-            host_tube,
-            device_tube,
+            (host_gpu_tube, device_gpu_tube),
+            device_control_tube,
         )?);
     }
 
@@ -453,7 +457,8 @@ fn create_devices(
     control_tubes: &mut Vec<TaggedControlTube>,
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
-    vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
+    // Tuple content: (host-side GPU tube, device-side GPU tube, device-side control tube).
+    vhost_user_gpu_tubes: Vec<(Tube, Tube, Tube)>,
     balloon_device_tube: Option<Tube>,
     init_balloon_size: u64,
     disk_device_tubes: &mut Vec<Tube>,
@@ -482,6 +487,7 @@ fn create_devices(
                 control_tubes,
                 vfio_path.as_path(),
                 None,
+                vfio_dev.guest_address(),
                 iommu_attached_endpoints,
                 Some(&mut coiommu_attached_endpoints),
                 vfio_dev.iommu_dev_type(),
@@ -640,15 +646,19 @@ fn create_file_backed_mappings(
             .build()
             .context("failed to map backing file for file-backed mapping")?;
 
-        resources
-            .mmio_allocator_any()
-            .allocate_at(
-                mapping.address,
-                mapping.size,
-                Alloc::FileBacked(mapping.address),
-                "file-backed mapping".to_owned(),
-            )
-            .context("failed to allocate guest address for file-backed mapping")?;
+        match resources.mmio_allocator_any().allocate_at(
+            mapping.address,
+            mapping.size,
+            Alloc::FileBacked(mapping.address),
+            "file-backed mapping".to_owned(),
+        ) {
+            // OutOfSpace just means that this mapping is not in the MMIO regions at all, so don't
+            // consider it an error.
+            // TODO(b/222769529): Reserve this region in a global memory address space allocator once
+            // we have that so nothing else can accidentally overlap with it.
+            Ok(()) | Err(resources::Error::OutOfSpace) => {}
+            e => e.context("failed to allocate guest address for file-backed mapping")?,
+        }
 
         vm.add_memory_region(
             GuestAddress(mapping.address),
@@ -662,13 +672,15 @@ fn create_file_backed_mappings(
     Ok(())
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn create_pcie_root_port(
-    host_pcie_rp: Vec<PathBuf>,
+    host_pcie_rp: Vec<HostPcieRootPortParameters>,
     sys_allocator: &mut SystemAllocator,
     control_tubes: &mut Vec<TaggedControlTube>,
     devices: &mut Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
     hp_vec: &mut Vec<Arc<Mutex<dyn HotPlugBus>>>,
     hp_endpoints_ranges: &mut Vec<RangeInclusive<u32>>,
+    gpe_notify_devs: &mut Vec<(u32, Arc<Mutex<dyn GpeNotify>>)>,
 ) -> Result<()> {
     if host_pcie_rp.is_empty() {
         // user doesn't specify host pcie root port which link to this virtual pcie rp,
@@ -720,8 +732,9 @@ fn create_pcie_root_port(
     } else {
         // user specify host pcie root port which link to this virtual pcie rp,
         // reserve the host pci BDF and create a virtual pcie RP with some attrs same as host
-        for pcie_sysfs in host_pcie_rp.iter() {
-            let pcie_host = PcieHostRootPort::new(pcie_sysfs.as_path())?;
+        for host_pcie in host_pcie_rp.iter() {
+            let (vm_host_tube, vm_device_tube) = Tube::pair().context("failed to create tube")?;
+            let pcie_host = PcieHostRootPort::new(host_pcie.host_path.as_path(), vm_device_tube)?;
             let bus_range = pcie_host.get_bus_range();
             let mut slot_implemented = true;
             for i in bus_range.secondary..=bus_range.subordinate {
@@ -731,12 +744,15 @@ fn create_pcie_root_port(
                 // hotplug capability and won't use slot.
                 if !sys_allocator.pci_bus_empty(i) {
                     slot_implemented = false;
+                    break;
                 }
             }
+
             let pcie_root_port = Arc::new(Mutex::new(PcieRootPort::new_from_host(
                 pcie_host,
                 slot_implemented,
             )?));
+            control_tubes.push(TaggedControlTube::Vm(vm_host_tube));
 
             let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
             control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
@@ -750,23 +766,32 @@ fn create_pcie_root_port(
                 );
             }
 
-            hp_endpoints_ranges.push(RangeInclusive::new(
-                PciAddress {
-                    bus: pci_bridge.get_secondary_num(),
-                    dev: 0,
-                    func: 0,
-                }
-                .to_u32(),
-                PciAddress {
-                    bus: pci_bridge.get_subordinate_num(),
-                    dev: 32,
-                    func: 8,
-                }
-                .to_u32(),
-            ));
+            // Only append the sub pci range of a hot-pluggable root port to virtio-iommu
+            if slot_implemented {
+                hp_endpoints_ranges.push(RangeInclusive::new(
+                    PciAddress {
+                        bus: pci_bridge.get_secondary_num(),
+                        dev: 0,
+                        func: 0,
+                    }
+                    .to_u32(),
+                    PciAddress {
+                        bus: pci_bridge.get_subordinate_num(),
+                        dev: 32,
+                        func: 8,
+                    }
+                    .to_u32(),
+                ));
+            }
 
             devices.push((pci_bridge, None));
-            hp_vec.push(pcie_root_port as Arc<Mutex<dyn HotPlugBus>>);
+            if slot_implemented {
+                if let Some(gpe) = host_pcie.hp_gpe {
+                    gpe_notify_devs
+                        .push((gpe, pcie_root_port.clone() as Arc<Mutex<dyn GpeNotify>>));
+                }
+                hp_vec.push(pcie_root_port as Arc<Mutex<dyn HotPlugBus>>);
+            }
         }
     }
 
@@ -776,12 +801,8 @@ fn create_pcie_root_port(
 fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     let initrd_image = if let Some(initrd_path) = &cfg.initrd_path {
         Some(
-            open_file(
-                initrd_path,
-                true,  /*read_only*/
-                false, /*O_DIRECT*/
-            )
-            .with_context(|| format!("failed to open initrd {}", initrd_path.display()))?,
+            open_file(initrd_path, OpenOptions::new().read(true))
+                .with_context(|| format!("failed to open initrd {}", initrd_path.display()))?,
         )
     } else {
         None
@@ -789,15 +810,12 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
 
     let vm_image = match cfg.executable_path {
         Some(Executable::Kernel(ref kernel_path)) => VmImage::Kernel(
-            open_file(
-                kernel_path,
-                true,  /*read_only*/
-                false, /*O_DIRECT*/
-            )
-            .with_context(|| format!("failed to open kernel image {}", kernel_path.display()))?,
+            open_file(kernel_path, OpenOptions::new().read(true)).with_context(|| {
+                format!("failed to open kernel image {}", kernel_path.display())
+            })?,
         ),
         Some(Executable::Bios(ref bios_path)) => VmImage::Bios(
-            open_file(bios_path, true /*read_only*/, false /*O_DIRECT*/)
+            open_file(bios_path, OpenOptions::new().read(true))
                 .with_context(|| format!("failed to open bios {}", bios_path.display()))?,
         ),
         _ => panic!("Did not receive a bios or kernel, should be impossible."),
@@ -828,6 +846,8 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         vcpu_affinity: cfg.vcpu_affinity.clone(),
         cpu_clusters: cfg.cpu_clusters.clone(),
         cpu_capacity: cfg.cpu_capacity.clone(),
+        #[cfg(feature = "direct")]
+        direct_gpe: cfg.direct_gpe.clone(),
         no_smt: cfg.no_smt,
         hugepages: cfg.hugepages,
         vm_image,
@@ -871,11 +891,58 @@ pub enum ExitState {
     GuestPanic,
 }
 
+// Remove ranges in `guest_mem_layout` that overlap with ranges in `file_backed_mappings`.
+// Returns the updated guest memory layout.
+fn punch_holes_in_guest_mem_layout_for_mappings(
+    guest_mem_layout: Vec<(GuestAddress, u64)>,
+    file_backed_mappings: &[FileBackedMappingParameters],
+) -> Vec<(GuestAddress, u64)> {
+    // Create a set containing (start, end) pairs with exclusive end (end = start + size; the byte
+    // at end is not included in the range).
+    let mut layout_set = BTreeSet::new();
+    for (addr, size) in &guest_mem_layout {
+        layout_set.insert((addr.offset(), addr.offset() + size));
+    }
+
+    for mapping in file_backed_mappings {
+        let mapping_start = mapping.address;
+        let mapping_end = mapping_start + mapping.size;
+
+        // Repeatedly split overlapping guest memory regions until no overlaps remain.
+        while let Some((range_start, range_end)) = layout_set
+            .iter()
+            .find(|&&(range_start, range_end)| {
+                mapping_start < range_end && mapping_end > range_start
+            })
+            .cloned()
+        {
+            layout_set.remove(&(range_start, range_end));
+
+            if range_start < mapping_start {
+                layout_set.insert((range_start, mapping_start));
+            }
+            if range_end > mapping_end {
+                layout_set.insert((mapping_end, range_end));
+            }
+        }
+    }
+
+    // Build the final guest memory layout from the modified layout_set.
+    layout_set
+        .iter()
+        .map(|(start, end)| (GuestAddress(*start), end - start))
+        .collect()
+}
+
 pub fn run_config(cfg: Config) -> Result<ExitState> {
     let components = setup_vm_components(&cfg)?;
 
     let guest_mem_layout =
         Arch::guest_memory_layout(&components).context("failed to create guest memory layout")?;
+
+    let guest_mem_layout =
+        punch_holes_in_guest_mem_layout_for_mappings(guest_mem_layout, &cfg.file_backed_mappings);
+
     let guest_mem = GuestMemory::new(&guest_mem_layout).context("failed to create guest memory")?;
     let mut mem_policy = MemoryPolicy::empty();
     if components.hugepages {
@@ -988,12 +1055,11 @@ where
 
     let mut vhost_user_gpu_tubes = Vec::with_capacity(cfg.vhost_user_gpu.len());
     for _ in 0..cfg.vhost_user_gpu.len() {
-        let (host_tube, device_tube) = Tube::pair().context("failed to create tube")?;
-        vhost_user_gpu_tubes.push((
-            host_tube.try_clone().context("failed to clone tube")?,
-            device_tube,
-        ));
-        control_tubes.push(TaggedControlTube::VmMemory(host_tube));
+        let (host_control_tube, device_control_tube) =
+            Tube::pair().context("failed to create tube")?;
+        let (host_gpu_tube, device_gpu_tube) = Tube::pair().context("failed to create tube")?;
+        vhost_user_gpu_tubes.push((host_gpu_tube, device_gpu_tube, device_control_tube));
+        control_tubes.push(TaggedControlTube::VmMemory(host_control_tube));
     }
 
     let (wayland_host_tube, wayland_device_tube) = Tube::pair().context("failed to create tube")?;
@@ -1103,13 +1169,23 @@ where
     let reset_evt = Event::new().context("failed to create event")?;
     let crash_evt = Event::new().context("failed to create event")?;
     let (panic_rdtube, panic_wrtube) = Tube::pair().context("failed to create tube")?;
-    let mut sys_allocator = Arch::create_system_allocator(&vm);
 
-    // Allocate the ramoops region first. AArch64::build_vm() assumes this.
+    let pstore_size = components.pstore.as_ref().map(|pstore| pstore.size as u64);
+    let mut sys_allocator = SystemAllocator::new(
+        Arch::get_system_allocator_config(&vm),
+        pstore_size,
+        &cfg.mmio_address_ranges,
+    )
+    .context("failed to create system allocator")?;
+
     let ramoops_region = match &components.pstore {
         Some(pstore) => Some(
-            arch::pstore::create_memory_region(&mut vm, &mut sys_allocator, pstore)
-                .context("failed to allocate pstore region")?,
+            arch::pstore::create_memory_region(
+                &mut vm,
+                sys_allocator.reserved_region().unwrap(),
+                pstore,
+            )
+            .context("failed to allocate pstore region")?,
         ),
         None => None,
     };
@@ -1132,6 +1208,42 @@ where
             m.checked_mul(1024 * 1024).unwrap_or(u64::MAX)
         }))
         .context("failed to calculate init balloon size")?;
+
+    #[cfg(feature = "direct")]
+    let mut irqs = Vec::new();
+
+    #[cfg(feature = "direct")]
+    for irq in &cfg.direct_level_irq {
+        if !sys_allocator.reserve_irq(*irq) {
+            warn!("irq {} already reserved.", irq);
+        }
+        let trigger = Event::new().context("failed to create event")?;
+        let resample = Event::new().context("failed to create event")?;
+        irq_chip
+            .register_irq_event(*irq, &trigger, Some(&resample))
+            .unwrap();
+        let direct_irq = devices::DirectIrq::new(trigger, Some(resample))
+            .context("failed to enable interrupt forwarding")?;
+        direct_irq
+            .irq_enable(*irq)
+            .context("failed to enable interrupt forwarding")?;
+        irqs.push(direct_irq);
+    }
+
+    #[cfg(feature = "direct")]
+    for irq in &cfg.direct_edge_irq {
+        if !sys_allocator.reserve_irq(*irq) {
+            warn!("irq {} already reserved.", irq);
+        }
+        let trigger = Event::new().context("failed to create event")?;
+        irq_chip.register_irq_event(*irq, &trigger, None).unwrap();
+        let direct_irq = devices::DirectIrq::new(trigger, None)
+            .context("failed to enable interrupt forwarding")?;
+        direct_irq
+            .irq_enable(*irq)
+            .context("failed to enable interrupt forwarding")?;
+        irqs.push(direct_irq);
+    }
 
     let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>> =
         BTreeMap::new();
@@ -1160,14 +1272,16 @@ where
     )?;
 
     let mut hp_endpoints_ranges: Vec<RangeInclusive<u32>> = Vec::new();
-
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let mut hotplug_buses: Vec<Arc<Mutex<dyn HotPlugBus>>> = Vec::new();
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let mut gpe_notify_devs: Vec<(u32, Arc<Mutex<dyn GpeNotify>>)> = Vec::new();
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         #[cfg(feature = "direct")]
         let rp_host = cfg.pcie_rp.clone();
         #[cfg(not(feature = "direct"))]
-        let rp_host: Vec<PathBuf> = Vec::new();
+        let rp_host: Vec<HostPcieRootPortParameters> = Vec::new();
 
         // Create Pcie Root Port
         create_pcie_root_port(
@@ -1177,6 +1291,7 @@ where
             &mut devices,
             &mut hotplug_buses,
             &mut hp_endpoints_ranges,
+            &mut gpe_notify_devs,
         )?;
     }
 
@@ -1252,6 +1367,12 @@ where
         for hotplug_bus in hotplug_buses.iter() {
             linux.hotplug_bus.push(hotplug_bus.clone());
         }
+
+        if let Some(pm) = &linux.pm {
+            while let Some((gpe, notify_dev)) = gpe_notify_devs.pop() {
+                pm.lock().register_gpe_notify_dev(gpe, notify_dev);
+            }
+        }
     }
 
     #[cfg(feature = "direct")]
@@ -1281,46 +1402,6 @@ where
                 .unwrap();
         }
     };
-
-    #[cfg(feature = "direct")]
-    let mut irqs = Vec::new();
-
-    #[cfg(feature = "direct")]
-    for irq in &cfg.direct_level_irq {
-        if !sys_allocator.reserve_irq(*irq) {
-            warn!("irq {} already reserved.", irq);
-        }
-        let trigger = Event::new().context("failed to create event")?;
-        let resample = Event::new().context("failed to create event")?;
-        linux
-            .irq_chip
-            .register_irq_event(*irq, &trigger, Some(&resample))
-            .unwrap();
-        let direct_irq = devices::DirectIrq::new(trigger, Some(resample))
-            .context("failed to enable interrupt forwarding")?;
-        direct_irq
-            .irq_enable(*irq)
-            .context("failed to enable interrupt forwarding")?;
-        irqs.push(direct_irq);
-    }
-
-    #[cfg(feature = "direct")]
-    for irq in &cfg.direct_edge_irq {
-        if !sys_allocator.reserve_irq(*irq) {
-            warn!("irq {} already reserved.", irq);
-        }
-        let trigger = Event::new().context("failed to create event")?;
-        linux
-            .irq_chip
-            .register_irq_event(*irq, &trigger, None)
-            .unwrap();
-        let direct_irq = devices::DirectIrq::new(trigger, None)
-            .context("failed to enable interrupt forwarding")?;
-        direct_irq
-            .irq_enable(*irq)
-            .context("failed to enable interrupt forwarding")?;
-        irqs.push(direct_irq);
-    }
 
     let gralloc = RutabagaGralloc::new().context("failed to create gralloc")?;
     run_control(
@@ -1384,6 +1465,7 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
         control_tubes,
         vfio_path,
         Some(bus_num),
+        None,
         &mut endpoints,
         None,
         if iommu_host_tube.is_some() {
@@ -1528,6 +1610,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         IrqFd { index: IrqEventIndex },
         VmControlServer,
         VmControl { index: usize },
+        DelayedIrqFd,
     }
 
     stdin()
@@ -1563,6 +1646,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     for (index, _gsi, evt) in events {
         wait_ctx
             .add(&evt, Token::IrqFd { index })
+            .context("failed to add descriptor to wait context")?;
+    }
+
+    if let Some(delayed_ioapic_irq_trigger) = linux.irq_chip.irq_delayed_event_token()? {
+        wait_ctx
+            .add(&delayed_ioapic_irq_trigger, Token::DelayedIrqFd)
             .context("failed to add descriptor to wait context")?;
     }
 
@@ -1691,10 +1780,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             }
         };
 
-        if let Err(e) = linux.irq_chip.process_delayed_irq_events() {
-            warn!("can't deliver delayed irqs: {}", e);
-        }
-
         let mut vm_control_indices_to_remove = Vec::new();
         for event in events.iter().filter(|e| e.is_readable) {
             match event.token {
@@ -1763,6 +1848,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         error!("failed to signal irq {}: {}", index, e);
                     }
                 }
+                Token::DelayedIrqFd => {
+                    if let Err(e) = linux.irq_chip.process_delayed_irq_events() {
+                        warn!("can't deliver delayed irqs: {}", e);
+                    }
+                }
                 Token::VmControlServer => {
                     if let Some(socket_server) = &control_server_socket {
                         match socket_server.accept() {
@@ -1805,6 +1895,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                             balloon_host_tube.as_ref(),
                                             &mut balloon_stats_id,
                                             disk_host_tubes,
+                                            &mut linux.pm,
                                             #[cfg(feature = "usb")]
                                             Some(&usb_control_tube),
                                             #[cfg(not(feature = "usb"))]
@@ -2034,4 +2125,163 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         .expect("failed to restore canonical mode for terminal");
 
     Ok(exit_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // Create a file-backed mapping parameters struct with the given `address` and `size` and other
+    // parameters set to default values.
+    fn test_file_backed_mapping(address: u64, size: u64) -> FileBackedMappingParameters {
+        FileBackedMappingParameters {
+            address,
+            size,
+            path: PathBuf::new(),
+            offset: 0,
+            writable: false,
+            sync: false,
+        }
+    }
+
+    #[test]
+    fn guest_mem_file_backed_mappings_overlap() {
+        // Base case: no file mappings; output layout should be identical.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000),
+            ]
+        );
+
+        // File mapping that does not overlap guest memory.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0xD000_0000, 0x1000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000),
+            ]
+        );
+
+        // File mapping at the start of the low address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0x2000), 0xD000_0000 - 0x2000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000),
+            ]
+        );
+
+        // File mapping at the end of the low address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0xD000_0000 - 0x2000, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000 - 0x2000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000),
+            ]
+        );
+
+        // File mapping fully contained within the middle of the low address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0x1000, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0), 0x1000),
+                (GuestAddress(0x3000), 0xD000_0000 - 0x3000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000),
+            ]
+        );
+
+        // File mapping at the start of the high address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0x1_0000_0000, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000),
+                (GuestAddress(0x1_0000_2000), 0x8_0000 - 0x2000),
+            ]
+        );
+
+        // File mapping at the end of the high address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0x1_0008_0000 - 0x2000, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000 - 0x2000),
+            ]
+        );
+
+        // File mapping fully contained within the middle of the high address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0x1_0000_1000, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000),
+                (GuestAddress(0x1_0000_0000), 0x1000),
+                (GuestAddress(0x1_0000_3000), 0x8_0000 - 0x3000),
+            ]
+        );
+
+        // File mapping overlapping two guest memory regions.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0xA000_0000, 0x60002000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xA000_0000),
+                (GuestAddress(0x1_0000_2000), 0x8_0000 - 0x2000),
+            ]
+        );
+    }
 }

@@ -20,7 +20,7 @@ use hypervisor::{
 };
 use minijail::Minijail;
 use remain::sorted;
-use resources::{MemRegion, MmioType, SystemAllocator, SystemAllocatorConfig};
+use resources::{range_inclusive_len, MemRegion, SystemAllocator, SystemAllocatorConfig};
 use sync::Mutex;
 use thiserror::Error;
 use vm_control::BatteryType;
@@ -207,8 +207,11 @@ impl arch::LinuxArch for AArch64 {
         Ok(arch_memory_regions(components.memory_size))
     }
 
-    fn create_system_allocator<V: Vm>(vm: &V) -> SystemAllocator {
-        Self::get_resource_allocator(vm.get_memory().memory_size(), vm.get_guest_phys_addr_bits())
+    fn get_system_allocator_config<V: Vm>(vm: &V) -> SystemAllocatorConfig {
+        Self::get_resource_allocator_config(
+            vm.get_memory().memory_size(),
+            vm.get_guest_phys_addr_bits(),
+        )
     }
 
     fn build_vm<V, Vcpu>(
@@ -404,55 +407,36 @@ impl arch::LinuxArch for AArch64 {
             cmdline.insert_str(&param).map_err(Error::Cmdline)?;
         }
 
-        let psci_version = vcpus[0].get_psci_version().map_err(Error::GetPsciVersion)?;
+        if let Some(ramoops_region) = ramoops_region {
+            arch::pstore::add_ramoops_kernel_cmdline(&mut cmdline, &ramoops_region)
+                .map_err(Error::Cmdline)?;
+        }
 
-        // Use the entire high MMIO except the ramoops region for PCI.
-        // Note: This assumes that the ramoops region is the first thing allocated from the high
-        //       MMIO region.
-        let high_mmio_alloc = system_allocator.mmio_allocator(MmioType::High);
-        let high_mmio_base = high_mmio_alloc.pool_base();
-        let high_mmio_size = high_mmio_alloc.pool_size();
-        let (pci_device_base, pci_device_size) = match &ramoops_region {
-            Some(r) => {
-                if r.address != high_mmio_base {
-                    return Err(Error::RamoopsAddress(r.address, high_mmio_base));
-                }
-                arch::pstore::add_ramoops_kernel_cmdline(&mut cmdline, r)
-                    .map_err(Error::Cmdline)?;
-                let base = r.address + r.size as u64;
-                (base, high_mmio_size - (base - high_mmio_base))
-            }
-            None => (high_mmio_base, high_mmio_size),
-        };
+        let psci_version = vcpus[0].get_psci_version().map_err(Error::GetPsciVersion)?;
 
         let pci_cfg = fdt::PciConfigRegion {
             base: AARCH64_PCI_CFG_BASE,
             size: AARCH64_PCI_CFG_SIZE,
         };
 
-        let pci_ranges = &[
-            fdt::PciRange {
+        let pci_ranges: Vec<fdt::PciRange> = system_allocator
+            .mmio_pools()
+            .iter()
+            .map(|range| fdt::PciRange {
                 space: fdt::PciAddressSpace::Memory64,
-                bus_address: AARCH64_MMIO_BASE,
-                cpu_physical_address: AARCH64_MMIO_BASE,
-                size: AARCH64_MMIO_SIZE,
+                bus_address: *range.start(),
+                cpu_physical_address: *range.start(),
+                size: range_inclusive_len(range).unwrap(),
                 prefetchable: false,
-            },
-            fdt::PciRange {
-                space: fdt::PciAddressSpace::Memory64,
-                bus_address: pci_device_base,
-                cpu_physical_address: pci_device_base,
-                size: pci_device_size,
-                prefetchable: false,
-            },
-        ];
+            })
+            .collect();
 
         fdt::create_fdt(
             AARCH64_FDT_MAX_SIZE as usize,
             &mem,
             pci_irqs,
             pci_cfg,
-            pci_ranges,
+            &pci_ranges,
             vcpu_count as u32,
             components.cpu_clusters,
             components.cpu_capacity,
@@ -482,6 +466,7 @@ impl arch::LinuxArch for AArch64 {
             rt_cpus: components.rt_cpus,
             delay_rt: components.delay_rt,
             bat_control: None,
+            pm: None,
             resume_notify_devices: Vec::new(),
             root_config: pci_root,
             hotplug_bus: Vec::new(),
@@ -522,13 +507,16 @@ impl AArch64 {
         cmdline
     }
 
-    /// Returns a system resource allocator.
+    /// Returns a system resource allocator configuration.
     ///
     /// # Arguments
     ///
     /// * `mem_size` - Size of guest memory (RAM) in bytes.
     /// * `guest_phys_addr_bits` - Size of guest physical addresses (IPA) in bits.
-    fn get_resource_allocator(mem_size: u64, guest_phys_addr_bits: u8) -> SystemAllocator {
+    fn get_resource_allocator_config(
+        mem_size: u64,
+        guest_phys_addr_bits: u8,
+    ) -> SystemAllocatorConfig {
         let guest_phys_end = 1u64 << guest_phys_addr_bits;
         // The platform MMIO region is immediately past the end of RAM.
         let plat_mmio_base = AARCH64_PHYS_MEM_START + mem_size;
@@ -543,7 +531,7 @@ impl AArch64 {
                     guest_phys_end, high_mmio_base,
                 );
             });
-        SystemAllocator::new(SystemAllocatorConfig {
+        SystemAllocatorConfig {
             io: None,
             low_mmio: MemRegion {
                 base: AARCH64_MMIO_BASE,
@@ -558,8 +546,7 @@ impl AArch64 {
                 size: plat_mmio_size,
             }),
             first_irq: AARCH64_IRQ_BASE,
-        })
-        .unwrap()
+        }
     }
 
     /// This adds any early platform devices for this architecture.

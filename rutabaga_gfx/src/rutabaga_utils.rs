@@ -22,7 +22,11 @@ use vulkano::image::ImageCreationError;
 #[cfg(feature = "vulkano")]
 use vulkano::instance::InstanceCreationError;
 #[cfg(feature = "vulkano")]
-use vulkano::memory::DeviceMemoryAllocError;
+use vulkano::memory::DeviceMemoryAllocationError;
+#[cfg(feature = "vulkano")]
+use vulkano::memory::DeviceMemoryExportError;
+#[cfg(feature = "vulkano")]
+use vulkano::memory::MemoryMapError;
 
 /// Represents a buffer.  `base` contains the address of a buffer, while `len` contains the length
 /// of the buffer.
@@ -196,8 +200,8 @@ pub enum RutabagaError {
     #[error("invalid resource id")]
     InvalidResourceId,
     /// Indicates an error in the RutabagaBuilder.
-    #[error("invalid rutabaga build parameters")]
-    InvalidRutabagaBuild,
+    #[error("invalid rutabaga build parameters: {0}")]
+    InvalidRutabagaBuild(&'static str),
     /// An error with the RutabagaHandle
     #[error("invalid rutabaga handle")]
     InvalidRutabagaHandle,
@@ -229,7 +233,11 @@ pub enum RutabagaError {
     /// Device memory allocation error
     #[cfg(feature = "vulkano")]
     #[error("vulkano device memory allocation failure {0}")]
-    VkDeviceMemoryAllocError(DeviceMemoryAllocError),
+    VkDeviceMemoryAllocationError(DeviceMemoryAllocationError),
+    /// Device memory export error
+    #[cfg(feature = "vulkano")]
+    #[error("vulkano device memory export failure {0}")]
+    VkDeviceMemoryExportError(DeviceMemoryExportError),
     /// Image creation error
     #[cfg(feature = "vulkano")]
     #[error("vulkano image creation failure {0}")]
@@ -238,6 +246,10 @@ pub enum RutabagaError {
     #[cfg(feature = "vulkano")]
     #[error("vulkano instance creation failure {0}")]
     VkInstanceCreationError(InstanceCreationError),
+    /// Memory map  error
+    #[cfg(feature = "vulkano")]
+    #[error("vullano memory map failure {0}")]
+    VkMemoryMapError(MemoryMapError),
     /// Volatile memory error
     #[error("noticed a volatile memory error {0}")]
     VolatileMemoryError(VolatileMemoryError),
