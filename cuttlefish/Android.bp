@@ -20,6 +20,6 @@ sh_binary_host {
         },
         linux_bionic: {
             src: "crosvm_bionic",
-       },
+        },
     },
 }

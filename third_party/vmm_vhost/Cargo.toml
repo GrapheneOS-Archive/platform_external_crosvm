@@ -8,7 +8,7 @@ repository = "https://github.com/rust-vmm/vhost"
 documentation = "https://docs.rs/vhost"
 readme = "README.md"
 license = "Apache-2.0 or BSD-3-Clause"
-edition = "2018"
+edition = "2021"
 
 [features]
 default = []
@@ -18,10 +18,15 @@ vfio-device = []
 
 [dependencies]
 anyhow = "*"
-base = { path = "../../common/base" }
+base = { path = "../../base" }
 bitflags = ">=1.0.1"
+cfg-if = "1.0.0"
 data_model = { path = "../../common/data_model" }
 libc = ">=0.2.39"
 remain = "*"
 tempfile = "*"
 thiserror = { version = "1.0.20" }
+
+[target.'cfg(windows)'.dependencies]
+serde = { version = "1", features = [ "derive" ] }
+serde_json = "*"
