@@ -7,14 +7,17 @@ use std::collections::BTreeMap;
 
 use acpi_tables::{facs::FACS, rsdp::RSDP, sdt::SDT};
 use arch::VcpuAffinity;
-use base::error;
+use base::{error, warn};
 use data_model::DataInit;
-use devices::{PciAddress, PciInterruptPin};
+use devices::{ACPIPMResource, PciAddress, PciInterruptPin};
+use std::sync::Arc;
+use sync::Mutex;
 use vm_memory::{GuestAddress, GuestMemory};
 
 pub struct AcpiDevResource {
     pub amls: Vec<u8>,
     pub pm_iobase: u64,
+    pub pm: Arc<Mutex<ACPIPMResource>>,
     /// Additional system descriptor tables.
     pub sdts: Vec<SDT>,
 }
@@ -105,18 +108,37 @@ const FADT_LOW_POWER_S2IDLE: u32 = 1 << 21;
 // FADT fields offset
 const FADT_FIELD_FACS_ADDR32: usize = 36;
 const FADT_FIELD_DSDT_ADDR32: usize = 40;
-const FADT_FIELD_SCI_INTERRUPT: usize = 46;
+pub const FADT_FIELD_SCI_INTERRUPT: usize = 46;
 const FADT_FIELD_SMI_COMMAND: usize = 48;
 const FADT_FIELD_PM1A_EVENT_BLK_ADDR: usize = 56;
+const FADT_FIELD_PM1B_EVENT_BLK_ADDR: usize = 60;
 const FADT_FIELD_PM1A_CONTROL_BLK_ADDR: usize = 64;
+const FADT_FIELD_PM1B_CONTROL_BLK_ADDR: usize = 68;
+const FADT_FIELD_PM2_CONTROL_BLK_ADDR: usize = 72;
+const FADT_FIELD_PM_TMR_BLK_ADDR: usize = 76;
+const FADT_FIELD_GPE0_BLK_ADDR: usize = 80;
+const FADT_FIELD_GPE1_BLK_ADDR: usize = 84;
 const FADT_FIELD_PM1A_EVENT_BLK_LEN: usize = 88;
 const FADT_FIELD_PM1A_CONTROL_BLK_LEN: usize = 89;
+const FADT_FIELD_PM2_CONTROL_BLK_LEN: usize = 90;
+const FADT_FIELD_PM_TMR_LEN: usize = 91;
+const FADT_FIELD_GPE0_BLK_LEN: usize = 92;
+const FADT_FIELD_GPE1_BLK_LEN: usize = 93;
+const FADT_FIELD_GPE1_BASE: usize = 94;
 const FADT_FIELD_FLAGS: usize = 112;
 const FADT_FIELD_RESET_REGISTER: usize = 116;
 const FADT_FIELD_RESET_VALUE: usize = 128;
 const FADT_FIELD_MINOR_REVISION: usize = 131;
 const FADT_FIELD_FACS_ADDR: usize = 132;
 const FADT_FIELD_DSDT_ADDR: usize = 140;
+const FADT_FIELD_X_PM1A_EVENT_BLK_ADDR: usize = 148;
+const FADT_FIELD_X_PM1B_EVENT_BLK_ADDR: usize = 160;
+const FADT_FIELD_X_PM1A_CONTROL_BLK_ADDR: usize = 172;
+const FADT_FIELD_X_PM1B_CONTROL_BLK_ADDR: usize = 184;
+const FADT_FIELD_X_PM2_CONTROL_BLK_ADDR: usize = 196;
+const FADT_FIELD_X_PM_TMR_BLK_ADDR: usize = 208;
+const FADT_FIELD_X_GPE0_BLK_ADDR: usize = 220;
+const FADT_FIELD_X_GPE1_BLK_ADDR: usize = 232;
 const FADT_FIELD_HYPERVISOR_ID: usize = 268;
 // MADT
 const MADT_LEN: u32 = 44;
@@ -152,7 +174,7 @@ const MCFG_FIELD_BASE_ADDRESS: usize = 44;
 const MCFG_FIELD_START_BUS_NUMBER: usize = 54;
 const MCFG_FIELD_END_BUS_NUMBER: usize = 55;
 
-fn create_dsdt_table(amls: Vec<u8>) -> SDT {
+fn create_dsdt_table(amls: &[u8]) -> SDT {
     let mut dsdt = SDT::new(
         *b"DSDT",
         acpi_tables::HEADER_LEN,
@@ -163,19 +185,13 @@ fn create_dsdt_table(amls: Vec<u8>) -> SDT {
     );
 
     if !amls.is_empty() {
-        dsdt.append_slice(amls.as_slice());
+        dsdt.append_slice(amls);
     }
 
     dsdt
 }
 
-fn create_facp_table(
-    sci_irq: u16,
-    pm_iobase: u32,
-    reset_port: u32,
-    reset_value: u8,
-    force_s2idle: bool,
-) -> SDT {
+fn create_facp_table(sci_irq: u16, force_s2idle: bool) -> SDT {
     let mut facp = SDT::new(
         *b"FACP",
         FADT_LEN,
@@ -185,8 +201,7 @@ fn create_facp_table(
         OEM_REVISION,
     );
 
-    let mut fadt_flags: u32 = FADT_POWER_BUTTON | FADT_SLEEP_BUTTON | // mask POWER and SLEEP BUTTON
-                          FADT_RESET_REGISTER; // indicate we support FADT RESET_REG
+    let mut fadt_flags: u32 = FADT_SLEEP_BUTTON; // mask SLEEP BUTTON
 
     if force_s2idle {
         fadt_flags |= FADT_LOW_POWER_S2IDLE;
@@ -197,8 +212,36 @@ fn create_facp_table(
     // SCI Interrupt
     facp.write(FADT_FIELD_SCI_INTERRUPT, sci_irq);
 
+    facp.write(FADT_FIELD_MINOR_REVISION, FADT_MINOR_REVISION); // FADT minor version
+    facp.write(FADT_FIELD_HYPERVISOR_ID, *b"CROSVM"); // Hypervisor Vendor Identity
+
+    facp
+}
+
+// Write virtualized FADT fields
+fn write_facp_overrides(
+    facp: &mut SDT,
+    facs_offset: GuestAddress,
+    dsdt_offset: GuestAddress,
+    pm_iobase: u32,
+    reset_port: u32,
+    reset_value: u8,
+) {
+    let fadt_flags: u32 = facp.read(FADT_FIELD_FLAGS);
+    // indicate we support FADT RESET_REG
+    facp.write(FADT_FIELD_FLAGS, fadt_flags | FADT_RESET_REGISTER);
+
+    facp.write(FADT_FIELD_SMI_COMMAND, 0u32);
+    facp.write(FADT_FIELD_FACS_ADDR32, 0u32);
+    facp.write(FADT_FIELD_DSDT_ADDR32, 0u32);
+    facp.write(FADT_FIELD_FACS_ADDR, facs_offset.0 as u64);
+    facp.write(FADT_FIELD_DSDT_ADDR, dsdt_offset.0 as u64);
+
     // PM1A Event Block Address
     facp.write(FADT_FIELD_PM1A_EVENT_BLK_ADDR, pm_iobase);
+
+    // PM1B Event Block Address (not supported)
+    facp.write(FADT_FIELD_PM1B_EVENT_BLK_ADDR, 0u32);
 
     // PM1A Control Block Address
     facp.write(
@@ -206,19 +249,119 @@ fn create_facp_table(
         pm_iobase + devices::acpi::ACPIPM_RESOURCE_EVENTBLK_LEN as u32,
     );
 
+    // PM1B Control Block Address (not supported)
+    facp.write(FADT_FIELD_PM1B_CONTROL_BLK_ADDR, 0u32);
+
+    // PM2 Control Block Address (not supported)
+    facp.write(FADT_FIELD_PM2_CONTROL_BLK_ADDR, 0u32);
+
+    // PM Timer Control Block Address (not supported)
+    facp.write(FADT_FIELD_PM_TMR_BLK_ADDR, 0u32);
+
+    // GPE0 Block Address
+    facp.write(
+        FADT_FIELD_GPE0_BLK_ADDR,
+        pm_iobase + devices::acpi::ACPIPM_RESOURCE_EVENTBLK_LEN as u32 + 4,
+    );
+
+    // GPE1 Block Address (not supported)
+    facp.write(FADT_FIELD_GPE1_BLK_ADDR, 0u32);
+
     // PM1 Event Block Length
     facp.write(
         FADT_FIELD_PM1A_EVENT_BLK_LEN,
-        devices::acpi::ACPIPM_RESOURCE_EVENTBLK_LEN as u8,
+        devices::acpi::ACPIPM_RESOURCE_EVENTBLK_LEN,
     );
 
     // PM1 Control Block Length
     facp.write(
         FADT_FIELD_PM1A_CONTROL_BLK_LEN,
-        devices::acpi::ACPIPM_RESOURCE_CONTROLBLK_LEN as u8,
+        devices::acpi::ACPIPM_RESOURCE_CONTROLBLK_LEN,
     );
 
-    // Reset register.
+    // PM2 Control Block Length (not supported)
+    facp.write(FADT_FIELD_PM2_CONTROL_BLK_LEN, 0u8);
+
+    // PM Timer Control Block Length (not supported)
+    facp.write(FADT_FIELD_PM_TMR_LEN, 0u8);
+
+    // GPE0 Block Length
+    facp.write(
+        FADT_FIELD_GPE0_BLK_LEN,
+        devices::acpi::ACPIPM_RESOURCE_GPE0_BLK_LEN,
+    );
+
+    // GPE1 Block Length (not supported)
+    facp.write(FADT_FIELD_GPE1_BLK_LEN, 0u8);
+
+    // GPE1 Base (not supported)
+    facp.write(FADT_FIELD_GPE1_BASE, 0u8);
+
+    // PM1A Extended Event Block Address (not supported)
+    facp.write(
+        FADT_FIELD_X_PM1A_EVENT_BLK_ADDR,
+        GenericAddress {
+            ..Default::default()
+        },
+    );
+
+    // PM1B Extended Event Block Address (not supported)
+    facp.write(
+        FADT_FIELD_X_PM1B_EVENT_BLK_ADDR,
+        GenericAddress {
+            ..Default::default()
+        },
+    );
+
+    // PM1A Extended Control Block Address (not supported)
+    facp.write(
+        FADT_FIELD_X_PM1A_CONTROL_BLK_ADDR,
+        GenericAddress {
+            ..Default::default()
+        },
+    );
+
+    // PM1B Extended Control Block Address (not supported)
+    facp.write(
+        FADT_FIELD_X_PM1B_CONTROL_BLK_ADDR,
+        GenericAddress {
+            ..Default::default()
+        },
+    );
+
+    // PM2 Extended Control Block Address (not supported)
+    facp.write(
+        FADT_FIELD_X_PM2_CONTROL_BLK_ADDR,
+        GenericAddress {
+            ..Default::default()
+        },
+    );
+
+    // PM Timer Extended Control Block Address (not supported)
+    facp.write(
+        FADT_FIELD_X_PM_TMR_BLK_ADDR,
+        GenericAddress {
+            ..Default::default()
+        },
+    );
+
+    // GPE0 Extended Address (not supported)
+    facp.write(
+        FADT_FIELD_X_GPE0_BLK_ADDR,
+        GenericAddress {
+            ..Default::default()
+        },
+    );
+
+    // GPE1 Extended Address (not supported)
+    facp.write(
+        FADT_FIELD_X_GPE1_BLK_ADDR,
+        GenericAddress {
+            ..Default::default()
+        },
+    );
+
+    // Reset register
     facp.write(
         FADT_FIELD_RESET_REGISTER,
         GenericAddress {
@@ -230,11 +373,6 @@ fn create_facp_table(
         },
     );
     facp.write(FADT_FIELD_RESET_VALUE, reset_value);
-
-    facp.write(FADT_FIELD_MINOR_REVISION, FADT_MINOR_REVISION); // FADT minor version
-    facp.write(FADT_FIELD_HYPERVISOR_ID, *b"CROSVM"); // Hypervisor Vendor Identity
-
-    facp
 }
 
 fn next_offset(offset: GuestAddress, len: u64) -> Option<GuestAddress> {
@@ -363,7 +501,7 @@ pub fn create_acpi_tables(
     sci_irq: u32,
     reset_port: u32,
     reset_value: u8,
-    acpi_dev_resource: AcpiDevResource,
+    acpi_dev_resource: &AcpiDevResource,
     host_cpus: Option<VcpuAffinity>,
     apic_ids: &mut Vec<usize>,
     pci_irqs: &[(PciAddress, u32, PciInterruptPin)],
@@ -408,7 +546,7 @@ pub fn create_acpi_tables(
         Some(dsdt_offset) => dsdt_offset,
         None => {
             let dsdt_offset = offset;
-            let dsdt = create_dsdt_table(acpi_dev_resource.amls);
+            let dsdt = create_dsdt_table(&acpi_dev_resource.amls);
             guest_mem.write_at_addr(dsdt.as_slice(), offset).ok()?;
             offset = next_offset(offset, dsdt.len() as u64)?;
             dsdt_offset
@@ -416,23 +554,28 @@ pub fn create_acpi_tables(
     };
 
     // FACP aka FADT
-    let pm_iobase = acpi_dev_resource.pm_iobase as u32;
-    let mut facp = facp.unwrap_or_else(|| {
-        create_facp_table(
-            sci_irq as u16,
-            pm_iobase,
-            reset_port,
-            reset_value,
-            force_s2idle,
-        )
-    });
+    let mut facp = facp.map_or_else(
+        || create_facp_table(sci_irq as u16, force_s2idle),
+        |facp| {
+            let fadt_flags: u32 = facp.read(FADT_FIELD_FLAGS);
+            if fadt_flags & FADT_POWER_BUTTON != 0 {
+                warn!(
+                    "Control Method Power Button is not supported. FADT flags = 0x{:x}",
+                    fadt_flags
+                );
+            }
+            facp
+        },
+    );
 
-    // Crosvm FACP overrides.
-    facp.write(FADT_FIELD_SMI_COMMAND, 0u32);
-    facp.write(FADT_FIELD_FACS_ADDR32, 0u32);
-    facp.write(FADT_FIELD_DSDT_ADDR32, 0u32);
-    facp.write(FADT_FIELD_FACS_ADDR, facs_offset.0 as u64);
-    facp.write(FADT_FIELD_DSDT_ADDR, dsdt_offset.0 as u64);
+    write_facp_overrides(
+        &mut facp,
+        facs_offset,
+        dsdt_offset,
+        acpi_dev_resource.pm_iobase as u32,
+        reset_port,
+        reset_value,
+    );
 
     guest_mem.write_at_addr(facp.as_slice(), offset).ok()?;
     tables.push(offset.0);

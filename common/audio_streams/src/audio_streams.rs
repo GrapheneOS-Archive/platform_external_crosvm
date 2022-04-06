@@ -39,18 +39,20 @@
 //! # Ok (())
 //! # }
 //! ```
+pub mod async_api;
 
 use async_trait::async_trait;
 use std::cmp::min;
 use std::error;
 use std::fmt::{self, Display};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::result::Result;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use cros_async::{Executor, TimerAsync};
+pub use async_api::{AsyncStream, AudioStreamsExecutor};
 use remain::sorted;
 use thiserror::Error;
 
@@ -159,7 +161,7 @@ pub trait StreamSource: Send {
         _format: SampleFormat,
         _frame_rate: u32,
         _buffer_size: usize,
-        _ex: &Executor,
+        _ex: &dyn AudioStreamsExecutor,
     ) -> Result<(Box<dyn StreamControl>, Box<dyn AsyncPlaybackBufferStream>), BoxError> {
         Err(Box::new(Error::Unimplemented))
     }
@@ -204,7 +206,7 @@ pub trait StreamSource: Send {
         frame_rate: u32,
         buffer_size: usize,
         _effects: &[StreamEffect],
-        _ex: &Executor,
+        _ex: &dyn AudioStreamsExecutor,
     ) -> Result<
         (
             Box<dyn StreamControl>,
@@ -225,6 +227,7 @@ pub trait StreamSource: Send {
 
     /// Returns any open file descriptors needed by the implementor. The FD list helps users of the
     /// StreamSource enter Linux jails making sure not to close needed FDs.
+    #[cfg(unix)]
     fn keep_fds(&self) -> Option<Vec<RawFd>> {
         None
     }
@@ -259,7 +262,7 @@ impl<S: PlaybackBufferStream + ?Sized> PlaybackBufferStream for &mut S {
 pub trait AsyncPlaybackBufferStream: Send {
     async fn next_playback_buffer<'a>(
         &'a mut self,
-        _ex: &Executor,
+        _ex: &dyn AudioStreamsExecutor,
     ) -> Result<AsyncPlaybackBuffer<'a>, BoxError>;
 }
 
@@ -267,7 +270,7 @@ pub trait AsyncPlaybackBufferStream: Send {
 impl<S: AsyncPlaybackBufferStream + ?Sized> AsyncPlaybackBufferStream for &mut S {
     async fn next_playback_buffer<'a>(
         &'a mut self,
-        ex: &Executor,
+        ex: &dyn AudioStreamsExecutor,
     ) -> Result<AsyncPlaybackBuffer<'a>, BoxError> {
         (**self).next_playback_buffer(ex).await
     }
@@ -280,7 +283,7 @@ impl<S: AsyncPlaybackBufferStream + ?Sized> AsyncPlaybackBufferStream for &mut S
 pub async fn async_write_playback_buffer<F>(
     stream: &mut dyn AsyncPlaybackBufferStream,
     f: F,
-    ex: &Executor,
+    ex: &dyn AudioStreamsExecutor,
 ) -> Result<(), BoxError>
 where
     F: for<'a> FnOnce(&'a mut AsyncPlaybackBuffer) -> Result<(), BoxError>,
@@ -598,12 +601,12 @@ impl PlaybackBufferStream for NoopStream {
 impl AsyncPlaybackBufferStream for NoopStream {
     async fn next_playback_buffer<'a>(
         &'a mut self,
-        ex: &Executor,
+        ex: &dyn AudioStreamsExecutor,
     ) -> Result<AsyncPlaybackBuffer<'a>, BoxError> {
         if let Some(start_time) = self.start_time {
             let elapsed = start_time.elapsed();
             if elapsed < self.next_frame {
-                TimerAsync::sleep(ex, self.next_frame - elapsed).await?;
+                ex.delay(self.next_frame - elapsed).await?;
             }
             self.next_frame += self.interval;
         } else {
@@ -667,7 +670,7 @@ impl StreamSource for NoopStreamSource {
         format: SampleFormat,
         frame_rate: u32,
         buffer_size: usize,
-        _ex: &Executor,
+        _ex: &dyn AudioStreamsExecutor,
     ) -> Result<(Box<dyn StreamControl>, Box<dyn AsyncPlaybackBufferStream>), BoxError> {
         Ok((
             Box::new(NoopStreamControl::new()),
@@ -683,7 +686,9 @@ impl StreamSource for NoopStreamSource {
 
 #[cfg(test)]
 mod tests {
+    use super::async_api::test::TestExecutor;
     use super::*;
+    use futures::FutureExt;
     use io::{self, Write};
 
     #[test]
@@ -871,13 +876,12 @@ mod tests {
             assert_eq!(test_commit.frame_count, 480);
         }
 
-        let ex = Executor::new().expect("failed to create executor");
-        ex.run_until(this_test()).unwrap();
+        this_test().now_or_never();
     }
 
     #[test]
     fn consumption_rate_async() {
-        async fn this_test(ex: &Executor) {
+        async fn this_test(ex: &TestExecutor) {
             let mut server = NoopStreamSource::new();
             let (_, mut stream) = server
                 .new_async_playback_stream(2, SampleFormat::S16LE, 48000, 480, ex)
@@ -903,12 +907,13 @@ mod tests {
                 );
                 Ok(())
             };
+
             async_write_playback_buffer(&mut *stream, assert_func, ex)
                 .await
                 .unwrap();
         }
 
-        let ex = Executor::new().expect("failed to create executor");
-        ex.run_until(this_test(&ex)).unwrap();
+        let ex = TestExecutor {};
+        this_test(&ex).now_or_never();
     }
 }
