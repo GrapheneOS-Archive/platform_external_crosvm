@@ -19,9 +19,11 @@ die() {
 }
 
 dirs=(
-    common/io_uring
+    io_uring
     devices/src/virtio/gpu
     kernel_loader
+    kvm_sys
+    libvda
 )
 
 for d in "${dirs[@]}"; do

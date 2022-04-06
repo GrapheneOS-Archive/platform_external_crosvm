@@ -2,7 +2,7 @@
 name = "crosvm-fuzz"
 version = "0.0.1"
 authors = ["The Chromium OS Authors"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 cros_fuzz = "*"
@@ -14,7 +14,7 @@ hypervisor = { path = "../hypervisor" }
 kernel_loader = { path = "../kernel_loader" }
 libc = "*"
 rand = "0.6"
-base = { path = "../common/base" }
+base = { path = "../base" }
 tempfile = "3"
 usb_util = { path = "../usb_util" }
 vm_memory = { path = "../vm_memory" }

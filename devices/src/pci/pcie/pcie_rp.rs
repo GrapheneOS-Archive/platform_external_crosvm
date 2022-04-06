@@ -17,6 +17,7 @@ use anyhow::{anyhow, Result};
 use base::warn;
 use data_model::DataInit;
 use resources::{Alloc, SystemAllocator};
+use vm_control::GpeNotify;
 
 // reserve 8MB memory window
 const PCIE_RP_BR_MEM_SIZE: u64 = 0x80_0000;
@@ -40,6 +41,7 @@ pub struct PcieRootPort {
     downstream_device: Option<(PciAddress, Option<HostHotPlugKey>)>,
     removed_downstream: Option<PciAddress>,
     pcie_host: Option<PcieHostRootPort>,
+    prepare_hotplug: bool,
 }
 
 impl PcieRootPort {
@@ -70,6 +72,7 @@ impl PcieRootPort {
             downstream_device: None,
             removed_downstream: None,
             pcie_host: None,
+            prepare_hotplug: false,
         }
     }
 
@@ -104,6 +107,7 @@ impl PcieRootPort {
             downstream_device: None,
             removed_downstream: None,
             pcie_host: Some(pcie_host),
+            prepare_hotplug: false,
         })
     }
 
@@ -255,25 +259,29 @@ impl PcieRootPort {
         }
     }
 
+    fn inject_pme(&mut self) {
+        if (self.root_status & PCIE_ROOTSTA_PME_STATUS) != 0 {
+            self.root_status |= PCIE_ROOTSTA_PME_PENDING;
+            self.pme_pending_request_id = self.pci_address;
+        } else {
+            let request_id = self.pci_address.unwrap();
+            let req_id = ((request_id.bus as u32) << 8)
+                | ((request_id.dev as u32) << 3)
+                | (request_id.func as u32);
+            self.root_status &= !PCIE_ROOTSTA_PME_REQ_ID_MASK;
+            self.root_status |= req_id;
+            self.pme_pending_request_id = None;
+            self.root_status |= PCIE_ROOTSTA_PME_STATUS;
+            self.trigger_pme_interrupt();
+        }
+    }
+
     // when RP is D3, HP interrupt is disabled by pcie driver, so inject a PME to wakeup
     // RP first, then inject HP interrupt.
     fn trigger_hp_or_pme_interrupt(&mut self) {
         if self.pmc_config.should_trigger_pme() {
             self.hp_interrupt_pending = true;
-            if (self.root_status & PCIE_ROOTSTA_PME_STATUS) != 0 {
-                self.root_status |= PCIE_ROOTSTA_PME_PENDING;
-                self.pme_pending_request_id = self.pci_address;
-            } else {
-                let request_id = self.pci_address.unwrap();
-                let req_id = ((request_id.bus as u32) << 8)
-                    | ((request_id.dev as u32) << 3)
-                    | (request_id.func as u32);
-                self.root_status &= !PCIE_ROOTSTA_PME_REQ_ID_MASK;
-                self.root_status |= req_id;
-                self.pme_pending_request_id = None;
-                self.root_status |= PCIE_ROOTSTA_PME_STATUS;
-                self.trigger_pme_interrupt();
-            }
+            self.inject_pme();
         } else {
             self.trigger_hp_interrupt();
         }
@@ -382,7 +390,18 @@ impl PcieDevice for PcieRootPort {
         }
         if let Some(pmc_cap_reg_idx) = self.pmc_cap_reg_idx {
             if reg_idx == pmc_cap_reg_idx + PMC_CAP_CONTROL_STATE_OFFSET {
+                let old_status = self.pmc_config.get_power_status();
                 self.pmc_config.write(offset, data);
+                let new_status = self.pmc_config.get_power_status();
+                if old_status == PciDevicePower::D3
+                    && new_status == PciDevicePower::D0
+                    && self.prepare_hotplug
+                {
+                    if let Some(host) = self.pcie_host.as_mut() {
+                        host.hotplug_probe();
+                        self.prepare_hotplug = false;
+                    }
+                }
             }
         }
         if let Some(host) = self.pcie_host.as_mut() {
@@ -444,6 +463,10 @@ impl HotPlugBus for PcieRootPort {
 
         self.slot_status = self.slot_status | PCIE_SLTSTA_PDC | PCIE_SLTSTA_ABP;
         self.trigger_hp_or_pme_interrupt();
+
+        if let Some(host) = self.pcie_host.as_mut() {
+            host.hot_unplug();
+        }
     }
 
     fn is_match(&self, host_addr: PciAddress) -> Option<u8> {
@@ -485,5 +508,21 @@ impl HotPlugBus for PcieRootPort {
         }
 
         None
+    }
+}
+
+impl GpeNotify for PcieRootPort {
+    fn notify(&mut self) {
+        if self.slot_control.is_none() {
+            return;
+        }
+
+        if self.pcie_host.is_some() {
+            self.prepare_hotplug = true;
+        }
+
+        if self.pmc_config.should_trigger_pme() {
+            self.inject_pme();
+        }
     }
 }

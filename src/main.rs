@@ -12,6 +12,8 @@ use std::default::Default;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader};
 use std::ops::Deref;
+#[cfg(feature = "direct")]
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::string::String;
@@ -23,14 +25,15 @@ use base::{debug, error, getpid, info, kill_process_group, pagesize, reap_child,
 #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
 use crosvm::platform::GpuRenderServerParameters;
 #[cfg(feature = "direct")]
-use crosvm::DirectIoOption;
+use crosvm::{argument::parse_hex_or_decimal, DirectIoOption, HostPcieRootPortParameters};
 use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
-    platform, BindMount, Config, DiskOption, Executable, FileBackedMappingParameters, GidMap,
-    SharedDir, TouchDeviceOption, VfioCommand, VhostUserFsOption, VhostUserOption,
-    VhostUserWlOption, VhostVsockDeviceParameter, VvuOption, DISK_ID_LEN,
+    platform, BindMount, Config, Executable, FileBackedMappingParameters, GidMap, SharedDir,
+    TouchDeviceOption, VfioCommand, VhostUserFsOption, VhostUserOption, VhostUserWlOption,
+    VhostVsockDeviceParameter, VvuOption,
 };
-use devices::serial_device::{SerialHardware, SerialParameters, SerialType};
+use devices::serial_device::{SerialHardware, SerialParameters};
+use devices::virtio::block::block::DiskOption;
 #[cfg(feature = "audio_cras")]
 use devices::virtio::snd::cras_backend::Error as CrasSndError;
 #[cfg(feature = "audio_cras")]
@@ -59,6 +62,8 @@ use disk::{
     create_composite_disk, create_disk_file, create_zero_filler, ImagePartitionType, PartitionInfo,
 };
 use hypervisor::ProtectionType;
+use serde_keyvalue::from_key_values;
+use uuid::Uuid;
 use vm_control::{
     client::{
         do_modify_battery, do_usb_attach, do_usb_detach, do_usb_list, handle_request, vms_request,
@@ -687,88 +692,19 @@ fn parse_ac97_options(s: &str) -> argument::Result<Ac97Parameters> {
 }
 
 fn parse_serial_options(s: &str) -> argument::Result<SerialParameters> {
-    let mut serial_setting = SerialParameters {
-        type_: SerialType::Sink,
-        hardware: SerialHardware::Serial,
-        path: None,
-        input: None,
-        num: 1,
-        console: false,
-        earlycon: false,
-        stdin: false,
-    };
+    let serial_setting: SerialParameters =
+        from_key_values(s).map_err(|e| argument::Error::ConfigParserError(e.to_string()))?;
 
-    let opts = s
-        .split(',')
-        .map(|frag| frag.splitn(2, '='))
-        .map(|mut kv| (kv.next().unwrap_or(""), kv.next().unwrap_or("")));
-
-    for (k, v) in opts {
-        match k {
-            "hardware" => {
-                serial_setting.hardware = v
-                    .parse::<SerialHardware>()
-                    .map_err(|e| argument::Error::UnknownArgument(format!("{}", e)))?
-            }
-            "type" => {
-                serial_setting.type_ = v
-                    .parse::<SerialType>()
-                    .map_err(|e| argument::Error::UnknownArgument(format!("{}", e)))?
-            }
-            "num" => {
-                let num = v.parse::<u8>().map_err(|e| {
-                    argument::Error::Syntax(format!("serial device number is not parsable: {}", e))
-                })?;
-                if num < 1 {
-                    return Err(argument::Error::InvalidValue {
-                        value: num.to_string(),
-                        expected: String::from("Serial port num must be at least 1"),
-                    });
-                }
-                serial_setting.num = num;
-            }
-            "console" => {
-                serial_setting.console = v.parse::<bool>().map_err(|e| {
-                    argument::Error::Syntax(format!(
-                        "serial device console is not parseable: {}",
-                        e
-                    ))
-                })?
-            }
-            "earlycon" => {
-                serial_setting.earlycon = v.parse::<bool>().map_err(|e| {
-                    argument::Error::Syntax(format!(
-                        "serial device earlycon is not parseable: {}",
-                        e,
-                    ))
-                })?
-            }
-            "stdin" => {
-                serial_setting.stdin = v.parse::<bool>().map_err(|e| {
-                    argument::Error::Syntax(format!("serial device stdin is not parseable: {}", e))
-                })?;
-                if serial_setting.stdin && serial_setting.input.is_some() {
-                    return Err(argument::Error::TooManyArguments(
-                        "Cannot specify both stdin and input options".to_string(),
-                    ));
-                }
-            }
-            "path" => serial_setting.path = Some(PathBuf::from(v)),
-            "input" => {
-                if serial_setting.stdin {
-                    return Err(argument::Error::TooManyArguments(
-                        "Cannot specify both stdin and input options".to_string(),
-                    ));
-                }
-                serial_setting.input = Some(PathBuf::from(v));
-            }
-            _ => {
-                return Err(argument::Error::UnknownArgument(format!(
-                    "serial parameter {}",
-                    k
-                )));
-            }
-        }
+    if serial_setting.stdin && serial_setting.input.is_some() {
+        return Err(argument::Error::TooManyArguments(
+            "Cannot specify both stdin and input options".to_string(),
+        ));
+    }
+    if serial_setting.num < 1 {
+        return Err(argument::Error::InvalidValue {
+            value: serial_setting.num.to_string(),
+            expected: String::from("Serial port num must be at least 1"),
+        });
     }
 
     if serial_setting.hardware == SerialHardware::Serial && serial_setting.num > 4 {
@@ -903,16 +839,6 @@ fn parse_battery_options(s: Option<&str>) -> argument::Result<BatteryType> {
     }
 
     Ok(battery_type)
-}
-
-#[cfg(feature = "direct")]
-fn parse_hex_or_decimal(maybe_hex_string: &str) -> Result<u64, std::num::ParseIntError> {
-    // Parse string starting with 0x as hex and others as numbers.
-    let without_prefix = maybe_hex_string.strip_prefix("0x");
-    match without_prefix {
-        Some(hex_string) => u64::from_str_radix(hex_string, 16),
-        None => u64::from_str(maybe_hex_string),
-    }
 }
 
 #[cfg(feature = "direct")]
@@ -1362,21 +1288,21 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.syslog_tag = Some(value.unwrap().to_owned());
         }
         "root" | "rwroot" | "disk" | "rwdisk" => {
-            let param = value.unwrap();
-            let mut components = param.split(',');
-            let read_only = !name.starts_with("rw");
-            let disk_path =
-                PathBuf::from(
-                    components
-                        .next()
-                        .ok_or_else(|| argument::Error::InvalidValue {
-                            value: param.to_owned(),
-                            expected: String::from("missing disk path"),
-                        })?,
-                );
+            let value = value.ok_or(argument::Error::ExpectedArgument(
+                "path to the disk image is missing".to_owned(),
+            ))?;
+            let mut params: DiskOption = from_key_values(value).map_err(|e| {
+                argument::Error::Syntax(format!("while parsing \"{}\" parameter: {}", name, e))
+            })?;
+
+            if !name.starts_with("rw") {
+                params.read_only = true;
+            }
+
+            let disk_path = &params.path;
             if !disk_path.exists() {
                 return Err(argument::Error::InvalidValue {
-                    value: param.to_owned(),
+                    value: disk_path.to_string_lossy().into_owned(),
                     expected: String::from("this disk path does not exist"),
                 });
             }
@@ -1389,80 +1315,11 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 cfg.params.push(format!(
                     "root=/dev/vd{} {}",
                     char::from(b'a' + cfg.disks.len() as u8),
-                    if read_only { "ro" } else { "rw" }
+                    if params.read_only { "ro" } else { "rw" }
                 ));
             }
 
-            let mut disk = DiskOption {
-                path: disk_path,
-                read_only,
-                o_direct: false,
-                sparse: true,
-                block_size: 512,
-                id: None,
-            };
-
-            for opt in components {
-                let mut o = opt.splitn(2, '=');
-                let kind = o.next().ok_or_else(|| argument::Error::InvalidValue {
-                    value: opt.to_owned(),
-                    expected: String::from("disk options must not be empty"),
-                })?;
-                let value = o.next().ok_or_else(|| argument::Error::InvalidValue {
-                    value: opt.to_owned(),
-                    expected: String::from("disk options must be of the form `kind=value`"),
-                })?;
-
-                match kind {
-                    "sparse" => {
-                        let sparse = value.parse().map_err(|_| argument::Error::InvalidValue {
-                            value: value.to_owned(),
-                            expected: String::from("`sparse` must be a boolean"),
-                        })?;
-                        disk.sparse = sparse;
-                    }
-                    "o_direct" => {
-                        let o_direct =
-                            value.parse().map_err(|_| argument::Error::InvalidValue {
-                                value: value.to_owned(),
-                                expected: String::from("`o_direct` must be a boolean"),
-                            })?;
-                        disk.o_direct = o_direct;
-                    }
-                    "block_size" => {
-                        let block_size =
-                            value.parse().map_err(|_| argument::Error::InvalidValue {
-                                value: value.to_owned(),
-                                expected: String::from("`block_size` must be an integer"),
-                            })?;
-                        disk.block_size = block_size;
-                    }
-                    "id" => {
-                        if value.len() > DISK_ID_LEN {
-                            return Err(argument::Error::InvalidValue {
-                                value: value.to_owned(),
-                                expected: format!(
-                                    "`id` must be {} or fewer characters",
-                                    DISK_ID_LEN
-                                ),
-                            });
-                        }
-                        let mut id = [0u8; DISK_ID_LEN];
-                        // Slicing id to value's length will never panic
-                        // because we checked that value will fit into id above.
-                        id[..value.len()].copy_from_slice(value.as_bytes());
-                        disk.id = Some(id);
-                    }
-                    _ => {
-                        return Err(argument::Error::InvalidValue {
-                            value: kind.to_owned(),
-                            expected: String::from("unrecognized disk option"),
-                        });
-                    }
-                }
-            }
-
-            cfg.disks.push(disk);
+            cfg.disks.push(params);
         }
         "pmem-device" | "rw-pmem-device" => {
             let disk_path = PathBuf::from(value.unwrap());
@@ -2238,6 +2095,17 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                         })?,
                 );
         }
+        #[cfg(feature = "direct")]
+        "direct-gpe" => {
+            cfg.direct_gpe.push(value.unwrap().parse().map_err(|_| {
+                argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from(
+                        "this value for `direct-gpe` must be an unsigned integer",
+                    ),
+                }
+            })?);
+        }
         "dmi" => {
             if cfg.dmi_path.is_some() {
                 return Err(argument::Error::TooManyArguments(
@@ -2273,32 +2141,56 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.stub_pci_devices.push(parse_stub_pci_parameters(value)?);
         }
         "vvu-proxy" => {
-            let opts: Vec<_> = value.unwrap().split(',').collect();
+            let opts: Vec<_> = value.unwrap().splitn(2, ',').collect();
             let socket = PathBuf::from(opts[0]);
-            let addr = match opts.get(1) {
-                Some(opt) => {
-                    let kvs = argument::parse_key_value_options("vvu-proxy", opt, ',')
-                        .collect::<Vec<_>>();
-                    if kvs.len() != 1 || kvs[0].key() != "addr" {
-                        return Err(argument::Error::InvalidValue {
-                            value: opt.to_string(),
-                            expected: String::from(
-                                "Please specify PCI address for VVU: addr=BUS:DEVICE.FUNCTION",
-                            ),
-                        });
-                    }
-                    let pci_address = kvs[0].value()?;
-                    Some(PciAddress::from_string(pci_address).map_err(|e| {
-                        argument::Error::InvalidValue {
-                            value: pci_address.to_string(),
-                            expected: format!("vvu-proxy PCI address: {}", e),
-                        }
-                    })?)
-                }
-                None => None,
+            let mut vvu_opt = VvuOption {
+                socket,
+                addr: None,
+                uuid: Default::default(),
             };
 
-            cfg.vvu_proxy.push(VvuOption { socket, addr });
+            if let Some(kvs) = opts.get(1) {
+                for kv in argument::parse_key_value_options("vvu-proxy", kvs, ',') {
+                    match kv.key() {
+                        "addr" => {
+                            let pci_address = kv.value()?;
+                            if vvu_opt.addr.is_some() {
+                                return Err(argument::Error::TooManyArguments(
+                                    "`addr` already given".to_owned(),
+                                ));
+                            }
+
+                            vvu_opt.addr =
+                                Some(PciAddress::from_string(pci_address).map_err(|e| {
+                                    argument::Error::InvalidValue {
+                                        value: pci_address.to_string(),
+                                        expected: format!("vvu-proxy PCI address: {}", e),
+                                    }
+                                })?);
+                        }
+                        "uuid" => {
+                            let value = kv.value()?;
+                            if vvu_opt.uuid.is_some() {
+                                return Err(argument::Error::TooManyArguments(
+                                    "`uuid` already given".to_owned(),
+                                ));
+                            }
+                            let uuid = Uuid::parse_str(value).map_err(|e| {
+                                argument::Error::InvalidValue {
+                                    value: value.to_string(),
+                                    expected: format!("invalid UUID is given for vvu-proxy: {}", e),
+                                }
+                            })?;
+                            vvu_opt.uuid = Some(uuid);
+                        }
+                        _ => {
+                            kv.invalid_key_err();
+                        }
+                    }
+                }
+            }
+
+            cfg.vvu_proxy.push(vvu_opt);
         }
         "coiommu" => {
             let mut params: devices::CoIommuParameters = Default::default();
@@ -2380,21 +2272,51 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         #[cfg(feature = "direct")]
         "pcie-root-port" => {
-            let pcie_path = PathBuf::from(value.unwrap());
+            let opts: Vec<_> = value.unwrap().split(',').collect();
+            if opts.len() > 2 {
+                return Err(argument::Error::TooManyArguments(
+                    "pcie-root-port has maxmimum two arguments".to_owned(),
+                ));
+            }
+            let pcie_path = PathBuf::from(opts[0]);
             if !pcie_path.exists() {
                 return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
+                    value: opts[0].to_owned(),
                     expected: String::from("the pcie root port path does not exist"),
                 });
             }
             if !pcie_path.is_dir() {
                 return Err(argument::Error::InvalidValue {
-                    value: value.unwrap().to_owned(),
+                    value: opts[0].to_owned(),
                     expected: String::from("the pcie root port path should be directory"),
                 });
             }
 
-            cfg.pcie_rp.push(pcie_path);
+            let hp_gpe = if opts.len() == 2 {
+                let gpes: Vec<&str> = opts[1].split('=').collect();
+                if gpes.len() != 2 || gpes[0] != "hp_gpe" {
+                    return Err(argument::Error::InvalidValue {
+                        value: opts[1].to_owned(),
+                        expected: String::from("it should be hp_gpe=Num"),
+                    });
+                }
+                match gpes[1].parse::<u32>() {
+                    Ok(gpe) => Some(gpe),
+                    Err(_) => {
+                        return Err(argument::Error::InvalidValue {
+                            value: gpes[1].to_owned(),
+                            expected: String::from("host hp gpe must be a non-negative integer"),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+
+            cfg.pcie_rp.push(HostPcieRootPortParameters {
+                host_path: pcie_path,
+                hp_gpe,
+            });
         }
         "pivot-root" => {
             cfg.pivot_root = Some(PathBuf::from(value.unwrap()));
@@ -2405,6 +2327,35 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         "strict-balloon" => {
             cfg.strict_balloon = true;
+        }
+        #[cfg(feature = "direct")]
+        "mmio-address-range" => {
+            let ranges: argument::Result<Vec<RangeInclusive<u64>>> = value
+                .unwrap()
+                .split(",")
+                .map(|s| {
+                    let r: Vec<&str> = s.split("-").collect();
+                    if r.len() != 2 {
+                        return Err(argument::Error::InvalidValue {
+                            value: s.to_string(),
+                            expected: String::from("invalid range"),
+                        });
+                    }
+                    let parse = |s: &str| -> argument::Result<u64> {
+                        match parse_hex_or_decimal(s) {
+                            Ok(v) => Ok(v),
+                            Err(_) => {
+                                return Err(argument::Error::InvalidValue {
+                                    value: s.to_owned(),
+                                    expected: String::from("expected u64 value"),
+                                });
+                            }
+                        }
+                    };
+                    Ok(RangeInclusive::new(parse(r[0])?, parse(r[1])?))
+                })
+                .collect();
+            cfg.mmio_address_ranges = ranges?;
         }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
@@ -2511,7 +2462,12 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
             "'balloon-control' requires enabled balloon".to_owned(),
         ));
     }
-    set_default_serial_parameters(&mut cfg.serial_parameters);
+
+    set_default_serial_parameters(
+        &mut cfg.serial_parameters,
+        !cfg.vhost_user_console.is_empty(),
+    );
+
     Ok(())
 }
 
@@ -2583,7 +2539,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
                               See --disk for valid options."),
           Argument::value("rw-pmem-device", "PATH", "Path to a writable disk image."),
           Argument::value("pmem-device", "PATH", "Path to a disk image."),
-          Argument::value("pstore", "path=PATH,size=SIZE", "Path to pstore buffer backend file follewed by size."),
+          Argument::value("pstore", "path=PATH,size=SIZE", "Path to pstore buffer backend file followed by size."),
           Argument::value("host_ip",
                           "IP",
                           "IP address to assign to host tap interface."),
@@ -2708,7 +2664,8 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
           #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("split-irqchip", "(EXPERIMENTAL) enable split-irqchip support"),
           Argument::value("bios", "PATH", "Path to BIOS/firmware ROM"),
-          Argument::value("vfio", "PATH[,iommu=on|off]", "Path to sysfs of PCI pass through or mdev device.
+          Argument::value("vfio", "PATH[,guest-address=auto|<BUS:DEVICE.FUNCTION>][,iommu=on|off]", "Path to sysfs of PCI pass through or mdev device.
+guest-address=auto|<BUS:DEVICE.FUNCTION> - PCI address that the device will be assigned in the guest (default: auto).  When set to \"auto\", the device will be assigned an address that mirrors its address in the host.
 iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("vfio-platform", "PATH", "Path to sysfs of platform pass through"),
           Argument::flag("virtio-iommu", "Add a virtio-iommu device"),
@@ -2745,9 +2702,10 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("vhost-user-wl", "SOCKET_PATH:TUBE_PATH", "Paths to a vhost-user socket for wayland and a Tube socket for additional wayland-specific messages"),
           Argument::value("vhost-user-fs", "SOCKET_PATH:TAG",
                           "Path to a socket path for vhost-user fs, and tag for the shared dir"),
-          Argument::value("vvu-proxy", "SOCKET_PATH[,addr=DOMAIN:BUS:DEVICE.FUNCTION]", "Socket path for the Virtio Vhost User proxy device.
+          Argument::value("vvu-proxy", "SOCKET_PATH[,addr=DOMAIN:BUS:DEVICE.FUNCTION,uuid=UUID]", "Socket path for the Virtio Vhost User proxy device.
                               Parameters
-                              addr=BUS:DEVICE.FUNCTION - PCI address that the proxy device will be allocated"),
+                              addr=BUS:DEVICE.FUNCTION - PCI address that the proxy device will be allocated (default: automatically allocated)
+                              uuid=UUID - UUID which will be stored in VVU PCI config space that is readable from guest userspace"),
           #[cfg(feature = "direct")]
           Argument::value("direct-pmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct port mapped I/O access. RANGE may be decimal or hex (starting with 0x)."),
           #[cfg(feature = "direct")]
@@ -2756,6 +2714,8 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("direct-level-irq", "irq", "Enable interrupt passthrough"),
 #[cfg(feature = "direct")]
           Argument::value("direct-edge-irq", "irq", "Enable interrupt passthrough"),
+#[cfg(feature = "direct")]
+          Argument::value("direct-gpe", "gpe", "Enable GPE interrupt and register access passthrough"),
           Argument::value("dmi", "DIR", "Directory with smbios_entry_point/DMI files"),
           Argument::flag("no-legacy", "Don't use legacy KBD/RTC devices emulation"),
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -2788,11 +2748,15 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
                               sync - open backing file with O_SYNC
                               align - whether to adjust addr and size to page boundaries implicitly"),
           #[cfg(feature = "direct")]
-          Argument::value("pcie-root-port", "PATH", "Path to sysfs of host pcie root port"),
+          Argument::value("pcie-root-port", "PATH[,hp_gpe=NUM]", "Path to sysfs of host pcie root port and host pcie root port hotplug gpe number"),
           Argument::value("pivot-root", "PATH", "Path to empty directory to use for sandbox pivot root."),
           #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("s2idle", "Set Low Power S0 Idle Capable Flag for guest Fixed ACPI Description Table"),
           Argument::flag("strict-balloon", "Don't allow guest to use pages from the balloon"),
+          Argument::value("mmio-address-range", "STARTADDR-ENDADDR[,STARTADDR-ENDADDR]*",
+                          "Ranges (inclusive) into which to limit guest mmio addresses. Note that
+                           this this may cause mmio allocations to fail if the specified ranges are
+                           incompatible with the default ranges calculated by crosvm."),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -2879,6 +2843,36 @@ fn resume_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     let socket_path = &args.next().unwrap();
     let socket_path = Path::new(&socket_path);
     vms_request(&VmRequest::Resume, socket_path)
+}
+
+fn powerbtn_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
+    if args.len() == 0 {
+        print_help("crosvm powerbtn", "VM_SOCKET...", &[]);
+        println!("Triggers a power button event in the crosvm instance listening on each `VM_SOCKET` given.");
+        return Err(());
+    }
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    vms_request(&VmRequest::Powerbtn, socket_path)
+}
+
+fn inject_gpe(mut args: std::env::Args) -> std::result::Result<(), ()> {
+    if args.len() < 2 {
+        print_help("crosvm gpe", "GPE# VM_SOCKET...", &[]);
+        println!("Injects a general-purpose event (GPE#) into the crosvm instance listening on each `VM_SOCKET` given.");
+        return Err(());
+    }
+    let gpe = match args.next().unwrap().parse::<u32>() {
+        Ok(n) => n,
+        Err(_) => {
+            error!("Failed to parse GPE#");
+            return Err(());
+        }
+    };
+
+    let socket_path = &args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+    vms_request(&VmRequest::Gpe(gpe), socket_path)
 }
 
 fn balloon_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
@@ -3394,6 +3388,8 @@ fn print_usage() {
     println!("    run - Start a new crosvm instance.");
     println!("    stop - Stops crosvm instances via their control sockets.");
     println!("    suspend - Suspends the crosvm instance.");
+    println!("    powerbtn - Triggers a power button event in the crosvm instance.");
+    println!("    gpe - Injects a general-purpose event into the crosvm instance.");
     println!("    usb - Manage attached virtual USB devices.");
     println!("    version - Show package version.");
     println!("    vfio - add/remove host vfio pci device into guest.");
@@ -3449,6 +3445,8 @@ fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
             "resume" => resume_vms(args),
             "stop" => stop_vms(args),
             "suspend" => suspend_vms(args),
+            "powerbtn" => powerbtn_vms(args),
+            "gpe" => inject_gpe(args),
             "usb" => modify_usb(args),
             "version" => pkg_version(),
             "vfio" => modify_vfio(args),

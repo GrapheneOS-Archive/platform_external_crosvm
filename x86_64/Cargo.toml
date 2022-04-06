@@ -2,7 +2,7 @@
 name = "x86_64"
 version = "0.1.0"
 authors = ["The Chromium OS Authors"]
-edition = "2018"
+edition = "2021"
 
 [features]
 gdb = ["gdbstub_arch", "arch/gdb"]
@@ -23,7 +23,7 @@ remain = "*"
 resources = { path = "../resources" }
 sync = { path = "../common/sync" }
 thiserror = "*"
-base = { path = "../common/base" }
+base = { path = "../base" }
 acpi_tables = {path = "../acpi_tables" }
 vm_control = { path = "../vm_control" }
 vm_memory = { path = "../vm_memory" }
