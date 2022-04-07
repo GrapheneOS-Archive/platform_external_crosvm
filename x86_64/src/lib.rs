@@ -46,6 +46,7 @@ mod regs;
 mod smbios;
 
 use std::collections::BTreeMap;
+use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Seek};
@@ -56,7 +57,7 @@ use crate::bootparam::boot_params;
 use acpi_tables::sdt::SDT;
 use acpi_tables::{aml, aml::Aml};
 use arch::{get_serial_cmdline, GetSerialCmdlineError, RunnableLinuxVm, VmComponents, VmImage};
-use base::Event;
+use base::{warn, Event};
 use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::{
     BusDeviceObj, BusResumeDevice, IrqChip, IrqChipX86_64, PciAddress, PciConfigIo, PciConfigMmio,
@@ -101,6 +102,9 @@ pub enum Error {
     CreateEvent(base::Error),
     #[error("failed to create fdt: {0}")]
     CreateFdt(arch::fdt::Error),
+    #[cfg(feature = "direct")]
+    #[error("failed to enable GPE forwarding: {0}")]
+    CreateGpe(devices::DirectIrqError),
     #[error("failed to create IOAPIC device: {0}")]
     CreateIoapicDevice(base::Error),
     #[error("failed to create a PCI root hub: {0}")]
@@ -137,8 +141,6 @@ pub enum Error {
     LoadKernel(kernel_loader::Error),
     #[error("error translating address: Page not present")]
     PageNotPresent,
-    #[error("failed to allocate pstore region: {0}")]
-    Pstore(arch::pstore::Error),
     #[error("error reading guest memory {0}")]
     ReadingGuestMemory(vm_memory::GuestMemoryError),
     #[error("error reading CPU registers {0}")]
@@ -401,11 +403,11 @@ impl arch::LinuxArch for X8664arch {
         Ok(arch_memory_regions(components.memory_size, bios_size))
     }
 
-    fn create_system_allocator<V: Vm>(vm: &V) -> SystemAllocator {
+    fn get_system_allocator_config<V: Vm>(vm: &V) -> SystemAllocatorConfig {
         let guest_mem = vm.get_memory();
         let high_mmio_start = Self::get_high_mmio_base(guest_mem);
         let high_mmio_size = Self::get_high_mmio_size(vm);
-        SystemAllocator::new(SystemAllocatorConfig {
+        SystemAllocatorConfig {
             io: Some(MemRegion {
                 base: 0xc000,
                 size: 0x4000,
@@ -420,8 +422,7 @@ impl arch::LinuxArch for X8664arch {
             },
             platform_mmio: None,
             first_irq: X86_64_IRQ_BASE,
-        })
-        .unwrap()
+        }
     }
 
     fn build_vm<V, Vcpu>(
@@ -452,6 +453,24 @@ impl arch::LinuxArch for X8664arch {
 
         let tss_addr = GuestAddress(TSS_ADDR);
         vm.set_tss_addr(tss_addr).map_err(Error::SetTssAddr)?;
+
+        // Use IRQ info in ACPI if provided by the user.
+        let mut noirq = true;
+        let mut mptable = true;
+        let mut sci_irq = X86_64_SCI_IRQ;
+
+        for sdt in components.acpi_sdts.iter() {
+            if sdt.is_signature(b"DSDT") || sdt.is_signature(b"APIC") {
+                noirq = false;
+            } else if sdt.is_signature(b"FACP") {
+                mptable = false;
+                let sci_irq_fadt: u16 = sdt.read(acpi::FADT_FIELD_SCI_INTERRUPT);
+                sci_irq = sci_irq_fadt.into();
+                if !system_allocator.reserve_irq(sci_irq) {
+                    warn!("sci irq {} already reserved.", sci_irq);
+                }
+            }
+        }
 
         let mmio_bus = Arc::new(devices::Bus::new());
         let io_bus = Arc::new(devices::Bus::new());
@@ -524,25 +543,21 @@ impl arch::LinuxArch for X8664arch {
         let max_bus = ((PCIE_CFG_MMIO_SIZE / 0x100000) - 1) as u8;
 
         let (acpi_dev_resource, bat_control) = Self::setup_acpi_devices(
-            &vm,
             &mem,
             &io_bus,
             system_allocator,
             suspend_evt.try_clone().map_err(Error::CloneEvent)?,
             exit_evt.try_clone().map_err(Error::CloneEvent)?,
             components.acpi_sdts,
+            #[cfg(feature = "direct")]
+            &components.direct_gpe,
             irq_chip.as_irq_chip_mut(),
+            sci_irq,
             battery,
             &mmio_bus,
             max_bus,
             &mut resume_notify_devices,
         )?;
-
-        // Use IRQ info in ACPI if provided by the user.
-        let noirq = !acpi_dev_resource
-            .sdts
-            .iter()
-            .any(|sdt| sdt.is_signature(b"DSDT") || sdt.is_signature(b"APIC"));
 
         irq_chip
             .finalize_devices(system_allocator, &io_bus, &mmio_bus)
@@ -556,8 +571,11 @@ impl arch::LinuxArch for X8664arch {
         // If another guest does need a way to pass these tables down to it's BIOS, this approach
         // should be rethought.
 
-        // Note that this puts the mptable at 0x9FC00 in guest physical memory.
-        mptable::setup_mptable(&mem, vcpu_count as u8, &pci_irqs).map_err(Error::SetupMptable)?;
+        if mptable {
+            // Note that this puts the mptable at 0x9FC00 in guest physical memory.
+            mptable::setup_mptable(&mem, vcpu_count as u8, &pci_irqs)
+                .map_err(Error::SetupMptable)?;
+        }
         smbios::setup_smbios(&mem, components.dmi_path).map_err(Error::SetupSmbios)?;
 
         let host_cpus = if components.host_cpu_topology {
@@ -570,10 +588,10 @@ impl arch::LinuxArch for X8664arch {
         acpi::create_acpi_tables(
             &mem,
             vcpu_count as u8,
-            X86_64_SCI_IRQ,
+            sci_irq,
             0xcf9,
             6, // RST_CPU|SYS_RST
-            acpi_dev_resource,
+            &acpi_dev_resource,
             host_cpus,
             kvm_vcpu_ids,
             &pci_irqs,
@@ -646,6 +664,7 @@ impl arch::LinuxArch for X8664arch {
             bat_control,
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             gdb: components.gdb,
+            pm: Some(acpi_dev_resource.pm),
             root_config: pci,
             hotplug_bus: Vec::new(),
         })
@@ -1257,15 +1276,16 @@ impl X8664arch {
     /// * - `irq_chip` the IrqChip object for registering irq events
     /// * - `battery` indicate whether to create the battery
     /// * - `mmio_bus` the MMIO bus to add the devices to
-    fn setup_acpi_devices<V: VmX86_64>(
-        vm: &V,
+    fn setup_acpi_devices(
         mem: &GuestMemory,
         io_bus: &devices::Bus,
         resources: &mut SystemAllocator,
         suspend_evt: Event,
         exit_evt: Event,
         sdts: Vec<SDT>,
+        #[cfg(feature = "direct")] direct_gpe: &[u32],
         irq_chip: &mut dyn IrqChip,
+        sci_irq: u32,
         battery: (&Option<BatteryType>, Option<Minijail>),
         mmio_bus: &devices::Bus,
         max_bus: u8,
@@ -1274,6 +1294,23 @@ impl X8664arch {
         // The AML data for the acpi devices
         let mut amls = Vec::new();
 
+        let bat_control = if let Some(battery_type) = battery.0 {
+            match battery_type {
+                BatteryType::Goldfish => {
+                    let control_tube = arch::add_goldfish_battery(
+                        &mut amls, battery.1, mmio_bus, irq_chip, sci_irq, resources,
+                    )
+                    .map_err(Error::CreateBatDevices)?;
+                    Some(BatControl {
+                        type_: BatteryType::Goldfish,
+                        control_tube,
+                    })
+                }
+            }
+        } else {
+            None
+        };
+
         let pm_alloc = resources.get_anon_alloc();
         let pm_iobase = match resources.io_allocator() {
             Some(io) => io
@@ -1281,17 +1318,81 @@ impl X8664arch {
                     devices::acpi::ACPIPM_RESOURCE_LEN as u64,
                     pm_alloc,
                     "ACPIPM".to_string(),
-                    devices::acpi::ACPIPM_RESOURCE_LEN as u64,
+                    4, // must be 32-bit aligned
                 )
                 .map_err(Error::AllocateIOResouce)?,
             None => 0x600,
         };
 
         let pcie_vcfg = aml::Name::new("VCFG".into(), &Self::get_pcie_vcfg_mmio_base(mem));
-        Aml::to_aml_bytes(&pcie_vcfg, &mut amls);
+        pcie_vcfg.to_aml_bytes(&mut amls);
 
-        let pmresource = devices::ACPIPMResource::new(suspend_evt, exit_evt);
-        Aml::to_aml_bytes(&pmresource, &mut amls);
+        let pm_sci_evt = Event::new().map_err(Error::CreateEvent)?;
+        let pm_sci_evt_resample = Event::new().map_err(Error::CreateEvent)?;
+        irq_chip
+            .register_irq_event(sci_irq, &pm_sci_evt, Some(&pm_sci_evt_resample))
+            .map_err(Error::RegisterIrqfd)?;
+
+        #[cfg(feature = "direct")]
+        let direct_gpe_info = if direct_gpe.is_empty() {
+            None
+        } else {
+            let direct_sci_evt = Event::new().map_err(Error::CreateEvent)?;
+            let direct_sci_evt_resample = Event::new().map_err(Error::CreateEvent)?;
+
+            let mut sci_devirq = devices::DirectIrq::new(
+                direct_sci_evt.try_clone().map_err(Error::CloneEvent)?,
+                Some(
+                    direct_sci_evt_resample
+                        .try_clone()
+                        .map_err(Error::CloneEvent)?,
+                ),
+            )
+            .map_err(Error::CreateGpe)?;
+
+            sci_devirq.sci_irq_prepare().map_err(Error::CreateGpe)?;
+
+            for gpe in direct_gpe {
+                sci_devirq
+                    .gpe_enable_forwarding(*gpe)
+                    .map_err(Error::CreateGpe)?;
+            }
+
+            Some((direct_sci_evt, direct_sci_evt_resample, direct_gpe))
+        };
+
+        let mut pmresource = devices::ACPIPMResource::new(
+            pm_sci_evt,
+            pm_sci_evt_resample,
+            #[cfg(feature = "direct")]
+            direct_gpe_info,
+            suspend_evt,
+            exit_evt,
+        );
+        pmresource.to_aml_bytes(&mut amls);
+        pmresource.start();
+
+        let mut crs_entries: Vec<Box<dyn Aml>> = vec![
+            Box::new(aml::AddressSpace::new_bus_number(0x0u16, max_bus as u16)),
+            Box::new(aml::IO::new(0xcf8, 0xcf8, 1, 0x8)),
+        ];
+        for r in resources.mmio_pools() {
+            let entry: Box<dyn Aml> = match (u32::try_from(*r.start()), u32::try_from(*r.end())) {
+                (Ok(start), Ok(end)) => Box::new(aml::AddressSpace::new_memory(
+                    aml::AddressSpaceCachable::NotCacheable,
+                    true,
+                    start,
+                    end,
+                )),
+                _ => Box::new(aml::AddressSpace::new_memory(
+                    aml::AddressSpaceCachable::NotCacheable,
+                    true,
+                    *r.start(),
+                    *r.end(),
+                )),
+            };
+            crs_entries.push(entry);
+        }
 
         let mut pci_dsdt_inner_data: Vec<&dyn aml::Aml> = Vec::new();
         let hid = aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A08"));
@@ -1308,22 +1409,7 @@ impl X8664arch {
         pci_dsdt_inner_data.push(&supp);
         let crs = aml::Name::new(
             "_CRS".into(),
-            &aml::ResourceTemplate::new(vec![
-                &aml::AddressSpace::new_bus_number(0x0u16, max_bus as u16),
-                &aml::IO::new(0xcf8, 0xcf8, 1, 0x8),
-                &aml::AddressSpace::new_memory(
-                    aml::AddressSpaceCachable::NotCacheable,
-                    true,
-                    END_ADDR_BEFORE_32BITS as u32,
-                    (END_ADDR_BEFORE_32BITS + PCI_MMIO_SIZE - 1) as u32,
-                ),
-                &aml::AddressSpace::new_memory(
-                    aml::AddressSpaceCachable::NotCacheable,
-                    true,
-                    Self::get_high_mmio_base(mem),
-                    Self::get_high_mmio_size(vm),
-                ),
-            ]),
+            &aml::ResourceTemplate::new(crs_entries.iter().map(|b| b.as_ref()).collect()),
         );
         pci_dsdt_inner_data.push(&crs);
 
@@ -1340,34 +1426,13 @@ impl X8664arch {
                 devices::acpi::ACPIPM_RESOURCE_LEN as u64,
             )
             .unwrap();
-        resume_notify_devices.push(pm);
-
-        let bat_control = if let Some(battery_type) = battery.0 {
-            match battery_type {
-                BatteryType::Goldfish => {
-                    let control_tube = arch::add_goldfish_battery(
-                        &mut amls,
-                        battery.1,
-                        mmio_bus,
-                        irq_chip,
-                        X86_64_SCI_IRQ,
-                        resources,
-                    )
-                    .map_err(Error::CreateBatDevices)?;
-                    Some(BatControl {
-                        type_: BatteryType::Goldfish,
-                        control_tube,
-                    })
-                }
-            }
-        } else {
-            None
-        };
+        resume_notify_devices.push(pm.clone());
 
         Ok((
             acpi::AcpiDevResource {
                 amls,
                 pm_iobase,
+                pm,
                 sdts,
             },
             bat_control,

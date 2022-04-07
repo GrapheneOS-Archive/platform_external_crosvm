@@ -58,6 +58,7 @@
 //! See the docs for `IoSourceExt` if support for kernels <5.4 is required. Focus on `UringSource` if
 //! all systems have support for io_uring.
 
+pub mod audio_streams_async;
 mod blocking;
 mod complete;
 mod event;
@@ -90,11 +91,13 @@ pub use timer::TimerAsync;
 pub use uring_executor::URingExecutor;
 pub use uring_source::UringSource;
 
-use std::future::Future;
-use std::io;
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    io,
+    marker::PhantomData,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use remain::sorted;
 use thiserror::Error as ThisError;
