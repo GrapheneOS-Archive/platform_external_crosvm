@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 
-use base::{AsRawDescriptor, EventFd, RawDescriptor};
+use base::{AsRawDescriptor, Event, RawDescriptor};
 use remain::sorted;
 use thiserror::Error as ThisError;
 
@@ -41,7 +41,7 @@ impl From<RecvIntoBufsError> for Error {
 /// VFIO device which can be used as virtio-vhost-user device backend.
 pub trait Device {
     /// This event must be read before handle_request() is called.
-    fn event(&self) -> &EventFd;
+    fn event(&self) -> &Event;
 
     /// Starts VFIO device.
     fn start(&mut self) -> std::result::Result<(), anyhow::Error>;

@@ -17,7 +17,7 @@ rust_defaults {
     cargo_env_compat: true,
     test_suites: ["general-tests"],
     auto_gen_config: true,
-    edition: "2018",
+    edition: "2021",
     rustlibs: [
         "libbit_field",
     ],
@@ -51,6 +51,6 @@ rust_library {
     crate_name: "bit_field",
     cargo_env_compat: true,
     srcs: ["src/lib.rs"],
-    edition: "2018",
+    edition: "2021",
     proc_macros: ["libbit_field_derive"],
 }

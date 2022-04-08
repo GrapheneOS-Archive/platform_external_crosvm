@@ -44,7 +44,7 @@ rust_library {
         android: {
             static_libs: [
                 "libwayland_client_static",
-                "libffi"
+                "libffi",
             ],
         },
     },
@@ -77,7 +77,7 @@ cc_library_static {
         android: {
             static_libs: [
                 "libwayland_client_static",
-                "libffi"
+                "libffi",
             ],
         },
         linux_glibc_x86: {

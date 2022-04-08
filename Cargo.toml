@@ -4,8 +4,10 @@ cargo-features = ["named-profiles"]
 name = "crosvm"
 version = "0.1.0"
 authors = ["The Chromium OS Authors"]
-edition = "2018"
+edition = "2021"
 default-run = "crosvm"
+# b:223855233
+resolver = "1"
 
 [lib]
 path = "src/crosvm.rs"
@@ -22,6 +24,10 @@ required-features = [ "direct" ]
 [profile.release]
 panic = 'abort'
 overflow-checks = true
+
+[profile.release-test]
+inherits = 'release'
+panic = 'unwind'
 
 # Reproduces the options used when building crosvm for Chrome OS.
 [profile.chromeos]
@@ -43,8 +49,11 @@ members = [
     "aarch64",
     "acpi_tables",
     "arch",
+    "base",
     "bit_field",
+    "cros_async",
     "crosvm-fuzz",
+    "crosvm_control",
     "crosvm_plugin",
     "devices",
     "disk",
@@ -52,11 +61,12 @@ members = [
     "gpu_display",
     "hypervisor",
     "integration_tests",
+    "io_uring",
     "kernel_cmdline",
     "kernel_loader",
     "kvm",
     "kvm_sys",
-    "crosvm_control",
+    "libcras_stub",
     "libvda",
     "linux_input_sys",
     "net_sys",
@@ -66,6 +76,8 @@ members = [
     "qcow_utils",
     "resources",
     "rutabaga_gfx",
+    "serde_keyvalue",
+    "system_api_stub",
     "tpm2",
     "tpm2-sys",
     "usb_sys",
@@ -75,14 +87,13 @@ members = [
     "virtio_sys",
     "vm_control",
     "vm_memory",
-    "third_party/vmm_vhost",
     "x86_64",
+    "third_party/vmm_vhost",
 ]
 exclude = [
     "common/assertions",
     "common/audio_streams",
-    "common/base",
-    "common/sys_util_core",
+    "common/balloon_control",
     "common/cros-fuzz",
     "common/cros_async",
     "common/cros_asyncv2",
@@ -91,6 +102,9 @@ exclude = [
     "common/p9",
     "common/sync",
     "common/sys_util",
+    "common/sys_util_core",
+    "common/win_sys_util",
+    "win_util",
 ]
 
 [features]
@@ -104,23 +118,25 @@ all-linux = [
     "virgl_renderer",
     "x",
     ]
-all-linux-armhf = [
-    "composite-disk",
-    "default",
-    "gdb",
-    "tpm",
-    ]
 audio = ["devices/audio"]
 audio_cras = ["devices/audio_cras"]
 chromeos = ["base/chromeos", "audio_cras", "devices/chromeos"]
 composite-disk = ["protos/composite-disk", "protobuf", "disk/composite-disk"]
 default = ["audio", "gpu", "usb"]
 default-no-sandbox = []
-direct = ["devices/direct", "x86_64/direct"]
+direct = ["devices/direct", "arch/direct", "x86_64/direct"]
 gdb = ["gdbstub", "gdbstub_arch", "arch/gdb", "vm_control/gdb", "x86_64/gdb"]
 gfxstream = ["devices/gfxstream"]
 gpu = ["devices/gpu"]
 libvda = ["devices/libvda"]
+linux-armhf = [
+    "composite-disk",
+    "default",
+    "gdb",
+    "tpm",
+    ]
+linux-x86_64 = ["all-linux", "plugin"]
+linux-aarch64 = ["all-linux"]
 plugin = ["protos/plugin", "crosvm_plugin", "kvm", "kvm_sys", "protobuf"]
 power-monitor-powerd = ["arch/power-monitor-powerd"]
 tpm = ["devices/tpm"]
@@ -137,7 +153,7 @@ anyhow = "1.0.32"
 arch = { path = "arch" }
 assertions = { path = "common/assertions" }
 audio_streams = "*"
-base = { path = "common/base" }
+base = { path = "base" }
 bit_field = { path = "bit_field" }
 crosvm_plugin = { path = "crosvm_plugin", optional = true }
 data_model = "*"
@@ -163,9 +179,11 @@ remain = "*"
 resources = { path = "resources" }
 scudo = { version = "0.1", optional = true }
 serde_json = "*"
+serde_keyvalue = { path = "serde_keyvalue" }
 sync = { path = "common/sync" }
 tempfile = "3"
 thiserror = { version = "1.0.20" }
+uuid = { version = "0.8.2" }
 vhost = { path = "vhost" }
 vm_control = { path = "vm_control" }
 acpi_tables = { path = "acpi_tables" }
@@ -178,14 +196,14 @@ x86_64 = { path = "x86_64" }
 aarch64 = { path = "aarch64" }
 
 [dev-dependencies]
-base = { path = "common/base" }
+base = { path = "base" }
 
 [patch.crates-io]
 assertions = { path = "common/assertions" }
 audio_streams = { path = "common/audio_streams" }
-base = { path = "common/base" }
+base = { path = "base" }
 sys_util_core = { path = "common/sys_util_core" }
-cros_async =  { path = "common/cros_async" }
+cros_async =  { path = "cros_async" }
 cros_fuzz = { path = "common/cros-fuzz" } # ignored by ebuild
 data_model = { path = "common/data_model" }
 libcras = { path = "libcras_stub" } # ignored by ebuild

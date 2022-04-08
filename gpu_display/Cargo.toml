@@ -2,7 +2,7 @@
 name = "gpu_display"
 version = "0.1.0"
 authors = ["The Chromium OS Authors"]
-edition = "2018"
+edition = "2021"
 
 [features]
 x = []
@@ -10,7 +10,7 @@ x = []
 [dependencies]
 data_model = { path = "../common/data_model" }
 libc = "*"
-base = { path = "../common/base" }
+base = { path = "../base" }
 linux_input_sys = { path = "../linux_input_sys" }
 remain = "*"
 thiserror = "*"
