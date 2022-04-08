@@ -20,7 +20,7 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use arch::{self, VirtioDeviceStub};
 use base::*;
-use devices::serial_device::SerialParameters;
+use devices::serial_device::{SerialParameters, SerialType};
 use devices::vfio::{VfioCommonSetup, VfioCommonTrait};
 use devices::virtio::ipc_memory_mapper::{create_ipc_mapper, CreateIpcMapperRet};
 use devices::virtio::memory_mapper::{BasicMemoryMapper, MemoryMapperTrait};
@@ -39,7 +39,9 @@ use devices::virtio::vhost::user::vmm::{
 use devices::virtio::VideoBackendType;
 use devices::virtio::{self, BalloonMode, Console, VirtioDevice};
 use devices::IommuDevType;
-use devices::{self, BusDeviceObj, PciDevice, VfioDevice, VfioPciDevice, VfioPlatformDevice};
+use devices::{
+    self, BusDeviceObj, PciAddress, PciDevice, VfioDevice, VfioPciDevice, VfioPlatformDevice,
+};
 use hypervisor::Vm;
 use minijail::{self, Minijail};
 use net_util::{MacAddress, Tap};
@@ -105,7 +107,15 @@ pub fn create_block_device(
     disk: &DiskOption,
     disk_device_tube: Tube,
 ) -> DeviceResult {
-    let raw_image: File = open_file(&disk.path, disk.read_only, disk.o_direct)
+    let mut options = OpenOptions::new();
+    options.read(true).write(!disk.read_only);
+
+    #[cfg(unix)]
+    if disk.o_direct {
+        options.custom_flags(libc::O_DIRECT);
+    }
+
+    let raw_image: File = open_file(&disk.path, &options)
         .with_context(|| format!("failed to load disk image {}", disk.path.display()))?;
     // Lock the disk image to prevent other crosvm instances from using it.
     let lock_op = if disk.read_only {
@@ -228,6 +238,7 @@ pub fn create_vvu_proxy_device(cfg: &Config, opt: &VvuOption, tube: Tube) -> Dev
         listener,
         tube,
         opt.addr,
+        opt.uuid,
     )
     .context("failed to create VVU proxy device")?;
 
@@ -779,7 +790,7 @@ pub fn create_vhost_vsock_device(cfg: &Config, cid: u64) -> DeviceResult {
     {
         VhostVsockDeviceParameter::Fd(fd) => {
             let fd = validate_raw_descriptor(*fd)
-                .context("failed to validate fd for virtual socker device")?;
+                .context("failed to validate fd for virtual socket device")?;
             // Safe because the `fd` is actually owned by this process and
             // we have a unique handle to it.
             unsafe { File::from_raw_fd(fd) }
@@ -893,8 +904,11 @@ pub fn create_pmem_device(
     index: usize,
     pmem_device_tube: Tube,
 ) -> DeviceResult {
-    let fd = open_file(&disk.path, disk.read_only, false /*O_DIRECT*/)
-        .with_context(|| format!("failed to load disk image {}", disk.path.display()))?;
+    let fd = open_file(
+        &disk.path,
+        OpenOptions::new().read(true).write(!disk.read_only),
+    )
+    .with_context(|| format!("failed to load disk image {}", disk.path.display()))?;
 
     let (disk_size, arena_size) = {
         let metadata = std::fs::metadata(&disk.path).with_context(|| {
@@ -1016,6 +1030,20 @@ pub fn create_iommu_device(
     })
 }
 
+fn add_bind_mounts(param: &SerialParameters, jail: &mut Minijail) -> Result<(), minijail::Error> {
+    if let Some(path) = &param.path {
+        if let SerialType::SystemSerialType = param.type_ {
+            if let Some(parent) = path.as_path().parent() {
+                if parent.exists() {
+                    info!("Bind mounting dir {}", parent.display());
+                    jail.mount_bind(parent, parent, true)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn create_console_device(cfg: &Config, param: &SerialParameters) -> DeviceResult {
     let mut keep_rds = Vec::new();
     let evt = Event::new().context("failed to create event")?;
@@ -1036,7 +1064,7 @@ pub fn create_console_device(cfg: &Config, param: &SerialParameters) -> DeviceRe
                 "size=67108864",
             )?;
             add_current_user_to_jail(&mut jail)?;
-            let res = param.add_bind_mounts(&mut jail);
+            let res = add_bind_mounts(param, &mut jail);
             if res.is_err() {
                 error!("failed to add bind mounts for console device");
             }
@@ -1069,6 +1097,7 @@ pub fn create_vfio_device(
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
     bus_num: Option<u8>,
+    guest_address: Option<PciAddress>,
     iommu_endpoints: &mut BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>>,
     coiommu_endpoints: Option<&mut Vec<u16>>,
     iommu_dev: IommuDevType,
@@ -1108,6 +1137,7 @@ pub fn create_vfio_device(
     let mut vfio_pci_device = Box::new(VfioPciDevice::new(
         vfio_device,
         bus_num,
+        guest_address,
         vfio_device_tube_msi,
         vfio_device_tube_msix,
         vfio_device_tube_mem,
@@ -1201,7 +1231,11 @@ pub fn setup_virtio_access_platform(
                 let CreateIpcMapperRet {
                     mapper: ipc_mapper,
                     response_tx,
-                } = create_ipc_mapper(endpoint_id, request_tx.try_clone()?);
+                } = create_ipc_mapper(
+                    endpoint_id,
+                    #[allow(deprecated)]
+                    request_tx.try_clone()?,
+                );
                 translate_response_senders
                     .get_or_insert_with(BTreeMap::new)
                     .insert(endpoint_id, response_tx);

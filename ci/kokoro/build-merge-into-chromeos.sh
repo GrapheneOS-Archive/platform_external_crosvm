@@ -66,7 +66,7 @@ get_previous_merge_id() {
     )
     # Pick the one that was created last.
     query_changes "${query[@]}" |
-        jq --raw-output 'sort_by(.created)[-1].change_id'
+        jq --raw-output 'sort_by(.created)[-1].id'
 }
 
 get_last_change_in_chain() {
@@ -77,14 +77,15 @@ get_last_change_in_chain() {
     # The list of commits is sorted by the git commit order, with the latest
     # change first and includes the current change.
     local last_change
-    last_change=$(query_related_changes "$change_id" | jq --raw-output \
-        "[.changes[] | select(.status == \"NEW\")][0].change_id")
+    last_change=$(query_related_changes "$change_id" |
+        jq --raw-output "[.changes[] | select(.status == \"NEW\")][0].change_id")
 
     # If there are no related changes the list will be empty.
     if [ "$last_change" == "null" ]; then
         echo "${change_id}"
     else
-        echo "${last_change}"
+        # The related API does not give us the unique ID of changes. Build it manually.
+        echo "chromiumos%2Fplatform%2Fcrosvm~chromeos~${last_change}"
     fi
 }
 
@@ -110,7 +111,7 @@ get_dry_run_ids() {
         owner:crosvm-bot@crosvm-packages.iam.gserviceaccount.com
     )
     query_changes "${query[@]}" |
-        jq --raw-output '.[].change_id'
+        jq --raw-output '.[].id'
 }
 
 abandon_dry_runs() {
@@ -194,18 +195,21 @@ main() {
         parent_commit="FETCH_HEAD"
     fi
 
-    local merge_count=$(git log --oneline --decorate=no --no-color \
-        "${parent_commit}..origin/main" | wc -l)
-    if [ "${merge_count}" -lt "$MIN_COMMIT_COUNT" ]; then
-        echo "Not enough commits to merge. Skipping."
-        return
-    fi
-
     echo "Checking out parent: ${parent_commit}"
     git checkout -b chromeos "${parent_commit}"
     git branch --set-upstream-to origin/chromeos chromeos
 
-    "${KOKORO_ARTIFACTS_DIR}/create_merge" "origin/main"
+    local merge_count=$(git log --oneline --decorate=no --no-color \
+        "${parent_commit}..origin/main" | wc -l)
+    if [ "${merge_count}" -ge "$MIN_COMMIT_COUNT" ]; then
+        "${KOKORO_ARTIFACTS_DIR}/create_merge" "origin/main"
+    else
+        echo "Not enough commits to merge."
+    fi
+
+    # Rebase to integrate cherry-picks. Always resolve conflicts with content from origin/main.
+    git rebase --rebase-merges -X theirs
+
     upload_with_retries
 
     echo "Abandoning previous dry runs"

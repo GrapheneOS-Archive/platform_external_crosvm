@@ -17,7 +17,7 @@ rust_proc_macro {
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
     srcs: ["poll_token_derive.rs"],
-    edition: "2018",
+    edition: "2021",
     rustlibs: [
         "libproc_macro2",
         "libquote",
