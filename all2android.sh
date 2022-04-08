@@ -5,6 +5,11 @@
 
 set -e
 
+if ! [ -x "$(command -v bpfmt)" ]; then
+  echo 'Error: bpfmt not found.' >&2
+  exit 1
+fi
+
 cargo2android() {
   local C2A=${C2A:-cargo2android.py}
   echo "Using $C2A to run this script."
@@ -15,6 +20,7 @@ cargo2android() {
   else
     $C2A --run --device --tests $@
   fi
+  bpfmt -w Android.bp || /bin/true
   rm -f cargo.out
   rm -rf target.tmp || /bin/true
 }
