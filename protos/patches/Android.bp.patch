@@ -5,7 +5,7 @@ index eaf06cf1..32a8f81b 100644
 @@ -17,7 +17,9 @@ rust_library {
      crate_name: "protos",
      srcs: ["src/lib.rs"],
-     edition: "2018",
+     edition: "2021",
 +    features: ["composite-disk"],
      rustlibs: [
 +        "libcdisk_spec_proto",

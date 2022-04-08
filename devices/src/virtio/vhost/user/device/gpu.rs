@@ -8,11 +8,10 @@ use anyhow::{anyhow, bail, Context};
 use argh::FromArgs;
 use async_task::Task;
 use base::{
-    clone_descriptor, error,
-    net::{UnixSeqpacketListener, UnlinkUnixSeqpacketListener},
-    warn, Event, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor, TimerFd, Tube,
+    clone_descriptor, error, warn, Event, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor,
+    TimerFd, Tube, UnixSeqpacketListener, UnlinkUnixSeqpacketListener,
 };
-use cros_async::{AsyncWrapper, EventAsync, Executor, IoSourceExt, TimerAsync};
+use cros_async::{AsyncTube, AsyncWrapper, EventAsync, Executor, IoSourceExt, TimerAsync};
 use futures::{
     future::{select, Either},
     pin_mut,
@@ -126,7 +125,7 @@ async fn run_resource_bridge(tube: Box<dyn IoSourceExt<Tube>>, state: Rc<RefCell
         }
 
         if let Err(e) = state.borrow_mut().process_resource_bridge(tube.as_source()) {
-            error!("Failed to process resource bridge: {}", e);
+            error!("Failed to process resource bridge: {:#}", e);
             break;
         }
     }
@@ -195,9 +194,10 @@ impl VhostUserBackend for GpuBackend {
     }
 
     fn set_device_request_channel(&mut self, channel: File) -> anyhow::Result<()> {
-        let tube = unsafe { Tube::from_raw_descriptor(channel.into_raw_descriptor()) }
-            .into_async_tube(&self.ex)
-            .context("failed to create AsyncTube")?;
+        let tube = AsyncTube::new(&self.ex, unsafe {
+            Tube::from_raw_descriptor(channel.into_raw_descriptor())
+        })
+        .context("failed to create AsyncTube")?;
 
         // We need a PciAddress in order to initialize the pci bar but this isn't part of the
         // vhost-user protocol. Instead we expect this to be the first message the crosvm main
@@ -213,11 +213,19 @@ impl VhostUserBackend for GpuBackend {
                     }
                 };
 
-                if let Err(e) = tube.send(&response) {
+                if let Err(e) = tube.send(response).await {
                     error!("Failed to send `PciBarConfiguration`: {}", e);
                 }
 
-                gpu.borrow_mut().set_device_tube(tube.into());
+                let device_tube: Tube = match tube.next().await {
+                    Ok(tube) => tube,
+                    Err(e) => {
+                        error!("Failed to get device tube: {}", e);
+                        return;
+                    }
+                };
+
+                gpu.borrow_mut().set_device_tube(device_tube);
             })
             .detach();
 

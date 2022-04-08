@@ -119,7 +119,11 @@ impl Default for GpuParameters {
             gfxstream_use_guest_angle: false,
             gfxstream_use_syncfd: true,
             use_vulkan: false,
-            mode: GpuMode::ModeVirglRenderer,
+            mode: if cfg!(feature = "virgl_renderer") {
+                GpuMode::ModeVirglRenderer
+            } else {
+                GpuMode::Mode2D
+            },
             cache_path: None,
             cache_size: None,
             udmabuf: false,
@@ -930,10 +934,10 @@ impl Worker {
             {
                 if should_process {
                     if let Err(e) = self.state.process_resource_bridge(bridge) {
-                        error!("Failed to process resource bridge: {}", e);
+                        error!("Failed to process resource bridge: {:#}", e);
                         error!("Removing that resource bridge from the wait context.");
                         wait_ctx.delete(bridge).unwrap_or_else(|e| {
-                            error!("Failed to remove faulty resource bridge: {}", e)
+                            error!("Failed to remove faulty resource bridge: {:#}", e)
                         });
                     }
                 }

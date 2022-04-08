@@ -26,11 +26,12 @@ use crate::DeviceRegistrationError;
 /// configured explicitly.
 pub fn set_default_serial_parameters(
     serial_parameters: &mut BTreeMap<(SerialHardware, u8), SerialParameters>,
+    is_vhost_user_console_enabled: bool,
 ) {
     // If no console device exists and the first serial port has not been specified,
     // set the first serial port as a stdout+stdin console.
     let default_console = (SerialHardware::Serial, 1);
-    if !serial_parameters.iter().any(|(_, p)| p.console) {
+    if !serial_parameters.iter().any(|(_, p)| p.console) && !is_vhost_user_console_enabled {
         serial_parameters
             .entry(default_console)
             .or_insert(SerialParameters {
@@ -42,6 +43,7 @@ pub fn set_default_serial_parameters(
                 console: true,
                 earlycon: false,
                 stdin: true,
+                out_timestamp: false,
             });
     }
 
@@ -59,6 +61,7 @@ pub fn set_default_serial_parameters(
             console: false,
             earlycon: false,
             stdin: false,
+            out_timestamp: false,
         });
     }
 }
@@ -146,6 +149,7 @@ pub type GetSerialCmdlineResult<T> = std::result::Result<T, GetSerialCmdlineErro
 /// Add serial options to the provided `cmdline` based on `serial_parameters`.
 /// `serial_io_type` should be "io" if the platform uses x86-style I/O ports for serial devices
 /// or "mmio" if the serial ports are memory mapped.
+// TODO(b/227407433): Support cases where vhost-user console is specified.
 pub fn get_serial_cmdline(
     cmdline: &mut kernel_cmdline::Cmdline,
     serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
@@ -205,7 +209,7 @@ mod tests {
         let mut cmdline = Cmdline::new(4096);
         let mut serial_parameters = BTreeMap::new();
 
-        set_default_serial_parameters(&mut serial_parameters);
+        set_default_serial_parameters(&mut serial_parameters, false);
         get_serial_cmdline(&mut cmdline, &serial_parameters, "io")
             .expect("get_serial_cmdline failed");
 
@@ -230,10 +234,11 @@ mod tests {
                 console: true,
                 earlycon: false,
                 stdin: true,
+                out_timestamp: false,
             },
         );
 
-        set_default_serial_parameters(&mut serial_parameters);
+        set_default_serial_parameters(&mut serial_parameters, false);
         get_serial_cmdline(&mut cmdline, &serial_parameters, "io")
             .expect("get_serial_cmdline failed");
 
@@ -258,6 +263,7 @@ mod tests {
                 console: true,
                 earlycon: false,
                 stdin: true,
+                out_timestamp: false,
             },
         );
 
@@ -273,10 +279,11 @@ mod tests {
                 console: false,
                 earlycon: true,
                 stdin: false,
+                out_timestamp: false,
             },
         );
 
-        set_default_serial_parameters(&mut serial_parameters);
+        set_default_serial_parameters(&mut serial_parameters, false);
         get_serial_cmdline(&mut cmdline, &serial_parameters, "io")
             .expect("get_serial_cmdline failed");
 
@@ -302,10 +309,11 @@ mod tests {
                 console: false,
                 earlycon: true,
                 stdin: true,
+                out_timestamp: false,
             },
         );
 
-        set_default_serial_parameters(&mut serial_parameters);
+        set_default_serial_parameters(&mut serial_parameters, false);
         get_serial_cmdline(&mut cmdline, &serial_parameters, "io")
             .expect_err("get_serial_cmdline succeeded");
     }
