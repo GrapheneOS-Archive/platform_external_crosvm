@@ -4,6 +4,7 @@
 
 //! Implement a userspace PCI device driver for the virtio vhost-user device.
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,23 +12,19 @@ use anyhow::{anyhow, bail, Context, Result};
 use base::{info, Event};
 use data_model::DataInit;
 use memoffset::offset_of;
+use resources::Alloc;
 use vfio_sys::*;
 use virtio_sys::vhost::VIRTIO_F_VERSION_1;
 
-use crate::pci::{MsixCap, PciCapabilityID, CAPABILITY_LIST_HEAD_OFFSET};
+use crate::pci::{MsixCap, PciAddress, PciCapabilityID, CAPABILITY_LIST_HEAD_OFFSET};
 use crate::vfio::{VfioDevice, VfioPciConfig, VfioRegionAddr};
 use crate::virtio::vhost::user::device::vvu::{
-    bus::PciSlot,
-    queue::{DescTableAddrs, UserQueue},
+    bus::open_vfio_device,
+    queue::{DescTableAddrs, IovaAllocator, UserQueue},
 };
 use crate::virtio::{PciCapabilityType, VirtioPciCap};
 
 const VIRTIO_CONFIG_STATUS_RESET: u8 = 0;
-
-/// Getting constant definitions from `linux/pci_regs.h`.`
-const PCI_COMMAND: u32 = 0x4;
-/// Enable bus mastering
-const PCI_COMMAND_MASTER: u16 = 0x4;
 
 fn get_pci_cap_addr(cap: &VirtioPciCap) -> Result<VfioRegionAddr> {
     const PCI_MAX_RESOURCE: u8 = 6;
@@ -88,6 +85,7 @@ struct virtio_pci_notification_cfg {
 
 unsafe impl DataInit for virtio_pci_notification_cfg {}
 
+#[derive(Clone)]
 pub struct VvuPciCaps {
     msix_table_size: u16,
     common_cfg_addr: VfioRegionAddr,
@@ -227,7 +225,6 @@ impl QueueNotifier {
 
 pub struct VvuPciDevice {
     pub vfio_dev: Arc<VfioDevice>,
-    config: VfioPciConfig,
     pub caps: VvuPciCaps,
     pub queues: Vec<UserQueue>,
     pub queue_notifiers: Vec<QueueNotifier>,
@@ -249,17 +246,23 @@ impl VvuPciDevice {
     /// * `pci_id` - PCI device ID such as `"0000:00:05.0"`.
     /// * `device_vq_num` - number of virtqueues that the device backend (e.g. block) may use.
     pub fn new(pci_id: &str, device_vq_num: usize) -> Result<Self> {
-        let slot = PciSlot::new(pci_id)?;
-        let vfio_dev = Arc::new(slot.open()?);
+        let pci_address = PciAddress::from_str(pci_id).context("failed to parse PCI address")?;
+        let vfio_dev = Arc::new(open_vfio_device(pci_address)?);
         let config = VfioPciConfig::new(vfio_dev.clone());
         let caps = VvuPciCaps::new(&config)?;
         vfio_dev
             .check_device_info()
             .context("failed to check VFIO device information")?;
 
+        let page_mask = vfio_dev
+            .vfio_get_iommu_page_size_mask()
+            .context("failed to get iommu page size mask")?;
+        if page_mask & (base::pagesize() as u64) == 0 {
+            bail!("Unsupported iommu page mask {:x}", page_mask);
+        }
+
         let mut pci_dev = Self {
             vfio_dev,
-            config,
             caps,
             queues: vec![],
             queue_notifiers: vec![],
@@ -267,21 +270,10 @@ impl VvuPciDevice {
             notification_evts: vec![],
         };
 
+        config.set_bus_master();
         pci_dev.init(device_vq_num)?;
 
         Ok(pci_dev)
-    }
-
-    fn set_bus_master(&self) {
-        let mut cmd: u16 = self.config.read_config(PCI_COMMAND);
-
-        if cmd & PCI_COMMAND_MASTER != 0 {
-            return;
-        }
-
-        cmd |= PCI_COMMAND_MASTER;
-
-        self.config.write_config(cmd, PCI_COMMAND);
     }
 
     fn set_status(&self, status: u8) {
@@ -326,7 +318,7 @@ impl VvuPciDevice {
             QueueType::Rx => true,
             QueueType::Tx => false,
         };
-        let queue = UserQueue::new(queue_size, device_writable)?;
+        let queue = UserQueue::new(queue_size, device_writable, typ as u8, self)?;
         let DescTableAddrs { desc, avail, used } = queue.desc_table_addrs()?;
 
         let desc_lo = (desc & 0xffffffff) as u32;
@@ -402,12 +394,12 @@ impl VvuPciDevice {
         }
 
         let mut msix_vec = Vec::with_capacity(msix_num);
-        msix_vec.push(&vvu_irqs[0]);
-        msix_vec.push(&vvu_irqs[1]);
-        msix_vec.extend(notification_evts.iter().take(device_vq_num));
+        msix_vec.push(Some(&vvu_irqs[0]));
+        msix_vec.push(Some(&vvu_irqs[1]));
+        msix_vec.extend(notification_evts.iter().take(device_vq_num).map(Some));
 
         self.vfio_dev
-            .irq_enable(&msix_vec, VFIO_PCI_MSIX_IRQ_INDEX)
+            .irq_enable(&msix_vec, VFIO_PCI_MSIX_IRQ_INDEX, 0)
             .map_err(|e| anyhow!("failed to enable irq: {}", e))?;
 
         // Registers VVU virtqueue's irqs by writing `queue_msix_vector`.
@@ -445,8 +437,6 @@ impl VvuPciDevice {
     }
 
     fn init(&mut self, device_vq_num: usize) -> Result<()> {
-        self.set_bus_master();
-
         self.set_status(VIRTIO_CONFIG_STATUS_RESET as u8);
         // Wait until reset is done with timeout.
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -508,5 +498,19 @@ impl VvuPciDevice {
 
         info!("vvu device started");
         Ok(())
+    }
+}
+
+impl IovaAllocator for VvuPciDevice {
+    fn alloc_iova(&self, size: u64, tag: u8) -> Result<u64> {
+        self.vfio_dev
+            .alloc_iova(size, base::pagesize() as u64, Alloc::VvuQueue(tag))
+            .context("failed to find an iova region to map the gpa region to")
+    }
+
+    unsafe fn map_iova(&self, iova: u64, size: u64, addr: *const u8) -> Result<()> {
+        self.vfio_dev
+            .vfio_dma_map(iova, size, addr as u64, true)
+            .context("failed to map iova")
     }
 }
