@@ -600,7 +600,7 @@ impl PciDevice for VirtioPciDevice {
         let mut ranges: Vec<BarRange> = Vec::new();
         for config in self.device.get_device_bars(address) {
             let device_addr = resources
-                .mmio_allocator_any()
+                .mmio_allocator(MmioType::High)
                 .allocate_with_align(
                     config.size(),
                     Alloc::PciBar {
