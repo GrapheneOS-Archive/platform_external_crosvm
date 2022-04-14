@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cmp::{max, min};
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::path::PathBuf;
@@ -15,8 +14,7 @@ use std::u32;
 use base::Error as SysError;
 use base::Result as SysResult;
 use base::{
-    error, info, iov_max, warn, AsRawDescriptor, Event, PollToken, RawDescriptor, Timer, Tube,
-    WaitContext,
+    error, info, warn, AsRawDescriptor, Event, PollToken, RawDescriptor, Timer, Tube, WaitContext,
 };
 use data_model::DataInit;
 use disk::DiskFile;
@@ -30,8 +28,8 @@ use vm_memory::GuestMemory;
 
 use super::common::*;
 use crate::virtio::{
-    copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt,
-    VirtioDevice, Writer, TYPE_BLOCK,
+    block::sys::*, copy_config, DescriptorChain, DescriptorError, Interrupt, Queue, Reader,
+    SignalableInterrupt, VirtioDevice, Writer, TYPE_BLOCK,
 };
 
 const QUEUE_SIZE: u16 = 256;
@@ -440,12 +438,7 @@ impl Block {
 
         let avail_features = build_avail_features(base_features, read_only, sparse, false);
 
-        let seg_max = min(max(iov_max(), 1), u32::max_value() as usize) as u32;
-
-        // Since we do not currently support indirect descriptors, the maximum
-        // number of segments must be smaller than the queue size.
-        // In addition, the request header and status each consume a descriptor.
-        let seg_max = min(seg_max, u32::from(QUEUE_SIZE) - 2);
+        let seg_max = get_seg_max(QUEUE_SIZE);
 
         Ok(Block {
             kill_evt: None,

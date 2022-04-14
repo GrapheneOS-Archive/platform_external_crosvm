@@ -377,23 +377,23 @@ impl arch::LinuxArch for AArch64 {
 
         Self::add_arch_devs(irq_chip.as_irq_chip_mut(), &mmio_bus)?;
 
-        let com_evt_1_3 = Event::new().map_err(Error::CreateEvent)?;
-        let com_evt_2_4 = Event::new().map_err(Error::CreateEvent)?;
+        let com_evt_1_3 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
+        let com_evt_2_4 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
         arch::add_serial_devices(
             components.protected_vm,
             &mmio_bus,
-            &com_evt_1_3,
-            &com_evt_2_4,
+            &com_evt_1_3.get_trigger(),
+            &com_evt_2_4.get_trigger(),
             serial_parameters,
             serial_jail,
         )
         .map_err(Error::CreateSerialDevices)?;
 
         irq_chip
-            .register_irq_event(AARCH64_SERIAL_1_3_IRQ, &com_evt_1_3, None)
+            .register_edge_irq_event(AARCH64_SERIAL_1_3_IRQ, &com_evt_1_3)
             .map_err(Error::RegisterIrqfd)?;
         irq_chip
-            .register_irq_event(AARCH64_SERIAL_2_4_IRQ, &com_evt_2_4, None)
+            .register_edge_irq_event(AARCH64_SERIAL_2_4_IRQ, &com_evt_2_4)
             .map_err(Error::RegisterIrqfd)?;
 
         mmio_bus
@@ -556,9 +556,9 @@ impl AArch64 {
     /// * `irq_chip` - The IRQ chip to add irqs to.
     /// * `bus` - The bus to add devices to.
     fn add_arch_devs(irq_chip: &mut dyn IrqChip, bus: &Bus) -> Result<()> {
-        let rtc_evt = Event::new().map_err(Error::CreateEvent)?;
+        let rtc_evt = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
         irq_chip
-            .register_irq_event(AARCH64_RTC_IRQ, &rtc_evt, None)
+            .register_edge_irq_event(AARCH64_RTC_IRQ, &rtc_evt)
             .map_err(Error::RegisterIrqfd)?;
 
         let rtc = Arc::new(Mutex::new(devices::pl030::Pl030::new(rtc_evt)));

@@ -9,13 +9,11 @@ use std::{
     time::Duration,
 };
 
+use crate::descriptor::{AsRawDescriptor, FromRawDescriptor, SafeDescriptor};
 use crate::{
-    platform::{
-        deserialize_with_descriptors, AsRawDescriptor, RawDescriptor, SerializeDescriptors,
-    },
+    platform::{deserialize_with_descriptors, RawDescriptor, SerializeDescriptors},
     tube::{Error, RecvTube, Result, SendTube},
-    BlockingMode, CloseNotifier, FramingMode, FromRawDescriptor, PollToken, ReadNotifier,
-    SafeDescriptor, StreamChannel,
+    BlockingMode, CloseNotifier, FramingMode, PollToken, ReadNotifier, StreamChannel,
 };
 use data_model::DataInit;
 use lazy_static::lazy_static;
@@ -139,7 +137,7 @@ impl Tube {
     }
 
     pub fn recv<T: DeserializeOwned>(&self) -> Result<T> {
-        deserialize_and_recv(|buf| (&*&self.socket).read(buf))
+        deserialize_and_recv(|buf| (&self.socket).read(buf))
     }
 
     /// NOTE: On Windows this will only succeed if called on a server pipe. See #pair

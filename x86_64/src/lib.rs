@@ -1327,28 +1327,18 @@ impl X8664arch {
         let pcie_vcfg = aml::Name::new("VCFG".into(), &Self::get_pcie_vcfg_mmio_base(mem));
         pcie_vcfg.to_aml_bytes(&mut amls);
 
-        let pm_sci_evt = Event::new().map_err(Error::CreateEvent)?;
-        let pm_sci_evt_resample = Event::new().map_err(Error::CreateEvent)?;
+        let pm_sci_evt = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
         irq_chip
-            .register_irq_event(sci_irq, &pm_sci_evt, Some(&pm_sci_evt_resample))
+            .register_level_irq_event(sci_irq, &pm_sci_evt)
             .map_err(Error::RegisterIrqfd)?;
 
         #[cfg(feature = "direct")]
         let direct_gpe_info = if direct_gpe.is_empty() {
             None
         } else {
-            let direct_sci_evt = Event::new().map_err(Error::CreateEvent)?;
-            let direct_sci_evt_resample = Event::new().map_err(Error::CreateEvent)?;
-
-            let mut sci_devirq = devices::DirectIrq::new(
-                direct_sci_evt.try_clone().map_err(Error::CloneEvent)?,
-                Some(
-                    direct_sci_evt_resample
-                        .try_clone()
-                        .map_err(Error::CloneEvent)?,
-                ),
-            )
-            .map_err(Error::CreateGpe)?;
+            let direct_sci_evt = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
+            let mut sci_devirq =
+                devices::DirectIrq::new_level(&direct_sci_evt).map_err(Error::CreateGpe)?;
 
             sci_devirq.sci_irq_prepare().map_err(Error::CreateGpe)?;
 
@@ -1358,12 +1348,11 @@ impl X8664arch {
                     .map_err(Error::CreateGpe)?;
             }
 
-            Some((direct_sci_evt, direct_sci_evt_resample, direct_gpe))
+            Some((direct_sci_evt, direct_gpe))
         };
 
         let mut pmresource = devices::ACPIPMResource::new(
             pm_sci_evt,
-            pm_sci_evt_resample,
             #[cfg(feature = "direct")]
             direct_gpe_info,
             suspend_evt,
@@ -1454,24 +1443,24 @@ impl X8664arch {
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
     ) -> Result<()> {
-        let com_evt_1_3 = Event::new().map_err(Error::CreateEvent)?;
-        let com_evt_2_4 = Event::new().map_err(Error::CreateEvent)?;
+        let com_evt_1_3 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
+        let com_evt_2_4 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
 
         arch::add_serial_devices(
             protected_vm,
             io_bus,
-            &com_evt_1_3,
-            &com_evt_2_4,
+            com_evt_1_3.get_trigger(),
+            com_evt_2_4.get_trigger(),
             serial_parameters,
             serial_jail,
         )
         .map_err(Error::CreateSerialDevices)?;
 
         irq_chip
-            .register_irq_event(X86_64_SERIAL_1_3_IRQ, &com_evt_1_3, None)
+            .register_edge_irq_event(X86_64_SERIAL_1_3_IRQ, &com_evt_1_3)
             .map_err(Error::RegisterIrqfd)?;
         irq_chip
-            .register_irq_event(X86_64_SERIAL_2_4_IRQ, &com_evt_2_4, None)
+            .register_edge_irq_event(X86_64_SERIAL_2_4_IRQ, &com_evt_2_4)
             .map_err(Error::RegisterIrqfd)?;
 
         Ok(())
