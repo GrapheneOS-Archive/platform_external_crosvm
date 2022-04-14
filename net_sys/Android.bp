@@ -21,24 +21,6 @@ rust_library {
     edition: "2021",
     rustlibs: [
         "libbase_rust",
-    ],
-}
-
-rust_test {
-    name: "net_sys_test_src_lib",
-    defaults: ["crosvm_defaults"],
-    host_supported: true,
-    crate_name: "net_sys",
-    cargo_env_compat: true,
-    cargo_pkg_version: "0.1.0",
-    srcs: ["src/lib.rs"],
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-    test_options: {
-        unit_test: true,
-    },
-    edition: "2021",
-    rustlibs: [
-        "libbase_rust",
+        "liblibc",
     ],
 }
