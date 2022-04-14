@@ -36,7 +36,7 @@ pub use balloon_control::BalloonStats;
 use balloon_control::{BalloonTubeCommand, BalloonTubeResult};
 
 use base::{
-    error, with_as_descriptor, AsRawDescriptor, Error as SysError, Event, ExternalMapping, Fd,
+    error, with_as_descriptor, AsRawDescriptor, Error as SysError, Event, ExternalMapping,
     FromRawDescriptor, IntoRawDescriptor, Killable, MappedRegion, MemoryMappingArena,
     MemoryMappingBuilder, MemoryMappingBuilderUnix, MmapError, Protection, Result, SafeDescriptor,
     SharedMemory, Tube, SIGRTMIN,
@@ -525,6 +525,9 @@ pub enum VmIrqRequest {
     /// Allocate one gsi, and associate gsi to irqfd with register_irqfd()
     AllocateOneMsi {
         irqfd: Event,
+        device_id: u32,
+        queue_id: usize,
+        device_name: String,
     },
     /// Add one msi route entry into the IRQ chip.
     AddMsiRoute {
@@ -543,7 +546,7 @@ pub enum VmIrqRequest {
 /// VmIrqRequest::execute can't take an `IrqChip` argument, because of a dependency cycle between
 /// devices and vm_control, so it takes a Fn that processes an `IrqSetup`.
 pub enum IrqSetup<'a> {
-    Event(u32, &'a Event),
+    Event(u32, &'a Event, u32, usize, String),
     Route(IrqRoute),
     UnRegister(u32, &'a Event),
 }
@@ -563,9 +566,20 @@ impl VmIrqRequest {
     {
         use self::VmIrqRequest::*;
         match *self {
-            AllocateOneMsi { ref irqfd } => {
+            AllocateOneMsi {
+                ref irqfd,
+                device_id,
+                queue_id,
+                ref device_name,
+            } => {
                 if let Some(irq_num) = sys_allocator.allocate_irq() {
-                    match set_up_irq(IrqSetup::Event(irq_num, irqfd)) {
+                    match set_up_irq(IrqSetup::Event(
+                        irq_num,
+                        irqfd,
+                        device_id,
+                        queue_id,
+                        device_name.clone(),
+                    )) {
                         Ok(_) => VmIrqResponse::AllocateOneMsi { gsi: irq_num },
                         Err(e) => VmIrqResponse::Err(e),
                     }
@@ -922,13 +936,11 @@ impl FsMappingRequest {
                 prot,
                 mem_offset,
             } => {
-                let raw_fd: Fd = Fd(fd.as_raw_descriptor());
-
                 match vm.add_fd_mapping(
                     slot,
                     mem_offset,
                     size,
-                    &raw_fd,
+                    fd,
                     file_offset,
                     Protection::from(prot as c_int & (libc::PROT_READ | libc::PROT_WRITE)),
                 ) {

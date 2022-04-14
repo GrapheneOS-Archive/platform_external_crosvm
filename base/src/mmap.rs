@@ -2,9 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use crate::descriptor::AsRawDescriptor;
 use crate::{
-    platform::MemoryMapping as SysUtilMmap, wrap_descriptor, AsRawDescriptor, MappedRegion,
-    MemoryMappingArena, MmapError, Protection, SharedMemory,
+    platform::MemoryMapping as SysUtilMmap, MappedRegion, MemoryMappingArena, MmapError,
+    Protection, SharedMemory,
 };
 use data_model::{volatile_memory::*, DataInit};
 use std::fs::File;
@@ -49,8 +50,7 @@ impl MemoryMapping {
         src: &dyn AsRawDescriptor,
         count: usize,
     ) -> Result<()> {
-        self.mapping
-            .read_to_memory(mem_offset, &wrap_descriptor(src), count)
+        self.mapping.read_to_memory(mem_offset, src, count)
     }
 
     pub fn write_from_memory(
@@ -59,8 +59,7 @@ impl MemoryMapping {
         dst: &dyn AsRawDescriptor,
         count: usize,
     ) -> Result<()> {
-        self.mapping
-            .write_from_memory(mem_offset, &wrap_descriptor(dst), count)
+        self.mapping.write_from_memory(mem_offset, dst, count)
     }
 }
 
@@ -170,7 +169,7 @@ impl<'a> MemoryMappingBuilder<'a> {
             }
             Some(descriptor) => {
                 MemoryMappingBuilder::wrap(SysUtilMmap::from_fd_offset_protection_populate(
-                    &wrap_descriptor(descriptor),
+                    descriptor,
                     self.size,
                     self.offset.unwrap_or(0),
                     self.protection.unwrap_or_else(Protection::read_write),
@@ -203,7 +202,7 @@ impl<'a> MemoryMappingBuilder<'a> {
             Some(descriptor) => {
                 MemoryMappingBuilder::wrap(SysUtilMmap::from_fd_offset_protection_fixed(
                     addr,
-                    &wrap_descriptor(descriptor),
+                    descriptor,
                     self.size,
                     self.offset.unwrap_or(0),
                     self.protection.unwrap_or_else(Protection::read_write),
