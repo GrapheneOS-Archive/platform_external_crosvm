@@ -23,7 +23,10 @@ dirs=(
     devices/src/virtio/gpu
     kernel_loader
     kvm_sys
-    libvda
+    media/libvda
+    net_sys
+    vfio_sys
+    virtio_sys
 )
 
 for d in "${dirs[@]}"; do

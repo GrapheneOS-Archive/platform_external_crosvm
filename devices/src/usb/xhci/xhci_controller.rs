@@ -14,7 +14,8 @@ use crate::usb::xhci::xhci::Xhci;
 use crate::usb::xhci::xhci_backend_device_provider::XhciBackendDeviceProvider;
 use crate::usb::xhci::xhci_regs::{init_xhci_mmio_space_and_regs, XhciRegs};
 use crate::utils::FailHandle;
-use base::{error, AsRawDescriptor, Event, RawDescriptor};
+use crate::IrqLevelEvent;
+use base::{error, AsRawDescriptor, RawDescriptor};
 use resources::{Alloc, MmioType, SystemAllocator};
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,8 +82,7 @@ enum XhciControllerState {
     },
     IrqAssigned {
         device_provider: HostBackendDeviceProvider,
-        irq_evt: Event,
-        irq_resample_evt: Event,
+        irq_evt: IrqLevelEvent,
     },
     Initialized {
         mmio: RegisterSpace,
@@ -131,7 +131,6 @@ impl XhciController {
             XhciControllerState::IrqAssigned {
                 device_provider,
                 irq_evt,
-                irq_resample_evt,
             } => {
                 let (mmio, regs) = init_xhci_mmio_space_and_regs();
                 let fail_handle: Arc<dyn FailHandle> = Arc::new(XhciFailHandle::new(&regs));
@@ -140,7 +139,6 @@ impl XhciController {
                     self.mem.clone(),
                     device_provider,
                     irq_evt,
-                    irq_resample_evt,
                     regs,
                 ) {
                     Ok(xhci) => Some(xhci),
@@ -193,11 +191,10 @@ impl PciDevice for XhciController {
             XhciControllerState::IrqAssigned {
                 device_provider,
                 irq_evt,
-                irq_resample_evt,
             } => {
                 let mut keep_rds = device_provider.keep_rds();
-                keep_rds.push(irq_evt.as_raw_descriptor());
-                keep_rds.push(irq_resample_evt.as_raw_descriptor());
+                keep_rds.push(irq_evt.get_trigger().as_raw_descriptor());
+                keep_rds.push(irq_evt.get_resample().as_raw_descriptor());
                 keep_rds
             }
             _ => {
@@ -209,8 +206,7 @@ impl PciDevice for XhciController {
 
     fn assign_irq(
         &mut self,
-        irq_evt: &Event,
-        irq_resample_evt: &Event,
+        irq_evt: &IrqLevelEvent,
         irq_num: Option<u32>,
     ) -> Option<(u32, PciInterruptPin)> {
         let gsi = irq_num?;
@@ -224,7 +220,6 @@ impl PciDevice for XhciController {
                 self.state = XhciControllerState::IrqAssigned {
                     device_provider,
                     irq_evt: irq_evt.try_clone().ok()?,
-                    irq_resample_evt: irq_resample_evt.try_clone().ok()?,
                 }
             }
             _ => {

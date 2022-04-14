@@ -7,8 +7,9 @@ use super::super::{
         PipeConnection, {self},
     },
     stream_channel::{BlockingMode, FramingMode},
-    AsRawDescriptor, CloseNotifier, Event, MultiProcessMutex, RawDescriptor, ReadNotifier, Result,
+    CloseNotifier, Event, MultiProcessMutex, RawDescriptor, ReadNotifier, Result,
 };
+use crate::descriptor::AsRawDescriptor;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 use std::{cell::RefCell, io, sync::Arc};
 use sync::Mutex;
@@ -451,7 +452,7 @@ mod test {
         let writer = std::thread::spawn(move || {
             let buf = [0u8; 100];
             for _ in 0..NUM_OPS {
-                writer.write(&buf).unwrap();
+                assert_eq!(writer.write(&buf).unwrap(), buf.len());
             }
             writer
         });
