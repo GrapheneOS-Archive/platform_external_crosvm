@@ -14,13 +14,13 @@ use thiserror::Error;
 use crate::bus::{BusDeviceObj, BusRange, BusType, ConfigWriteResult};
 use crate::pci::pci_configuration::{
     self, PciBarConfiguration, BAR0_REG, COMMAND_REG, COMMAND_REG_IO_SPACE_MASK,
-    COMMAND_REG_MEMORY_SPACE_MASK, NUM_BAR_REGS, ROM_BAR_REG,
+    COMMAND_REG_MEMORY_SPACE_MASK, NUM_BAR_REGS, PCI_ID_REG, ROM_BAR_REG,
 };
 use crate::pci::{PciAddress, PciAddressError, PciInterruptPin};
 use crate::virtio::ipc_memory_mapper::IpcMemoryMapper;
 #[cfg(feature = "audio")]
 use crate::virtio::snd::vios_backend::Error as VioSError;
-use crate::{BusAccessInfo, BusDevice};
+use crate::{BusAccessInfo, BusDevice, IrqLevelEvent};
 
 #[sorted]
 #[derive(Error, Debug)]
@@ -96,8 +96,7 @@ pub trait PciDevice: Send {
     /// If legacy INTx is used, function shall return requested IRQ number and PCI INTx pin.
     fn assign_irq(
         &mut self,
-        _irq_evt: &Event,
-        _irq_resample_evt: &Event,
+        _irq_evt: &IrqLevelEvent,
         _irq_num: Option<u32>,
     ) -> Option<(u32, PciInterruptPin)> {
         None
@@ -197,6 +196,11 @@ pub trait PciDevice: Send {
 impl<T: PciDevice> BusDevice for T {
     fn debug_label(&self) -> String {
         PciDevice::debug_label(self)
+    }
+
+    fn device_id(&self) -> u32 {
+        // Use the PCI ID for PCI devices, which contains the PCI vendor ID and the PCI device ID
+        PciDevice::read_config_register(self, PCI_ID_REG)
     }
 
     fn read(&mut self, info: BusAccessInfo, data: &mut [u8]) {
@@ -363,11 +367,10 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     }
     fn assign_irq(
         &mut self,
-        irq_evt: &Event,
-        irq_resample_evt: &Event,
+        irq_evt: &IrqLevelEvent,
         irq_num: Option<u32>,
     ) -> Option<(u32, PciInterruptPin)> {
-        (**self).assign_irq(irq_evt, irq_resample_evt, irq_num)
+        (**self).assign_irq(irq_evt, irq_num)
     }
     fn allocate_io_bars(&mut self, resources: &mut SystemAllocator) -> Result<Vec<BarRange>> {
         (**self).allocate_io_bars(resources)

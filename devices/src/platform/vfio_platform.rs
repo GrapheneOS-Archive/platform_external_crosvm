@@ -2,10 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 use crate::vfio::{VfioDevice, VfioError, VfioIrq};
-use crate::{BusAccessInfo, BusDevice, BusDeviceObj};
+use crate::{BusAccessInfo, BusDevice, BusDeviceObj, IrqEdgeEvent, IrqLevelEvent};
+use anyhow::{bail, Context, Result};
 use base::{
-    error, pagesize, AsRawDescriptor, Event, MappedRegion, MemoryMapping, MemoryMappingBuilder,
-    RawDescriptor, Tube,
+    error, pagesize, AsRawDescriptor, AsRawDescriptors, Event, MappedRegion, MemoryMapping,
+    MemoryMappingBuilder, RawDescriptor, Tube,
 };
 use resources::SystemAllocator;
 use std::fs::File;
@@ -22,7 +23,8 @@ struct MmioInfo {
 
 pub struct VfioPlatformDevice {
     device: Arc<VfioDevice>,
-    interrupt_evt: Vec<(Option<Event>, Option<Event>)>,
+    interrupt_edge_evt: Vec<IrqEdgeEvent>,
+    interrupt_level_evt: Vec<IrqLevelEvent>,
     mmio_regions: Vec<MmioInfo>,
     vm_socket_mem: Tube,
     // scratch MemoryMapping to avoid unmap beform vm exit
@@ -61,7 +63,8 @@ impl VfioPlatformDevice {
         let dev = Arc::new(device);
         VfioPlatformDevice {
             device: dev,
-            interrupt_evt: Vec::new(),
+            interrupt_edge_evt: Vec::new(),
+            interrupt_level_evt: Vec::new(),
             mmio_regions: Vec::new(),
             vm_socket_mem: vfio_device_socket_mem,
             mem: Vec::new(),
@@ -76,34 +79,37 @@ impl VfioPlatformDevice {
         irq.flags & VFIO_IRQ_INFO_AUTOMASKED != 0
     }
 
-    pub fn assign_platform_irq(
-        &mut self,
-        irq_evt: Event,
-        irq_resample_evt: Option<Event>,
-        index: u32,
-    ) {
-        if let Err(e) = self.device.irq_enable(&[&irq_evt], index) {
-            error!("platform irq enable failed: {}", e);
-            return;
+    fn setup_irq_resample(&mut self, resample_evt: &Event, index: u32) -> Result<()> {
+        self.device.irq_mask(index).context("Intx mask failed")?;
+        self.device
+            .resample_virq_enable(resample_evt, index)
+            .context("resample enable failed")?;
+        self.device
+            .irq_unmask(index)
+            .context("Intx unmask failed")?;
+        Ok(())
+    }
+
+    pub fn assign_edge_platform_irq(&mut self, irq_evt: &IrqEdgeEvent, index: u32) -> Result<()> {
+        let interrupt_evt = irq_evt.try_clone().context("failed to clone irq event")?;
+        self.device
+            .irq_enable(&[Some(interrupt_evt.get_trigger())], index, 0)
+            .context("platform irq enable failed")?;
+        self.interrupt_edge_evt.push(interrupt_evt);
+        Ok(())
+    }
+
+    pub fn assign_level_platform_irq(&mut self, irq_evt: &IrqLevelEvent, index: u32) -> Result<()> {
+        let interrupt_evt = irq_evt.try_clone().context("failed to clone irq event")?;
+        self.device
+            .irq_enable(&[Some(interrupt_evt.get_trigger())], index, 0)
+            .context("platform irq enable failed")?;
+        if let Err(e) = self.setup_irq_resample(interrupt_evt.get_resample(), index) {
+            self.disable_irqs(index);
+            bail!("failed to set up irq resampling: {}", e);
         }
-        if let Some(ref irq_res_evt) = irq_resample_evt {
-            if let Err(e) = self.device.irq_mask(index) {
-                error!("Intx mask failed: {}", e);
-                self.disable_irqs(index);
-                return;
-            }
-            if let Err(e) = self.device.resample_virq_enable(irq_res_evt, index) {
-                error!("resample enable failed: {}", e);
-                self.disable_irqs(index);
-                return;
-            }
-            if let Err(e) = self.device.irq_unmask(index) {
-                error!("Intx unmask failed: {}", e);
-                self.disable_irqs(index);
-                return;
-            }
-        }
-        self.interrupt_evt.push((Some(irq_evt), irq_resample_evt));
+        self.interrupt_level_evt.push(interrupt_evt);
+        Ok(())
     }
 
     fn find_region(&self, addr: u64) -> Option<MmioInfo> {
@@ -261,14 +267,14 @@ impl VfioPlatformDevice {
     pub fn keep_rds(&self) -> Vec<RawDescriptor> {
         let mut rds = self.device.keep_rds();
 
-        for (irq_evt, itq_res_evt) in self.interrupt_evt.iter() {
-            if let Some(ref interrupt_evt) = irq_evt {
-                rds.push(interrupt_evt.as_raw_descriptor());
-            }
-            if let Some(ref interrupt_resample_evt) = itq_res_evt {
-                rds.push(interrupt_resample_evt.as_raw_descriptor());
-            }
+        for irq_evt in self.interrupt_edge_evt.iter() {
+            rds.extend(irq_evt.as_raw_descriptors());
         }
+
+        for irq_evt in self.interrupt_level_evt.iter() {
+            rds.extend(irq_evt.as_raw_descriptors());
+        }
+
         rds.push(self.vm_socket_mem.as_raw_descriptor());
         rds
     }

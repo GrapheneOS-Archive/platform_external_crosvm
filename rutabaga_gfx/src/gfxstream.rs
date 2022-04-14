@@ -8,12 +8,10 @@
 
 #![cfg(feature = "gfxstream")]
 
-use std::cell::RefCell;
 use std::convert::TryInto;
 use std::mem::{size_of, transmute};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::ptr::{null, null_mut};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use base::{
@@ -31,12 +29,35 @@ use crate::rutabaga_utils::*;
 
 use data_model::VolatileSlice;
 
+#[repr(C)]
+pub struct VirglRendererGlCtxParam {
+    pub version: c_int,
+    pub shared: bool,
+    pub major_ver: c_int,
+    pub minor_ver: c_int,
+}
+
 // In gfxstream, only write_fence is used (for synchronization of commands delivered)
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct GfxstreamRendererCallbacks {
+pub struct VirglRendererCallbacks {
     pub version: c_int,
     pub write_fence: unsafe extern "C" fn(cookie: *mut c_void, fence: u32),
+    pub create_gl_context: Option<
+        unsafe extern "C" fn(
+            cookie: *mut c_void,
+            scanout_idx: c_int,
+            param: *mut VirglRendererGlCtxParam,
+        ) -> *mut c_void,
+    >,
+    pub destroy_gl_context: Option<unsafe extern "C" fn(cookie: *mut c_void, ctx: *mut c_void)>,
+    pub make_current: Option<
+        unsafe extern "C" fn(cookie: *mut c_void, scanout_idx: c_int, ctx: *mut c_void) -> c_int,
+    >,
+
+    pub get_drm_fd: Option<unsafe extern "C" fn(cookie: *mut c_void) -> c_int>,
+    pub write_context_fence:
+        unsafe extern "C" fn(cookie: *mut c_void, fence_id: u64, ctx_id: u32, ring_idx: u8),
 }
 
 #[repr(C)]
@@ -60,7 +81,7 @@ extern "C" {
         display_type: u32,
         renderer_cookie: *mut c_void,
         renderer_flags: i32,
-        renderer_callbacks: *mut GfxstreamRendererCallbacks,
+        renderer_callbacks: *mut VirglRendererCallbacks,
         gfxstream_callbacks: *mut c_void,
     );
 
@@ -70,7 +91,6 @@ extern "C" {
     // forwarding and the notification of new API calls forwarded by the guest, unless they
     // correspond to minigbm resource targets (PIPE_TEXTURE_2D), in which case they create globally
     // visible shared GL textures to support gralloc.
-    fn pipe_virgl_renderer_poll();
     fn pipe_virgl_renderer_resource_create(
         args: *mut virgl_renderer_resource_create_args,
         iov: *mut iovec,
@@ -138,13 +158,11 @@ extern "C" {
     ) -> c_int;
     fn stream_renderer_resource_unmap(res_handle: u32) -> c_int;
     fn stream_renderer_resource_map_info(res_handle: u32, map_info: *mut u32) -> c_int;
+    fn stream_renderer_context_create_fence(fence_id: u64, ctx_id: u32, ring_idx: u8) -> c_int;
 }
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
-pub struct Gfxstream {
-    fence_state: Rc<RefCell<FenceState>>,
-    fence_handler: RutabagaFenceHandler,
-}
+pub struct Gfxstream;
 
 struct GfxstreamContext {
     ctx_id: u32,
@@ -193,6 +211,15 @@ impl RutabagaContext for GfxstreamContext {
     fn component_type(&self) -> RutabagaComponentType {
         RutabagaComponentType::Gfxstream
     }
+
+    fn context_create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
+        // Safe becase only integers are given to gfxstream, not memory.
+        let ret = unsafe {
+            stream_renderer_context_create_fence(fence.fence_id, fence.ctx_id, fence.ring_idx)
+        };
+
+        ret_to_res(ret)
+    }
 }
 
 impl Drop for GfxstreamContext {
@@ -204,9 +231,14 @@ impl Drop for GfxstreamContext {
     }
 }
 
-const GFXSTREAM_RENDERER_CALLBACKS: &GfxstreamRendererCallbacks = &GfxstreamRendererCallbacks {
-    version: 1,
+const GFXSTREAM_RENDERER_CALLBACKS: &VirglRendererCallbacks = &VirglRendererCallbacks {
+    version: 3,
     write_fence,
+    create_gl_context: None,
+    destroy_gl_context: None,
+    make_current: None,
+    get_drm_fd: None,
+    write_context_fence,
 };
 
 fn map_func(resource_id: u32) -> ExternalMappingResult<(u64, usize)> {
@@ -233,14 +265,9 @@ impl Gfxstream {
         gfxstream_flags: GfxstreamFlags,
         fence_handler: RutabagaFenceHandler,
     ) -> RutabagaResult<Box<dyn RutabagaComponent>> {
-        let fence_state = Rc::new(RefCell::new(FenceState {
-            latest_fence: 0,
-            handler: None,
-        }));
-
         let cookie: *mut VirglCookie = Box::into_raw(Box::new(VirglCookie {
-            fence_state: Rc::clone(&fence_state),
             render_server_fd: None,
+            fence_handler: Some(fence_handler),
         }));
 
         unsafe {
@@ -255,10 +282,7 @@ impl Gfxstream {
             );
         }
 
-        Ok(Box::new(Gfxstream {
-            fence_state,
-            fence_handler,
-        }))
+        Ok(Box::new(Gfxstream))
     }
 
     fn map_info(&self, resource_id: u32) -> RutabagaResult<u32> {
@@ -297,15 +321,8 @@ impl RutabagaComponent for Gfxstream {
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
         let ret = unsafe { pipe_virgl_renderer_create_fence(fence.fence_id as i32, fence.ctx_id) };
-        // This can be moved to the cookie once gfxstream directly calls the
-        // write_fence callback in pipe_virgl_renderer_create_fence
-        self.fence_handler.call(fence);
-        ret_to_res(ret)
-    }
 
-    fn poll(&self) -> u32 {
-        unsafe { pipe_virgl_renderer_poll() };
-        self.fence_state.borrow().latest_fence
+        ret_to_res(ret)
     }
 
     fn create_3d(
