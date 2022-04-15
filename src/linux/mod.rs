@@ -15,6 +15,7 @@ use std::ops::RangeInclusive;
 use std::os::unix::net::UnixStream;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ use std::process;
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use std::thread;
 
+use devices::virtio::vhost::vsock::{VhostVsockConfig, VhostVsockDeviceParameter};
 use libc;
 
 use acpi_tables::sdt::SDT;
@@ -77,16 +79,19 @@ use {
 
 mod device_helpers;
 use device_helpers::*;
-mod jail_helpers;
+pub(crate) mod jail_helpers;
 use jail_helpers::*;
 mod vcpu;
 
 #[cfg(feature = "gpu")]
-mod gpu;
+pub(crate) mod gpu;
 #[cfg(feature = "gpu")]
 pub use gpu::GpuRenderServerParameters;
 #[cfg(feature = "gpu")]
 use gpu::*;
+
+#[cfg(target_os = "android")]
+mod android;
 
 // gpu_device_tube is not used when GPU support is disabled.
 #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
@@ -107,6 +112,7 @@ fn create_virtio_devices(
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     vvu_proxy_device_tubes: &mut Vec<Tube>,
+    vvu_proxy_max_sibling_mem_size: u64,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -127,6 +133,7 @@ fn create_virtio_devices(
             cfg,
             opt,
             vvu_proxy_device_tubes.remove(0),
+            vvu_proxy_max_sibling_mem_size,
         )?);
     }
 
@@ -203,7 +210,7 @@ fn create_virtio_devices(
                 .context("failed to set up mouse device")?;
                 devs.push(VirtioDeviceStub {
                     dev: Box::new(dev),
-                    jail: simple_jail(cfg, "input_device")?,
+                    jail: simple_jail(&cfg.jail_config, "input_device")?,
                 });
                 event_devices.push(EventDevice::touchscreen(event_device_socket));
             }
@@ -220,7 +227,7 @@ fn create_virtio_devices(
                 .context("failed to set up keyboard device")?;
                 devs.push(VirtioDeviceStub {
                     dev: Box::new(dev),
-                    jail: simple_jail(cfg, "input_device")?,
+                    jail: simple_jail(&cfg.jail_config, "input_device")?,
                 });
                 event_devices.push(EventDevice::keyboard(event_device_socket));
             }
@@ -281,7 +288,7 @@ fn create_virtio_devices(
     #[cfg(feature = "tpm")]
     {
         if cfg.software_tpm {
-            devs.push(create_tpm_device(cfg)?);
+            devs.push(create_software_tpm_device(cfg)?);
         }
     }
 
@@ -399,7 +406,14 @@ fn create_virtio_devices(
     }
 
     if let Some(cid) = cfg.cid {
-        devs.push(create_vhost_vsock_device(cfg, cid)?);
+        let vhost_config = VhostVsockConfig {
+            device: cfg
+                .vhost_vsock_device
+                .clone()
+                .unwrap_or(VhostVsockDeviceParameter::default()),
+            cid,
+        };
+        devs.push(create_vhost_vsock_device(cfg, &vhost_config)?);
     }
 
     for vhost_user_fs in &cfg.vhost_user_fs {
@@ -468,6 +482,7 @@ fn create_devices(
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     vvu_proxy_device_tubes: &mut Vec<Tube>,
+    vvu_proxy_max_sibling_mem_size: u64,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     let mut balloon_inflate_tube: Option<Tube> = None;
@@ -561,7 +576,7 @@ fn create_devices(
             )
             .context("failed to create coiommu device")?;
 
-            devices.push((Box::new(dev), simple_jail(cfg, "coiommu")?));
+            devices.push((Box::new(dev), simple_jail(&cfg.jail_config, "coiommu")?));
         }
     }
 
@@ -583,6 +598,7 @@ fn create_devices(
         #[cfg(feature = "gpu")]
         render_server_fd,
         vvu_proxy_device_tubes,
+        vvu_proxy_max_sibling_mem_size,
     )?;
 
     for stub in stubs {
@@ -598,7 +614,7 @@ fn create_devices(
     for ac97_param in &cfg.ac97_parameters {
         let dev = Ac97Dev::try_new(vm.get_memory().clone(), ac97_param.clone())
             .context("failed to create ac97 device")?;
-        let jail = simple_jail(cfg, dev.minijail_policy())?;
+        let jail = simple_jail(&cfg.jail_config, dev.minijail_policy())?;
         devices.push((Box::new(dev), jail));
     }
 
@@ -606,7 +622,7 @@ fn create_devices(
     if cfg.usb {
         // Create xhci controller.
         let usb_controller = Box::new(XhciController::new(vm.get_memory().clone(), usb_provider));
-        devices.push((usb_controller, simple_jail(cfg, "xhci")?));
+        devices.push((usb_controller, simple_jail(&cfg.jail_config, "xhci")?));
     }
 
     for params in &cfg.stub_pci_devices {
@@ -680,7 +696,9 @@ fn create_pcie_root_port(
     devices: &mut Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
     hp_vec: &mut Vec<Arc<Mutex<dyn HotPlugBus>>>,
     hp_endpoints_ranges: &mut Vec<RangeInclusive<u32>>,
-    gpe_notify_devs: &mut Vec<(u32, Arc<Mutex<dyn GpeNotify>>)>,
+    // TODO(b/228627457): clippy is incorrectly warning about this Vec, which needs to be a Vec so
+    // we can push into it
+    #[allow(clippy::ptr_arg)] gpe_notify_devs: &mut Vec<(u32, Arc<Mutex<dyn GpeNotify>>)>,
 ) -> Result<()> {
     if host_pcie_rp.is_empty() {
         // user doesn't specify host pcie root port which link to this virtual pcie rp,
@@ -951,6 +969,12 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
     guest_mem.set_memory_policy(mem_policy);
     let kvm = Kvm::new_with_path(&cfg.kvm_device_path).context("failed to create kvm")?;
     let vm = KvmVm::new(&kvm, guest_mem, components.protected_vm).context("failed to create vm")?;
+
+    if !cfg.userspace_msr.is_empty() {
+        vm.enable_userspace_msr()
+            .context("failed to enable userspace MSR handling, do you have kernel 5.10 or later")?;
+    }
+
     // Check that the VM was actually created in protected mode as expected.
     if cfg.protected_vm != ProtectionType::Unprotected && !vm.check_capability(VmCap::Protected) {
         bail!("Failed to create protected VM");
@@ -1013,7 +1037,7 @@ where
     Vcpu: VcpuArch + 'static,
     V: VmArch + 'static,
 {
-    if cfg.sandbox {
+    if cfg.jail_config.is_some() {
         // Printing something to the syslog before entering minijail so that libc's syslogger has a
         // chance to open files necessary for its operation, like `/etc/localtime`. After jailing,
         // access to those files will not be possible.
@@ -1114,7 +1138,7 @@ where
 
     let battery = if cfg.battery_type.is_some() {
         #[cfg_attr(not(feature = "power-monitor-powerd"), allow(clippy::manual_map))]
-        let jail = match simple_jail(&cfg, "battery")? {
+        let jail = match simple_jail(&cfg.jail_config, "battery")? {
             #[cfg_attr(not(feature = "power-monitor-powerd"), allow(unused_mut))]
             Some(mut jail) => {
                 // Setup a bind mount to the system D-Bus socket if the powerd monitor is used.
@@ -1217,16 +1241,20 @@ where
         if !sys_allocator.reserve_irq(*irq) {
             warn!("irq {} already reserved.", irq);
         }
-        let trigger = Event::new().context("failed to create event")?;
-        let resample = Event::new().context("failed to create event")?;
-        irq_chip
-            .register_irq_event(*irq, &trigger, Some(&resample))
-            .unwrap();
-        let direct_irq = devices::DirectIrq::new(trigger, Some(resample))
+        let irq_evt = devices::IrqLevelEvent::new().context("failed to create event")?;
+        irq_chip.register_level_irq_event(*irq, &irq_evt).unwrap();
+        let direct_irq = devices::DirectIrq::new_level(&irq_evt)
             .context("failed to enable interrupt forwarding")?;
         direct_irq
             .irq_enable(*irq)
             .context("failed to enable interrupt forwarding")?;
+
+        if cfg.direct_wake_irq.contains(&irq) {
+            direct_irq
+                .irq_wake_enable(*irq)
+                .context("failed to enable interrupt wake")?;
+        }
+
         irqs.push(direct_irq);
     }
 
@@ -1235,13 +1263,20 @@ where
         if !sys_allocator.reserve_irq(*irq) {
             warn!("irq {} already reserved.", irq);
         }
-        let trigger = Event::new().context("failed to create event")?;
-        irq_chip.register_irq_event(*irq, &trigger, None).unwrap();
-        let direct_irq = devices::DirectIrq::new(trigger, None)
+        let irq_evt = devices::IrqEdgeEvent::new().context("failed to create event")?;
+        irq_chip.register_edge_irq_event(*irq, &irq_evt).unwrap();
+        let direct_irq = devices::DirectIrq::new_edge(&irq_evt)
             .context("failed to enable interrupt forwarding")?;
         direct_irq
             .irq_enable(*irq)
             .context("failed to enable interrupt forwarding")?;
+
+        if cfg.direct_wake_irq.contains(&irq) {
+            direct_irq
+                .irq_wake_enable(*irq)
+                .context("failed to enable interrupt wake")?;
+        }
+
         irqs.push(direct_irq);
     }
 
@@ -1269,6 +1304,7 @@ where
         #[cfg(feature = "gpu")]
         render_server_fd,
         &mut vvu_proxy_device_tubes,
+        components.memory_size,
     )?;
 
     let mut hp_endpoints_ranges: Vec<RangeInclusive<u32>> = Vec::new();
@@ -1352,7 +1388,7 @@ where
         &reset_evt,
         &mut sys_allocator,
         &cfg.serial_parameters,
-        simple_jail(&cfg, "serial")?,
+        simple_jail(&cfg.jail_config, "serial")?,
         battery,
         vm,
         ramoops_region,
@@ -1452,8 +1488,7 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     let host_str = host_os_str
         .to_str()
         .ok_or_else(|| anyhow!("failed to parse or find vfio path"))?;
-    let host_addr =
-        PciAddress::from_string(host_str).context("failed to parse vfio pci address")?;
+    let host_addr = PciAddress::from_str(host_str).context("failed to parse vfio pci address")?;
 
     let (hp_bus, bus_num) = get_hp_bus(linux, host_addr)?;
 
@@ -1520,8 +1555,7 @@ fn remove_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     let host_str = host_os_str
         .to_str()
         .ok_or_else(|| anyhow!("failed to parse or find vfio path"))?;
-    let host_addr =
-        PciAddress::from_string(host_str).context("failed to parse vfio pci address")?;
+    let host_addr = PciAddress::from_str(host_str).context("failed to parse vfio pci address")?;
     let host_key = HostHotPlugKey::Vfio { host_addr };
     for hp_bus in linux.hotplug_bus.iter() {
         let mut hp_bus_lock = hp_bus.lock();
@@ -1655,7 +1689,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             .context("failed to add descriptor to wait context")?;
     }
 
-    if cfg.sandbox {
+    if cfg.jail_config.is_some() {
         // Before starting VCPUs, in case we started with some capabilities, drop them all.
         drop_capabilities().context("failed to drop process capabilities")?;
     }
@@ -1699,6 +1733,10 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             Some(f)
         }
     };
+
+    #[cfg(target_os = "android")]
+    android::set_process_profiles(&cfg.task_profiles)?;
+
     for (cpu_id, vcpu) in vcpus.into_iter().enumerate() {
         let (to_vcpu_channel, from_main_channel) = mpsc::channel();
         let vcpu_affinity = match linux.vcpu_affinity.clone() {
@@ -1742,6 +1780,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         .context("failed to clone vcpu cgroup tasks file")?,
                 ),
             },
+            cfg.userspace_msr.clone(),
         )?;
         vcpu_handles.push((handle, to_vcpu_channel));
     }
@@ -1965,9 +2004,10 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                         let irq_chip = &mut linux.irq_chip;
                                         request.execute(
                                             |setup| match setup {
-                                                IrqSetup::Event(irq, ev) => {
+                                                IrqSetup::Event(irq, ev, _, _, _) => {
+                                                    let irq_evt = devices::IrqEdgeEvent::from_event(ev.try_clone()?);
                                                     if let Some(event_index) = irq_chip
-                                                        .register_irq_event(irq, ev, None)?
+                                                        .register_edge_irq_event(irq, &irq_evt)?
                                                     {
                                                         match wait_ctx.add(
                                                             ev,
@@ -1988,7 +2028,10 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                                     }
                                                 }
                                                 IrqSetup::Route(route) => irq_chip.route_irq(route),
-                                                IrqSetup::UnRegister(irq, ev) => irq_chip.unregister_irq_event(irq, ev),
+                                                IrqSetup::UnRegister(irq, ev) => {
+                                                    let irq_evt = devices::IrqEdgeEvent::from_event(ev.try_clone()?);
+                                                    irq_chip.unregister_edge_irq_event(irq, &irq_evt)
+                                                }
                                             },
                                             &mut sys_allocator,
                                         )
