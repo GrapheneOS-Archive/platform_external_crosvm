@@ -8,27 +8,15 @@ use anyhow::{anyhow, Result};
 use libc;
 use std::ffi::{CStr, CString};
 
-// #[link(name = "processgroup")]
-// extern "C" {
-//     fn android_set_process_profiles(
-//         uid: libc::uid_t,
-//         pid: libc::pid_t,
-//         num_profiles: libc::size_t,
-//         profiles: *const *const libc::c_char,
-//     ) -> bool;
-// }
-
-// ANDROID PATCH: The real android_set_process_profiles implementation isn't available to link
-// against yet, so it is replaced with a stub.
-unsafe fn android_set_process_profiles(
-    uid: libc::uid_t,
-    pid: libc::pid_t,
-    num_profiles: libc::size_t,
-    profiles: *const *const libc::c_char,
-) -> bool {
-    return true;
+#[link(name = "processgroup")]
+extern "C" {
+    fn android_set_process_profiles(
+        uid: libc::uid_t,
+        pid: libc::pid_t,
+        num_profiles: libc::size_t,
+        profiles: *const *const libc::c_char,
+    ) -> bool;
 }
-
 
 // Apply the listed task profiles to all tasks (current and future) in this process.
 pub fn set_process_profiles(profiles: &Vec<String>) -> Result<()> {
