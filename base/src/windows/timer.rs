@@ -8,10 +8,8 @@ use std::{
 };
 use sync::Mutex;
 
-use super::{
-    AsRawDescriptor, Event, EventReadResult, FakeClock, FromRawDescriptor, IntoRawDescriptor,
-    RawDescriptor, Result, SafeDescriptor,
-};
+use super::{Event, EventReadResult, FakeClock, RawDescriptor, Result};
+use crate::descriptor::{AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor};
 
 #[path = "win/timer.rs"]
 mod timer_platform;
@@ -153,11 +151,6 @@ impl FakeTimer {
         }
     }
 
-    /// Returns `true` if the timer is currently armed.
-    pub fn is_armed(&self) -> Result<bool> {
-        Ok(self.deadline_ns.is_some())
-    }
-
     /// Disarms the timer.
     pub fn clear(&mut self) -> Result<()> {
         self.deadline_ns = None;
@@ -278,12 +271,10 @@ mod tests {
     fn fake_one_shot() {
         let clock = Arc::new(Mutex::new(FakeClock::new()));
         let mut tfd = FakeTimer::new(clock.clone());
-        assert_eq!(tfd.is_armed().unwrap(), false);
 
         let dur = Duration::from_nanos(200);
         tfd.reset(dur, None).expect("failed to arm timer");
 
-        assert_eq!(tfd.is_armed().unwrap(), true);
         clock.lock().add_ns(200);
 
         let result = tfd.wait(None).expect("unable to wait for timer");
@@ -295,11 +286,9 @@ mod tests {
     fn fake_one_shot_timeout() {
         let clock = Arc::new(Mutex::new(FakeClock::new()));
         let mut tfd = FakeTimer::new(clock.clone());
-        assert_eq!(tfd.is_armed().unwrap(), false);
 
         let dur = Duration::from_nanos(200);
         tfd.reset(dur, None).expect("failed to arm timer");
-        assert_eq!(tfd.is_armed().unwrap(), true);
 
         clock.lock().add_ns(100);
         let result = tfd
