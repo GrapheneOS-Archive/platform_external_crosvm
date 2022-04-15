@@ -97,6 +97,11 @@ rust_binary {
                 "gpu",
             ],
         },
+        android: {
+            shared_libs: [
+                "libprocessgroup",
+            ],
+        },
         darwin: {
             enabled: false,
         },
@@ -109,6 +114,9 @@ rust_binary {
                 "libgdbstub",
                 "libgdbstub_arch",
                 "libthiserror",
+            ],
+            shared_libs: [
+                "libprocessgroup",
             ],
         },
         linux_bionic_arm64: {
@@ -368,6 +376,11 @@ rust_library {
                 "gpu",
             ],
         },
+        android: {
+            shared_libs: [
+                "libprocessgroup",
+            ],
+        },
         host_linux: {
             features: [
                 "gdb",
@@ -377,6 +390,9 @@ rust_library {
                 "libgdbstub",
                 "libgdbstub_arch",
                 "libthiserror",
+            ],
+            shared_libs: [
+                "libprocessgroup",
             ],
         },
     },
