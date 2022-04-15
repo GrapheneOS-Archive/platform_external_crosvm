@@ -90,9 +90,7 @@ pub trait VhostUserSlaveReqHandler {
 #[allow(missing_docs)]
 pub trait VhostUserSlaveReqHandlerMut {
     /// Returns the type of vhost-user protocol that the handler support.
-    fn protocol(&self) -> Protocol {
-        Protocol::Regular
-    }
+    fn protocol(&self) -> Protocol;
 
     fn set_owner(&mut self) -> Result<()>;
     fn reset_owner(&mut self) -> Result<()>;
@@ -831,21 +829,22 @@ impl<S: VhostUserSlaveReqHandler, E: Endpoint<MasterReq>> SlaveReqHandler<S, E> 
         if size - mem::size_of::<VhostUserConfig>() != msg.size as usize {
             return Err(Error::InvalidMessage);
         }
-        let flags: VhostUserConfigFlags;
-        match VhostUserConfigFlags::from_bits(msg.flags) {
-            Some(val) => flags = val,
+        let flags: VhostUserConfigFlags = match VhostUserConfigFlags::from_bits(msg.flags) {
+            Some(val) => val,
             None => return Err(Error::InvalidMessage),
-        }
+        };
 
         self.backend.set_config(msg.offset, buf, flags)
     }
 
     fn set_slave_req_fd(&mut self, files: Option<Vec<File>>) -> Result<()> {
-        #[cfg(windows)]
-        unimplemented!();
-        let file = take_single_file(files).ok_or(Error::InvalidMessage)?;
-        self.backend.set_slave_req_fd(file);
-        Ok(())
+        if cfg!(windows) {
+            unimplemented!();
+        } else {
+            let file = take_single_file(files).ok_or(Error::InvalidMessage)?;
+            self.backend.set_slave_req_fd(file);
+            Ok(())
+        }
     }
 
     fn handle_vring_fd_request(

@@ -3,7 +3,6 @@
 // found in the LICENSE file.
 
 use std::cell::RefCell;
-use std::cmp::{max, min};
 use std::fs::OpenOptions;
 use std::rc::Rc;
 use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc};
@@ -14,20 +13,20 @@ use futures::future::{AbortHandle, Abortable};
 use sync::Mutex;
 use vmm_vhost::message::*;
 
-use base::{error, iov_max, warn, Event, Timer};
+use base::{warn, Event, Timer};
 use cros_async::{sync::Mutex as AsyncMutex, EventAsync, Executor, TimerAsync};
 use data_model::DataInit;
 use disk::create_async_disk_file;
 use hypervisor::ProtectionType;
 use vm_memory::GuestMemory;
 
-use crate::virtio::block::asynchronous::{flush_disk, process_one_chain};
+use crate::virtio::block::asynchronous::{flush_disk, handle_queue};
 use crate::virtio::block::*;
 use crate::virtio::vhost::user::device::{
     handler::{DeviceRequestHandler, Doorbell, VhostUserBackend},
     vvu::pci::VvuPciDevice,
 };
-use crate::virtio::{self, base_features, copy_config, Queue};
+use crate::virtio::{self, base_features, block::sys::*, copy_config};
 
 const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: u16 = 16;
@@ -86,12 +85,7 @@ impl BlockBackend {
         let avail_features = build_avail_features(base_features, read_only, sparse, true)
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
 
-        let seg_max = min(max(iov_max(), 1), u32::max_value() as usize) as u32;
-
-        // Since we do not currently support indirect descriptors, the maximum
-        // number of segments must be smaller than the queue size.
-        // In addition, the request header and status each consume a descriptor.
-        let seg_max = min(seg_max, u32::from(QUEUE_SIZE) - 2);
+        let seg_max = get_seg_max(QUEUE_SIZE);
 
         let async_image = disk_image.to_async_disk(ex)?;
 
@@ -246,48 +240,6 @@ impl VhostUserBackend for BlockBackend {
     fn stop_queue(&mut self, idx: usize) {
         if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
             handle.abort();
-        }
-    }
-}
-
-// There is one async task running `handle_queue` per virtio queue in use.
-// Receives messages from the guest and queues a task to complete the operations with the async
-// executor.
-async fn handle_queue(
-    ex: Executor,
-    mem: GuestMemory,
-    disk_state: Rc<AsyncMutex<DiskState>>,
-    queue: Rc<RefCell<Queue>>,
-    evt: EventAsync,
-    interrupt: Arc<Mutex<Doorbell>>,
-    flush_timer: Rc<RefCell<TimerAsync>>,
-    flush_timer_armed: Rc<RefCell<bool>>,
-) {
-    loop {
-        if let Err(e) = evt.next_val().await {
-            error!("Failed to read the next queue event: {}", e);
-            continue;
-        }
-        while let Some(descriptor_chain) = queue.borrow_mut().pop(&mem) {
-            let queue = Rc::clone(&queue);
-            let disk_state = Rc::clone(&disk_state);
-            let mem = mem.clone();
-            let interrupt = Arc::clone(&interrupt);
-            let flush_timer = Rc::clone(&flush_timer);
-            let flush_timer_armed = Rc::clone(&flush_timer_armed);
-            ex.spawn_local(async move {
-                process_one_chain(
-                    queue,
-                    descriptor_chain,
-                    disk_state,
-                    mem,
-                    &interrupt,
-                    flush_timer,
-                    flush_timer_armed,
-                )
-                .await
-            })
-            .detach();
         }
     }
 }

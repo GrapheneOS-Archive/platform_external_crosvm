@@ -30,7 +30,7 @@ use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
     platform, BindMount, Config, Executable, FileBackedMappingParameters, GidMap, SharedDir,
     TouchDeviceOption, VfioCommand, VhostUserFsOption, VhostUserOption, VhostUserWlOption,
-    VhostVsockDeviceParameter, VvuOption,
+    VvuOption,
 };
 use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::virtio::block::block::DiskOption;
@@ -42,6 +42,7 @@ use devices::virtio::vhost::user::device::{
     run_block_device, run_console_device, run_fs_device, run_net_device, run_vsock_device,
     run_wl_device,
 };
+use devices::virtio::vhost::vsock::VhostVsockDeviceParameter;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::VideoBackendType;
 #[cfg(feature = "gpu")]
@@ -483,8 +484,13 @@ fn parse_video_options(s: Option<&str>) -> argument::Result<VideoBackendType> {
     ];
 
     match s {
-        #[cfg(feature = "libvda")]
-        None => Ok(VideoBackendType::Libvda),
+        None => {
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "libvda")] {
+                    Ok(VideoBackendType::Libvda)
+                }
+            }
+        }
         #[cfg(feature = "libvda")]
         Some("libvda") => Ok(VideoBackendType::Libvda),
         #[cfg(feature = "libvda")]
@@ -689,6 +695,41 @@ fn parse_ac97_options(s: &str) -> argument::Result<Ac97Parameters> {
     }
 
     Ok(ac97_params)
+}
+
+enum MsrAction {
+    Invalid,
+    /// Read MSR value from host CPU0 regardless of current vcpu.
+    ReadFromCPU0,
+}
+
+fn parse_userspace_msr_options(value: &str) -> argument::Result<u32> {
+    // TODO(b/215297064): Implement different type of operations, such
+    // as write or reading from the correct CPU.
+    let mut options = argument::parse_key_value_options("userspace-msr", value, ',');
+    let index: u32 = options
+        .next()
+        .ok_or(argument::Error::ExpectedValue(String::from(
+            "userspace-msr: expected index",
+        )))?
+        .key_numeric()?;
+    let mut msr_config = MsrAction::Invalid;
+    for opt in options {
+        match opt.key() {
+            "action" => match opt.value()? {
+                "r0" => msr_config = MsrAction::ReadFromCPU0,
+                _ => return Err(opt.invalid_value_err(String::from("bad action"))),
+            },
+            _ => return Err(opt.invalid_key_err()),
+        }
+    }
+
+    match msr_config {
+        MsrAction::ReadFromCPU0 => Ok(index),
+        _ => Err(argument::Error::UnknownArgument(
+            "userspace-msr action not specified".to_string(),
+        )),
+    }
 }
 
 fn parse_serial_options(s: &str) -> argument::Result<SerialParameters> {
@@ -913,7 +954,7 @@ fn parse_stub_pci_parameters(s: Option<&str>) -> argument::Result<StubPciParamet
         )))?
         .key();
     let mut params = StubPciParameters {
-        address: PciAddress::from_string(addr).map_err(|e| argument::Error::InvalidValue {
+        address: PciAddress::from_str(addr).map_err(|e| argument::Error::InvalidValue {
             value: addr.to_owned(),
             expected: format!("stub-pci-device: expected PCI address: {}", e),
         })?,
@@ -1546,7 +1587,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.balloon_control = Some(path);
         }
         "disable-sandbox" => {
-            cfg.sandbox = false;
+            cfg.jail_config = None;
         }
         "cid" => {
             if cfg.cid.is_some() {
@@ -1709,8 +1750,10 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             cfg.shared_dirs.push(shared_dir);
         }
         "seccomp-policy-dir" => {
-            // `value` is Some because we are in this match so it's safe to unwrap.
-            cfg.seccomp_policy_dir = PathBuf::from(value.unwrap());
+            if let Some(jail_config) = &mut cfg.jail_config {
+                // `value` is Some because we are in this match so it's safe to unwrap.
+                jail_config.seccomp_policy_dir = PathBuf::from(value.unwrap());
+            }
         }
         "seccomp-log-failures" => {
             // A side-effect of this flag is to force the use of .policy files
@@ -1730,7 +1773,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             // or 2) do not use this command-line parameter and instead
             // temporarily change the build by passing "log" rather than
             // "trap" as the "--default-action" to compile_seccomp_policy.py.
-            cfg.seccomp_log_failures = true;
+            if let Some(jail_config) = &mut cfg.jail_config {
+                jail_config.seccomp_log_failures = true;
+            }
         }
         "plugin" => {
             if cfg.executable_path.is_some() {
@@ -2096,6 +2141,21 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 );
         }
         #[cfg(feature = "direct")]
+        "direct-wake-irq" => {
+            cfg.direct_wake_irq
+                .push(
+                    value
+                        .unwrap()
+                        .parse()
+                        .map_err(|_| argument::Error::InvalidValue {
+                            value: value.unwrap().to_owned(),
+                            expected: String::from(
+                                "this value for `direct-wake-irq` must be an unsigned integer",
+                            ),
+                        })?,
+                );
+        }
+        #[cfg(feature = "direct")]
         "direct-gpe" => {
             cfg.direct_gpe.push(value.unwrap().parse().map_err(|_| {
                 argument::Error::InvalidValue {
@@ -2130,6 +2190,10 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "no-legacy" => {
             cfg.no_legacy = true;
         }
+        "userspace-msr" => {
+            let index = parse_userspace_msr_options(value.unwrap())?;
+            cfg.userspace_msr.insert(index);
+        }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         "host-cpu-topology" => {
             cfg.host_cpu_topology = true;
@@ -2161,7 +2225,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                             }
 
                             vvu_opt.addr =
-                                Some(PciAddress::from_string(pci_address).map_err(|e| {
+                                Some(PciAddress::from_str(pci_address).map_err(|e| {
                                     argument::Error::InvalidValue {
                                         value: pci_address.to_string(),
                                         expected: format!("vvu-proxy PCI address: {}", e),
@@ -2319,7 +2383,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             });
         }
         "pivot-root" => {
-            cfg.pivot_root = Some(PathBuf::from(value.unwrap()));
+            if let Some(jail_config) = &mut cfg.jail_config {
+                jail_config.pivot_root = PathBuf::from(value.unwrap());
+            }
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         "s2idle" => {
@@ -2356,6 +2422,12 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 })
                 .collect();
             cfg.mmio_address_ranges = ranges?;
+        }
+        #[cfg(target_os = "android")]
+        "task-profiles" => {
+            for name in value.unwrap().split(',') {
+                cfg.task_profiles.push(name.to_owned());
+            }
         }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
@@ -2467,6 +2539,11 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
         &mut cfg.serial_parameters,
         !cfg.vhost_user_console.is_empty(),
     );
+
+    // Remove jail configuration if it has not been enabled.
+    if !cfg.jail_enabled {
+        cfg.jail_config = None;
+    }
 
     Ok(())
 }
@@ -2715,9 +2792,14 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
 #[cfg(feature = "direct")]
           Argument::value("direct-edge-irq", "irq", "Enable interrupt passthrough"),
 #[cfg(feature = "direct")]
+          Argument::value("direct-wake-irq", "irq", "Enable wakeup interrupt for host"),
+#[cfg(feature = "direct")]
           Argument::value("direct-gpe", "gpe", "Enable GPE interrupt and register access passthrough"),
           Argument::value("dmi", "DIR", "Directory with smbios_entry_point/DMI files"),
           Argument::flag("no-legacy", "Don't use legacy KBD/RTC devices emulation"),
+          Argument::value("userspace-msr", "INDEX,action=r0", "Userspace MSR handling. Takes INDEX of the MSR and how they are handled.
+                              action=r0 - forward RDMSR to host kernel cpu0.
+"),
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("host-cpu-topology", "Use mirror cpu topology of Host for Guest VM"),
           Argument::flag("privileged-vm", "Grant this Guest VM certian privileges to manage Host resources, such as power management."),
@@ -2757,6 +2839,8 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
                           "Ranges (inclusive) into which to limit guest mmio addresses. Note that
                            this this may cause mmio allocations to fail if the specified ranges are
                            incompatible with the default ranges calculated by crosvm."),
+          #[cfg(target_os = "android")]
+          Argument::value("task-profiles", "NAME[,...]", "Comma-separated names of the task profiles to apply to all threads in crosvm including the vCPU threads."),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -4244,5 +4328,14 @@ mod tests {
             parse_file_backed_mapping(Some("addr=0x3042,size=0xff0,path=/dev/mem,align")).unwrap();
         assert_eq!(params.address, 0x3000);
         assert_eq!(params.size, 0x2000);
+    }
+
+    #[test]
+    fn parse_userspace_msr_options_test() {
+        let index = parse_userspace_msr_options("0x10,action=r0").unwrap();
+        assert_eq!(index, 0x10);
+        assert!(parse_userspace_msr_options("0x10,action=none").is_err());
+        assert!(parse_userspace_msr_options("0x10").is_err());
+        assert!(parse_userspace_msr_options("hoge").is_err());
     }
 }

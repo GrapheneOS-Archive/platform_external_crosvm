@@ -2,9 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::{
-    AsRawDescriptor, FakeClock, FromRawDescriptor, IntoRawDescriptor, RawDescriptor, Result,
-};
+use crate::descriptor::{AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor};
+use crate::{FakeClock, RawDescriptor, Result};
 
 use crate::platform::{FakeTimerFd, TimerFd};
 use std::{
@@ -41,10 +40,6 @@ macro_rules! build_timer {
 
             pub fn wait(&mut self) -> Result<()> {
                 self.0.wait().map(|_| ())
-            }
-
-            pub fn is_armed(&self) -> Result<bool> {
-                self.0.is_armed()
             }
 
             pub fn clear(&mut self) -> Result<()> {

@@ -12,15 +12,23 @@ use remain::sorted;
 use thiserror::Error;
 use vfio_sys::*;
 
+use crate::{IrqEdgeEvent, IrqLevelEvent};
+
 #[sorted]
 #[derive(Error, Debug)]
 pub enum DirectIrqError {
+    #[error("failed to clone trigger event: {0}")]
+    CloneEvent(base::Error),
+    #[error("failed to clone resample event: {0}")]
+    CloneResampleEvent(base::Error),
     #[error("failed to enable direct irq")]
     Enable,
     #[error("failed to enable gpe irq")]
     EnableGpe,
     #[error("failed to enable direct sci irq")]
     EnableSci,
+    #[error("failed to enable wake irq")]
+    EnableWake,
     #[error("failed to open /dev/plat-irq-forward: {0}")]
     Open(io::Error),
 }
@@ -33,8 +41,19 @@ pub struct DirectIrq {
 }
 
 impl DirectIrq {
-    /// Create DirectIrq object to access hardware triggered interrupts.
-    pub fn new(trigger: Event, resample: Option<Event>) -> Result<Self, DirectIrqError> {
+    fn new(trigger_evt: &Event, resample_evt: Option<&Event>) -> Result<Self, DirectIrqError> {
+        let trigger = trigger_evt
+            .try_clone()
+            .map_err(DirectIrqError::CloneEvent)?;
+        let resample = if let Some(event) = resample_evt {
+            Some(
+                event
+                    .try_clone()
+                    .map_err(DirectIrqError::CloneResampleEvent)?,
+            )
+        } else {
+            None
+        };
         let dev = OpenOptions::new()
             .read(true)
             .write(true)
@@ -46,6 +65,16 @@ impl DirectIrq {
             resample,
             sci_irq_prepared: false,
         })
+    }
+
+    /// Create DirectIrq object to access hardware edge triggered interrupts.
+    pub fn new_edge(irq_evt: &IrqEdgeEvent) -> Result<Self, DirectIrqError> {
+        DirectIrq::new(irq_evt.get_trigger(), None)
+    }
+
+    /// Create DirectIrq object to access hardware level triggered interrupts.
+    pub fn new_level(irq_evt: &IrqLevelEvent) -> Result<Self, DirectIrqError> {
+        DirectIrq::new(irq_evt.get_trigger(), Some(irq_evt.get_resample()))
     }
 
     /// Enable hardware triggered interrupt handling.
@@ -78,6 +107,10 @@ impl DirectIrq {
         };
 
         Ok(())
+    }
+
+    pub fn irq_wake_enable(&self, irq_num: u32) -> Result<(), DirectIrqError> {
+        self.plat_irq_wake_ioctl(irq_num, PLAT_IRQ_WAKE_ENABLE)
     }
 
     /// Enable hardware triggered SCI interrupt handling for GPE.
@@ -128,6 +161,21 @@ impl DirectIrq {
         let ret = unsafe { ioctl_with_ref(self, PLAT_IRQ_FORWARD_SET(), &irq_set[0]) };
         if ret < 0 {
             Err(DirectIrqError::Enable)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn plat_irq_wake_ioctl(&self, irq_num: u32, action: u32) -> Result<(), DirectIrqError> {
+        let mut irq_wake_set = vec_with_array_field::<plat_irq_wake_set, u32>(0);
+        irq_wake_set[0].argsz = (size_of::<plat_irq_wake_set>()) as u32;
+        irq_wake_set[0].action_flags = action;
+        irq_wake_set[0].irq_number_host = irq_num;
+
+        // Safe as we are the owner of plat_irq_wake_set and irq_wake_set which are valid value
+        let ret = unsafe { ioctl_with_ref(self, PLAT_IRQ_WAKE_SET(), &irq_wake_set[0]) };
+        if ret < 0 {
+            Err(DirectIrqError::EnableWake)
         } else {
             Ok(())
         }
