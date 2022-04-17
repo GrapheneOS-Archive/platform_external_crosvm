@@ -1,56 +1,7 @@
 #!/bin/bash
 
-# Convenience script to run cargo2android.py with the appropriate arguments in the crosvm directory
-# and all subdirectories with Cargo.toml files.
+# Run cargo2android.py for every crate in crosvm.
 
 set -e
 
-if ! [ -x "$(command -v bpfmt)" ]; then
-  echo 'Error: bpfmt not found.' >&2
-  exit 1
-fi
-
-cargo2android() {
-  local C2A=${C2A:-cargo2android.py}
-  echo "Using $C2A to run this script."
-
-  # Some crates need special options to cargo2android.py, if there's a config file then use it.
-  if [[ -f "cargo2android.json" ]]; then
-    $C2A --config cargo2android.json
-  else
-    $C2A --run --device --tests $@
-  fi
-  bpfmt -w Android.bp || /bin/true
-  rm -f cargo.out
-  rm -rf target.tmp || /bin/true
-}
-
-# Run in the main crosvm directory.
-cargo2android --no-subdir
-
-initial_dir=`pwd`
-for dir in */src common/*/src third_party/*/src
-do
-  base=`dirname $dir`
-  echo "$base"
-  cd "$base"
-  # If the subdirectory has more subdirectories with crates, then pass --no-subdir and run it in
-  # each of them too.
-  if compgen -G "*/Cargo.toml" > /dev/null
-  then
-    cargo2android --global_defaults=crosvm_defaults --add_workspace --no-subdir
-
-    for dir in */Cargo.toml
-    do
-      sub_base=`dirname $dir`
-      echo "$base/$sub_base"
-      cd "$sub_base"
-      cargo2android --global_defaults=crosvm_defaults --add_workspace
-      cd ..
-    done
-  else
-    cargo2android --global_defaults=crosvm_defaults --add_workspace
-  fi
-
-  cd "$initial_dir"
-done
+find . -type f -name Cargo.toml | xargs dirname | sort | xargs -L1 ./run_c2a.sh
