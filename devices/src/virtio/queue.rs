@@ -162,11 +162,8 @@ impl DescriptorChain {
         if self.len > 0 {
             match self.get_mem_regions() {
                 Ok(regions) => {
-                    if regions.iter().any(|r| {
-                        self.mem
-                            .checked_offset(r.gpa, r.len as u64 - 1u64)
-                            .is_none()
-                    }) {
+                    // Each region in `self.regions` must be a contiguous range in `self.mem`.
+                    if !regions.iter().all(|r| self.mem.is_valid_range(r.gpa, r.len as u64)) {
                         return false;
                     }
                 }

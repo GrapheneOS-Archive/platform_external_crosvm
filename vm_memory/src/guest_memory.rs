@@ -315,7 +315,10 @@ impl GuestMemory {
             .any(|region| region.start() < end && start < region.end())
     }
 
-    /// Returns the address plus the offset if it is in range.
+    /// Returns an address `addr + offset` if it's in range.
+    ///
+    /// This function doesn't care whether a region `[addr, addr + offset)` is in range or not. To
+    /// guarantee it's a valid range, use `is_valid_range()` instead.
     pub fn checked_offset(&self, addr: GuestAddress, offset: u64) -> Option<GuestAddress> {
         addr.checked_add(offset).and_then(|a| {
             if self.address_in_range(a) {
@@ -324,6 +327,24 @@ impl GuestMemory {
                 None
             }
         })
+    }
+
+    /// Returns true if the given range `[start, start + length)` is a valid contiguous memory
+    /// range available to the guest and it's backed by a single underlying memory region.
+    pub fn is_valid_range(&self, start: GuestAddress, length: u64) -> bool {
+        if length == 0 {
+            return false;
+        }
+
+        let end = if let Some(end) = start.checked_add(length - 1) {
+            end
+        } else {
+            return false;
+        };
+
+        self.regions
+            .iter()
+            .any(|region| region.start() <= start && end < region.end())
     }
 
     /// Returns the size of the memory region in bytes.
